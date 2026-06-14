@@ -449,3 +449,388 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Path as AxumPath;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::{routing::get, routing::patch, routing::post, Json, Router};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    async fn wait_listening(port: u16) {
+        for _ in 0..80 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("mock server on port {} never came up", port);
+    }
+
+    async fn spawn(app: Router) -> String {
+        let port = free_port().await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        wait_listening(port).await;
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn sample_item_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "item_type": "received",
+            "encrypted_envelope": "ZW52",
+            "envelope_nonce": "",
+            "folder_token": "tok",
+            "is_external": false,
+            "created_at": "2026-06-14T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn list_mail_parses_200_json_list() {
+        let body = serde_json::json!({
+            "items": [sample_item_json("msg-a"), sample_item_json("msg-b")],
+            "total": 2,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: Some("received".to_string()),
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: Some(100),
+            cursor: None,
+        };
+        let resp = client.list_mail("tok", &q).await.unwrap();
+        assert_eq!(resp.total, 2);
+        assert!(!resp.has_more);
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(resp.items[0].id, "msg-a");
+        assert_eq!(resp.items[1].id, "msg-b");
+    }
+
+    #[tokio::test]
+    async fn list_mail_forwards_query_params() {
+        let seen: Arc<TokioMutex<Vec<(String, String)>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
+                let cap = cap.clone();
+                async move {
+                    let raw = raw.unwrap_or_default();
+                    let mut pairs = Vec::new();
+                    for kv in raw.split('&') {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            pairs.push((k.to_string(), v.to_string()));
+                        }
+                    }
+                    *cap.lock().await = pairs;
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: None,
+            is_trashed: Some(true),
+            is_archived: None,
+            is_spam: None,
+            limit: Some(50),
+            cursor: Some("cur1".to_string()),
+        };
+        let _ = client.list_mail("tok", &q).await.unwrap();
+        let pairs = seen.lock().await.clone();
+        assert!(pairs.iter().any(|(k, v)| k == "is_trashed" && v == "true"));
+        assert!(pairs.iter().any(|(k, v)| k == "limit" && v == "50"));
+        assert!(pairs.iter().any(|(k, v)| k == "cursor" && v == "cur1"));
+        assert!(pairs.iter().any(|(k, v)| k == "group_by_thread" && v == "false"));
+        assert!(!pairs.iter().any(|(k, _)| k == "item_type"));
+    }
+
+    #[tokio::test]
+    async fn list_mail_sends_bearer_token() {
+        let seen: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    *cap.lock().await = auth;
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": null
+                    }))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let q = MailListQuery {
+            item_type: None,
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: None,
+            cursor: None,
+        };
+        let _ = client.list_mail("secret-token", &q).await.unwrap();
+        let auth = seen.lock().await.clone();
+        assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
+    }
+
+    #[tokio::test]
+    async fn fetch_mail_item_parses_single_item() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|AxumPath(id): AxumPath<String>| async move { Json(sample_item_json(&id)) }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let item = client.fetch_mail_item("tok", "msg-xyz").await.unwrap();
+        assert_eq!(item.id, "msg-xyz");
+        assert_eq!(item.item_type, "received");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::UNAUTHORIZED, "no token").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("401")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_plain_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::FORBIDDEN, "denied").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("403")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_plan_upgrade_maps_to_plan_upgrade_required() {
+        let app = Router::new().route(
+            "/core/v1/billing/plan",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "plan_upgrade_required",
+                        "message": "Star plan needed"
+                    })),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.get_plan_info("tok").await.unwrap_err();
+        match err {
+            BridgeError::PlanUpgradeRequired(msg) => assert_eq!(msg, "Star plan needed"),
+            other => panic!("expected PlanUpgradeRequired, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.fetch_mail_item("tok", "msg-1").await.unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("500")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_metadata_patch_body_has_expected_fields() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        client
+            .update_metadata("tok", "msg-1", "ENC", "NON")
+            .await
+            .unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["encrypted_metadata"], "ENC");
+        assert_eq!(body["metadata_nonce"], "NON");
+    }
+
+    #[tokio::test]
+    async fn set_read_status_patch_body_has_is_read() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        client.set_read_status("tok", "msg-1", true).await.unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["is_read"], true);
+    }
+
+    #[tokio::test]
+    async fn set_mailbox_flags_forwards_raw_flags() {
+        let seen: Arc<TokioMutex<Option<serde_json::Value>>> = Arc::new(TokioMutex::new(None));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id/metadata",
+            patch(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let flags = serde_json::json!({"is_archived": true, "is_trashed": false});
+        client.set_mailbox_flags("tok", "msg-1", flags).await.unwrap();
+        let body = seen.lock().await.clone().unwrap();
+        assert_eq!(body["is_archived"], true);
+        assert_eq!(body["is_trashed"], false);
+    }
+
+    #[tokio::test]
+    async fn send_mail_posts_body_and_returns_ok() {
+        let seen: Arc<TokioMutex<Vec<serde_json::Value>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    cap.lock().await.push(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let payload = serde_json::json!({"subject": "hi", "body": "there"});
+        client.send_mail("tok", &payload).await.unwrap();
+        let captured = seen.lock().await.clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["subject"], "hi");
+        assert_eq!(captured[0]["body"], "there");
+    }
+
+    #[tokio::test]
+    async fn send_mail_non_2xx_maps_to_api_error() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async { (StatusCode::BAD_REQUEST, "bad").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .send_mail("tok", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            BridgeError::Api(msg) => assert!(msg.contains("400")),
+            other => panic!("expected Api error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_plan_info_parses_bridge_access() {
+        let app = Router::new().route(
+            "/core/v1/billing/plan",
+            get(|| async {
+                Json(serde_json::json!({"plan_code": "star", "has_bridge_access": true}))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let info = client.get_plan_info("tok").await.unwrap();
+        assert_eq!(info.plan_code, "star");
+        assert!(info.has_bridge_access);
+    }
+
+    #[test]
+    fn mail_item_deserializes_with_optional_fields_absent() {
+        let item: MailItem = serde_json::from_value(sample_item_json("only-required")).unwrap();
+        assert_eq!(item.id, "only-required");
+        assert!(item.ephemeral_key.is_none());
+        assert!(item.thread_token.is_none());
+        assert!(item.is_spam.is_none());
+    }
+}
