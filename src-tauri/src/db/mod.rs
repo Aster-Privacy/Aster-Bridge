@@ -737,6 +737,16 @@ impl Database {
         })
     }
 
+    pub fn set_folder_if_changed(&self, aster_id: &str, folder: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET folder = ?2 WHERE aster_id = ?1 AND folder != ?2",
+                rusqlite::params![aster_id, folder],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(

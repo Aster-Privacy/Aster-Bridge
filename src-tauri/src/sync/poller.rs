@@ -258,6 +258,7 @@ fn cache_mail_item(
     }
 
     if db.body_cached(&item.id) {
+        let _ = db.set_folder_if_changed(&item.id, folder);
         let _ = db.assign_uid_if_missing(folder, &item.id);
         return false;
     }
