@@ -2015,6 +2015,7 @@ mod tests {
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);
 
+        let _g = crate::port_picker::TEST_SERVER_START.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -2026,7 +2027,7 @@ mod tests {
             let _ = run(&addr_str, session, db_clone, client, passwords, tx_clone, None).await;
         });
 
-        for _ in 0..40 {
+        for _ in 0..80 {
             if TcpStream::connect(addr).await.is_ok() {
                 break;
             }

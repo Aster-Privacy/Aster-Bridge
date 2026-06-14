@@ -221,32 +221,33 @@ mod e2e_tests {
         }));
 
         let client = Arc::new(ApiClient::new());
-        let (tx, _rx) = broadcast::channel(8);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        drop(listener);
-        let addr = format!("127.0.0.1:{}", bound.port());
-        let url_base = format!("http://{}", addr);
-
-        let addr_clone = addr.clone();
-        tokio::spawn(async move {
-            let _ = run(&addr_clone, session, db, client, passwords, tx, None).await;
-        });
-
-        for _ in 0..20 {
-            if reqwest::get(format!("{}/.well-known/jmap", url_base))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
         let basic = base64::engine::general_purpose::STANDARD
             .encode(b"tester@aster.test:abcd-efgh-ijkl-mnop");
-        (url_base, format!("Basic {}", basic), dir)
+        let auth = format!("Basic {}", basic);
+        for _ in 0..20 {
+            let _g = crate::port_picker::TEST_SERVER_START.lock().await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            drop(listener);
+            let url_base = format!("http://{}", addr);
+            let (tx, _rx) = broadcast::channel(8);
+            let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+            tokio::spawn(async move {
+                let _ = run(&addr, s, d, c, p, tx, None).await;
+            });
+            let mut ready = false;
+            for _ in 0..200 {
+                if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if ready {
+                return (url_base, auth, dir);
+            }
+        }
+        panic!("jmap test server did not become ready");
     }
 
     #[tokio::test]
@@ -393,26 +394,33 @@ mod e2e_tests {
             identity_key: None,
         }));
         let client = Arc::new(ApiClient::new());
-        let (tx, _rx) = broadcast::channel(8);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        drop(listener);
-        let addr = format!("127.0.0.1:{}", bound.port());
-        let url_base = format!("http://{}", addr);
-        let db_clone = db.clone();
-        let addr_clone = addr.clone();
-        tokio::spawn(async move {
-            let _ = run(&addr_clone, session, db_clone, client, passwords, tx, None).await;
-        });
-        for _ in 0..20 {
-            if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         let basic = base64::engine::general_purpose::STANDARD
             .encode(b"tester@aster.test:abcd-efgh-ijkl-mnop");
-        (url_base, format!("Basic {}", basic), db, dir)
+        let auth = format!("Basic {}", basic);
+        for _ in 0..20 {
+            let _g = crate::port_picker::TEST_SERVER_START.lock().await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            drop(listener);
+            let url_base = format!("http://{}", addr);
+            let (tx, _rx) = broadcast::channel(8);
+            let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+            tokio::spawn(async move {
+                let _ = run(&addr, s, d, c, p, tx, None).await;
+            });
+            let mut ready = false;
+            for _ in 0..200 {
+                if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if ready {
+                return (url_base, auth, db, dir);
+            }
+        }
+        panic!("jmap test server did not become ready");
     }
 
     fn seed_message(db: &Database, id: &str, folder: &str, subject: &str, body: &str) {

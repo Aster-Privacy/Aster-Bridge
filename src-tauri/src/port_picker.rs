@@ -49,3 +49,6 @@ pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
         MAX_PROBE_STEPS, preferred
     ))
 }
+
+#[cfg(test)]
+pub(crate) static TEST_SERVER_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
