@@ -1543,34 +1543,37 @@ async fn handle_copy_move(
     if selected.is_empty() {
         return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
+    if selected.len() > 10000 {
+        return write_no(writer, tag, "[LIMIT] too many messages in one COPY/MOVE").await;
+    }
 
     let token = session.read().await.access_token.to_string();
     let validity = uid_validity(db);
     let mut src_uids: Vec<u32> = Vec::new();
     let mut tgt_uids: Vec<u32> = Vec::new();
     let mut moved_seqs: Vec<usize> = Vec::new();
-    for (seq, m) in &selected {
+    for (_, m) in &selected {
         if let Err(e) = client.set_mailbox_flags(&token, &m.aster_id, flags.clone()).await {
             tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
             return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
         }
+    }
+    for (seq, m) in &selected {
+        let _ = db.upsert_cached_message(
+            &m.aster_id,
+            target_internal,
+            m.subject.as_deref(),
+            m.sender.as_deref(),
+            m.recipients.as_deref(),
+            m.date.as_deref(),
+            m.size,
+            m.body_text.as_deref(),
+            m.raw_headers.as_deref(),
+        );
+        let _ = db.remove_uid_mapping(m.imap_uid as i64, &source_folder);
         src_uids.push(m.imap_uid);
-        if is_move {
-            let _ = db.upsert_cached_message(
-                &m.aster_id,
-                target_internal,
-                m.subject.as_deref(),
-                m.sender.as_deref(),
-                m.recipients.as_deref(),
-                m.date.as_deref(),
-                m.size,
-                m.body_text.as_deref(),
-                m.raw_headers.as_deref(),
-            );
-            let _ = db.remove_uid_mapping(m.imap_uid as i64, &source_folder);
-            moved_seqs.push(*seq);
-        }
         tgt_uids.push(db.assign_uid_if_missing(target_internal, &m.aster_id).unwrap_or(0));
+        moved_seqs.push(*seq);
     }
     let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
     let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
@@ -1579,16 +1582,18 @@ async fn handle_copy_move(
         writer
             .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
             .await?;
-        moved_seqs.sort_unstable();
-        let mut adjustment = 0usize;
-        for seq in &moved_seqs {
-            let adjusted = seq.saturating_sub(adjustment);
-            writer
-                .write_all(format!("* {} EXPUNGE\r\n", adjusted).as_bytes())
-                .await?;
-            conn.message_count = conn.message_count.saturating_sub(1);
-            adjustment += 1;
-        }
+    }
+    moved_seqs.sort_unstable();
+    let mut adjustment = 0usize;
+    for seq in &moved_seqs {
+        let adjusted = seq.saturating_sub(adjustment);
+        writer
+            .write_all(format!("* {} EXPUNGE\r\n", adjusted).as_bytes())
+            .await?;
+        conn.message_count = conn.message_count.saturating_sub(1);
+        adjustment += 1;
+    }
+    if is_move {
         write_ok(writer, tag, "MOVE completed").await
     } else {
         writer

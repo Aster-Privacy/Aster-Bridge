@@ -213,6 +213,7 @@ async fn protocol_feature_matrix() {
     let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
     db.seed_jmap_mailboxes().unwrap();
     seed_message(&db, "msg-harness-1", "inbox", "Harness Subject");
+    seed_message(&db, "msg-harness-2", "inbox", "Harness Subject Two");
 
     let passwords = Arc::new(AppPasswords::new(db.clone()));
     passwords.store("harness", APP_PW).unwrap();
@@ -374,7 +375,7 @@ async fn protocol_feature_matrix() {
             copy.contains("COPYUID") && copy.contains("cp1 OK"),
             "archived",
         );
-        let movecmd = imap_cmd(&mut reader, &mut w, "mv1", "UID MOVE 1 Trash").await;
+        let movecmd = imap_cmd(&mut reader, &mut w, "mv1", "UID MOVE 2 Trash").await;
         cl.check(
             "IMAP UID MOVE to Trash (COPYUID + EXPUNGE)",
             movecmd.contains("COPYUID") && movecmd.contains("EXPUNGE") && movecmd.contains("mv1 OK"),
