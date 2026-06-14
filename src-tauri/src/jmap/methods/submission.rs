@@ -160,3 +160,122 @@ pub async fn set(
         "notDestroyed": null,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::Database;
+    use serde_json::Value;
+    use tokio::sync::{broadcast, RwLock};
+    use uuid::Uuid;
+
+    fn ok(r: Result<Value, MethodError>) -> Value {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected ok, got error: {} {}", e.kind, e.message),
+        }
+    }
+
+    fn err_kind(r: Result<Value, MethodError>) -> String {
+        match r {
+            Ok(_) => panic!("expected error, got ok"),
+            Err(e) => e.kind,
+        }
+    }
+
+    fn test_ctx() -> (Arc<JmapContext>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[3u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let account = Uuid::new_v4();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: account,
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+        }));
+        let client = Arc::new(crate::api_client::ApiClient::new());
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), account.to_string(), dir)
+    }
+
+    fn add_msg(ctx: &Arc<JmapContext>, id: &str) {
+        ctx.db
+            .upsert_cached_message(id, "drafts", Some("Subj"), Some("a@b.com"), Some("to@x.com, two@y.com"), Some("2026-01-01T00:00:00Z"), 10, Some("body"), Some("{}"))
+            .unwrap();
+    }
+
+    #[test]
+    fn strip_header_chars_removes_crlf_nul() {
+        assert_eq!(strip_header_chars("a\r\nb\0c"), "abc");
+        assert_eq!(strip_header_chars("clean"), "clean");
+    }
+
+    #[tokio::test]
+    async fn get_always_not_found() {
+        let (ctx, _a, _d) = test_ctx();
+        let res = ok(get(&ctx, json!({"ids": ["s1", "s2"]})).await);
+        assert!(res["list"].as_array().unwrap().is_empty());
+        assert_eq!(res["notFound"], json!(["s1", "s2"]));
+    }
+
+    #[tokio::test]
+    async fn get_wrong_account_rejected() {
+        let (ctx, _a, _d) = test_ctx();
+        assert_eq!(
+            err_kind(get(&ctx, json!({"accountId": "nope"})).await),
+            "accountNotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_missing_email_id_invalid_properties() {
+        let (ctx, _a, _d) = test_ctx();
+        let args = json!({"create": {"c1": {"identityId": "x"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        let entry = &res["notCreated"]["c1"];
+        assert_eq!(entry["type"], json!("invalidProperties"));
+        assert_eq!(entry["properties"], json!(["emailId"]));
+    }
+
+    #[tokio::test]
+    async fn set_email_not_found() {
+        let (ctx, _a, _d) = test_ctx();
+        let args = json!({"create": {"c1": {"emailId": "ghost"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notCreated"]["c1"]["type"], json!("invalidProperties"));
+        assert_eq!(res["notCreated"]["c1"]["description"], json!("email not found"));
+    }
+
+    #[tokio::test]
+    async fn set_unknown_identity_rejected() {
+        let (ctx, _a, _d) = test_ctx();
+        add_msg(&ctx, "e1");
+        let args = json!({"create": {"c1": {"emailId": "e1", "identityId": "identity-bogus"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notCreated"]["c1"]["type"], json!("invalidProperties"));
+        assert_eq!(res["notCreated"]["c1"]["properties"], json!(["identityId"]));
+    }
+
+    #[tokio::test]
+    async fn set_empty_create_is_noop() {
+        let (ctx, _a, _d) = test_ctx();
+        let res = ok(set(&ctx, json!({}), &mut HashMap::new()).await);
+        assert!(res["created"].as_object().unwrap().is_empty());
+        assert!(res["notCreated"].as_object().unwrap().is_empty());
+        assert_eq!(res["destroyed"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn set_send_failure_maps_to_forbidden() {
+        let (ctx, account, _d) = test_ctx();
+        add_msg(&ctx, "e2");
+        let identity = format!("identity-{}", account);
+        let args = json!({"create": {"c1": {"emailId": "e2", "identityId": identity}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notCreated"]["c1"]["type"], json!("forbiddenToSend"));
+    }
+}

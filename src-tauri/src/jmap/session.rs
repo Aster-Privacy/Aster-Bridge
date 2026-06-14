@@ -93,3 +93,100 @@ pub async fn build_session(ctx: &Arc<JmapContext>, port: u16, use_https: bool) -
         "state": session_state
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::Database;
+    use tokio::sync::{broadcast, RwLock};
+    use uuid::Uuid;
+
+    fn test_ctx(email: &str) -> (Arc<JmapContext>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[10u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let account = Uuid::new_v4();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: account,
+            username: "tester".to_string(),
+            email: email.to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+        }));
+        let client = Arc::new(crate::api_client::ApiClient::new());
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), account.to_string(), dir)
+    }
+
+    #[tokio::test]
+    async fn build_session_advertises_capabilities() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 9000, false).await;
+        let caps = s["capabilities"].as_object().unwrap();
+        assert!(caps.contains_key("urn:ietf:params:jmap:core"));
+        assert!(caps.contains_key("urn:ietf:params:jmap:mail"));
+        assert!(caps.contains_key("urn:ietf:params:jmap:submission"));
+        assert_eq!(s["@type"], json!("Session"));
+    }
+
+    #[tokio::test]
+    async fn build_session_account_keyed_by_id() {
+        let (ctx, account, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 9000, false).await;
+        assert!(s["accounts"].get(&account).is_some());
+        assert_eq!(s["accounts"][&account]["name"], json!("user@aster.test"));
+        assert_eq!(s["primaryAccounts"]["urn:ietf:params:jmap:mail"], json!(account));
+        assert_eq!(s["username"], json!("user@aster.test"));
+    }
+
+    #[tokio::test]
+    async fn build_session_http_urls_when_no_tls() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 12345, false).await;
+        assert_eq!(s["apiUrl"], json!("http://127.0.0.1:12345/jmap/api"));
+        let ws = s["capabilities"]["urn:ietf:params:jmap:websocket"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(ws.starts_with("ws://127.0.0.1:12345/jmap/ws"));
+    }
+
+    #[tokio::test]
+    async fn build_session_https_urls_when_tls() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 443, true).await;
+        assert!(s["apiUrl"].as_str().unwrap().starts_with("https://"));
+        assert!(s["downloadUrl"].as_str().unwrap().starts_with("https://"));
+        let ws = s["capabilities"]["urn:ietf:params:jmap:websocket"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(ws.starts_with("wss://"));
+    }
+
+    #[tokio::test]
+    async fn build_session_state_starts_at_zeros() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 80, false).await;
+        assert_eq!(s["state"], json!("0-0-0"));
+    }
+
+    #[tokio::test]
+    async fn build_session_state_reflects_bumps() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        ctx.db.jmap_state_bump("Email").unwrap();
+        ctx.db.jmap_state_bump("Thread").unwrap();
+        let s = build_session(&ctx, 80, false).await;
+        assert_eq!(s["state"], json!("1-0-1"));
+    }
+
+    #[tokio::test]
+    async fn build_session_download_url_has_placeholders() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session(&ctx, 80, false).await;
+        let url = s["downloadUrl"].as_str().unwrap();
+        assert!(url.contains("{accountId}"));
+        assert!(url.contains("{blobId}"));
+        assert!(url.contains("{name}"));
+    }
+}

@@ -89,3 +89,116 @@ pub async fn changes(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, Metho
         "destroyed": destroyed,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::Database;
+    use tokio::sync::{broadcast, RwLock};
+    use uuid::Uuid;
+
+    fn ok(r: Result<Value, MethodError>) -> Value {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected ok, got error: {} {}", e.kind, e.message),
+        }
+    }
+
+    fn err_kind(r: Result<Value, MethodError>) -> String {
+        match r {
+            Ok(_) => panic!("expected error, got ok"),
+            Err(e) => e.kind,
+        }
+    }
+
+    fn test_ctx() -> (Arc<JmapContext>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[4u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+        }));
+        let client = Arc::new(crate::api_client::ApiClient::new());
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), dir)
+    }
+
+    fn add_msg(ctx: &Arc<JmapContext>, id: &str, thread: Option<&str>, date: &str) {
+        ctx.db
+            .upsert_cached_message(id, "inbox", Some("s"), Some("a@b.com"), Some("c@d.com"), Some(date), 10, Some("body"), Some("{}"))
+            .unwrap();
+        ctx.db.update_message_thread_and_msgid(id, thread, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_groups_messages_in_thread_ordered_by_date() {
+        let (ctx, _d) = test_ctx();
+        add_msg(&ctx, "m1", Some("t1"), "2026-01-02T00:00:00Z");
+        add_msg(&ctx, "m2", Some("t1"), "2026-01-01T00:00:00Z");
+        let res = ok(get(&ctx, json!({"ids": ["t1"]})).await);
+        assert_eq!(res["list"][0]["id"], json!("t1"));
+        assert_eq!(res["list"][0]["emailIds"], json!(["m2", "m1"]));
+    }
+
+    #[tokio::test]
+    async fn get_singleton_thread_via_aster_id() {
+        let (ctx, _d) = test_ctx();
+        add_msg(&ctx, "solo", None, "2026-01-01T00:00:00Z");
+        let res = ok(get(&ctx, json!({"ids": ["solo"]})).await);
+        assert_eq!(res["list"][0]["emailIds"], json!(["solo"]));
+    }
+
+    #[tokio::test]
+    async fn get_unknown_thread_is_not_found() {
+        let (ctx, _d) = test_ctx();
+        let res = ok(get(&ctx, json!({"ids": ["nope"]})).await);
+        assert!(res["list"].as_array().unwrap().is_empty());
+        assert_eq!(res["notFound"], json!(["nope"]));
+    }
+
+    #[tokio::test]
+    async fn get_empty_ids() {
+        let (ctx, _d) = test_ctx();
+        let res = ok(get(&ctx, json!({})).await);
+        assert!(res["list"].as_array().unwrap().is_empty());
+        assert!(res["notFound"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_rejects_too_many_ids() {
+        let (ctx, _d) = test_ctx();
+        let ids: Vec<String> = (0..501).map(|i| i.to_string()).collect();
+        assert_eq!(err_kind(get(&ctx, json!({"ids": ids})).await), "requestTooLarge");
+    }
+
+    #[tokio::test]
+    async fn changes_requires_since_state() {
+        let (ctx, _d) = test_ctx();
+        assert_eq!(err_kind(changes(&ctx, json!({})).await), "invalidArguments");
+    }
+
+    #[tokio::test]
+    async fn changes_partitions_ops() {
+        let (ctx, _d) = test_ctx();
+        ctx.db.jmap_change_log_append("Thread", 1, "t1", "created").unwrap();
+        let res = ok(changes(&ctx, json!({"sinceState": "0"})).await);
+        assert_eq!(res["created"], json!(["t1"]));
+        assert_eq!(res["oldState"], json!("0"));
+    }
+
+    #[tokio::test]
+    async fn changes_too_old_rejected() {
+        let (ctx, _d) = test_ctx();
+        ctx.db.jmap_change_log_append("Thread", 50, "t1", "created").unwrap();
+        assert_eq!(
+            err_kind(changes(&ctx, json!({"sinceState": "1"})).await),
+            "cannotCalculateChanges"
+        );
+    }
+}

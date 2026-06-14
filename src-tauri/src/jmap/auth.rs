@@ -132,3 +132,95 @@ fn unauthorized() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn throttle_test_lock() -> &'static std::sync::Mutex<()> {
+        static L: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn decode_basic(value: &str) -> Option<(String, String)> {
+        let b64 = value.strip_prefix("Basic ")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .ok()?;
+        let decoded_str = String::from_utf8(decoded).ok()?;
+        let (user, pass) = decoded_str.split_once(':')?;
+        Some((user.to_string(), pass.to_string()))
+    }
+
+    #[test]
+    fn unauthorized_sets_www_authenticate() {
+        let resp = unauthorized();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let hdr = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        assert!(hdr.to_str().unwrap().contains("Basic realm"));
+    }
+
+    #[test]
+    fn basic_credential_round_trip() {
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"user@x.com:secret-pw");
+        let header = format!("Basic {}", raw);
+        let (user, pass) = decode_basic(&header).unwrap();
+        assert_eq!(user, "user@x.com");
+        assert_eq!(pass, "secret-pw");
+    }
+
+    #[test]
+    fn basic_credential_rejects_non_basic_scheme() {
+        assert!(decode_basic("Bearer abc").is_none());
+    }
+
+    #[test]
+    fn basic_credential_rejects_bad_base64() {
+        assert!(decode_basic("Basic !!!notbase64!!!").is_none());
+    }
+
+    #[test]
+    fn basic_credential_rejects_missing_colon() {
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"nocolon");
+        assert!(decode_basic(&format!("Basic {}", raw)).is_none());
+    }
+
+    #[test]
+    fn email_compare_is_case_insensitive() {
+        assert!("User@Aster.Test".eq_ignore_ascii_case("user@aster.test"));
+        assert!(!"other@aster.test".eq_ignore_ascii_case("user@aster.test"));
+    }
+
+    #[tokio::test]
+    async fn throttle_no_delay_under_free_threshold() {
+        let _g = throttle_test_lock().lock().unwrap();
+        register_auth_success();
+        let start = Instant::now();
+        for _ in 0..AUTH_FAIL_FREE {
+            register_auth_failure().await;
+        }
+        assert!(start.elapsed() < Duration::from_millis(AUTH_FAIL_STEP_MS));
+        register_auth_success();
+    }
+
+    #[tokio::test]
+    async fn throttle_delays_after_threshold() {
+        let _g = throttle_test_lock().lock().unwrap();
+        register_auth_success();
+        for _ in 0..AUTH_FAIL_FREE {
+            register_auth_failure().await;
+        }
+        let start = Instant::now();
+        register_auth_failure().await;
+        assert!(start.elapsed() >= Duration::from_millis(AUTH_FAIL_STEP_MS));
+        register_auth_success();
+    }
+
+    #[tokio::test]
+    async fn throttle_success_resets_counter() {
+        let _g = throttle_test_lock().lock().unwrap();
+        register_auth_success();
+        let guard = auth_throttle().lock().unwrap();
+        assert_eq!(guard.0, 0);
+    }
+}

@@ -75,3 +75,85 @@ pub fn list_messages_all(db: &Database) -> Vec<CachedMessage> {
     })
     .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[1u8; 32]).unwrap();
+        db.seed_jmap_mailboxes().unwrap();
+        (db, dir)
+    }
+
+    fn add(db: &Database, id: &str, folder: &str, seen: bool) {
+        db.upsert_cached_message(id, folder, Some("s"), Some("a@b.com"), Some("c@d.com"), Some("2026-01-01T00:00:00Z"), 10, Some("body"), Some("{}"))
+            .unwrap();
+        if seen {
+            db.set_message_flags_by_id(id, 1).unwrap();
+        }
+    }
+
+    #[test]
+    fn all_mailboxes_has_six_seeded() {
+        let (db, _d) = test_db();
+        let rows = all_mailboxes(&db);
+        assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn label_and_id_maps_are_inverses() {
+        let (db, _d) = test_db();
+        let l2i = label_to_mailbox_id_map(&db);
+        let i2l = mailbox_id_to_label_map(&db);
+        assert_eq!(l2i.get("inbox").map(|s| s.as_str()), Some("mbx_inbox"));
+        assert_eq!(i2l.get("mbx_inbox").map(|s| s.as_str()), Some("inbox"));
+        for (label, id) in &l2i {
+            assert_eq!(i2l.get(id), Some(label));
+        }
+    }
+
+    #[test]
+    fn folder_counts_total_and_unread() {
+        let (db, _d) = test_db();
+        add(&db, "m1", "inbox", false);
+        add(&db, "m2", "inbox", true);
+        add(&db, "m3", "inbox", false);
+        let (total, unread) = folder_counts(&db, "inbox");
+        assert_eq!(total, 3);
+        assert_eq!(unread, 2);
+    }
+
+    #[test]
+    fn folder_counts_empty_folder_is_zero() {
+        let (db, _d) = test_db();
+        assert_eq!(folder_counts(&db, "archive"), (0, 0));
+    }
+
+    #[test]
+    fn folder_counts_scoped_per_folder() {
+        let (db, _d) = test_db();
+        add(&db, "a", "inbox", false);
+        add(&db, "b", "sent", false);
+        assert_eq!(folder_counts(&db, "inbox").0, 1);
+        assert_eq!(folder_counts(&db, "sent").0, 1);
+    }
+
+    #[test]
+    fn list_messages_all_returns_inserted() {
+        let (db, _d) = test_db();
+        add(&db, "x1", "inbox", false);
+        add(&db, "x2", "sent", false);
+        let all = list_messages_all(&db);
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|m| m.aster_id.as_str()).collect();
+        assert!(ids.contains(&"x1") && ids.contains(&"x2"));
+    }
+
+    #[test]
+    fn list_messages_all_empty() {
+        let (db, _d) = test_db();
+        assert!(list_messages_all(&db).is_empty());
+    }
+}
