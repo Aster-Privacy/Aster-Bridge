@@ -572,9 +572,9 @@ where
     let _ = client;
     let starttls_capable = tls_config.is_some();
     let greeting_cap = if starttls_capable {
-        b"* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n" as &[u8]
+        b"* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n" as &[u8]
     } else {
-        b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n"
+        b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n"
     };
     writer.write_all(greeting_cap).await?;
 
@@ -632,9 +632,9 @@ where
         match command.as_str() {
             "CAPABILITY" => {
                 let cap_line: &[u8] = if starttls_capable && conn.state == ImapState::NotAuthenticated {
-                    b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                    b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
                 } else {
-                    b"* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN IDLE UIDPLUS UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                    b"* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
                 };
                 writer.write_all(cap_line).await?;
                 write_ok(&mut writer, &tag, "CAPABILITY completed").await?;
@@ -918,8 +918,22 @@ where
                         write_ok(&mut writer, &tag, "UID EXPUNGE completed").await?;
                     }
                     "COPY" | "MOVE" => {
-                        write_no(&mut writer, &tag, &format!("[CANNOT] UID {} not supported", subcmd))
-                            .await?;
+                        if conn.state != ImapState::Selected {
+                            write_no(&mut writer, &tag, "No mailbox selected").await?;
+                            continue;
+                        }
+                        handle_copy_move(
+                            &mut writer,
+                            &db,
+                            &client,
+                            &session,
+                            &mut conn,
+                            &tag,
+                            subargs,
+                            true,
+                            subcmd == "MOVE",
+                        )
+                        .await?;
                     }
                     _ => {
                         write_bad(&mut writer, &tag, "Unknown UID subcommand").await?;
@@ -1043,7 +1057,18 @@ where
             }
             "COPY" | "MOVE" => {
                 require_selected!(conn, writer, tag);
-                write_no(&mut writer, &tag, "[CANNOT] COPY not supported").await?;
+                handle_copy_move(
+                    &mut writer,
+                    &db,
+                    &client,
+                    &session,
+                    &mut conn,
+                    &tag,
+                    &args,
+                    false,
+                    command.eq_ignore_ascii_case("MOVE"),
+                )
+                .await?;
             }
             "IDLE" => {
                 require_auth!(conn, writer, tag);
@@ -1454,6 +1479,128 @@ async fn handle_lsub(
         }
     }
     write_ok(writer, tag, "LSUB completed").await
+}
+
+fn move_flags_for(internal: &str) -> Option<serde_json::Value> {
+    match internal {
+        "archive" => Some(serde_json::json!({"is_archived": true, "is_trashed": false, "is_spam": false})),
+        "trash" => Some(serde_json::json!({"is_trashed": true, "is_archived": false})),
+        "spam" => Some(serde_json::json!({"is_spam": true, "is_archived": false, "is_trashed": false})),
+        "inbox" => Some(serde_json::json!({"is_archived": false, "is_trashed": false, "is_spam": false})),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_copy_move(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    args: &str,
+    is_uid: bool,
+    is_move: bool,
+) -> std::io::Result<()> {
+    let verb = if is_move { "MOVE" } else { "COPY" };
+    let source_folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
+    let trimmed = args.trim();
+    let (set_str, mailbox_raw) = match trimmed.split_once(char::is_whitespace) {
+        Some((s, m)) => (s.trim(), m.trim()),
+        None => return write_bad(writer, tag, "command requires a message set and mailbox").await,
+    };
+    let mailbox = mailbox_raw.trim().trim_matches('"');
+    let target_internal = match IMAP_FOLDERS
+        .iter()
+        .find(|(disp, _, _)| disp.eq_ignore_ascii_case(mailbox))
+        .map(|(_, internal, _)| *internal)
+    {
+        Some(f) => f,
+        None => return write_no(writer, tag, "[TRYCREATE] mailbox does not exist").await,
+    };
+    let flags = match move_flags_for(target_internal) {
+        Some(f) => f,
+        None => return write_no(writer, tag, "[CANNOT] cannot move messages into that mailbox").await,
+    };
+    if target_internal == source_folder.as_str() {
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
+    }
+
+    let messages = db.list_cached_messages(&source_folder).unwrap_or_default();
+    let mut selected: Vec<(usize, CachedMessage)> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        let seq = (i + 1) as u32;
+        let hit = if is_uid {
+            uid_set_contains(set_str, m.imap_uid)
+        } else {
+            uid_set_contains(set_str, seq)
+        };
+        if hit {
+            selected.push((i + 1, m.clone()));
+        }
+    }
+    if selected.is_empty() {
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
+    }
+
+    let token = session.read().await.access_token.to_string();
+    let validity = uid_validity(db);
+    let mut src_uids: Vec<u32> = Vec::new();
+    let mut tgt_uids: Vec<u32> = Vec::new();
+    let mut moved_seqs: Vec<usize> = Vec::new();
+    for (seq, m) in &selected {
+        if let Err(e) = client.set_mailbox_flags(&token, &m.aster_id, flags.clone()).await {
+            tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
+            return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+        }
+        src_uids.push(m.imap_uid);
+        if is_move {
+            let _ = db.upsert_cached_message(
+                &m.aster_id,
+                target_internal,
+                m.subject.as_deref(),
+                m.sender.as_deref(),
+                m.recipients.as_deref(),
+                m.date.as_deref(),
+                m.size,
+                m.body_text.as_deref(),
+                m.raw_headers.as_deref(),
+            );
+            let _ = db.remove_uid_mapping(m.imap_uid as i64, &source_folder);
+            moved_seqs.push(*seq);
+        }
+        tgt_uids.push(db.assign_uid_if_missing(target_internal, &m.aster_id).unwrap_or(0));
+    }
+    let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+
+    if is_move {
+        writer
+            .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
+            .await?;
+        moved_seqs.sort_unstable();
+        let mut adjustment = 0usize;
+        for seq in &moved_seqs {
+            let adjusted = seq.saturating_sub(adjustment);
+            writer
+                .write_all(format!("* {} EXPUNGE\r\n", adjusted).as_bytes())
+                .await?;
+            conn.message_count = conn.message_count.saturating_sub(1);
+            adjustment += 1;
+        }
+        write_ok(writer, tag, "MOVE completed").await
+    } else {
+        writer
+            .write_all(
+                format!(
+                    "{} OK [COPYUID {} {} {}] COPY completed\r\n",
+                    tag, validity, src_set, tgt_set
+                )
+                .as_bytes(),
+            )
+            .await
+    }
 }
 
 async fn handle_select(

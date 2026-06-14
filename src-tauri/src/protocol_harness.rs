@@ -72,16 +72,21 @@ async fn start_mock_backend() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     use axum::{routing::post, Json, Router};
     let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let cap = captured.clone();
-    let app = Router::new().route(
-        "/bridge/v1/send",
-        post(move |Json(body): Json<serde_json::Value>| {
-            let cap = cap.clone();
-            async move {
-                cap.lock().await.push(body);
-                Json(serde_json::json!({"success": true}))
-            }
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/bridge/v1/send",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    cap.lock().await.push(body);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        )
+        .route(
+            "/bridge/v1/messages/:id/metadata",
+            axum::routing::patch(|| async { Json(serde_json::json!({"success": true})) }),
+        );
     let port = free_port().await;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -363,6 +368,20 @@ async fn protocol_feature_matrix() {
             appresp.trim().to_string(),
         );
 
+        let copy = imap_cmd(&mut reader, &mut w, "cp1", "UID COPY 1 Archive").await;
+        cl.check(
+            "IMAP UID COPY to Archive (COPYUID)",
+            copy.contains("COPYUID") && copy.contains("cp1 OK"),
+            "archived",
+        );
+        let movecmd = imap_cmd(&mut reader, &mut w, "mv1", "UID MOVE 1 Trash").await;
+        cl.check(
+            "IMAP UID MOVE to Trash (COPYUID + EXPUNGE)",
+            movecmd.contains("COPYUID") && movecmd.contains("EXPUNGE") && movecmd.contains("mv1 OK"),
+            "moved",
+        );
+        let cap_move = imap_cmd(&mut reader, &mut w, "cm1", "CAPABILITY").await;
+        cl.check("IMAP CAPABILITY advertises MOVE", cap_move.contains("MOVE"), "MOVE advertised");
         let logout = imap_cmd(&mut reader, &mut w, "z1", "LOGOUT").await;
         cl.check("IMAP LOGOUT", logout.contains("BYE") && logout.contains("z1 OK"), "clean bye");
     }

@@ -396,6 +396,26 @@ impl ApiClient {
         Ok(())
     }
 
+    pub async fn set_mailbox_flags(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        flags: serde_json::Value,
+    ) -> Result<()> {
+        let resp = self.client
+            .patch(format!("{}/bridge/v1/messages/{}/metadata", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&flags)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
     pub async fn send_mail(
         &self,
         access_token: &str,

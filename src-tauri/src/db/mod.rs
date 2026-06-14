@@ -737,6 +737,16 @@ impl Database {
         })
     }
 
+    pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+                rusqlite::params![uid, folder],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
