@@ -19,7 +19,7 @@ const MAX_LINE_LENGTH: usize = 512;
 const MAX_FAILED_AUTH: u32 = 5;
 
 fn pop3_size(m: &crate::db::CachedMessage) -> usize {
-    build_rfc822(m).len() + m.size.max(0) as usize
+    build_rfc822(m).len()
 }
 
 static POP3_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -337,7 +337,7 @@ where
                     let rfc = build_rfc822(&full);
                     let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
                     let header_str = &rfc[..sep];
-                    let body = &rfc[sep + 2..];
+                    let body = rfc.get(sep + 2..).unwrap_or("");
                     writer.write_all(b"+OK\r\n").await?;
                     for hline in header_str.split("\r\n") {
                         if hline.starts_with('.') {

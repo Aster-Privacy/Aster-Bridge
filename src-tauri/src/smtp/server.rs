@@ -36,7 +36,7 @@ pub fn is_transient_send_error(err: &BridgeError) -> bool {
     match err {
         BridgeError::Network(_) | BridgeError::Io(_) => true,
         BridgeError::Api(msg) => {
-            for code in ["401", "408", "429", "500", "502", "503", "504"] {
+            for code in ["408", "429", "500", "502", "503", "504"] {
                 if msg.starts_with(code) {
                     return true;
                 }

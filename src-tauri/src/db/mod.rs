@@ -739,10 +739,16 @@ impl Database {
 
     pub fn set_folder_if_changed(&self, aster_id: &str, folder: &str) -> Result<(), String> {
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE message_cache SET folder = ?2 WHERE aster_id = ?1 AND folder != ?2",
                 rusqlite::params![aster_id, folder],
             )?;
+            if changed > 0 {
+                conn.execute(
+                    "DELETE FROM uid_map WHERE aster_id = ?1 AND folder != ?2",
+                    rusqlite::params![aster_id, folder],
+                )?;
+            }
             Ok(())
         })
     }
@@ -815,17 +821,41 @@ impl Database {
 
     pub fn assign_uid_if_missing(&self, folder: &str, aster_id: &str) -> Result<u32, String> {
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO uid_map (aster_id, folder, imap_uid)
-                 SELECT ?1, ?2, COALESCE(MAX(imap_uid), 0) + 1 FROM uid_map WHERE folder = ?2",
-                rusqlite::params![aster_id, folder],
-            )?;
-            let uid: i64 = conn.query_row(
+            if let Ok(uid) = conn.query_row(
                 "SELECT imap_uid FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
                 rusqlite::params![aster_id, folder],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
+            ) {
+                return Ok(uid as u32);
+            }
+            let key = format!("uidnext:{}", folder);
+            let stored: i64 = conn
+                .query_row(
+                    "SELECT value FROM sync_state WHERE key = ?1",
+                    rusqlite::params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let existing_max: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(imap_uid), 0) FROM uid_map WHERE folder = ?1",
+                    rusqlite::params![folder],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let next = stored.max(existing_max + 1).max(1);
+            conn.execute(
+                "INSERT INTO uid_map (aster_id, folder, imap_uid) VALUES (?1, ?2, ?3)",
+                rusqlite::params![aster_id, folder, next],
             )?;
-            Ok(uid as u32)
+            conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, (next + 1).to_string()],
+            )?;
+            Ok(next as u32)
         })
     }
 
