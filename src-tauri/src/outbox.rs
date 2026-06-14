@@ -170,3 +170,178 @@ pub async fn run_outbox_loop(
 pub fn outbox_trigger_channel() -> (tokio::sync::mpsc::Sender<i64>, tokio::sync::mpsc::Receiver<i64>) {
     tokio::sync::mpsc::channel(16)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn test_db() -> (tempfile::TempDir, Arc<Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        (dir, Arc::new(db))
+    }
+
+    fn row_with(attempts: i64, last_attempt_at: Option<i64>, queued_at: i64) -> OutboxRow {
+        OutboxRow {
+            id: 1,
+            raw_mime: b"raw".to_vec(),
+            envelope_from: "a@b.test".to_string(),
+            envelope_to: "c@d.test".to_string(),
+            queued_at,
+            attempts,
+            last_attempt_at,
+            last_error: None,
+            status: "pending".to_string(),
+        }
+    }
+
+    #[test]
+    fn now_secs_is_positive() {
+        assert!(now_secs() > 0);
+    }
+
+    #[test]
+    fn backoff_table_matches_max_attempts() {
+        assert_eq!(BACKOFF_SECS.len() as i64, MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn backoff_table_is_monotonic() {
+        for w in BACKOFF_SECS.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+    }
+
+    #[test]
+    fn ready_to_retry_first_attempt_is_immediate() {
+        let row = row_with(0, None, now_secs());
+        assert!(ready_to_retry(&row));
+    }
+
+    #[test]
+    fn ready_to_retry_false_within_backoff_window() {
+        let row = row_with(1, Some(now_secs()), now_secs());
+        assert!(!ready_to_retry(&row));
+    }
+
+    #[test]
+    fn ready_to_retry_true_after_backoff_elapsed() {
+        let long_ago = now_secs() - BACKOFF_SECS[0] - 5;
+        let row = row_with(1, Some(long_ago), long_ago);
+        assert!(ready_to_retry(&row));
+    }
+
+    #[test]
+    fn ready_to_retry_uses_queued_at_when_no_last_attempt() {
+        let long_ago = now_secs() - BACKOFF_SECS[0] - 5;
+        let row = row_with(1, None, long_ago);
+        assert!(ready_to_retry(&row));
+    }
+
+    #[test]
+    fn ready_to_retry_clamps_index_for_high_attempts() {
+        let last = now_secs() - BACKOFF_SECS[BACKOFF_SECS.len() - 1] - 1;
+        let row = row_with(50, Some(last), last);
+        assert!(ready_to_retry(&row));
+        let recent = row_with(50, Some(now_secs()), now_secs());
+        assert!(!ready_to_retry(&recent));
+    }
+
+    #[test]
+    fn enqueue_then_get_round_trip() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"hello mime", "from@x.test", "to@x.test").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.raw_mime, b"hello mime");
+        assert_eq!(row.envelope_from, "from@x.test");
+        assert_eq!(row.envelope_to, "to@x.test");
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.status, "pending");
+    }
+
+    #[test]
+    fn list_pending_orders_by_queued_at() {
+        let (_dir, db) = test_db();
+        let id1 = db.outbox_insert(b"first", "a@x", "b@x").unwrap();
+        let id2 = db.outbox_insert(b"second", "a@x", "b@x").unwrap();
+        let rows = db.outbox_list_pending().unwrap();
+        assert!(rows.len() >= 2);
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        let p1 = ids.iter().position(|&i| i == id1).unwrap();
+        let p2 = ids.iter().position(|&i| i == id2).unwrap();
+        assert!(p1 < p2);
+    }
+
+    #[test]
+    fn mark_sending_claims_once() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        let first = db.outbox_mark_sending(id).unwrap();
+        assert_eq!(first, 1);
+        let second = db.outbox_mark_sending(id).unwrap();
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn mark_sent_removes_from_pending() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        db.outbox_mark_sending(id).unwrap();
+        db.outbox_mark_sent(id).unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.status, "sent");
+        let pending = db.outbox_list_pending().unwrap();
+        assert!(!pending.iter().any(|r| r.id == id));
+    }
+
+    #[test]
+    fn bump_attempt_increments_and_records_error() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        db.outbox_bump_attempt(id, "transient 503").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.last_error.as_deref(), Some("transient 503"));
+        assert!(row.last_attempt_at.is_some());
+    }
+
+    #[test]
+    fn mark_failed_records_terminal_state() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        db.outbox_mark_failed(id, "permanent 401").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.last_error.as_deref(), Some("permanent 401"));
+    }
+
+    #[test]
+    fn failed_row_is_reclaimable_for_retry() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        db.outbox_bump_attempt(id, "503").unwrap();
+        let claimed = db.outbox_mark_sending(id).unwrap();
+        assert_eq!(claimed, 1);
+    }
+
+    #[test]
+    fn get_missing_id_returns_none() {
+        let (_dir, db) = test_db();
+        assert!(db.outbox_get(99999).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn trigger_channel_delivers_ids() {
+        let (tx, mut rx) = outbox_trigger_channel();
+        tx.send(42).await.unwrap();
+        assert_eq!(rx.recv().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn trigger_channel_closes_on_sender_drop() {
+        let (tx, mut rx) = outbox_trigger_channel();
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
+    }
+}
