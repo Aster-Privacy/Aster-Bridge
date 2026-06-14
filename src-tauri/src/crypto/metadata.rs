@@ -104,3 +104,94 @@ pub fn encrypt_metadata(
 
     Ok((encrypted_b64, nonce_b64))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips() {
+        let master_key = [11u8; 32];
+        let plaintext = r#"{"from":"a@b.com","subject":"hi"}"#;
+        let (ct, nonce) = encrypt_metadata(plaintext, &master_key, "envelope").unwrap();
+        let out = decrypt_metadata(&ct, &nonce, &master_key, "envelope").unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn empty_plaintext_round_trips() {
+        let master_key = [1u8; 32];
+        let (ct, nonce) = encrypt_metadata("", &master_key, "ctx").unwrap();
+        let out = decrypt_metadata(&ct, &nonce, &master_key, "ctx").unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn nonce_is_twelve_bytes_and_random_per_call() {
+        let master_key = [2u8; 32];
+        let (_, nonce_a) = encrypt_metadata("same", &master_key, "ctx").unwrap();
+        let (_, nonce_b) = encrypt_metadata("same", &master_key, "ctx").unwrap();
+        assert_eq!(STANDARD.decode(&nonce_a).unwrap().len(), 12);
+        assert_ne!(nonce_a, nonce_b);
+    }
+
+    #[test]
+    fn wrong_master_key_fails_without_panic() {
+        let (ct, nonce) = encrypt_metadata("secret", &[3u8; 32], "ctx").unwrap();
+        let err = decrypt_metadata(&ct, &nonce, &[4u8; 32], "ctx");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn wrong_context_fails_authentication() {
+        let master_key = [5u8; 32];
+        let (ct, nonce) = encrypt_metadata("secret", &master_key, "subject").unwrap();
+        let err = decrypt_metadata(&ct, &nonce, &master_key, "sender");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_authentication() {
+        let master_key = [6u8; 32];
+        let (ct, nonce) = encrypt_metadata("authentic", &master_key, "ctx").unwrap();
+        let mut raw = STANDARD.decode(&ct).unwrap();
+        raw[0] ^= 0xff;
+        let tampered = STANDARD.encode(&raw);
+        let err = decrypt_metadata(&tampered, &nonce, &master_key, "ctx");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn wrong_nonce_fails_authentication() {
+        let master_key = [7u8; 32];
+        let (ct, _) = encrypt_metadata("payload", &master_key, "ctx").unwrap();
+        let other_nonce = STANDARD.encode([0u8; 12]);
+        let err = decrypt_metadata(&ct, &other_nonce, &master_key, "ctx");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn non_twelve_byte_nonce_is_rejected() {
+        let master_key = [8u8; 32];
+        let (ct, _) = encrypt_metadata("payload", &master_key, "ctx").unwrap();
+        let short_nonce = STANDARD.encode([0u8; 8]);
+        let err = decrypt_metadata(&ct, &short_nonce, &master_key, "ctx");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn invalid_base64_inputs_error_not_panic() {
+        let master_key = [9u8; 32];
+        assert!(decrypt_metadata("!!!notb64", "AAAA", &master_key, "ctx").is_err());
+    }
+
+    #[test]
+    fn derive_metadata_key_deterministic_and_context_separated() {
+        let mk = [10u8; 32];
+        let a = derive_metadata_key(&mk, "subject").unwrap();
+        let a_again = derive_metadata_key(&mk, "subject").unwrap();
+        let b = derive_metadata_key(&mk, "body").unwrap();
+        assert_eq!(a, a_again);
+        assert_ne!(a, b);
+    }
+}

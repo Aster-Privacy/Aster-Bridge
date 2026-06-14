@@ -52,3 +52,49 @@ pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
 
 #[cfg(test)]
 pub(crate) static TEST_SERVER_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn picks_preferred_port_when_free() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+        let picked = pick_available_port("127.0.0.1", free).unwrap();
+        assert_eq!(picked, free);
+    }
+
+    #[test]
+    fn picked_port_is_actually_bindable() {
+        let picked = pick_available_port("127.0.0.1", 23456).unwrap();
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", picked));
+        assert!(listener.is_ok());
+    }
+
+    #[test]
+    fn skips_busy_preferred_and_picks_next() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        if busy >= u16::MAX - MAX_PROBE_STEPS {
+            return;
+        }
+        let picked = pick_available_port("127.0.0.1", busy).unwrap();
+        assert_ne!(picked, busy);
+        assert!(picked > busy);
+    }
+
+    #[test]
+    fn rejects_non_loopback_host() {
+        let err = pick_available_port("8.8.8.8", 30000).unwrap_err();
+        assert!(err.contains("non-loopback"));
+    }
+
+    #[test]
+    fn rejects_invalid_host() {
+        let err = pick_available_port("not-an-ip", 30000).unwrap_err();
+        assert!(err.contains("invalid bind host"));
+    }
+}

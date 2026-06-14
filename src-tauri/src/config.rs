@@ -177,3 +177,77 @@ pub fn save_config(config: &BridgeConfig) -> Result<(), String> {
     std::fs::write(&config_path, contents).map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_sensible_and_distinct() {
+        let c = BridgeConfig::default();
+        assert_eq!(c.imap_port, 1143);
+        assert_eq!(c.smtp_port, 1025);
+        assert_eq!(c.jmap_port, 1080);
+        assert_eq!(c.poll_interval_secs, 30);
+        assert!(c.jmap_enabled);
+        assert!(c.tls_enabled);
+        assert!(!c.service_mode);
+        validate_ports(&c).expect("default ports must validate");
+    }
+
+    #[test]
+    fn validate_ports_rejects_privileged_port() {
+        let mut c = BridgeConfig::default();
+        c.imap_port = 143;
+        let err = validate_ports(&c).unwrap_err();
+        assert!(err.contains("imap_port"));
+    }
+
+    #[test]
+    fn validate_ports_rejects_duplicate_ports() {
+        let mut c = BridgeConfig::default();
+        c.smtp_port = c.imap_port;
+        let err = validate_ports(&c).unwrap_err();
+        assert!(err.contains("multiple protocols"));
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_fields() {
+        let c = BridgeConfig::default();
+        let serialized = toml::to_string_pretty(&c).unwrap();
+        let parsed: BridgeConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.imap_port, c.imap_port);
+        assert_eq!(parsed.pop3s_port, c.pop3s_port);
+        assert_eq!(parsed.poll_interval_secs, c.poll_interval_secs);
+    }
+
+    #[test]
+    fn missing_optional_fields_fall_back_to_defaults() {
+        let minimal = "imap_port = 1143\nsmtp_port = 1025\npoll_interval_secs = 30\n";
+        let parsed: BridgeConfig = toml::from_str(minimal).unwrap();
+        assert_eq!(parsed.jmap_port, default_jmap_port());
+        assert!(parsed.jmap_enabled);
+        assert_eq!(parsed.pop3_port, default_pop3_port());
+        assert!(!parsed.service_mode);
+    }
+
+    #[test]
+    fn save_config_writes_toml_that_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = BridgeConfig::default();
+        c.data_dir = dir.path().to_path_buf();
+        c.smtp_port = 2025;
+        save_config(&c).unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let parsed: BridgeConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(parsed.smtp_port, 2025);
+    }
+
+    #[test]
+    fn data_dir_is_not_serialized() {
+        let c = BridgeConfig::default();
+        let serialized = toml::to_string_pretty(&c).unwrap();
+        assert!(!serialized.contains("data_dir"));
+    }
+}

@@ -187,4 +187,125 @@ mod tests {
         let out = decrypt_envelope(&b64, None, b"p", Some("ignored-ik")).unwrap();
         assert_eq!(out, json);
     }
+
+    fn build_pbkdf2_envelope(plaintext: &[u8], passphrase: &[u8]) -> String {
+        let salt = [7u8; SALT_LEN];
+        let nonce_bytes = [9u8; NONCE_LEN];
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, &salt, PBKDF2_ITERATIONS, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&salt);
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        STANDARD.encode(&combined)
+    }
+
+    fn pbkdf2_nonce_marker() -> String {
+        STANDARD.encode([0x01u8])
+    }
+
+    fn build_identity_envelope(plaintext: &[u8], identity_key: &str, version: &[u8]) -> (String, String) {
+        let key = derive_envelope_key(identity_key.as_bytes(), version).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce_bytes = [4u8; NONCE_LEN];
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
+        (STANDARD.encode(&ciphertext), STANDARD.encode(&nonce_bytes))
+    }
+
+    #[test]
+    fn pbkdf2_envelope_round_trips() {
+        let plaintext = r#"{"subject":"secret","body":"hello"}"#;
+        let pass = b"correct horse battery staple";
+        let data = build_pbkdf2_envelope(plaintext.as_bytes(), pass);
+        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn pbkdf2_envelope_wrong_passphrase_fails_without_panic() {
+        let data = build_pbkdf2_envelope(b"top secret", b"right-pass");
+        let err = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), b"wrong-pass", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn pbkdf2_envelope_empty_plaintext_round_trips() {
+        let pass = b"p";
+        let data = build_pbkdf2_envelope(b"", pass);
+        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None).unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn pbkdf2_envelope_tampered_ciphertext_fails_authentication() {
+        let pass = b"p";
+        let data = build_pbkdf2_envelope(b"untampered", pass);
+        let mut raw = STANDARD.decode(&data).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        let tampered = STANDARD.encode(&raw);
+        let err = decrypt_envelope(&tampered, Some(&pbkdf2_nonce_marker()), pass, None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn pbkdf2_envelope_too_short_is_rejected() {
+        let short = STANDARD.encode([0u8; 8]);
+        let err = decrypt_envelope(&short, Some(&pbkdf2_nonce_marker()), b"p", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn nonce_decode_failure_is_error_not_panic() {
+        let data = STANDARD.encode(b"whatever");
+        let err = decrypt_envelope(&data, Some("not valid base64 !!!"), b"p", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn identity_key_envelope_round_trips() {
+        let plaintext = r#"{"subject":"ik"}"#;
+        let ik = "my-identity-key-material";
+        let (data, nonce) = build_identity_envelope(plaintext.as_bytes(), ik, ENVELOPE_VERSIONS[0].as_bytes());
+        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik)).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn identity_key_envelope_second_version_round_trips() {
+        let plaintext = "import payload";
+        let ik = "another-identity-key";
+        let (data, nonce) = build_identity_envelope(plaintext.as_bytes(), ik, ENVELOPE_VERSIONS[1].as_bytes());
+        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik)).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn identity_key_envelope_wrong_key_falls_back_and_errors() {
+        let ik = "right-identity-key";
+        let (data, nonce) = build_identity_envelope(b"hidden", ik, ENVELOPE_VERSIONS[0].as_bytes());
+        let err = decrypt_envelope(&data, Some(&nonce), b"wrong-pass", Some("wrong-identity-key"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn identity_key_envelope_bad_nonce_length_falls_through_to_pbkdf2() {
+        let bad_nonce = STANDARD.encode([0u8; 8]);
+        let data = STANDARD.encode(b"junk");
+        let err = decrypt_envelope(&data, Some(&bad_nonce), b"pass", Some("ik"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn derive_envelope_key_is_deterministic_and_version_separated() {
+        let a = derive_envelope_key(b"ik", b"v1").unwrap();
+        let a_again = derive_envelope_key(b"ik", b"v1").unwrap();
+        let b = derive_envelope_key(b"ik", b"v2").unwrap();
+        assert_eq!(a, a_again);
+        assert_ne!(a, b);
+    }
 }

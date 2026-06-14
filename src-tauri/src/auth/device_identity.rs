@@ -476,3 +476,121 @@ pub fn clear_identity(data_dir: &Path) {
     }
     let _ = wrap_key_delete();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    #[test]
+    fn b64url_round_trips_arbitrary_bytes() {
+        let data = [0u8, 1, 2, 250, 255, 128, 64];
+        let encoded = b64url(&data);
+        assert!(!encoded.contains('='));
+        let decoded = b64url_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn b64url_decode_rejects_invalid_input() {
+        assert!(b64url_decode("####not base64####").is_err());
+    }
+
+    #[test]
+    fn aead_seal_open_round_trips() {
+        let key = [7u8; 32];
+        let plaintext = b"device identity secret bytes";
+        let sealed = aead_seal(&key, MAGIC_ID, plaintext).unwrap();
+        assert_eq!(&sealed[..8], MAGIC_ID);
+        let opened = aead_open(&key, MAGIC_ID, &sealed).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn aead_open_wrong_key_fails_without_panic() {
+        let sealed = aead_seal(&[1u8; 32], MAGIC_PP, b"secret").unwrap();
+        assert!(aead_open(&[2u8; 32], MAGIC_PP, &sealed).is_err());
+    }
+
+    #[test]
+    fn aead_open_wrong_magic_aad_fails() {
+        let sealed = aead_seal(&[3u8; 32], MAGIC_ID, b"secret").unwrap();
+        assert!(aead_open(&[3u8; 32], MAGIC_PP, &sealed).is_err());
+    }
+
+    #[test]
+    fn aead_open_tampered_ciphertext_fails() {
+        let key = [4u8; 32];
+        let mut sealed = aead_seal(&key, MAGIC_ID, b"authentic payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        assert!(aead_open(&key, MAGIC_ID, &sealed).is_err());
+    }
+
+    #[test]
+    fn aead_open_short_input_is_rejected() {
+        assert!(aead_open(&[0u8; 32], MAGIC_ID, b"tiny").is_err());
+    }
+
+    fn test_identity() -> DeviceIdentity {
+        let ed25519_signing_key = SigningKey::generate(&mut OsRng);
+        let (dk, ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let x25519_static_secret = StaticSecret::random_from_rng(OsRng);
+        let x25519_public_bytes = *XPublicKey::from(&x25519_static_secret).as_bytes();
+        DeviceIdentity {
+            device_id: None,
+            ed25519_signing_key,
+            mlkem_decaps_key: dk,
+            mlkem_encaps_key_bytes: ek.as_bytes().to_vec(),
+            x25519_static_secret,
+            x25519_public_bytes,
+        }
+    }
+
+    #[test]
+    fn sign_challenge_produces_verifiable_signature() {
+        let identity = test_identity();
+        let nonce_raw = [9u8; 32];
+        let nonce_b64 = b64url(&nonce_raw);
+        let sig_b64 = sign_challenge(&identity, &nonce_b64).unwrap();
+
+        let sig_bytes = b64url_decode(&sig_b64).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        let verifying: VerifyingKey = identity.ed25519_signing_key.verifying_key();
+        assert!(verifying.verify(&nonce_raw, &sig).is_ok());
+    }
+
+    #[test]
+    fn signature_fails_verification_for_wrong_message() {
+        let identity = test_identity();
+        let nonce_b64 = b64url(&[1u8; 32]);
+        let sig_b64 = sign_challenge(&identity, &nonce_b64).unwrap();
+        let sig_bytes = b64url_decode(&sig_b64).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        let verifying = identity.ed25519_signing_key.verifying_key();
+        assert!(verifying.verify(&[2u8; 32], &sig).is_err());
+    }
+
+    #[test]
+    fn sign_challenge_rejects_invalid_nonce_encoding() {
+        let identity = test_identity();
+        assert!(sign_challenge(&identity, "###not base64###").is_err());
+    }
+
+    #[test]
+    fn get_pubkeys_returns_well_formed_keys() {
+        let identity = test_identity();
+        let (ed_pk, mlkem_pk, x25519_pk) = get_pubkeys(&identity);
+
+        assert_eq!(b64url_decode(&ed_pk).unwrap().len(), 32);
+        assert_eq!(b64url_decode(&x25519_pk).unwrap().len(), 32);
+        assert!(!b64url_decode(&mlkem_pk).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unseal_vault_envelope_rejects_short_envelope() {
+        let identity = test_identity();
+        let short = b64url(&[0u8; 16]);
+        assert!(unseal_vault_envelope(&identity, &short).is_err());
+    }
+}

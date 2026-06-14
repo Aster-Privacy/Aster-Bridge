@@ -224,3 +224,48 @@ pub async fn first_time_setup(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_session() -> Session {
+        Session {
+            user_id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            email: "alice@astermail.org".to_string(),
+            access_token: Zeroizing::new("token-abc".to_string()),
+            vault_passphrase: b"passphrase-bytes".to_vec(),
+            identity_key: Some("identity-key".to_string()),
+        }
+    }
+
+    #[test]
+    fn session_fields_are_accessible() {
+        let s = sample_session();
+        assert_eq!(s.username, "alice");
+        assert_eq!(s.email, "alice@astermail.org");
+        assert_eq!(s.access_token.as_str(), "token-abc");
+        assert_eq!(s.vault_passphrase, b"passphrase-bytes");
+        assert_eq!(s.identity_key.as_deref(), Some("identity-key"));
+    }
+
+    #[test]
+    fn dropping_session_does_not_panic() {
+        let s = sample_session();
+        drop(s);
+    }
+
+    #[test]
+    fn dropping_session_without_identity_key_does_not_panic() {
+        let s = Session {
+            user_id: Uuid::new_v4(),
+            username: "bob".to_string(),
+            email: "bob@astermail.org".to_string(),
+            access_token: Zeroizing::new(String::new()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+        };
+        drop(s);
+    }
+}

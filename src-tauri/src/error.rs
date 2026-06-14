@@ -57,3 +57,55 @@ pub enum BridgeError {
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_includes_variant_label_and_message() {
+        assert_eq!(
+            BridgeError::Auth("bad token".to_string()).to_string(),
+            "authentication failed: bad token"
+        );
+        assert_eq!(
+            BridgeError::Crypto("nonce".to_string()).to_string(),
+            "crypto error: nonce"
+        );
+        assert_eq!(
+            BridgeError::Config("missing".to_string()).to_string(),
+            "configuration error: missing"
+        );
+        assert_eq!(
+            BridgeError::PlanUpgradeRequired("pro".to_string()).to_string(),
+            "plan_upgrade_required: pro"
+        );
+    }
+
+    #[test]
+    fn from_io_error_maps_to_io_variant() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
+        let err: BridgeError = io.into();
+        assert!(matches!(err, BridgeError::Io(_)));
+        assert!(err.to_string().starts_with("IO error:"));
+    }
+
+    #[test]
+    fn from_io_error_propagates_through_result() {
+        fn fails() -> Result<()> {
+            std::fs::read_to_string("/nonexistent/aster/bridge/path")?;
+            Ok(())
+        }
+        let err = fails().unwrap_err();
+        assert!(matches!(err, BridgeError::Io(_)));
+    }
+
+    #[test]
+    fn debug_is_distinct_from_display() {
+        let err = BridgeError::Api("rate limited".to_string());
+        let debug = format!("{:?}", err);
+        let display = err.to_string();
+        assert!(debug.contains("Api"));
+        assert_eq!(display, "API error: rate limited");
+    }
+}
