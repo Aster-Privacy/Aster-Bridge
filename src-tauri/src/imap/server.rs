@@ -799,6 +799,23 @@ where
                 require_auth!(conn, writer, tag);
                 handle_lsub(&mut writer, &tag, &args).await?;
             }
+            "SUBSCRIBE" | "UNSUBSCRIBE" => {
+                require_auth!(conn, writer, tag);
+                write_ok(&mut writer, &tag, "completed").await?;
+            }
+            "CREATE" | "DELETE" | "RENAME" => {
+                require_auth!(conn, writer, tag);
+                write_no(
+                    &mut writer,
+                    &tag,
+                    "[CANNOT] folder management is not supported; folders mirror your Aster account",
+                )
+                .await?;
+            }
+            "SORT" | "THREAD" => {
+                require_auth!(conn, writer, tag);
+                write_no(&mut writer, &tag, "[CANNOT] server-side SORT/THREAD not supported").await?;
+            }
             "SELECT" | "EXAMINE" => {
                 require_auth!(conn, writer, tag);
                 handle_select(
