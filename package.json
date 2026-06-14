@@ -1,0 +1,47 @@
+{
+  "name": "aster-bridge",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@aster/ui": "file:../aster-ui",
+    "@fontsource/google-sans-flex": "^5.2.2",
+    "@heroicons/react": "^2.2.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-autostart": "^2.5.1",
+    "@tauri-apps/plugin-process": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "@tauri-apps/plugin-updater": "^2.0.0",
+    "class-variance-authority": "^0.7.0",
+    "framer-motion": "^11.18.2",
+    "i18next": "^24.2.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-i18next": "^15.5.2",
+    "react-router-dom": "^7.17.0",
+    "tailwind-merge": "^3.4.0"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.1.11",
+    "@tauri-apps/cli": "^2.11.2",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "4.7.0",
+    "tailwindcss": "4.1.11",
+    "typescript": "5.6.3",
+    "vite": "^6.4.2",
+    "vite-tsconfig-paths": "^4.3.0"
+  }
+}

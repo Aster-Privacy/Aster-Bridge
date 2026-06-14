@@ -1,0 +1,297 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Aster Communications Inc. */
+
+@import "tailwindcss";
+
+@import "@aster/ui/styles";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --sidebar-bg: #f5f5f5;
+  --indicator-bg: #ffffff;
+  --bg-tertiary: #f3f4f6;
+  --bg-hover: #f9fafb;
+  --bg-selected: #eff6ff;
+  --bg-card: #ffffff;
+  --border-primary: #e8e8e8;
+  --border-secondary: #e5e7eb;
+  --text-primary: #111827;
+  --text-secondary: #374151;
+  --text-tertiary: #6b7280;
+  --text-muted: #9ca3af;
+  --accent-color: #3b82f6;
+  --accent-color-hover: #2563eb;
+  --modal-bg: #ffffff;
+  --modal-overlay: rgba(0, 0, 0, 0.5);
+  --input-bg: #ffffff;
+  --input-border: #d1d5db;
+  --color-danger: #ef4444;
+  --color-warning: #f59e0b;
+  --color-success: #22c55e;
+  --color-info: #3b82f6;
+  --dropdown-bg: #ffffff;
+  --dropdown-hover: #f3f4f6;
+}
+
+.dark {
+  --bg-primary: #121212;
+  --bg-secondary: #0a0a0a;
+  --sidebar-bg: #0a0a0a;
+  --indicator-bg: #121212;
+  --bg-tertiary: #121212;
+  --bg-hover: #1a1a1a;
+  --bg-selected: #142744;
+  --bg-card: #121212;
+  --border-primary: #333333;
+  --border-secondary: #2a2a2a;
+  --text-primary: #ffffff;
+  --text-secondary: #e5e5e5;
+  --text-tertiary: #888888;
+  --text-muted: #666666;
+  --accent-color: #3b82f6;
+  --accent-color-hover: #60a5fa;
+  --modal-bg: #121212;
+  --modal-overlay: rgba(0, 0, 0, 0.5);
+  --input-bg: #1a1a1a;
+  --input-border: #2a2a2a;
+  --color-danger: #ef4444;
+  --color-warning: #f59e0b;
+  --color-success: #22c55e;
+  --color-info: #3b82f6;
+  --dropdown-bg: #121212;
+  --dropdown-hover: #252525;
+}
+
+@theme inline {
+  --color-txt-primary: var(--text-primary);
+  --color-txt-secondary: var(--text-secondary);
+  --color-txt-tertiary: var(--text-tertiary);
+  --color-txt-muted: var(--text-muted);
+  --color-surf-primary: var(--bg-primary);
+  --color-surf-secondary: var(--bg-secondary);
+  --color-surf-tertiary: var(--bg-tertiary);
+  --color-surf-hover: var(--bg-hover);
+  --color-surf-selected: var(--bg-selected);
+  --color-surf-card: var(--bg-card);
+  --color-edge-primary: var(--border-primary);
+  --color-edge-secondary: var(--border-secondary);
+  --color-brand: var(--accent-color);
+  --color-brand-hover: var(--accent-color-hover);
+  --color-aster-danger: var(--color-danger);
+  --color-aster-warning: var(--color-warning);
+  --color-aster-success: var(--color-success);
+  --color-aster-info: var(--color-info);
+  --color-modal-bg: var(--modal-bg);
+  --color-modal-overlay: var(--modal-overlay);
+  --color-input-bg: var(--input-bg);
+  --color-input-border: var(--input-border);
+}
+
+* {
+  font-family: 'Google Sans Flex';
+}
+
+html,
+body,
+#root {
+  background-color: var(--bg-secondary);
+  min-height: 100%;
+  overflow-x: hidden;
+}
+
+html,
+body {
+  overflow-y: hidden;
+  height: 100%;
+  width: 100%;
+}
+
+html:not(.dark) {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+button:focus:not(:focus-visible),
+[role="button"]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.aster_btn:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+
+button,
+[role="button"],
+[data-pressed="true"],
+[data-hover="true"] {
+  transform: none !important;
+  scale: 1 !important;
+}
+
+button *:not(.animate-spin),
+[role="button"] *:not(.animate-spin) {
+  transform: none !important;
+  scale: 1 !important;
+}
+
+input,
+textarea,
+select {
+  border-color: var(--input-border);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent-color) !important;
+  box-shadow: none;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.sidebar-nav-btn {
+  margin-bottom: 2px;
+  transition: none !important;
+  -webkit-transition: none !important;
+}
+
+.sidebar-nav-btn * {
+  transition: none !important;
+  -webkit-transition: none !important;
+}
+
+@media (hover: hover) {
+  .sidebar-nav-btn:not(.sidebar-active):hover {
+    color: var(--text-primary) !important;
+    background-color: var(--indicator-bg) !important;
+    border-radius: 8px;
+  }
+
+  .sidebar-nav-btn:not(.sidebar-active):hover span {
+    color: var(--text-primary) !important;
+  }
+}
+
+.sidebar-indicator {
+  border: 1px solid var(--border-primary);
+  will-change: transform, opacity;
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-panel-in {
+  animation: panel-in 0.15s ease-out;
+}
+
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.95);
+  }
+}
+
+.animate-dropdown-in {
+  animation: dropdown-in 0.15s ease-out;
+}
+
+.animate-toast-in {
+  animation: toast-in 0.2s ease-out;
+}
+
+.animate-toast-out {
+  animation: toast-out 0.15s ease-in forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-panel-in,
+  .animate-dropdown-in,
+  .animate-toast-in,
+  .animate-toast-out {
+    animation: none !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .sidebar-indicator,
+  .sidebar-active {
+    border: 1px solid Highlight;
+  }
+
+  svg {
+    forced-color-adjust: auto;
+  }
+}
+
+.aster_modal {
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35) !important;
+  border: 1px solid var(--border-primary) !important;
+  border-radius: 12px !important;
+}
+
+.aster_modal_body {
+  overflow-x: hidden !important;
+}
+
+.aster_modal_overlay {
+  backdrop-filter: blur(6px) !important;
+  -webkit-backdrop-filter: blur(6px) !important;
+}
