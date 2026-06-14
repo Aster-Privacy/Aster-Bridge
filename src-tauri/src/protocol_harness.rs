@@ -87,14 +87,11 @@ async fn start_mock_backend() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
             "/bridge/v1/messages/:id/metadata",
             axum::routing::patch(|| async { Json(serde_json::json!({"success": true})) }),
         );
-    let port = free_port().await;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    wait_listening(port).await;
     (format!("http://127.0.0.1:{}", port), captured)
 }
 

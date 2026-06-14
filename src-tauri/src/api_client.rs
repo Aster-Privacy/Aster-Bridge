@@ -460,32 +460,12 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
-    async fn free_port() -> u16 {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    }
-
-    async fn wait_listening(port: u16) {
-        for _ in 0..80 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        panic!("mock server on port {} never came up", port);
-    }
-
     async fn spawn(app: Router) -> String {
-        let port = free_port().await;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        wait_listening(port).await;
         format!("http://127.0.0.1:{}", port)
     }
 
