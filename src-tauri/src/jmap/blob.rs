@@ -122,3 +122,80 @@ fn sha256_hex(b: &[u8]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_64_hex_chars() {
+        let h = sha256_hex(b"some payload");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn blob_id_format_matches_upload() {
+        let blob_id = format!("blob-{}", sha256_hex(b"data"));
+        assert!(blob_id.starts_with("blob-"));
+        assert_eq!(blob_id.len(), 5 + 64);
+    }
+
+    #[test]
+    fn sanitize_keeps_safe_chars() {
+        assert_eq!(sanitize("file-name_1.txt"), "file-name_1.txt");
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_with_underscore() {
+        assert_eq!(sanitize("a/b\\c d"), "a_b_c_d");
+        assert_eq!(sanitize("../../etc/passwd"), ".._.._etc_passwd");
+    }
+
+    #[test]
+    fn sanitize_empty_yields_download() {
+        assert_eq!(sanitize(""), "download");
+    }
+
+    #[test]
+    fn sanitize_truncates_to_128() {
+        let long = "a".repeat(500);
+        assert_eq!(sanitize(&long).chars().count(), 128);
+    }
+
+    #[test]
+    fn sanitize_strips_quotes_preventing_header_injection() {
+        let out = sanitize("evil\"; rm -rf /");
+        assert!(!out.contains('"'));
+        assert!(!out.contains(' '));
+    }
+
+    #[test]
+    fn build_blob_response_sets_headers() {
+        let resp = build_blob_response(b"hello".to_vec(), "text/plain", "note.txt");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert_eq!(ct.to_str().unwrap(), "text/plain");
+        let disp = resp.headers().get(header::CONTENT_DISPOSITION).unwrap();
+        assert_eq!(disp.to_str().unwrap(), "attachment; filename=\"note.txt\"");
+    }
+
+    #[test]
+    fn build_blob_response_invalid_content_type_falls_back() {
+        let resp = build_blob_response(vec![1, 2, 3], "bad\nvalue", "f");
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert_eq!(ct.to_str().unwrap(), "application/octet-stream");
+    }
+}

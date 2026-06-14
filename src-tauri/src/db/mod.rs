@@ -1685,3 +1685,545 @@ mod encryption_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    fn open_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        (dir, db)
+    }
+
+    fn insert(db: &Database, aster_id: &str, folder: &str) {
+        db.upsert_cached_message(aster_id, folder, Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, Some("body"), Some("headers"))
+            .unwrap();
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates() {
+        let (_d, db) = open_db();
+        let inserted = db
+            .upsert_cached_message("a1", "inbox", Some("s"), None, None, None, 5, None, None)
+            .unwrap();
+        assert!(inserted, "first upsert reports inserted");
+        let again = db
+            .upsert_cached_message("a1", "inbox", Some("s2"), None, None, None, 6, None, None)
+            .unwrap();
+        assert!(!again, "second upsert reports update not insert");
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.subject.as_deref(), Some("s2"));
+        assert_eq!(msg.size, 6);
+    }
+
+    #[test]
+    fn upsert_preserves_flags_on_update() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.set_message_flags_by_id("a1", 3).unwrap();
+        db.upsert_cached_message("a1", "inbox", Some("new"), None, None, None, 99, None, None)
+            .unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 3);
+    }
+
+    #[test]
+    fn upsert_sets_body_cached_only_with_body() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, None, None)
+            .unwrap();
+        assert!(!db.body_cached("a1"));
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, Some("hello"), None)
+            .unwrap();
+        assert!(db.body_cached("a1"));
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.body_text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn upsert_strips_c0_controls() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("a\u{0001}b\tc"), None, None, None, 0, Some("x\u{0007}y"), None)
+            .unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.subject.as_deref(), Some("ab\tc"));
+        assert_eq!(msg.body_text.as_deref(), Some("xy"));
+    }
+
+    #[test]
+    fn get_cached_message_missing_is_none() {
+        let (_d, db) = open_db();
+        assert!(db.get_cached_message("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_cached_message_includes_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.imap_uid, uid);
+    }
+
+    #[test]
+    fn list_cached_messages_orders_by_uid_and_filters_folder() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        insert(&db, "b1", "archive");
+        let u1 = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let u2 = db.assign_uid_if_missing("inbox", "a2").unwrap();
+        assert!(u2 > u1);
+        let inbox = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0].aster_id, "a1");
+        assert_eq!(inbox[1].aster_id, "a2");
+        let archive = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].aster_id, "b1");
+    }
+
+    #[test]
+    fn list_cached_message_meta_omits_body() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        assert_eq!(meta.len(), 1);
+        assert!(meta[0].body_text.is_none());
+        assert_eq!(meta[0].subject.as_deref(), Some("subj"));
+    }
+
+    #[test]
+    fn list_empty_folder_is_empty() {
+        let (_d, db) = open_db();
+        assert!(db.list_cached_messages("nothing").unwrap().is_empty());
+        assert!(db.list_cached_message_meta("nothing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_cached_and_unread() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 2);
+        assert_eq!(db.count_unread_messages("inbox").unwrap(), 2);
+        db.set_message_flags_by_id("a1", 1).unwrap();
+        assert_eq!(db.count_unread_messages("inbox").unwrap(), 1);
+        assert_eq!(db.count_cached_messages("empty").unwrap(), 0);
+    }
+
+    #[test]
+    fn flags_get_set_roundtrip() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 0);
+        db.set_message_flags_by_id("a1", 5).unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 5);
+    }
+
+    #[test]
+    fn get_flags_missing_errors() {
+        let (_d, db) = open_db();
+        assert!(db.get_message_flags_by_id("missing").is_err());
+    }
+
+    #[test]
+    fn update_message_flags_by_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.update_message_flags(uid as i64, "inbox", 7).unwrap();
+        assert_eq!(db.get_message_flags_by_id("a1").unwrap(), 7);
+    }
+
+    #[test]
+    fn update_message_flags_unknown_uid_is_noop() {
+        let (_d, db) = open_db();
+        db.update_message_flags(999, "inbox", 7).unwrap();
+    }
+
+    #[test]
+    fn list_all_message_ids_returns_all() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "archive");
+        let ids = db.list_all_message_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"a1".to_string()));
+        assert!(ids.contains(&"a2".to_string()));
+    }
+
+    #[test]
+    fn delete_message_by_aster_id_removes_cache_and_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.delete_message_by_aster_id("a1").unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_none());
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_message_by_aster_id_missing_is_noop() {
+        let (_d, db) = open_db();
+        db.delete_message_by_aster_id("nope").unwrap();
+    }
+
+    #[test]
+    fn delete_message_by_uid_removes_both() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.delete_message_by_uid(uid as i64, "inbox").unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_message_by_uid_unknown_is_noop() {
+        let (_d, db) = open_db();
+        db.delete_message_by_uid(123, "inbox").unwrap();
+    }
+
+    #[test]
+    fn remove_uid_mapping_drops_only_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.remove_uid_mapping(uid as i64, "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+        assert!(db.get_cached_message("a1").unwrap().is_some());
+    }
+
+    #[test]
+    fn assign_uid_is_stable_for_same_message() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let first = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let second = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn assign_uid_never_reused_after_delete() {
+        let (_d, db) = open_db();
+        insert(&db, "a", "inbox");
+        let uid_a = db.assign_uid_if_missing("inbox", "a").unwrap();
+        db.delete_message_by_aster_id("a").unwrap();
+        insert(&db, "b", "inbox");
+        let uid_b = db.assign_uid_if_missing("inbox", "b").unwrap();
+        assert!(uid_b > uid_a, "uid {} must exceed retired uid {}", uid_b, uid_a);
+    }
+
+    #[test]
+    fn assign_uid_monotonic_and_per_folder() {
+        let (_d, db) = open_db();
+        insert(&db, "i1", "inbox");
+        insert(&db, "i2", "inbox");
+        insert(&db, "ar1", "archive");
+        let i1 = db.assign_uid_if_missing("inbox", "i1").unwrap();
+        let i2 = db.assign_uid_if_missing("inbox", "i2").unwrap();
+        let ar1 = db.assign_uid_if_missing("archive", "ar1").unwrap();
+        assert!(i2 > i1);
+        assert_eq!(i1, 1);
+        assert_eq!(i2, 2);
+        assert_eq!(ar1, 1, "archive has an independent counter");
+    }
+
+    #[test]
+    fn assign_uid_high_water_mark_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [11u8; 32];
+        let uid_a;
+        {
+            let db = Database::open_with_key(dir.path(), &key).unwrap();
+            insert(&db, "a", "inbox");
+            uid_a = db.assign_uid_if_missing("inbox", "a").unwrap();
+            db.delete_message_by_aster_id("a").unwrap();
+        }
+        let db2 = Database::open_with_key(dir.path(), &key).unwrap();
+        insert(&db2, "b", "inbox");
+        let uid_b = db2.assign_uid_if_missing("inbox", "b").unwrap();
+        assert!(uid_b > uid_a, "high-water mark must survive reopen");
+    }
+
+    #[test]
+    fn set_folder_if_changed_moves_and_drops_old_uid() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_folder_if_changed("a1", "archive").unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.folder, "archive");
+        assert_eq!(db.max_uid("inbox").unwrap(), 0, "stale old-folder uid must be removed");
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_folder_if_changed_noop_when_same() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let uid = db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_folder_if_changed("a1", "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), uid, "no-op must not drop the uid");
+    }
+
+    #[test]
+    fn max_uid_empty_is_zero() {
+        let (_d, db) = open_db();
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_state_get_set_and_missing() {
+        let (_d, db) = open_db();
+        assert!(db.get_sync_state("k").unwrap().is_none());
+        db.set_sync_state("k", "v1").unwrap();
+        assert_eq!(db.get_sync_state("k").unwrap().as_deref(), Some("v1"));
+        db.set_sync_state("k", "v2").unwrap();
+        assert_eq!(db.get_sync_state("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn update_message_thread_and_msgid_coalesces() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.update_message_thread_and_msgid("a1", Some("t1"), Some("m1")).unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("t1"));
+        db.update_message_thread_and_msgid("a1", None, Some("m2")).unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("t1"), "null thread keeps prior value");
+    }
+
+    #[test]
+    fn seed_jmap_mailboxes_idempotent() {
+        let (_d, db) = open_db();
+        db.seed_jmap_mailboxes().unwrap();
+        db.seed_jmap_mailboxes().unwrap();
+        let boxes = db.list_jmap_mailboxes().unwrap();
+        assert_eq!(boxes.len(), 6);
+        assert_eq!(boxes[0].name, "Inbox");
+        assert_eq!(boxes[0].folder_label, "inbox");
+    }
+
+    #[test]
+    fn jmap_state_get_default_and_bump() {
+        let (_d, db) = open_db();
+        assert_eq!(db.jmap_state_get("Email").unwrap(), 0);
+        assert_eq!(db.jmap_state_bump("Email").unwrap(), 1);
+        assert_eq!(db.jmap_state_bump("Email").unwrap(), 2);
+        assert_eq!(db.jmap_state_get("Email").unwrap(), 2);
+        assert_eq!(db.jmap_state_get("Mailbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn jmap_change_log_and_changes_since() {
+        let (_d, db) = open_db();
+        let s1 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s1, "obj1", "created").unwrap();
+        let s2 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s2, "obj2", "updated").unwrap();
+        let (entries, new_state, too_old, has_more) = db.jmap_changes_since("Email", 0).unwrap();
+        assert!(!too_old);
+        assert!(!has_more);
+        assert_eq!(new_state, s2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("obj1".to_string(), "created".to_string()));
+        assert_eq!(entries[1], ("obj2".to_string(), "updated".to_string()));
+    }
+
+    #[test]
+    fn jmap_changes_since_latest_is_empty() {
+        let (_d, db) = open_db();
+        let s1 = db.jmap_state_bump("Email").unwrap();
+        db.jmap_change_log_append("Email", s1, "obj1", "created").unwrap();
+        let (entries, new_state, too_old, _) = db.jmap_changes_since("Email", s1).unwrap();
+        assert!(entries.is_empty());
+        assert!(!too_old);
+        assert_eq!(new_state, s1);
+    }
+
+    #[test]
+    fn jmap_blob_put_get_and_gc() {
+        let (_d, db) = open_db();
+        db.jmap_blob_put("blob1", b"hello", Some("text/plain")).unwrap();
+        let got = db.jmap_blob_get("blob1").unwrap().unwrap();
+        assert_eq!(got.0, b"hello");
+        assert_eq!(got.1.as_deref(), Some("text/plain"));
+        assert!(db.jmap_blob_get("missing").unwrap().is_none());
+        let removed = db.jmap_blob_gc(-1).unwrap();
+        assert_eq!(removed, 1);
+        assert!(db.jmap_blob_get("blob1").unwrap().is_none());
+    }
+
+    #[test]
+    fn jmap_blob_gc_keeps_recent() {
+        let (_d, db) = open_db();
+        db.jmap_blob_put("blob1", b"x", None).unwrap();
+        let removed = db.jmap_blob_gc(100000).unwrap();
+        assert_eq!(removed, 0);
+        assert!(db.jmap_blob_get("blob1").unwrap().is_some());
+    }
+
+    #[test]
+    fn jmap_record_sync_batch_logs_ids() {
+        let (_d, db) = open_db();
+        let state = db.jmap_record_sync_batch("Email", &["x1", "x2"]).unwrap();
+        assert_eq!(state, 1);
+        let (entries, _, _, _) = db.jmap_changes_since("Email", 0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "created");
+    }
+
+    #[test]
+    fn replay_check_records_and_detects() {
+        let (_d, db) = open_db();
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap());
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "same nonce is allowed");
+        assert!(!db.replay_check_and_record("a1", "nonce2").unwrap(), "different nonce is a replay");
+    }
+
+    #[test]
+    fn fts_search_and_snippet() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("Hello World"), Some("alice@x"), None, Some("2026-01-01"), 0, Some("the quick brown fox"), None)
+            .unwrap();
+        let hits = db.fts_search("quick", 10).unwrap();
+        assert_eq!(hits, vec!["a1".to_string()]);
+        assert!(db.fts_search("", 10).unwrap().is_empty());
+        assert!(db.fts_search("nonexistentword", 10).unwrap().is_empty());
+        let snip = db.fts_snippet("a1", "quick").unwrap();
+        assert!(snip.is_some());
+        assert!(db.fts_snippet("a1", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn db_stats_counts() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.set_sync_state("last_sync_ts", "1234").unwrap();
+        let (messages, passwords, last_sync) = db.db_stats().unwrap();
+        assert_eq!(messages, 1);
+        assert_eq!(passwords, 0);
+        assert_eq!(last_sync.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn repair_cache_wipes_messages() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        db.set_sync_state("k", "v").unwrap();
+        db.repair_cache().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.max_uid("inbox").unwrap(), 0);
+        assert!(db.get_sync_state("k").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_user_data_wipes_passwords_and_outbox() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.clear_user_data().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_all_user_data_wipes_everything() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.clear_all_user_data().unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_insert_and_get() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.raw_mime, b"raw");
+        assert_eq!(row.envelope_from, "from@x");
+        assert_eq!(row.envelope_to, "to@y");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempts, 0);
+        assert!(db.outbox_get(99999).unwrap().is_none());
+    }
+
+    #[test]
+    fn outbox_list_pending_includes_states() {
+        let (_d, db) = open_db();
+        let id1 = db.outbox_insert(b"a", "f", "t").unwrap();
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        db.outbox_mark_sent(id1).unwrap();
+        let pending = db.outbox_list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id2);
+    }
+
+    #[test]
+    fn outbox_mark_sending_transitions() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 1);
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "sending");
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 0, "already sending cannot re-mark");
+    }
+
+    #[test]
+    fn outbox_mark_sent_and_failed() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sent(id).unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.status, "sent");
+        assert!(row.last_error.is_none());
+
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        db.outbox_mark_failed(id2, "boom").unwrap();
+        let row2 = db.outbox_get(id2).unwrap().unwrap();
+        assert_eq!(row2.status, "failed");
+        assert_eq!(row2.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn outbox_bump_attempt_increments_and_requeues() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sending(id).unwrap();
+        db.outbox_bump_attempt(id, "retry").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.last_error.as_deref(), Some("retry"));
+    }
+
+    #[test]
+    fn outbox_reset_stale_sending() {
+        let (_d, db) = open_db();
+        let id = db.outbox_insert(b"a", "f", "t").unwrap();
+        db.outbox_mark_sending(id).unwrap();
+        let n = db.outbox_reset_stale_sending().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "pending");
+    }
+
+    #[test]
+    fn outbox_stats_buckets() {
+        let (_d, db) = open_db();
+        let id1 = db.outbox_insert(b"a", "f", "t").unwrap();
+        let id2 = db.outbox_insert(b"b", "f", "t").unwrap();
+        let id3 = db.outbox_insert(b"c", "f", "t").unwrap();
+        db.outbox_mark_sent(id1).unwrap();
+        db.outbox_mark_failed(id2, "e").unwrap();
+        let _ = id3;
+        let stats = db.outbox_stats().unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.sent_24h, 1);
+    }
+}

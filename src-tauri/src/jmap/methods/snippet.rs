@@ -128,3 +128,139 @@ fn make_substring_snippet(text: &str, term: &str) -> String {
     let suffix: String = collected[local_match + needle_chars..].iter().collect();
     format!("{}<mark>{}</mark>{}", html_escape(&prefix), html_escape(&middle), html_escape(&suffix))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::Database;
+    use tokio::sync::{broadcast, RwLock};
+    use uuid::Uuid;
+
+    fn ok(r: Result<Value, MethodError>) -> Value {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected ok, got error: {} {}", e.kind, e.message),
+        }
+    }
+
+    fn err_kind(r: Result<Value, MethodError>) -> String {
+        match r {
+            Ok(_) => panic!("expected error, got ok"),
+            Err(e) => e.kind,
+        }
+    }
+
+    fn test_ctx() -> (Arc<JmapContext>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[8u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+        }));
+        let client = Arc::new(crate::api_client::ApiClient::new());
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), dir)
+    }
+
+    fn add_msg(ctx: &Arc<JmapContext>, id: &str, subject: &str, body: &str) {
+        ctx.db
+            .upsert_cached_message(id, "inbox", Some(subject), Some("a@b.com"), Some("c@d.com"), Some("2026-01-01T00:00:00Z"), 10, Some(body), Some("{}"))
+            .unwrap();
+    }
+
+    #[test]
+    fn html_escape_all_specials() {
+        assert_eq!(html_escape("<a> & \"b\""), "&lt;a&gt; &amp; &quot;b&quot;");
+    }
+
+    #[test]
+    fn truncate_chars_respects_unicode_boundaries() {
+        assert_eq!(truncate_chars("héllo", 3), "hél");
+        assert_eq!(truncate_chars("ab", 10), "ab");
+    }
+
+    #[test]
+    fn extract_text_filter_priority_and_nested() {
+        assert_eq!(extract_text_filter(&json!({"text": "x"})), Some("x".to_string()));
+        assert_eq!(extract_text_filter(&json!({"subject": "y"})), Some("y".to_string()));
+        let nested = json!({"conditions": [{"body": "z"}]});
+        assert_eq!(extract_text_filter(&nested), Some("z".to_string()));
+        assert_eq!(extract_text_filter(&json!({"from": "q"})), None);
+        assert_eq!(extract_text_filter(&Value::Null), None);
+    }
+
+    #[test]
+    fn make_substring_snippet_marks_match() {
+        let s = make_substring_snippet("the quick brown fox", "brown");
+        assert!(s.contains("<mark>brown</mark>"));
+    }
+
+    #[test]
+    fn make_substring_snippet_no_match_truncates() {
+        let s = make_substring_snippet("hello world", "zzz");
+        assert_eq!(s, "hello world");
+        assert!(!s.contains("<mark>"));
+    }
+
+    #[test]
+    fn make_substring_snippet_empty_text() {
+        assert_eq!(make_substring_snippet("", "x"), "");
+    }
+
+    #[test]
+    fn make_substring_snippet_escapes_html() {
+        let s = make_substring_snippet("a <b> match here", "match");
+        assert!(s.contains("&lt;b&gt;"));
+        assert!(s.contains("<mark>match</mark>"));
+    }
+
+    #[tokio::test]
+    async fn get_without_term_returns_truncated_escaped() {
+        let (ctx, _d) = test_ctx();
+        add_msg(&ctx, "e1", "Hello <World>", "body text");
+        let res = ok(get(&ctx, json!({"emailIds": ["e1"]})).await);
+        assert_eq!(res["list"][0]["emailId"], json!("e1"));
+        assert_eq!(res["list"][0]["subject"], json!("Hello &lt;World&gt;"));
+    }
+
+    #[tokio::test]
+    async fn get_reports_not_found() {
+        let (ctx, _d) = test_ctx();
+        let res = ok(get(&ctx, json!({"emailIds": ["ghost"]})).await);
+        assert!(res["list"].as_array().unwrap().is_empty());
+        assert_eq!(res["notFound"], json!(["ghost"]));
+    }
+
+    #[tokio::test]
+    async fn get_with_term_highlights() {
+        let (ctx, _d) = test_ctx();
+        add_msg(&ctx, "e2", "Report", "the quarterly report is attached");
+        let res = ok(get(&ctx, json!({"emailIds": ["e2"], "filter": {"text": "quarterly"}})).await);
+        let preview = res["list"][0]["preview"].as_str().unwrap_or("");
+        assert!(preview.contains("<mark>"));
+    }
+
+    #[tokio::test]
+    async fn get_rejects_too_many_ids() {
+        let (ctx, _d) = test_ctx();
+        let ids: Vec<String> = (0..501).map(|i| i.to_string()).collect();
+        assert_eq!(
+            err_kind(get(&ctx, json!({"emailIds": ids})).await),
+            "requestTooLarge"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_empty_email_ids() {
+        let (ctx, _d) = test_ctx();
+        let res = ok(get(&ctx, json!({})).await);
+        assert!(res["list"].as_array().unwrap().is_empty());
+        assert!(res["notFound"].as_array().unwrap().is_empty());
+    }
+}

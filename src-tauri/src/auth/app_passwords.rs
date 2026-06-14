@@ -223,3 +223,118 @@ impl AppPasswords {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> (tempfile::TempDir, Arc<Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[42u8; 32]).unwrap());
+        (dir, db)
+    }
+
+    #[test]
+    fn generate_app_password_has_expected_shape() {
+        let pw = generate_app_password();
+        let segments: Vec<&str> = pw.split('-').collect();
+        assert_eq!(segments.len(), PASSWORD_SEGMENTS);
+        for seg in &segments {
+            assert_eq!(seg.len(), PASSWORD_SEGMENT_LEN);
+            for ch in seg.bytes() {
+                assert!(PASSWORD_CHARSET.contains(&ch));
+            }
+        }
+    }
+
+    #[test]
+    fn generate_app_password_is_not_constant() {
+        assert_ne!(generate_app_password(), generate_app_password());
+    }
+
+    #[test]
+    fn correct_password_verifies_and_wrong_one_does_not() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        ap.store("thunderbird", &pw).unwrap();
+        assert!(ap.verify(&pw));
+        assert!(!ap.verify("xxxx-xxxx-xxxx-xxxx"));
+    }
+
+    #[test]
+    fn verify_ignores_dashes_in_input() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        ap.store("client", &pw).unwrap();
+        let no_dashes = pw.replace('-', "");
+        assert!(ap.verify(&no_dashes));
+    }
+
+    #[test]
+    fn verify_and_id_returns_matching_record_id() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("label-a", &pw).unwrap();
+        assert_eq!(ap.verify_and_id(&pw), Some(id));
+    }
+
+    #[test]
+    fn verify_on_empty_table_returns_none_without_panic() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        assert!(!ap.verify("anything-here-now-yep"));
+        assert_eq!(ap.verify_and_id("anything-here-now-yep"), None);
+    }
+
+    #[tokio::test]
+    async fn verify_and_id_async_matches_sync_result() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("async-label", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_async(&pw).await, Some(id));
+        assert_eq!(ap.verify_and_id_async("wrong-wrong-wrong-x").await, None);
+    }
+
+    #[test]
+    fn store_list_and_delete_round_trip() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("to-delete", &pw).unwrap();
+        let listed = ap.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "to-delete");
+        ap.delete(&id).unwrap();
+        assert!(ap.list().is_empty());
+        assert!(!ap.verify(&pw));
+    }
+
+    #[test]
+    fn record_use_increments_use_count() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("counted", &pw).unwrap();
+        ap.record_use(&id, Some("Thunderbird/128"));
+        ap.record_use(&id, None);
+        let entry = ap.list().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(entry.use_count, 2);
+        assert!(entry.last_used_at.is_some());
+    }
+
+    #[test]
+    fn multiple_passwords_each_verify_to_their_own_id() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw_a = generate_app_password();
+        let pw_b = generate_app_password();
+        let id_a = ap.store("a", &pw_a).unwrap();
+        let id_b = ap.store("b", &pw_b).unwrap();
+        assert_eq!(ap.verify_and_id(&pw_a), Some(id_a));
+        assert_eq!(ap.verify_and_id(&pw_b), Some(id_b));
+    }
+}

@@ -525,3 +525,287 @@ pub async fn run_poll_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    fn temp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        (dir, db)
+    }
+
+    fn envelope_b64(json: &serde_json::Value) -> String {
+        STANDARD.encode(json.to_string().as_bytes())
+    }
+
+    fn item_with_envelope(id: &str, json: &serde_json::Value) -> MailItem {
+        MailItem {
+            id: id.to_string(),
+            item_type: "received".to_string(),
+            encrypted_envelope: envelope_b64(json),
+            envelope_nonce: String::new(),
+            ephemeral_key: None,
+            ephemeral_pq_key: None,
+            sender_sealed: None,
+            folder_token: "tok".to_string(),
+            is_external: false,
+            thread_token: None,
+            thread_message_count: None,
+            created_at: "2026-06-14T00:00:00Z".to_string(),
+            encrypted_metadata: None,
+            metadata_nonce: None,
+            metadata_version: None,
+            scheduled_at: None,
+            send_status: None,
+            message_ts: None,
+            snoozed_until: None,
+            expires_at: None,
+            expiry_type: None,
+            is_spam: None,
+        }
+    }
+
+    #[test]
+    fn is_valid_item_id_accepts_safe_ids() {
+        assert!(is_valid_item_id("abc-123_DEF"));
+        assert!(is_valid_item_id("a"));
+        assert!(is_valid_item_id(&"x".repeat(128)));
+    }
+
+    #[test]
+    fn is_valid_item_id_rejects_bad_ids() {
+        assert!(!is_valid_item_id(""));
+        assert!(!is_valid_item_id(&"x".repeat(129)));
+        assert!(!is_valid_item_id("has space"));
+        assert!(!is_valid_item_id("has/slash"));
+        assert!(!is_valid_item_id("semi;colon"));
+        assert!(!is_valid_item_id("dot.dot"));
+    }
+
+    #[test]
+    fn json_str_extracts_string_fields_only() {
+        let v = serde_json::json!({"a": "hello", "b": 5, "c": null});
+        assert_eq!(json_str(&v, "a"), Some("hello".to_string()));
+        assert_eq!(json_str(&v, "b"), None);
+        assert_eq!(json_str(&v, "c"), None);
+        assert_eq!(json_str(&v, "missing"), None);
+    }
+
+    #[test]
+    fn extract_from_field_handles_string_form() {
+        let v = serde_json::json!({"from": "alice@example.com"});
+        assert_eq!(extract_from_field(&v), Some("alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_from_field_handles_name_and_email_object() {
+        let v = serde_json::json!({"from": {"name": "Alice", "email": "alice@example.com"}});
+        assert_eq!(
+            extract_from_field(&v),
+            Some("Alice <alice@example.com>".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_from_field_email_only_object() {
+        let v = serde_json::json!({"from": {"email": "bob@example.com"}});
+        assert_eq!(extract_from_field(&v), Some("bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_from_field_none_when_absent_or_empty() {
+        assert_eq!(extract_from_field(&serde_json::json!({})), None);
+        assert_eq!(
+            extract_from_field(&serde_json::json!({"from": {"name": "", "email": ""}})),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_recipients_joins_mixed_forms() {
+        let v = serde_json::json!({
+            "to": [
+                "raw@example.com",
+                {"name": "Carol", "email": "carol@example.com"},
+                {"email": "dave@example.com"}
+            ]
+        });
+        assert_eq!(
+            extract_recipients(&v, "to"),
+            Some("raw@example.com, Carol <carol@example.com>, dave@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_recipients_none_for_empty_or_missing() {
+        assert_eq!(extract_recipients(&serde_json::json!({"to": []}), "to"), None);
+        assert_eq!(extract_recipients(&serde_json::json!({}), "to"), None);
+    }
+
+    #[test]
+    fn build_folder_queries_covers_all_six_folders() {
+        let queries = build_folder_queries();
+        let labels: Vec<&str> = queries.iter().map(|q| q.label).collect();
+        assert_eq!(labels, vec!["inbox", "sent", "drafts", "trash", "spam", "archive"]);
+
+        let inbox = &queries[0].query;
+        assert_eq!(inbox.item_type.as_deref(), Some("received"));
+        assert_eq!(inbox.is_trashed, None);
+
+        let trash = &queries[3].query;
+        assert_eq!(trash.is_trashed, Some(true));
+        assert_eq!(trash.item_type, None);
+
+        let spam = &queries[4].query;
+        assert_eq!(spam.is_spam, Some(true));
+
+        let archive = &queries[5].query;
+        assert_eq!(archive.is_archived, Some(true));
+    }
+
+    #[test]
+    fn cache_mail_item_rejects_invalid_id() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "x", "body_text": "y"});
+        let mut item = item_with_envelope("good", &json);
+        item.id = "bad id".to_string();
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(db.get_cached_message("bad id").unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_mail_item_inserts_new_message_and_maps_fields() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({
+            "subject": "Hello",
+            "from": {"name": "Alice", "email": "alice@example.com"},
+            "to": ["bob@example.com"],
+            "date": "Wed, 21 May 2026 10:00:00 +0000",
+            "body_html": "<p>hi</p>",
+            "message_id": "mid-1@test"
+        });
+        let item = item_with_envelope("msg-new", &json);
+        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(was_new);
+
+        let cached = db.get_cached_message("msg-new").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
+        assert_eq!(cached.subject.as_deref(), Some("Hello"));
+        assert_eq!(cached.sender.as_deref(), Some("Alice <alice@example.com>"));
+        assert_eq!(cached.recipients.as_deref(), Some("bob@example.com"));
+        assert_eq!(cached.date.as_deref(), Some("Wed, 21 May 2026 10:00:00 +0000"));
+        assert_eq!(cached.body_text.as_deref(), Some("<p>hi</p>"));
+        assert!(cached.imap_uid >= 1);
+        let raw = cached.raw_headers.unwrap();
+        assert!(raw.contains("\"is_html\":true"));
+        assert!(raw.contains("mid-1@test"));
+    }
+
+    #[test]
+    fn cache_mail_item_prefers_plain_body_when_no_html() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
+        let item = item_with_envelope("msg-plain", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        let cached = db.get_cached_message("msg-plain").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("plain words"));
+        let raw = cached.raw_headers.unwrap();
+        assert!(raw.contains("\"is_html\":false"));
+    }
+
+    #[test]
+    fn cache_mail_item_replaces_ratchet_body_with_placeholder() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({
+            "type": "double_ratchet_v2",
+            "subject": "secret",
+            "body_text": "ciphertext-blob"
+        });
+        let item = item_with_envelope("msg-ratchet", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        let cached = db.get_cached_message("msg-ratchet").unwrap().unwrap();
+        let body = cached.body_text.unwrap();
+        assert!(body.contains("end-to-end encrypted"));
+        assert!(!body.contains("ciphertext-blob"));
+    }
+
+    #[test]
+    fn cache_mail_item_skips_already_body_cached_and_reconciles_folder() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let item = item_with_envelope("msg-move", &json);
+
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        let first = db.get_cached_message("msg-move").unwrap().unwrap();
+        assert_eq!(first.folder, "inbox");
+        let inbox_uid = first.imap_uid;
+
+        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None);
+        assert!(!was_new, "already-body-cached item must not count as new");
+
+        let moved = db.get_cached_message("msg-move").unwrap().unwrap();
+        assert_eq!(moved.folder, "archive", "folder must be reconciled on early return");
+        assert!(moved.imap_uid >= 1);
+        let _ = inbox_uid;
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.count_cached_messages("archive").unwrap(), 1);
+    }
+
+    #[test]
+    fn cache_mail_item_same_folder_reentry_is_noop_skip() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let item = item_with_envelope("msg-dedup", &json);
+
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
+    }
+
+    #[test]
+    fn cache_mail_item_skips_on_undecryptable_envelope() {
+        let (_dir, db) = temp_db();
+        let mut item = item_with_envelope("msg-bad-env", &serde_json::json!({"subject": "x"}));
+        item.encrypted_envelope = "!!!not-base64!!!".to_string();
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(db.get_cached_message("msg-bad-env").unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_mail_item_truncates_oversized_body() {
+        let (_dir, db) = temp_db();
+        let big = "a".repeat(6 * 1024 * 1024);
+        let json = serde_json::json!({"subject": "s", "body_text": big});
+        let item = item_with_envelope("msg-big", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        let cached = db.get_cached_message("msg-big").unwrap().unwrap();
+        let body = cached.body_text.unwrap();
+        assert!(body.len() < 6 * 1024 * 1024);
+        assert!(body.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn cache_mail_item_records_envelope_nonce_replay() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let nonce_pbkdf2 = STANDARD.encode([0x01u8]);
+
+        let mut first = item_with_envelope("msg-replay", &json);
+        first.envelope_nonce = nonce_pbkdf2.clone();
+        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None);
+        assert_eq!(
+            db.replay_check_and_record("msg-replay", &nonce_pbkdf2).unwrap(),
+            true,
+            "same nonce must be accepted"
+        );
+        assert_eq!(
+            db.replay_check_and_record("msg-replay", &STANDARD.encode([0x02u8])).unwrap(),
+            false,
+            "different nonce for same id is a replay/rollback"
+        );
+    }
+}

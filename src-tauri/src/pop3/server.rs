@@ -411,3 +411,192 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::CachedMessage;
+
+    fn sample_message(aster_id: &str) -> CachedMessage {
+        CachedMessage {
+            aster_id: aster_id.to_string(),
+            folder: "inbox".to_string(),
+            subject: Some("Test Subject".to_string()),
+            sender: Some("sender@aster.test".to_string()),
+            recipients: Some("rcpt@aster.test".to_string()),
+            date: Some("Mon, 01 Jan 2026 00:00:00 +0000".to_string()),
+            size: 999999,
+            flags: 0,
+            body_text: Some("line one\nline two\nline three".to_string()),
+            raw_headers: None,
+            imap_uid: 1,
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn pop3_size_equals_build_rfc822_len() {
+        let m = sample_message("id-1");
+        let expected = build_rfc822(&m).len();
+        assert_eq!(pop3_size(&m), expected);
+    }
+
+    #[test]
+    fn pop3_size_ignores_stored_size_field() {
+        let mut m = sample_message("id-2");
+        let baseline = pop3_size(&m);
+        m.size = 123456789;
+        assert_eq!(pop3_size(&m), baseline);
+        assert_ne!(pop3_size(&m), m.size as usize);
+    }
+
+    #[test]
+    fn pop3_size_is_nonzero_for_real_message() {
+        let m = sample_message("id-3");
+        assert!(pop3_size(&m) > 0);
+    }
+
+    #[test]
+    fn rfc822_contains_expected_headers() {
+        let m = sample_message("id-4");
+        let rfc = build_rfc822(&m);
+        assert!(rfc.contains("Subject: Test Subject"));
+        assert!(rfc.contains("From: sender@aster.test"));
+        assert!(rfc.contains("\r\n\r\n"));
+    }
+
+    #[test]
+    fn top_split_with_separator() {
+        let m = sample_message("id-5");
+        let rfc = build_rfc822(&m);
+        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
+        let header_str = &rfc[..sep];
+        let body = rfc.get(sep + 2..).unwrap_or("");
+        assert!(header_str.contains("From:"));
+        assert!(body.contains("line one"));
+    }
+
+    #[test]
+    fn top_split_no_separator_does_not_panic() {
+        let rfc = "Header-Only: yes\r\nNo-Body-Here: true";
+        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
+        let header_str = &rfc[..sep];
+        let body = rfc.get(sep + 2..).unwrap_or("");
+        assert_eq!(header_str, rfc);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn top_split_empty_string_does_not_panic() {
+        let rfc = "";
+        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
+        let header_str = &rfc[..sep];
+        let body = rfc.get(sep + 2..).unwrap_or("");
+        assert_eq!(header_str, "");
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn dot_stuffing_prefixes_leading_dot_lines() {
+        let rfc = ".secret\r\nnormal\r\n..double\r\n";
+        let mut dot_stuffed = String::new();
+        let lines: Vec<&str> = rfc.split("\r\n").collect();
+        let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+            &lines[..lines.len() - 1]
+        } else {
+            &lines[..]
+        };
+        for rline in content_lines {
+            if rline.starts_with('.') {
+                dot_stuffed.push('.');
+            }
+            dot_stuffed.push_str(rline);
+            dot_stuffed.push_str("\r\n");
+        }
+        assert!(dot_stuffed.starts_with("..secret\r\n"));
+        assert!(dot_stuffed.contains("normal\r\n"));
+        assert!(dot_stuffed.contains("...double\r\n"));
+    }
+
+    #[test]
+    fn dot_stuffing_leaves_normal_lines_untouched() {
+        let rfc = "plain line\r\nanother\r\n";
+        let mut dot_stuffed = String::new();
+        let lines: Vec<&str> = rfc.split("\r\n").collect();
+        let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+            &lines[..lines.len() - 1]
+        } else {
+            &lines[..]
+        };
+        for rline in content_lines {
+            if rline.starts_with('.') {
+                dot_stuffed.push('.');
+            }
+            dot_stuffed.push_str(rline);
+            dot_stuffed.push_str("\r\n");
+        }
+        assert_eq!(dot_stuffed, "plain line\r\nanother\r\n");
+    }
+
+    #[test]
+    fn uidl_line_format() {
+        let messages = vec![sample_message("uid-a"), sample_message("uid-b")];
+        let deleted = vec![false, false];
+        let mut resp = String::from("+OK\r\n");
+        for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
+            if !del {
+                resp.push_str(&format!("{} {}\r\n", i + 1, msg.aster_id));
+            }
+        }
+        resp.push_str(".\r\n");
+        assert_eq!(resp, "+OK\r\n1 uid-a\r\n2 uid-b\r\n.\r\n");
+    }
+
+    #[test]
+    fn uidl_skips_deleted() {
+        let messages = vec![sample_message("uid-a"), sample_message("uid-b")];
+        let deleted = vec![true, false];
+        let mut resp = String::from("+OK\r\n");
+        for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
+            if !del {
+                resp.push_str(&format!("{} {}\r\n", i + 1, msg.aster_id));
+            }
+        }
+        resp.push_str(".\r\n");
+        assert_eq!(resp, "+OK\r\n2 uid-b\r\n.\r\n");
+    }
+
+    #[test]
+    fn list_line_format() {
+        let messages = vec![sample_message("l-a")];
+        let deleted = vec![false];
+        let count = deleted.iter().filter(|d| !**d).count();
+        let total: usize = messages.iter().zip(deleted.iter())
+            .filter(|(_, d)| !*d)
+            .map(|(m, _)| pop3_size(m))
+            .sum();
+        let mut resp = format!("+OK {} messages ({} octets)\r\n", count, total);
+        for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
+            if !del {
+                resp.push_str(&format!("{} {}\r\n", i + 1, pop3_size(msg)));
+            }
+        }
+        resp.push_str(".\r\n");
+        let expected_size = pop3_size(&messages[0]);
+        assert!(resp.starts_with(&format!("+OK 1 messages ({} octets)\r\n", expected_size)));
+        assert!(resp.contains(&format!("1 {}\r\n", expected_size)));
+    }
+
+    #[test]
+    fn stat_totals_exclude_deleted() {
+        let messages = vec![sample_message("s-a"), sample_message("s-b")];
+        let deleted = vec![false, true];
+        let count = deleted.iter().filter(|d| !**d).count();
+        let total_octets: usize = messages.iter().zip(deleted.iter())
+            .filter(|(_, d)| !*d)
+            .map(|(m, _)| pop3_size(m))
+            .sum();
+        assert_eq!(count, 1);
+        assert_eq!(total_octets, pop3_size(&messages[0]));
+    }
+}

@@ -768,3 +768,227 @@ async fn send_via_api(
     };
     client.send_mail(&access_token, &payload).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_err() -> BridgeError {
+        BridgeError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+    }
+
+    #[test]
+    fn io_errors_are_transient() {
+        assert!(is_transient_send_error(&io_err()));
+    }
+
+    #[test]
+    fn server_5xx_codes_are_transient() {
+        for code in ["500", "502", "503", "504"] {
+            let e = BridgeError::Api(format!("{} upstream broke", code));
+            assert!(is_transient_send_error(&e), "{} should be transient", code);
+        }
+    }
+
+    #[test]
+    fn timeout_and_rate_limit_are_transient() {
+        assert!(is_transient_send_error(&BridgeError::Api("408 request timeout".into())));
+        assert!(is_transient_send_error(&BridgeError::Api("429 too many requests".into())));
+    }
+
+    #[test]
+    fn unauthorized_401_is_permanent() {
+        let e = BridgeError::Api("401 unauthorized".into());
+        assert!(!is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn other_4xx_codes_are_permanent() {
+        for code in ["400", "403", "404", "422"] {
+            let e = BridgeError::Api(format!("{} client error", code));
+            assert!(!is_transient_send_error(&e), "{} should be permanent", code);
+        }
+    }
+
+    #[test]
+    fn non_api_non_io_errors_are_permanent() {
+        assert!(!is_transient_send_error(&BridgeError::Auth("nope".into())));
+        assert!(!is_transient_send_error(&BridgeError::Smtp("bad".into())));
+        assert!(!is_transient_send_error(&BridgeError::PlanUpgradeRequired("upgrade".into())));
+        assert!(!is_transient_send_error(&BridgeError::PlanLimit("limit".into())));
+        assert!(!is_transient_send_error(&BridgeError::Crypto("x".into())));
+        assert!(!is_transient_send_error(&BridgeError::Database("x".into())));
+        assert!(!is_transient_send_error(&BridgeError::Config("x".into())));
+    }
+
+    #[test]
+    fn api_code_must_be_a_prefix_not_substring() {
+        let e = BridgeError::Api("error 500 happened".into());
+        assert!(!is_transient_send_error(&e));
+    }
+
+    #[test]
+    fn empty_api_message_is_permanent() {
+        assert!(!is_transient_send_error(&BridgeError::Api(String::new())));
+    }
+
+    #[test]
+    fn extract_addr_angle_brackets() {
+        assert_eq!(extract_addr("<alice@example.com>"), "alice@example.com");
+        assert_eq!(extract_addr("  <bob@x.org> "), "bob@x.org");
+    }
+
+    #[test]
+    fn extract_addr_display_name_and_angle() {
+        assert_eq!(extract_addr("Alice <alice@example.com>"), "alice@example.com");
+    }
+
+    #[test]
+    fn extract_addr_bare_address() {
+        assert_eq!(extract_addr("carol@example.com"), "carol@example.com");
+        assert_eq!(extract_addr("  dave@x.org  extra"), "dave@x.org");
+    }
+
+    #[test]
+    fn extract_addr_empty_angle_pair() {
+        assert_eq!(extract_addr("<>"), "");
+    }
+
+    #[test]
+    fn extract_addr_empty_input() {
+        assert_eq!(extract_addr(""), "");
+        assert_eq!(extract_addr("   "), "");
+    }
+
+    #[test]
+    fn extract_addr_inner_trimmed() {
+        assert_eq!(extract_addr("<  spaced@x.org  >"), "spaced@x.org");
+    }
+
+    #[test]
+    fn find_ci_prefix_basic() {
+        assert_eq!(find_ci_prefix("FROM:<a@b>", "FROM:"), Some(0));
+        assert_eq!(find_ci_prefix("from:<a@b>", "FROM:"), Some(0));
+        assert_eq!(find_ci_prefix("  TO:<a@b>", "TO:"), Some(2));
+    }
+
+    #[test]
+    fn find_ci_prefix_not_found() {
+        assert_eq!(find_ci_prefix("RCPT", "TO:"), None);
+        assert_eq!(find_ci_prefix("", "TO:"), None);
+    }
+
+    #[test]
+    fn find_ci_prefix_empty_needle() {
+        assert_eq!(find_ci_prefix("anything", ""), None);
+    }
+
+    #[test]
+    fn find_ci_prefix_needle_longer_than_haystack() {
+        assert_eq!(find_ci_prefix("ab", "abcdef"), None);
+    }
+
+    #[test]
+    fn mail_from_argument_parsing() {
+        let args = "FROM:<sender@aster.test> SIZE=100";
+        let start = find_ci_prefix(args, "FROM:").unwrap();
+        let addr = extract_addr(&args[start + 5..]);
+        assert_eq!(addr, "sender@aster.test");
+    }
+
+    #[test]
+    fn rcpt_to_argument_parsing() {
+        let args = "TO:<rcpt@aster.test>";
+        let start = find_ci_prefix(args, "TO:").unwrap();
+        let addr = extract_addr(&args[start + 3..]);
+        assert_eq!(addr, "rcpt@aster.test");
+    }
+
+    #[test]
+    fn mail_from_empty_address_is_extractable_as_empty() {
+        let args = "FROM:<>";
+        let start = find_ci_prefix(args, "FROM:").unwrap();
+        let addr = extract_addr(&args[start + 5..]);
+        assert_eq!(addr, "");
+    }
+
+    #[test]
+    fn line_length_limits_are_distinct() {
+        assert!(MAX_DATA_LINE_LENGTH > MAX_LINE_LENGTH);
+        assert_eq!(MAX_LINE_LENGTH, 998);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_reads_single_line() {
+        let data = b"hello world\r\n".to_vec();
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let n = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_rejects_overlong_line() {
+        let mut data = vec![b'a'; MAX_LINE_LENGTH + 5];
+        data.push(b'\n');
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let err = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_bytes_empty_input_returns_zero() {
+        let data: Vec<u8> = Vec::new();
+        let mut reader = BufReader::new(&data[..]);
+        let mut out = Vec::new();
+        let n = read_line_bytes(&mut reader, &mut out, MAX_LINE_LENGTH).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn build_send_payload_uses_envelope_recipients_as_bcc_when_no_headers() {
+        let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\nbody here\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        assert_eq!(payload["subject"], "hi");
+        assert_eq!(payload["to"][0], "rcpt@example.com");
+        assert_eq!(payload["client_source"], "bridge");
+        assert_eq!(payload["is_e2e_encrypted"], false);
+    }
+
+    #[test]
+    fn build_send_payload_prefers_header_to() {
+        let raw = b"From: sender@aster.test\r\nTo: named@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["named@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        assert_eq!(payload["to"][0], "named@example.com");
+        assert!(payload["bcc"].is_null());
+    }
+
+    #[test]
+    fn build_send_payload_envelope_only_recipient_added_as_bcc() {
+        let raw = b"From: sender@aster.test\r\nTo: visible@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        assert_eq!(payload["bcc"][0], "hidden@example.com");
+    }
+
+    #[test]
+    fn build_send_payload_body_is_never_empty() {
+        let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn build_send_payload_invalid_message_errors() {
+        let raw: &[u8] = b"";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let result = build_send_payload(raw, None, &recipients, "sender@aster.test");
+        assert!(result.is_err());
+    }
+}
