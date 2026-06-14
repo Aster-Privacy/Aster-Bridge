@@ -173,7 +173,7 @@ pub async fn run(
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_session(stream, session, client, passwords, db, tls_config).await {
+            if let Err(e) = handle_session(stream, session, client, passwords, db, tls_config, true).await {
                 tracing::error!("SMTP connection error: {}", e);
             }
         });
@@ -227,7 +227,7 @@ pub async fn run_implicit_tls(
                     return;
                 }
             };
-            if let Err(e) = handle_session(tls_stream, session, client, passwords, db, None).await {
+            if let Err(e) = handle_session(tls_stream, session, client, passwords, db, None, true).await {
                 tracing::error!("SMTPS connection error: {}", e);
             }
         });
@@ -241,7 +241,7 @@ async fn handle_session_erased(
     passwords: Arc<AppPasswords>,
     db: Arc<Database>,
 ) -> Result<()> {
-    handle_session(stream, session, client, passwords, db, None).await
+    handle_session(stream, session, client, passwords, db, None, false).await
 }
 
 async fn handle_session<S>(
@@ -251,6 +251,7 @@ async fn handle_session<S>(
     passwords: Arc<AppPasswords>,
     db: Arc<Database>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    greet: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -259,9 +260,11 @@ where
     let mut reader = BufReader::new(read_half);
     let starttls_capable = tls_config.is_some();
 
-    writer
-        .write_all(b"220 Aster Bridge SMTP ready\r\n")
-        .await?;
+    if greet {
+        writer
+            .write_all(b"220 Aster Bridge SMTP ready\r\n")
+            .await?;
+    }
 
     let mut smtp = SmtpSession {
         state: SmtpState::Connected,

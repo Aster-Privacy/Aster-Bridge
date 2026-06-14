@@ -678,6 +678,12 @@ where
             "NOOP" => {
                 write_ok(&mut writer, &tag, "NOOP completed").await?;
             }
+            "ID" => {
+                writer
+                    .write_all(b"* ID (\"name\" \"Aster Bridge\")\r\n")
+                    .await?;
+                write_ok(&mut writer, &tag, "ID completed").await?;
+            }
             "CHECK" => {
                 require_selected!(conn, writer, tag);
                 write_ok(&mut writer, &tag, "CHECK completed").await?;
@@ -1653,6 +1659,20 @@ fn parse_header_fields_request(fetch_parts: &str) -> Option<(String, Vec<String>
     Some((fields.join(" "), fields))
 }
 
+fn parse_body_partial(upper_parts: &str) -> Option<(usize, Option<usize>)> {
+    let idx = upper_parts
+        .find("BODY[]<")
+        .map(|i| i + "BODY[]<".len())
+        .or_else(|| upper_parts.find("BODY.PEEK[]<").map(|i| i + "BODY.PEEK[]<".len()))?;
+    let rest = &upper_parts[idx..];
+    let end = rest.find('>')?;
+    let spec = &rest[..end];
+    let mut it = spec.split('.');
+    let off: usize = it.next()?.parse().ok()?;
+    let len = it.next().and_then(|s| s.parse::<usize>().ok());
+    Some((off, len))
+}
+
 fn filter_header_fields(header: &str, fields: &[String]) -> String {
     let wanted: Vec<String> = fields.iter().map(|f| f.to_ascii_lowercase()).collect();
     let mut out = String::new();
@@ -1949,7 +1969,18 @@ async fn handle_fetch(
                     );
                 }
             }
-            items.push(format!("BODY[] {{{}}}\r\n{}", rfc.len(), rfc));
+            if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
+                let bytes = rfc.as_bytes();
+                let start = off.min(bytes.len());
+                let end = match len_opt {
+                    Some(l) => start.saturating_add(l).min(bytes.len()),
+                    None => bytes.len(),
+                };
+                let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+                items.push(format!("BODY[]<{}> {{{}}}\r\n{}", off, slice.len(), slice));
+            } else {
+                items.push(format!("BODY[] {{{}}}\r\n{}", rfc.len(), rfc));
+            }
         }
 
         if wants_rfc822_text {
