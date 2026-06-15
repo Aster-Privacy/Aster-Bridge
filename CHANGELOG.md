@@ -2,6 +2,18 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.3.1 - 2026-06-15
+
+### Fixed
+- Messages keep stable identifiers after you delete mail, so connected clients no longer mismatch or re-download messages.
+- POP3 list and message sizes are now exact, and a rare crash on unusually formatted messages is gone.
+- Sending now fails fast with a clear error when a server rejects your credentials, instead of silently retrying.
+- Archiving, trashing, and marking spam fully clean up the old folder state behind the scenes.
+- Live updates recover on their own after a busy burst of mail instead of going quiet, and only the update types a client asks for are sent.
+
+### Changed
+- Greatly expanded the automated test suite for steadier releases.
+
 ## 0.3.0 - 2026-06-14
 
 ### Added
