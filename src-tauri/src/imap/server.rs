@@ -2211,6 +2211,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: Vec::new(),
             identity_key: None,
+            ratchet_keys: Vec::new(),
         }));
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);

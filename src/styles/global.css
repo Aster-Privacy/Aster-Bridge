@@ -141,6 +141,17 @@ button *:not(.animate-spin),
   scale: 1 !important;
 }
 
+/*
+ * Hover feedback is instant. Interactive surfaces (buttons, rows, the shared
+ * aster_btn variants) change state on hover with no fade. State changes driven
+ * by child elements (toggle knob slide, caret rotate) keep their own transitions.
+ */
+button,
+[role="button"],
+[class*="aster_btn"] {
+  transition: none !important;
+}
+
 input,
 textarea,
 select {

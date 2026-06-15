@@ -767,15 +767,18 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
             let token_for_profile = access_token.clone();
             let token_for_plan = access_token.clone();
 
-            let identity_key = match crypto::vault::decrypt_vault(
+            let (identity_key, ratchet_keys) = match crypto::vault::decrypt_vault(
                 &login_resp.encrypted_vault,
                 &login_resp.vault_nonce,
                 &passphrase,
             ) {
-                Ok(v) => Some(v.identity_key.clone()),
+                Ok(v) => (
+                    Some(v.identity_key.clone()),
+                    crypto::ratchet::build_receiver_key_sets(&v),
+                ),
                 Err(e) => {
                     tracing::warn!("vault decrypt failed at setup: {}", e);
-                    None
+                    (None, Vec::new())
                 }
             };
 
@@ -786,6 +789,7 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 access_token,
                 vault_passphrase: passphrase,
                 identity_key,
+                ratchet_keys,
             };
 
             let session_arc = Arc::new(RwLock::new(session));

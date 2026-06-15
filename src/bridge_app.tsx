@@ -346,7 +346,7 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       await navigator.clipboard.writeText(value);
       set_copied(true);
       show_toast(t("copied_to_clipboard"), "success");
-      setTimeout(() => set_copied(false), 1400);
+      setTimeout(() => set_copied(false), 1200);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -357,13 +357,95 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       onClick={on_copy}
       title={t("copy_to_clipboard")}
       aria-label={t("copy_to_clipboard")}
-      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 rounded-md px-2 py-1 cursor-pointer transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/40"
+      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 rounded-md px-2 py-1 cursor-pointer hover:bg-black/[0.05] dark:hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
     >
-      <span title={value} className={`truncate ${mono ? "font-mono" : ""} ${copied ? "text-brand" : "text-txt-primary"}`}>{value}</span>
-      <span className={`flex-shrink-0 transition-colors ${copied ? "text-brand" : "text-txt-muted group-hover:text-txt-primary"}`}>
-        <CopyIcon copied={false} />
+      <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
+      <span className={`flex-shrink-0 ${copied ? "text-emerald-500" : "text-txt-muted group-hover:text-txt-primary"}`}>
+        <CopyIcon copied={copied} />
       </span>
     </button>
+  );
+}
+
+function ChevronRightIcon() {
+  return (
+    <svg className="w-4 h-4 flex-shrink-0 text-txt-muted opacity-60 group-hover:opacity-100" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function SettingsGroup({ title, hint, children }: { title?: string; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="mb-5">
+      {title && (
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-txt-tertiary px-1 mb-2">{title}</h3>
+      )}
+      <div
+        className="rounded-xl border border-edge-secondary overflow-hidden [&>*:not(:first-child)]:border-t [&>*:not(:first-child)]:border-edge-secondary"
+        style={{ backgroundColor: "color-mix(in srgb, var(--text-primary) 3%, var(--bg-primary))", boxShadow: "0 1px 2px rgba(0, 0, 0, 0.04)" }}
+      >
+        {children}
+      </div>
+      {hint && <p className="text-[11px] text-txt-muted px-1 mt-2 leading-relaxed">{hint}</p>}
+    </section>
+  );
+}
+
+function SettingRow({ icon, label, sublabel, danger, children }: { icon?: ReactNode; label: ReactNode; sublabel?: ReactNode; danger?: boolean; children?: ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 px-3.5 py-3 min-h-[52px]">
+      {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted"}`}>{icon}</span>}
+      <div className="min-w-0 flex-1">
+        <p className={`text-[14px] leading-tight ${danger ? "text-aster-danger" : "text-txt-primary"}`}>{label}</p>
+        {sublabel && <p className="text-[12px] text-txt-muted mt-0.5 leading-snug">{sublabel}</p>}
+      </div>
+      {children && <div className="flex-shrink-0">{children}</div>}
+    </div>
+  );
+}
+
+function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }: { icon?: ReactNode; label: ReactNode; sublabel?: ReactNode; on_click: () => void; disabled?: boolean; right?: ReactNode; danger?: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={on_click}
+      disabled={disabled}
+      className="group w-full flex items-center gap-3 px-3.5 py-3 min-h-[52px] text-left hover:bg-black/[0.035] dark:hover:bg-white/[0.05] disabled:opacity-50 disabled:pointer-events-none"
+    >
+      {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
+      <div className="min-w-0 flex-1">
+        <p className={`text-[14px] leading-tight ${danger ? "text-aster-danger" : "text-txt-primary"}`}>{label}</p>
+        {sublabel && <p className="text-[12px] text-txt-muted mt-0.5 leading-snug truncate">{sublabel}</p>}
+      </div>
+      {right !== undefined ? right : <ChevronRightIcon />}
+    </button>
+  );
+}
+
+function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: boolean; on_click: () => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={on_click}
+      className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors disabled:opacity-50 ${checked ? "bg-brand" : "bg-edge-secondary"}`}
+    >
+      <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4" : ""}`} />
+    </button>
+  );
+}
+
+function InfoRow({ label, value, copy = true, mono = true }: { label: string; value: string; copy?: boolean; mono?: boolean }) {
+  return (
+    <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
+      <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
+      {copy
+        ? <CopyValue value={value} mono={mono} />
+        : <span className={`text-[13px] text-right text-txt-primary truncate ${mono ? "font-mono" : ""}`} title={value}>{value}</span>}
+    </div>
   );
 }
 
@@ -995,15 +1077,15 @@ function ConfigPanel({
             <p className="text-sm font-semibold text-txt-primary truncate">{display_name || email?.split("@")[0] || "-"}</p>
             <p className="text-[11px] text-txt-muted truncate">{email_value}</p>
             <div
-              className="flex items-center gap-1.5 mt-0.5 cursor-help w-fit"
+              className="flex items-center gap-1.5 mt-0.5 cursor-default w-fit"
               title={bridge_running
                 ? (connected_since
                     ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
                     : t("connected_tooltip_servers"))
                 : t("not_connected_tooltip")}
             >
-              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${bridge_running ? "bg-brand" : "bg-txt-muted/30"}`} />
-              <span className={`text-[13px] font-medium ${bridge_running ? "text-brand" : "text-txt-muted"}`}>
+              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${bridge_running ? "" : "bg-txt-muted/30"}`} style={bridge_running ? { backgroundColor: "var(--color-success)" } : undefined} />
+              <span className={`text-[13px] font-medium ${bridge_running ? "" : "text-txt-muted"}`} style={bridge_running ? { color: "var(--color-success)" } : undefined}>
                 {bridge_running
                   ? connected_since
                     ? <>{t("connected_for")} <UptimeCounter since={connected_since} /></>
@@ -1061,110 +1143,45 @@ function ConfigPanel({
         </div>
       )}
 
-      <div className="space-y-4">
-        <div className="h-px" style={{ backgroundColor: "var(--border-secondary)" }} />
+      <SettingsGroup title={t("section_incoming")}>
+        <InfoRow label={t("field_protocol")} value="IMAP" copy={false} />
+        <InfoRow label={t("field_hostname")} value={imap_host} />
+        <InfoRow label={t("field_port")} value={imap_port} />
+        <InfoRow label={t("field_connection_security")} value={imap_security} copy={false} mono={false} />
+        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={imap_implicit_tls_port} />}
+        <InfoRow label={t("field_auth_method")} value={t("field_normal_password")} copy={false} mono={false} />
+        <InfoRow label={t("field_username")} value={email_value} />
+      </SettingsGroup>
 
-        <div>
-          <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_incoming")}</h3>
-          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[15px]">
-            <span className="text-txt-muted">{t("field_protocol")}</span>
-            <span className="text-txt-primary font-mono text-right">IMAP</span>
-            <span className="text-txt-muted">{t("field_hostname")}</span>
-            <CopyValue value={imap_host} />
-            <span className="text-txt-muted">{t("field_port")}</span>
-            <CopyValue value={imap_port} />
-            <span className="text-txt-muted">{t("field_connection_security")}</span>
-            <span className="text-txt-primary font-mono text-right">{imap_security}</span>
-            {tls_enabled && (
-              <>
-                <span className="text-txt-muted">{t("field_implicit_tls_port")}</span>
-                <CopyValue value={imap_implicit_tls_port} />
-              </>
-            )}
-            <span className="text-txt-muted">{t("field_auth_method")}</span>
-            <span className="text-txt-primary font-mono text-right">{t("field_normal_password")}</span>
-            <span className="text-txt-muted">{t("field_username")}</span>
-            <CopyValue value={email_value} />
-          </div>
+      <SettingsGroup title={t("section_outgoing")}>
+        <InfoRow label={t("field_hostname")} value={smtp_host} />
+        <InfoRow label={t("field_port")} value={smtp_port} />
+        <InfoRow label={t("field_connection_security")} value={smtp_security} copy={false} mono={false} />
+        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={smtp_implicit_tls_port} />}
+      </SettingsGroup>
+
+      <SettingsGroup title={jmap_enabled ? t("section_jmap") : t("section_jmap_disabled")} hint={t("jmap_hint")}>
+        <InfoRow label={t("field_protocol")} value={t("field_jmap_protocol")} copy={false} mono={false} />
+        <InfoRow label={t("field_session_url")} value={jmap_url} />
+        <InfoRow label={t("field_hostname")} value={jmap_host} />
+        <InfoRow label={t("field_port")} value={jmap_port} />
+        <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
+        <InfoRow label={t("field_username")} value={email_value} />
+        <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
+          <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
+          <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
         </div>
+      </SettingsGroup>
 
-        <div className="h-px" style={{ backgroundColor: "var(--border-secondary)" }} />
+      <SettingsGroup title={t("section_pop3")}>
+        <InfoRow label={t("field_hostname")} value={pop3_host} />
+        <InfoRow label={t("field_port")} value={pop3_port} />
+        <InfoRow label={t("field_connection_security")} value={t("field_none")} copy={false} mono={false} />
+        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={pop3s_port} />}
+        <InfoRow label={t("field_username")} value={email_value} />
+      </SettingsGroup>
 
-        <div>
-          <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_outgoing")}</h3>
-          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[15px]">
-            <span className="text-txt-muted">{t("field_hostname")}</span>
-            <CopyValue value={smtp_host} />
-            <span className="text-txt-muted">{t("field_port")}</span>
-            <CopyValue value={smtp_port} />
-            <span className="text-txt-muted">{t("field_connection_security")}</span>
-            <span className="text-txt-primary font-mono text-right">{smtp_security}</span>
-            {tls_enabled && (
-              <>
-                <span className="text-txt-muted">{t("field_implicit_tls_port")}</span>
-                <CopyValue value={smtp_implicit_tls_port} />
-              </>
-            )}
-          </div>
-        </div>
-
-        <div className="h-px" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-        <div>
-          <h3 className="text-[15px] font-semibold text-txt-primary mb-3">
-            {jmap_enabled ? t("section_jmap") : t("section_jmap_disabled")}
-          </h3>
-          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[15px]">
-            <span className="text-txt-muted">{t("field_protocol")}</span>
-            <span className="text-txt-primary font-mono text-right">{t("field_jmap_protocol")}</span>
-            <span className="text-txt-muted">{t("field_session_url")}</span>
-            <CopyValue value={jmap_url} />
-            <span className="text-txt-muted">{t("field_hostname")}</span>
-            <CopyValue value={jmap_host} />
-            <span className="text-txt-muted">{t("field_port")}</span>
-            <CopyValue value={jmap_port} />
-            <span className="text-txt-muted">{t("field_authentication")}</span>
-            <span className="text-txt-primary font-mono text-right">{t("field_http_basic")}</span>
-            <span className="text-txt-muted">{t("field_username")}</span>
-            <CopyValue value={email_value} />
-            <span className="text-txt-muted">{t("field_password")}</span>
-            <span className="text-txt-muted text-right text-xs">{t("field_password_hint")}</span>
-          </div>
-          <p className="text-txt-tertiary text-xs mt-2">
-            {t("jmap_hint")}
-          </p>
-        </div>
-
-        <div className="h-px" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-        <div>
-          <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_pop3")}</h3>
-          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[15px]">
-            <span className="text-txt-muted">{t("field_hostname")}</span>
-            <CopyValue value={pop3_host} />
-            <span className="text-txt-muted">{t("field_port")}</span>
-            <CopyValue value={pop3_port} />
-            <span className="text-txt-muted">{t("field_connection_security")}</span>
-            <span className="text-txt-primary font-mono text-right">{t("field_none")}</span>
-            {tls_enabled && (
-              <>
-                <span className="text-txt-muted">{t("field_implicit_tls_port")}</span>
-                <CopyValue value={pop3s_port} />
-              </>
-            )}
-            <span className="text-txt-muted">{t("field_username")}</span>
-            <CopyValue value={email_value} />
-          </div>
-        </div>
-
-        {tls_enabled && (
-          <>
-            <div className="h-px" style={{ backgroundColor: "var(--border-secondary)" }} />
-            <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />
-          </>
-        )}
-
-      </div>
+      {tls_enabled && <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />}
     </div>
   );
 }
@@ -1184,31 +1201,24 @@ function TlsInfoBlock({
   const fingerprint = tls_info?.fingerprint_sha256 || "(unavailable)";
   const cert_path = tls_info?.cert_path || "(unavailable)";
   return (
-    <div>
-      <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_tls")}</h3>
-      <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[15px]">
-        <span className="text-txt-muted">{t("tls_status")}</span>
-        <span className="text-txt-primary font-mono text-right">{t("tls_enabled")}</span>
-        <span className="text-txt-muted">{t("tls_cert_sha256")}</span>
-        <CopyValue value={fingerprint} />
-        <span className="text-txt-muted">{t("tls_cert_path")}</span>
-        <span className="text-right inline-flex items-center justify-end gap-2">
-          <span className="text-txt-muted font-mono text-xs truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
+    <SettingsGroup title={t("section_tls")} hint={t("tls_hint")}>
+      <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
+      <InfoRow label={t("tls_cert_sha256")} value={fingerprint} />
+      <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
+        <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
+        <span className="inline-flex items-center justify-end gap-2 min-w-0">
+          <span className="text-[13px] text-txt-primary font-mono truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
           <button
             type="button"
-            className="text-[10px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0"
+            className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0"
             onClick={() => api.open_tls_cert().catch(() => {})}
           >
             {t("tls_open_cert_folder")}
           </button>
         </span>
-        <span className="text-txt-muted">{t("tls_jmap_scheme")}</span>
-        <span className="text-txt-primary font-mono text-right">{jmap_https_enabled ? "https://" : "http://"}</span>
       </div>
-      <p className="text-txt-tertiary text-xs mt-2">
-        {t("tls_hint")}
-      </p>
-    </div>
+      <InfoRow label={t("tls_jmap_scheme")} value={jmap_https_enabled ? "https://" : "http://"} copy={false} />
+    </SettingsGroup>
   );
 }
 
@@ -1390,7 +1400,6 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [copying_bundle, set_copying_bundle] = useState(false);
   const log_container_ref = useRef<HTMLDivElement>(null);
   const [outbox_items, set_outbox_items] = useState<api.OutboxItem[]>([]);
-  const [outbox_loading, set_outbox_loading] = useState(false);
   const [outbox_retrying_id, set_outbox_retrying_id] = useState<number | null>(null);
 
   useEffect(() => {
@@ -1405,14 +1414,12 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   };
 
   const load_outbox = useCallback(async () => {
-    set_outbox_loading(true);
     try {
       const items = await api.outbox_list();
       set_outbox_items(items);
     } catch {
       set_outbox_items([]);
     }
-    set_outbox_loading(false);
   }, []);
 
   useEffect(() => {
@@ -1595,210 +1602,145 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     <div className="p-5">
       <h2 className="text-base font-semibold text-txt-primary mb-4">{t("settings_title")}</h2>
 
-      <div className="space-y-1">
-        <div className="flex items-center justify-between py-2.5 px-2.5">
-          <div>
-            <p className="text-sm text-txt-primary">{t("launch_on_startup")}</p>
-            <p className="text-[11px] text-txt-muted">{t("launch_on_startup_hint")}</p>
-          </div>
-          <button
-            className={`relative w-9 h-5 rounded-full transition-colors ${autostart ? "bg-brand" : "bg-edge-secondary"}`}
-            disabled={autostart_loading}
-            onClick={handle_toggle_autostart}
-          >
-            <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${autostart ? "translate-x-4" : ""}`} />
-          </button>
-        </div>
-        <div className="flex items-center justify-between py-2.5 px-2.5">
-          <div>
-            <p className="text-sm text-txt-primary">{t("run_in_background")}</p>
-            <p className="text-[11px] text-txt-muted">{t("run_in_background_hint")}</p>
-          </div>
-          <button
-            className={`relative w-9 h-5 rounded-full transition-colors ${service_mode ? "bg-brand" : "bg-edge-secondary"}`}
-            disabled={service_mode_loading}
-            onClick={handle_toggle_service_mode}
-          >
-            <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${service_mode ? "translate-x-4" : ""}`} />
-          </button>
-        </div>
-      </div>
+      <SettingsGroup title={t("section_general")}>
+        <SettingRow label={t("launch_on_startup")} sublabel={t("launch_on_startup_hint")}>
+          <Toggle checked={autostart} disabled={autostart_loading} on_click={handle_toggle_autostart} />
+        </SettingRow>
+        <SettingRow label={t("run_in_background")} sublabel={t("run_in_background_hint")}>
+          <Toggle checked={service_mode} disabled={service_mode_loading} on_click={handle_toggle_service_mode} />
+        </SettingRow>
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_email_client_setup")}</h3>
-        <div className="space-y-0.5">
-          {["Thunderbird", "Outlook", "Apple Mail"].map((client) => (
-            <button
-              key={client}
-              className="group w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-sm text-txt-primary transition-all duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-              onClick={() => set_setup_client(client)}
-            >
-              <svg className="w-4 h-4 text-txt-muted flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-                <path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.431.992a7.723 7.723 0 0 1 0 .255c-.007.378.138.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" strokeLinecap="round" strokeLinejoin="round" />
+      <SettingsGroup title={t("section_email_client_setup")}>
+        {["Thunderbird", "Outlook", "Apple Mail"].map((client) => (
+          <ActionRow
+            key={client}
+            label={t("setup_with_client", { client })}
+            on_click={() => set_setup_client(client)}
+            icon={
+              <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                <rect x="2.25" y="5.25" width="19.5" height="13.5" rx="2" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="m3 6.75 9 6 9-6" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
-              <span className="flex-1">{t("setup_with_client", { client })}</span>
-              <svg className="w-4 h-4 text-txt-muted flex-shrink-0 opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-150" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
-          ))}
-        </div>
-      </div>
+            }
+          />
+        ))}
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_support")}</h3>
-        <div className="space-y-0.5">
-          <button
-            className="group w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-sm text-txt-primary transition-all duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-            onClick={() => api.open_url("https://astermail.org/help")}
-          >
-            <svg className="w-4 h-4 text-txt-muted flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-              <path d="M16.712 4.33a9.027 9.027 0 0 1 1.652 1.306c.51.51.944 1.064 1.306 1.652M16.712 4.33l-3.448 4.138m3.448-4.138a9.014 9.014 0 0 0-9.424 0M19.67 7.288l-4.138 3.448m4.138-3.448a9.014 9.014 0 0 1 0 9.424m-4.138-5.976a3.736 3.736 0 0 0-.88-1.388 3.737 3.737 0 0 0-1.388-.88m2.268 2.268a3.765 3.765 0 0 1 0 2.528m-2.268-4.796a3.765 3.765 0 0 0-2.528 0m4.796 4.796c-.181.506-.475.982-.88 1.388a3.736 3.736 0 0 1-1.388.88m2.268-2.268 4.138 3.448m0 0a9.027 9.027 0 0 1-1.306 1.652 9.027 9.027 0 0 1-1.652 1.306m0 0-3.448-4.138m3.448 4.138a9.014 9.014 0 0 1-9.424 0m5.976-4.138a3.765 3.765 0 0 1-2.528 0m0 0a3.736 3.736 0 0 1-1.388-.88 3.737 3.737 0 0 1-.88-1.388m0 0-4.138 3.448m0 0a9.027 9.027 0 0 1-1.306-1.652 9.027 9.027 0 0 1-1.652-1.306m0 0 4.138-3.448M4.33 16.712a9.014 9.014 0 0 1 0-9.424m4.138 5.976a3.765 3.765 0 0 1 0-2.528m0 0c.181-.506.475-.982.88-1.388a3.736 3.736 0 0 1 1.388-.88m-2.268 2.268L4.33 7.288m6.406 1.18L7.288 4.33m0 0a9.027 9.027 0 0 0-1.652 1.306A9.027 9.027 0 0 0 4.33 7.288" strokeLinecap="round" strokeLinejoin="round" />
+      <SettingsGroup title={t("section_support")}>
+        <ActionRow
+          label={t("help_center")}
+          on_click={() => api.open_url("https://astermail.org/help")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 5.25h.008v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            {t("help_center")}
-          </button>
-          <button
-            className="group w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-sm text-txt-primary transition-all duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-            onClick={() => api.open_url("https://astermail.org/issue")}
-          >
-            <svg className="w-4 h-4 text-txt-muted flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+          }
+        />
+        <ActionRow
+          label={t("report_bug")}
+          on_click={() => api.open_url("https://astermail.org/issue")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
               <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            {t("report_bug")}
-          </button>
-        </div>
-      </div>
+          }
+        />
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_port_config")}</h3>
-        <p className="text-[11px] text-txt-muted mb-3">{t("port_config_hint")}</p>
-        <div className="space-y-2.5">
-          <div className="flex items-center justify-between px-2.5">
-            <label className="text-sm text-txt-primary">{t("imap_port")}</label>
-            <input
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              value={imap_port}
-              onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_imap_port(v); set_ports_dirty(true); }}
-              className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-              style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
-            />
-          </div>
-          <div className="flex items-center justify-between px-2.5">
-            <label className="text-sm text-txt-primary">{t("smtp_port")}</label>
-            <input
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              value={smtp_port}
-              onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_smtp_port(v); set_ports_dirty(true); }}
-              className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-              style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
-            />
-          </div>
-          {ports_dirty && (
-            <div className="flex justify-end px-2.5 pt-1">
-              <Button variant="primary" size="sm" disabled={saving_ports} onClick={handle_save_ports}>
-                {saving_ports ? t("saving") : t("save")}
-              </Button>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <div className="flex items-center gap-2 mb-2">
-          <h3 className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("section_outbox")}</h3>
-          {outbox_items.length > 0 && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#ef4444]/15 text-[#ef4444] font-mono">
-              {outbox_items.length}
-            </span>
-          )}
-        </div>
-        {outbox_items.length === 0 ? (
-          <p className="text-[11px] text-txt-muted px-2.5">
-            {outbox_loading ? t("loading") : t("outbox_empty")}
-          </p>
-        ) : (
-          <div className="space-y-2">
-            {outbox_items.map((item) => (
-              <div
-                key={item.id}
-                className="rounded-lg p-3"
-                style={{ backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-secondary)" }}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm text-txt-primary truncate">
-                      {item.subject && item.subject.trim().length > 0 ? item.subject : t("no_subject")}
-                    </div>
-                    <div className="text-[11px] text-txt-muted truncate mt-0.5">
-                      {t("outbox_to", { to: item.envelope_to || "-" })}
-                    </div>
-                    <div className="text-[11px] text-txt-muted mt-0.5">
-                      {t("outbox_status", { status: item.status, count: item.attempts })}
-                    </div>
-                    {item.last_error && (
-                      <div className="text-[11px] text-[#ef4444] mt-1 break-words">
-                        {sanitize_error(item.last_error)}
-                      </div>
-                    )}
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!bridge_running || outbox_retrying_id === item.id || item.status === "sending"}
-                    title={!bridge_running ? t("start_bridge_to_retry") : undefined}
-                    onClick={() => handle_outbox_retry(item.id)}
-                  >
-                    {outbox_retrying_id === item.id ? t("retrying") : t("retry_now")}
-                  </Button>
-                </div>
-              </div>
-            ))}
+      <SettingsGroup title={t("section_port_config")} hint={t("port_config_hint")}>
+        <SettingRow label={t("imap_port")}>
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={imap_port}
+            onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_imap_port(v); set_ports_dirty(true); }}
+            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
+            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+          />
+        </SettingRow>
+        <SettingRow label={t("smtp_port")}>
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={smtp_port}
+            onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_smtp_port(v); set_ports_dirty(true); }}
+            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
+            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+          />
+        </SettingRow>
+        {ports_dirty && (
+          <div className="flex justify-end px-3.5 py-2.5">
+            <Button variant="depth" size="sm" disabled={saving_ports} onClick={handle_save_ports}>
+              {saving_ports ? t("saving") : t("save")}
+            </Button>
           </div>
         )}
-        <p className="text-[11px] text-txt-muted mt-2 px-2.5">{t("auto_sync_note")}</p>
-      </div>
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
+      {outbox_items.length > 0 && (
+        <SettingsGroup title={t("section_outbox")} hint={t("auto_sync_note")}>
+          {outbox_items.map((item) => (
+            <div key={item.id} className="flex items-start justify-between gap-3 px-3.5 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-[14px] text-txt-primary truncate">
+                  {item.subject && item.subject.trim().length > 0 ? item.subject : t("no_subject")}
+                </div>
+                <div className="text-[12px] text-txt-muted truncate mt-0.5">
+                  {t("outbox_to", { to: item.envelope_to || "-" })}
+                </div>
+                <div className="text-[12px] text-txt-muted mt-0.5">
+                  {t("outbox_status", { status: item.status, count: item.attempts })}
+                </div>
+                {item.last_error && (
+                  <div className="text-[12px] text-aster-danger mt-1 break-words">
+                    {sanitize_error(item.last_error)}
+                  </div>
+                )}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!bridge_running || outbox_retrying_id === item.id || item.status === "sending"}
+                title={!bridge_running ? t("start_bridge_to_retry") : undefined}
+                onClick={() => handle_outbox_retry(item.id)}
+              >
+                {outbox_retrying_id === item.id ? t("retrying") : t("retry_now")}
+              </Button>
+            </div>
+          ))}
+        </SettingsGroup>
+      )}
 
-      <div>
-        <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_diagnostics")}</h3>
-        <div className="space-y-2 px-2.5">
-          <div className="flex items-center gap-2 flex-wrap">
-            <Button variant="outline" size="sm" onClick={handle_toggle_logs}>
-              {logs_open ? t("hide_logs") : t("show_recent_logs")}
-            </Button>
-            <Button variant="depth" size="sm" disabled={copying_bundle} onClick={handle_copy_bundle}>
-              {copying_bundle ? t("building") : t("copy_diagnostic_bundle")}
-            </Button>
-            {logs_open && (
+      <SettingsGroup title={t("section_diagnostics")} hint={t("bundle_hint")}>
+        <SettingRow label={t("diagnostics_logs_label")} sublabel={t("diagnostics_logs_hint")}>
+          <Button variant="secondary" size="sm" onClick={handle_toggle_logs}>
+            {logs_open ? t("hide") : t("show")}
+          </Button>
+        </SettingRow>
+        <SettingRow label={t("diagnostics_bundle_label")} sublabel={t("diagnostics_bundle_sub")}>
+          <Button variant="secondary" size="sm" disabled={copying_bundle} onClick={handle_copy_bundle}>
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <rect height="13" rx="2" width="13" x="9" y="9" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            {copying_bundle ? t("building") : t("copy")}
+          </Button>
+        </SettingRow>
+        {logs_open && (
+          <div className="px-3.5 py-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("show_recent_logs")}</span>
               <Button variant="ghost" size="sm" disabled={logs_loading} onClick={handle_refresh_logs}>
                 {logs_loading ? t("loading") : t("refresh")}
               </Button>
-            )}
-          </div>
-          {logs_open && (
+            </div>
             <div
               ref={log_container_ref}
-              className="rounded-lg p-3 text-[11px] font-mono whitespace-pre overflow-auto"
-              style={{
-                backgroundColor: "var(--bg-tertiary)",
-                border: "1px solid var(--border-secondary)",
-                maxHeight: "240px",
-                color: "var(--text-secondary)",
-              }}
+              className="rounded-lg p-3 text-[11px] font-mono whitespace-pre overflow-auto border border-edge-secondary"
+              style={{ backgroundColor: "var(--bg-secondary)", maxHeight: "240px", color: "var(--text-secondary)" }}
             >
               {logs_loading && log_lines.length === 0 ? t("loading") : null}
               {!logs_loading && log_lines.length === 0 ? t("no_log_entries") : null}
@@ -1806,78 +1748,70 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                 <div key={idx}>{line}</div>
               ))}
             </div>
-          )}
-          <p className="text-[11px] text-txt-muted">
-            {t("bundle_hint")}
-          </p>
-        </div>
-      </div>
+          </div>
+        )}
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <h3 className="text-[15px] font-semibold text-txt-primary mb-3">{t("section_updates")}</h3>
-        {update_info ? (
-          <div className="rounded-lg p-3 mb-3" style={{ backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-secondary)" }}>
-            <p className="text-sm font-medium text-txt-primary mb-0.5">{t("update_available", { version: update_info.version })}</p>
+      <SettingsGroup title={t("section_updates")}>
+        {update_info && (
+          <div className="px-3.5 py-3">
+            <p className="text-[14px] font-medium text-txt-primary mb-0.5">{t("update_available", { version: update_info.version })}</p>
             {update_info.notes && (
-              <p className="text-[11px] text-txt-muted mb-2 line-clamp-3">{update_info.notes}</p>
+              <p className="text-[12px] text-txt-muted mb-2.5 line-clamp-3 leading-snug">{update_info.notes}</p>
             )}
             <Button variant="depth" size="sm" disabled={update_installing} onClick={handle_install_update}>
               {update_installing ? t("update_installing") : t("update_install")}
             </Button>
           </div>
-        ) : null}
-        <div className="flex items-center gap-2 px-2.5">
+        )}
+        <SettingRow label={t("updates_app_row")} sublabel={app_version ? `${t("app_version")} ${app_version}` : undefined}>
           <Button variant="outline" size="sm" disabled={update_checking || update_installing} onClick={handle_check_updates}>
             {update_checking ? t("update_checking") : t("update_check_now")}
           </Button>
-        </div>
-      </div>
+        </SettingRow>
+      </SettingsGroup>
 
-      <div className="h-px my-4" style={{ backgroundColor: "var(--border-secondary)" }} />
-
-      <div>
-        <h3 className="text-[11px] font-medium uppercase tracking-wider text-txt-muted mb-3">{t("section_advanced")}</h3>
-        <div className="flex flex-col items-start gap-2">
-          <Button
-            variant="ghost"
-            size="md"
-            disabled={repairing}
-            onClick={() => set_show_repair_modal(true)}
-          >
-            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+      <SettingsGroup title={t("section_advanced")}>
+        {data_dir && (
+          <ActionRow
+            label={t("open_data_folder")}
+            sublabel={data_dir}
+            on_click={() => api.open_data_directory()}
+            icon={
+              <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                <path d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            }
+          />
+        )}
+        <SettingRow
+          label={t("repair_cache")}
+          sublabel={t("repair_cache_sub")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
               <path d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            {repairing ? t("rebuilding_cache") : t("repair_cache")}
+          }
+        >
+          <Button variant="secondary" size="sm" disabled={repairing} onClick={() => set_show_repair_modal(true)}>
+            {repairing ? t("rebuilding_cache") : t("repair")}
           </Button>
-          {data_dir && (
-            <div>
-              <Button
-                variant="ghost"
-                size="md"
-                onClick={() => api.open_data_directory()}
-              >
-                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-                  <path d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                {t("open_data_folder")}
-              </Button>
-              <p className="text-[10px] text-txt-muted mt-0.5 ml-1 truncate max-w-xs">{data_dir}</p>
-            </div>
-          )}
-          <Button
-            variant="destructive"
-            size="md"
-            onClick={() => set_show_reset_modal(true)}
-          >
-            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+        </SettingRow>
+        <SettingRow
+          danger
+          label={t("reset_bridge")}
+          sublabel={t("reset_bridge_sub")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
               <path d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
+          }
+        >
+          <Button variant="destructive" size="sm" onClick={() => set_show_reset_modal(true)}>
             {t("reset_bridge")}
           </Button>
-        </div>
-      </div>
+        </SettingRow>
+      </SettingsGroup>
 
       <Modal open={show_repair_modal} on_close={() => !repairing && set_show_repair_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("repair_cache_title")}</p>
@@ -1890,9 +1824,6 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalActions>
       </Modal>
 
-      {app_version && (
-        <p className="text-[11px] text-txt-muted text-center mt-6 pb-1">{t("app_version")} {app_version}</p>
-      )}
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>

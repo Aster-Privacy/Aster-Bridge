@@ -19,6 +19,7 @@
 
 const en = {
   copied_to_clipboard: "Copied to clipboard",
+  copied: "Copied",
   failed_to_copy: "Failed to copy to clipboard",
   cancel: "Cancel",
   done: "Done",
@@ -101,6 +102,18 @@ const en = {
   deleting: "Deleting...",
 
   settings_title: "Settings",
+  section_general: "General",
+  diagnostics_logs_label: "Recent activity logs",
+  diagnostics_logs_hint: "View the latest bridge events",
+  diagnostics_bundle_label: "Diagnostic bundle",
+  diagnostics_bundle_sub: "App version, OS, ports, and recent logs",
+  show: "Show",
+  hide: "Hide",
+  copy: "Copy",
+  updates_app_row: "Aster Bridge",
+  open_data_folder_sub: "Browse cached mail and logs on this device",
+  repair_cache_sub: "Clear and rebuild the local mail cache",
+  reset_bridge_sub: "Sign out and erase all local data",
   launch_on_startup: "Launch on startup",
   launch_on_startup_hint: "Start Aster Bridge when you log in",
   run_in_background: "Run silently in background",

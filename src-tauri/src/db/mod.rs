@@ -252,6 +252,7 @@ fn restrict_db_file_permissions(db_path: &Path) {
         }
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
             let user = whoami::fallible::username()
                 .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
             if !user.is_empty() {
@@ -262,6 +263,7 @@ fn restrict_db_file_permissions(db_path: &Path) {
                         "/grant:r",
                         &format!("{}:(F)", user),
                     ])
+                    .creation_flags(0x0800_0000)
                     .output();
             }
         }
@@ -627,6 +629,29 @@ impl Database {
             Ok(cached == Some(1))
         })
         .unwrap_or(false)
+    }
+
+    pub fn update_cached_body(
+        &self,
+        aster_id: &str,
+        body_text: &str,
+        raw_headers: Option<&str>,
+    ) -> Result<(), String> {
+        let body = strip_c0_controls(body_text);
+        let size = body.len() as i64;
+        self.with_conn(|conn| {
+            match raw_headers {
+                Some(rh) => conn.execute(
+                    "UPDATE message_cache SET body_cached=1, body_text=?2, size=?3, raw_headers=?4 WHERE aster_id=?1",
+                    rusqlite::params![aster_id, body, size, rh],
+                )?,
+                None => conn.execute(
+                    "UPDATE message_cache SET body_cached=1, body_text=?2, size=?3 WHERE aster_id=?1",
+                    rusqlite::params![aster_id, body, size],
+                )?,
+            };
+            Ok(())
+        })
     }
 
     pub fn list_cached_messages(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {

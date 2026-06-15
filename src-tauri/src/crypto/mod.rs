@@ -23,4 +23,6 @@ pub mod envelope;
 #[allow(dead_code)]
 pub mod metadata;
 #[allow(dead_code)]
+pub mod ratchet;
+#[allow(dead_code)]
 pub mod vault;

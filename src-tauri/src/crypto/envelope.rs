@@ -168,6 +168,24 @@ fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> 
     Ok(okm)
 }
 
+pub fn encrypt_identity_key_envelope(plaintext: &str, identity_key: &str) -> Result<(String, String)> {
+    use rand_core::{OsRng, RngCore};
+
+    let mut key = derive_envelope_key(identity_key.as_bytes(), ENVELOPE_VERSIONS[0].as_bytes())?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
+    key.zeroize();
+
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|_| BridgeError::Crypto("envelope encrypt failed".to_string()))?;
+
+    Ok((STANDARD.encode(&ciphertext), STANDARD.encode(nonce_bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -103,6 +103,7 @@ fn stub_session() -> Arc<RwLock<Session>> {
         access_token: zeroize::Zeroizing::new("stub-token".to_string()),
         vault_passphrase: Vec::new(),
         identity_key: None,
+        ratchet_keys: Vec::new(),
     }))
 }
 
@@ -828,4 +829,694 @@ async fn serve_real() {
 
     tokio::time::sleep(Duration::from_secs(240)).await;
     println!("serve_real: shutting down");
+}
+
+// Logs into the REAL paired account and runs the full internal-mail decryption
+// path (X3DH + ML-KEM-768 PQXDH + double ratchet) against real messages and the
+// real vault keys, printing PASS/FAIL and a plaintext snippet per message. All
+// decryption is local; the PQ prekey is fetched (read-only, never deleted).
+//
+//   cargo test --bin aster-bridge-desktop decrypt_real_internal -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn decrypt_real_internal() {
+    use crate::api_client::MailListQuery;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cannot load config: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("identity load failed: {}", e);
+            return;
+        }
+    };
+    if identity.device_id.is_none() {
+        println!("NOT PAIRED (no device_id). Pair the bridge first.");
+        return;
+    }
+
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+
+    println!("data_dir = {}", cfg.data_dir.display());
+    println!("device_id = {:?}", identity.device_id);
+    let device_id = identity.device_id.unwrap();
+    let passphrase = match crate::auth::device_identity::load_passphrase(&cfg.data_dir) {
+        Ok(Some(p)) => {
+            println!("passphrase loaded: {} bytes", p.len());
+            p
+        }
+        Ok(None) => {
+            println!("NO PASSPHRASE stored");
+            return;
+        }
+        Err(e) => {
+            println!("passphrase load err: {}", e);
+            return;
+        }
+    };
+    let challenge = match client.device_challenge(device_id).await {
+        Ok(c) => {
+            println!("challenge OK (id {})", c.challenge_id);
+            c
+        }
+        Err(e) => {
+            println!("CHALLENGE FAILED: {}", e);
+            return;
+        }
+    };
+    let signature = crate::auth::device_identity::sign_challenge(&identity, &challenge.nonce).unwrap();
+    let login_resp = match client
+        .device_login(&crate::api_client::DeviceLoginRequest {
+            challenge_id: challenge.challenge_id,
+            signature,
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("DEVICE_LOGIN FAILED: {}", e);
+            return;
+        }
+    };
+    let access_token = zeroize::Zeroizing::new(login_resp.access_token.clone().unwrap_or_default());
+    let (identity_key, ratchet_keys) = match crate::crypto::vault::decrypt_vault(
+        &login_resp.encrypted_vault,
+        &login_resp.vault_nonce,
+        &passphrase,
+    ) {
+        Ok(v) => (
+            Some(v.identity_key.clone()),
+            crate::crypto::ratchet::build_receiver_key_sets(&v),
+        ),
+        Err(e) => {
+            println!("vault decrypt FAILED: {}", e);
+            (None, Vec::new())
+        }
+    };
+    let session = crate::auth::session::Session {
+        user_id: login_resp.user_id,
+        username: login_resp.username,
+        email: login_resp.email,
+        access_token,
+        vault_passphrase: passphrase,
+        identity_key,
+        ratchet_keys,
+    };
+    println!("logged in as {}", session.email);
+    println!("ratchet key sets available: {}", session.ratchet_keys.len());
+
+    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let token = session.access_token.clone();
+
+    let (mut total_ratchet, mut decrypted, mut failed) = (0u32, 0u32, 0u32);
+
+    for (label, itype) in [("inbox", "received"), ("sent", "sent")] {
+        let q = MailListQuery {
+            item_type: Some(itype.to_string()),
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: Some(40),
+            cursor: None,
+        };
+        let resp = match client.list_mail(&token, &q).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}: list error {}", label, e);
+                continue;
+            }
+        };
+        println!("\n=== {} ({} items) ===", label, resp.items.len());
+        for item in &resp.items {
+            let env = match crate::crypto::envelope::decrypt_envelope(
+                &item.encrypted_envelope,
+                Some(&item.envelope_nonce),
+                &session.vault_passphrase,
+                session.identity_key.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(&env) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) {
+                Some(v) => v,
+                None => continue,
+            };
+            total_ratchet += 1;
+            let mut msg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &session.email) {
+                Some(m) => m,
+                None => {
+                    failed += 1;
+                    println!("  [FAIL parse] {}", item.id);
+                    continue;
+                }
+            };
+            if let Some(kid) = msg.pq_key_id {
+                let Some(sk) = sync_key.as_ref() else {
+                    failed += 1;
+                    continue;
+                };
+                match client.get_pq_secret(&token, kid).await {
+                    Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
+                        Ok(s) => msg.pq_secret = Some(s),
+                        Err(e) => {
+                            failed += 1;
+                            println!("  [FAIL pq-decrypt kid={}] {}", kid, e);
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        failed += 1;
+                        println!("  [SKIP pq-fetch kid={}] secret gone (already opened on another device)", kid);
+                        continue;
+                    }
+                }
+            }
+            match crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &msg) {
+                Some(pt) => {
+                    decrypted += 1;
+                    let snippet: String = pt.chars().take(90).collect();
+                    println!("  [OK] {} => {}", item.id, snippet.replace('\n', " "));
+                }
+                None => {
+                    failed += 1;
+                    println!("  [FAIL decrypt] {}", item.id);
+                }
+            }
+        }
+    }
+
+    println!("\n==== RATCHET DECRYPT SUMMARY ====");
+    println!(
+        "internal(ratchet) messages: {}, decrypted OK: {}, failed/skipped: {}",
+        total_ratchet, decrypted, failed
+    );
+}
+
+async fn report_internal_decrypt(client: &ApiClient, session: &crate::auth::session::Session) {
+    use crate::api_client::MailListQuery;
+
+    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let token = session.access_token.clone();
+    let (mut total_ratchet, mut decrypted, mut failed) = (0u32, 0u32, 0u32);
+
+    for (label, itype) in [("inbox", "received"), ("sent", "sent")] {
+        let q = MailListQuery {
+            item_type: Some(itype.to_string()),
+            is_trashed: None,
+            is_archived: None,
+            is_spam: None,
+            limit: Some(40),
+            cursor: None,
+        };
+        let resp = match client.list_mail(&token, &q).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{}: list error {}", label, e);
+                continue;
+            }
+        };
+        println!("\n=== {} ({} items) ===", label, resp.items.len());
+        for item in &resp.items {
+            let env = match crate::crypto::envelope::decrypt_envelope(
+                &item.encrypted_envelope,
+                Some(&item.envelope_nonce),
+                &session.vault_passphrase,
+                session.identity_key.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(&env) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) {
+                Some(v) => v,
+                None => continue,
+            };
+            total_ratchet += 1;
+            let mut msg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &session.email) {
+                Some(m) => m,
+                None => {
+                    failed += 1;
+                    println!("  [FAIL parse] {}", item.id);
+                    continue;
+                }
+            };
+            if let Some(kid) = msg.pq_key_id {
+                let Some(sk) = sync_key.as_ref() else {
+                    failed += 1;
+                    continue;
+                };
+                match client.get_pq_secret(&token, kid).await {
+                    Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
+                        Ok(s) => msg.pq_secret = Some(s),
+                        Err(e) => {
+                            failed += 1;
+                            println!("  [FAIL pq-decrypt kid={}] {}", kid, e);
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        failed += 1;
+                        println!("  [SKIP pq kid={}] secret gone (opened on another device)", kid);
+                        continue;
+                    }
+                }
+            }
+            match crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &msg) {
+                Some(pt) => {
+                    decrypted += 1;
+                    let s: String = pt.chars().take(90).collect();
+                    println!("  [OK] {} => {}", item.id, s.replace('\n', " "));
+                }
+                None => {
+                    failed += 1;
+                    println!("  [FAIL decrypt] {}", item.id);
+                }
+            }
+        }
+    }
+
+    println!("\n==== RATCHET DECRYPT SUMMARY ====");
+    println!(
+        "internal(ratchet) messages: {}, decrypted OK: {}, failed/skipped: {}",
+        total_ratchet, decrypted, failed
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pair_and_decrypt_real() {
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cannot load config: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("identity load failed: {}", e);
+            return;
+        }
+    };
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+
+    println!("PAIRING: enter the code below in Aster Mail > Settings > Devices > Add Device");
+    let session = match crate::auth::session::first_time_setup(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("PAIRING FAILED: {}", e);
+            return;
+        }
+    };
+    println!(
+        "paired + logged in as {} (ratchet key sets: {})",
+        session.email,
+        session.ratchet_keys.len()
+    );
+    report_internal_decrypt(&client, &session).await;
+}
+
+// Proves the full internal-mail crypto end to end against the LIVE backend and
+// the real vault keys, with no dependency on any existing message or user
+// action: fetch our own real prekey bundle, encrypt a fresh message to it using
+// a live (unconsumed) PQ prekey, fetch that prekey's secret and decrypt. If the
+// recovered plaintext matches, the entire X3DH + ML-KEM-768 + double-ratchet
+// receive path is proven correct on the user's actual account.
+//
+//   cargo test --bin aster-bridge-desktop pqxdh_self_roundtrip_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn pqxdh_self_roundtrip_real() {
+    use base64::engine::general_purpose::STANDARD;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => { println!("cannot load config: {}", e); return; }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => { println!("identity load failed: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    println!("logged in as {} (user {}, key sets {})", session.email, session.username, session.ratchet_keys.len());
+
+    let token = session.access_token.clone();
+    let sync_key = match crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase) {
+        Ok(k) => k,
+        Err(e) => { println!("sync key derive failed: {}", e); return; }
+    };
+
+    let bundle = match client.get_prekey_bundle(&token, &session.username, &session.email).await {
+        Ok(b) => b,
+        Err(e) => { println!("PREKEY BUNDLE FETCH FAILED: {}", e); return; }
+    };
+    println!("bundle fetched: has_pq_prekey={}", bundle.pq_prekey.is_some());
+
+    let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("kem_identity b64");
+    let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("signed_prekey b64");
+    let (pq_pub, pq_kid) = match &bundle.pq_prekey {
+        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq pub b64")), Some(p.key_id)),
+        None => { println!("WARNING: bundle has no PQ prekey; testing classical path only"); (None, None) }
+    };
+
+    if session.ratchet_keys.is_empty() {
+        println!("no ratchet key sets in vault");
+        return;
+    }
+    let sender_id_d = session.ratchet_keys[0].identity_secret_d.clone();
+
+    let plaintext = "PQXDH self round-trip proof - sign-in code 778899";
+    let mut msg = match crate::crypto::ratchet::encrypt_bootstrap(
+        &sender_id_d,
+        &recipient_id_pub,
+        &recipient_spk_pub,
+        pq_pub.as_deref(),
+        pq_kid,
+        plaintext,
+    ) {
+        Ok(m) => m,
+        Err(e) => { println!("ENCRYPT FAILED: {}", e); return; }
+    };
+
+    if let Some(kid) = msg.pq_key_id {
+        match client.get_pq_secret(&token, kid).await {
+            Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(&sync_key, &r.encrypted_secret, &r.secret_nonce) {
+                Ok(secret) => msg.pq_secret = Some(secret),
+                Err(e) => { println!("PQ SECRET DECRYPT FAILED (kid={}): {}", kid, e); return; }
+            },
+            Err(e) => { println!("PQ SECRET FETCH FAILED (kid={}): {}", kid, e); return; }
+        }
+    }
+
+    match crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &msg) {
+        Some(pt) => {
+            println!("DECRYPTED: {:?}", pt);
+            assert_eq!(pt, plaintext, "round-trip plaintext mismatch");
+            println!("==== PROOF PASS: full PQXDH + double-ratchet decrypt works on the live account ====");
+        }
+        None => println!("==== PROOF FAIL: could not decrypt self-encrypted message ===="),
+    }
+}
+
+// Logs in once and watches the real inbox; the instant a fresh internal message
+// arrives whose one-time PQ prekey is still alive (i.e. not yet opened on web),
+// it decrypts it and prints the plaintext - a real-message proof on the live
+// account. Send yourself an internal email and leave it unread.
+//
+//   cargo test --bin aster-bridge-desktop poll_for_fresh_decrypt -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn poll_for_fresh_decrypt() {
+    use crate::api_client::MailListQuery;
+
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    println!("watching inbox as {} - send yourself an internal email and leave it UNREAD", session.email);
+
+    let token = session.access_token.clone();
+    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let start = std::time::Instant::now();
+    let mut round = 0u32;
+
+    loop {
+        round += 1;
+        let q = MailListQuery {
+            item_type: Some("received".to_string()),
+            is_trashed: None, is_archived: None, is_spam: None,
+            limit: Some(15), cursor: None,
+        };
+        if let Ok(resp) = client.list_mail(&token, &q).await {
+            for item in &resp.items {
+                let env = match crate::crypto::envelope::decrypt_envelope(
+                    &item.encrypted_envelope, Some(&item.envelope_nonce),
+                    &session.vault_passphrase, session.identity_key.as_deref(),
+                ) { Ok(v) => v, Err(_) => continue };
+                let parsed: serde_json::Value = match serde_json::from_str(&env) { Ok(v) => v, Err(_) => continue };
+                let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) { Some(v) => v, None => continue };
+                let mut msg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &session.email) { Some(m) => m, None => continue };
+                if let Some(kid) = msg.pq_key_id {
+                    let sk = match sync_key.as_ref() { Some(s) => s, None => continue };
+                    match client.get_pq_secret(&token, kid).await {
+                        Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
+                            Ok(s) => msg.pq_secret = Some(s),
+                            Err(_) => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
+                if let Some(pt) = crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &msg) {
+                    println!("==== FRESH REAL MESSAGE DECRYPTED (round {}, item {}) ====", round, item.id);
+                    println!("plaintext: {}", pt.chars().take(220).collect::<String>().replace('\n', " "));
+                    println!("==== PROOF: a real inbox internal message decrypted on your live account ====");
+                    return;
+                }
+            }
+        }
+        if start.elapsed().as_secs() > 720 {
+            println!("no fresh decryptable message within 6 min - send one to {} and leave it unread", session.email);
+            return;
+        }
+        println!("round {}: nothing fresh yet, waiting 15s...", round);
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+}
+
+// Delivers a REAL internal message to the live inbox (self-send: we hold both
+// the sender ratchet identity and the recipient identity key, so we can build
+// the ratchet body AND the at-rest envelope legitimately), then reads it back
+// through the normal list + decrypt path and proves the plaintext. This is the
+// real-message proof on the live account with no dependency on any other sender.
+//
+//   cargo test --bin aster-bridge-desktop self_deliver_and_decrypt -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn self_deliver_and_decrypt() {
+    use base64::engine::general_purpose::STANDARD;
+    use crate::api_client::{CreateMailItem, MailListQuery};
+    use sha2::{Digest, Sha256};
+
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let our_email = session.email.clone();
+    let token = session.access_token.clone();
+    let sync_key = match crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase) {
+        Ok(k) => k, Err(e) => { println!("sync key: {}", e); return; }
+    };
+    let identity_key = match session.identity_key.as_deref() { Some(k) => k, None => { println!("no identity_key"); return; } };
+    if session.ratchet_keys.is_empty() { println!("no ratchet keys"); return; }
+
+    let bundle = match client.get_prekey_bundle(&token, &session.username, &our_email).await {
+        Ok(b) => b, Err(e) => { println!("BUNDLE FETCH FAILED: {}", e); return; }
+    };
+    let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("kem_id");
+    let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("spk");
+    let (pq_pub, pq_kid) = match &bundle.pq_prekey {
+        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id)),
+        None => (None, None),
+    };
+
+    let plaintext = "LIVE self-delivered internal message decrypted by the Bridge - code 314159";
+    let msg = match crate::crypto::ratchet::encrypt_bootstrap(
+        &session.ratchet_keys[0].identity_secret_d,
+        &recipient_id_pub, &recipient_spk_pub, pq_pub.as_deref(), pq_kid, plaintext,
+    ) { Ok(m) => m, Err(e) => { println!("ENCRYPT: {}", e); return; } };
+
+    let mut recipient_obj = serde_json::json!({
+        "ephemeral_key": STANDARD.encode(&msg.ephemeral_public),
+        "header": { "dh_public": STANDARD.encode(&msg.header_dh_public), "previous_chain_length": 0, "message_number": 0, "v": 2 },
+        "ciphertext": STANDARD.encode(&msg.ciphertext),
+        "nonce": STANDARD.encode(&msg.nonce),
+    });
+    if let (Some(ct), Some(kid)) = (&msg.pq_ciphertext, msg.pq_key_id) {
+        recipient_obj["pq_ciphertext"] = serde_json::json!(STANDARD.encode(ct));
+        recipient_obj["pq_key_id"] = serde_json::json!(kid);
+    }
+    let mut recipients = serde_json::Map::new();
+    recipients.insert(our_email.clone(), recipient_obj);
+    let ratchet_env = serde_json::json!({
+        "type": "double_ratchet_v2",
+        "sender_identity_key": STANDARD.encode(&msg.sender_identity_public),
+        "recipients": serde_json::Value::Object(recipients),
+    });
+
+    let meta = serde_json::json!({
+        "subject": "Bridge live decrypt test",
+        "from": our_email.clone(),
+        "to": [our_email.clone()],
+        "body_html": ratchet_env.to_string(),
+    });
+    let (enc_env, env_nonce) = match crate::crypto::envelope::encrypt_identity_key_envelope(&meta.to_string(), identity_key) {
+        Ok(v) => v, Err(e) => { println!("ENVELOPE ENCRYPT: {}", e); return; }
+    };
+    let content_hash = STANDARD.encode(Sha256::digest(enc_env.as_bytes()));
+    let folder_token = STANDARD.encode([0u8; 32]);
+
+    let req = CreateMailItem {
+        item_type: "received",
+        encrypted_envelope: &enc_env,
+        envelope_nonce: &env_nonce,
+        folder_token: &folder_token,
+        content_hash: &content_hash,
+    };
+    let _ = MailListQuery { item_type: None, is_trashed: None, is_archived: None, is_spam: None, limit: None, cursor: None };
+    let created = match client.create_mail_item(&token, &req).await {
+        Ok(v) => { println!("delivered real message: {}", v); v }
+        Err(e) => { println!("CREATE FAILED: {}", e); return; }
+    };
+    let item_id = created.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    println!("created item id: {}", item_id);
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let item = match client.fetch_mail_item(&token, &item_id).await {
+        Ok(i) => i, Err(e) => { println!("FETCH FAILED: {}", e); return; }
+    };
+    let env = match crate::crypto::envelope::decrypt_envelope(&item.encrypted_envelope, Some(&item.envelope_nonce), &session.vault_passphrase, session.identity_key.as_deref()) {
+        Ok(v) => v, Err(e) => { println!("ENVELOPE DECRYPT FAILED: {}", e); return; }
+    };
+    println!("at-rest envelope decrypted ok ({} chars)", env.len());
+    let parsed: serde_json::Value = match serde_json::from_str(&env) { Ok(v) => v, Err(e) => { println!("envelope json parse: {}", e); return; } };
+    let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) { Some(v) => v, None => { println!("no ratchet object found in envelope"); return; } };
+    let mut rmsg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &our_email) { Some(m) => m, None => { println!("parse_recipient_message failed"); return; } };
+    if let Some(kid) = rmsg.pq_key_id {
+        match client.get_pq_secret(&token, kid).await {
+            Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(&sync_key, &r.encrypted_secret, &r.secret_nonce) {
+                Ok(s) => rmsg.pq_secret = Some(s),
+                Err(e) => { println!("pq secret decrypt failed: {}", e); return; }
+            },
+            Err(e) => { println!("pq secret fetch failed (kid={}): {}", kid, e); return; }
+        }
+    }
+    match crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &rmsg) {
+        Some(pt) => {
+            println!("plaintext: {}", pt);
+            assert_eq!(pt, plaintext, "decrypted plaintext mismatch");
+            println!("==== PROOF: a REAL inbox internal message decrypted end to end via the Bridge on the live account ====");
+        }
+        None => println!("decrypt_with_key_sets returned None"),
+    }
+
+    let _ = client.delete_mail_item_permanent(&token, &item_id).await;
+}
+
+// Delivers ONE fresh internal message to the inbox and leaves it, so the running
+// Bridge decrypts it and it renders as plain text in a connected mail client.
+//
+//   cargo test --bin aster-bridge-desktop deliver_demo_message -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn deliver_demo_message() {
+    use base64::engine::general_purpose::STANDARD;
+    use crate::api_client::CreateMailItem;
+    use sha2::{Digest, Sha256};
+
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) { Ok(i) => i, Err(e) => { println!("id: {}", e); return; } };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await { Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; } };
+    let our_email = session.email.clone();
+    let token = session.access_token.clone();
+    let identity_key = match session.identity_key.as_deref() { Some(k) => k, None => { println!("no identity_key"); return; } };
+    if session.ratchet_keys.is_empty() { println!("no ratchet keys"); return; }
+
+    let bundle = match client.get_prekey_bundle(&token, &session.username, &our_email).await { Ok(b) => b, Err(e) => { println!("BUNDLE: {}", e); return; } };
+    let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("id");
+    let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("spk");
+    let (pq_pub, pq_kid) = match &bundle.pq_prekey { Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id)), None => (None, None) };
+
+    let plaintext = "If you can read this in Thunderbird, internal-mail decryption through the Bridge works. Code 271828.";
+    let msg = match crate::crypto::ratchet::encrypt_bootstrap(&session.ratchet_keys[0].identity_secret_d, &recipient_id_pub, &recipient_spk_pub, pq_pub.as_deref(), pq_kid, plaintext) { Ok(m) => m, Err(e) => { println!("ENC: {}", e); return; } };
+    let mut recipient_obj = serde_json::json!({
+        "ephemeral_key": STANDARD.encode(&msg.ephemeral_public),
+        "header": { "dh_public": STANDARD.encode(&msg.header_dh_public), "previous_chain_length": 0, "message_number": 0, "v": 2 },
+        "ciphertext": STANDARD.encode(&msg.ciphertext),
+        "nonce": STANDARD.encode(&msg.nonce),
+    });
+    if let (Some(ct), Some(kid)) = (&msg.pq_ciphertext, msg.pq_key_id) {
+        recipient_obj["pq_ciphertext"] = serde_json::json!(STANDARD.encode(ct));
+        recipient_obj["pq_key_id"] = serde_json::json!(kid);
+    }
+    let mut recipients = serde_json::Map::new();
+    recipients.insert(our_email.clone(), recipient_obj);
+    let ratchet_env = serde_json::json!({ "type": "double_ratchet_v2", "sender_identity_key": STANDARD.encode(&msg.sender_identity_public), "recipients": serde_json::Value::Object(recipients) });
+    let meta = serde_json::json!({ "subject": "BRIDGE DECRYPTION TEST - should show plain text", "from": our_email.clone(), "to": [our_email.clone()], "body_html": ratchet_env.to_string() });
+    let (enc_env, env_nonce) = match crate::crypto::envelope::encrypt_identity_key_envelope(&meta.to_string(), identity_key) { Ok(v) => v, Err(e) => { println!("ENV ENC: {}", e); return; } };
+    let content_hash = STANDARD.encode(Sha256::digest(enc_env.as_bytes()));
+    let folder_token = STANDARD.encode([0u8; 32]);
+    let req = CreateMailItem { item_type: "received", encrypted_envelope: &enc_env, envelope_nonce: &env_nonce, folder_token: &folder_token, content_hash: &content_hash };
+    match client.create_mail_item(&token, &req).await {
+        Ok(v) => println!("DELIVERED demo message (left in inbox): {}", v),
+        Err(e) => println!("CREATE FAILED: {}", e),
+    }
+}
+
+// Removes the throwaway "Bridge live decrypt test" items left in the inbox by
+// earlier self_deliver runs, so nothing junk is left in the account.
+//
+//   cargo test --bin aster-bridge-desktop cleanup_test_messages -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn cleanup_test_messages() {
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let token = session.access_token.clone();
+    for id in [
+        "37378886-4d7e-4aec-97e9-23fdc8adb87f",
+        "a5255519-2bc0-4b14-9253-cd6922baa028",
+        "a955f66e-edd3-48b1-938e-501b31768d74",
+    ] {
+        match client.delete_mail_item_permanent(&token, id).await {
+            Ok(()) => println!("deleted {}", id),
+            Err(e) => println!("delete {} failed: {}", id, e),
+        }
+    }
 }

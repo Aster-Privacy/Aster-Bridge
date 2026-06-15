@@ -145,6 +145,7 @@ fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
 #[cfg(windows)]
 fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
     use std::io::Write;
+    use std::os::windows::process::CommandExt;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -158,6 +159,7 @@ fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
     });
     let acl_ok = match std::process::Command::new("icacls")
         .args([p.as_ref(), "/inheritance:r", "/grant:r", &format!("{}:(F)", user)])
+        .creation_flags(0x0800_0000)
         .output()
     {
         Ok(out) if out.status.success() => true,

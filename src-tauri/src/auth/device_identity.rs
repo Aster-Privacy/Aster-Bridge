@@ -84,6 +84,7 @@ fn set_file_permissions_restrictive(path: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let user = whoami::fallible::username()
             .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
         if !user.is_empty() {
@@ -94,6 +95,7 @@ fn set_file_permissions_restrictive(path: &Path) -> Result<(), String> {
                     "/grant:r",
                     &format!("{}:(F)", user),
                 ])
+                .creation_flags(0x0800_0000)
                 .output()
             {
                 Ok(out) if !out.status.success() => {

@@ -31,6 +31,14 @@ use crate::error::{BridgeError, Result};
 const PBKDF2_ITERATIONS: u32 = 310_000;
 const SALT_LEN: usize = 16;
 
+#[derive(Deserialize, Zeroize, Clone)]
+pub struct RatchetKeySet {
+    pub ratchet_identity_key: Option<String>,
+    pub ratchet_identity_public: Option<String>,
+    pub ratchet_signed_prekey: Option<String>,
+    pub ratchet_signed_prekey_public: Option<String>,
+}
+
 #[derive(Deserialize, ZeroizeOnDrop)]
 pub struct VaultContents {
     pub identity_key: String,
@@ -38,6 +46,11 @@ pub struct VaultContents {
     pub signed_prekey: Option<String>,
     pub recovery_codes: Option<Vec<String>>,
     pub vault_id: Option<String>,
+    pub ratchet_identity_key: Option<String>,
+    pub ratchet_identity_public: Option<String>,
+    pub ratchet_signed_prekey: Option<String>,
+    pub ratchet_signed_prekey_public: Option<String>,
+    pub ratchet_previous_keys: Option<Vec<RatchetKeySet>>,
 }
 
 pub fn decrypt_vault(

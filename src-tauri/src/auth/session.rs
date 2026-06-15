@@ -34,6 +34,7 @@ pub struct Session {
     pub access_token: Zeroizing<String>,
     pub vault_passphrase: Vec<u8>,
     pub identity_key: Option<String>,
+    pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
 }
 
 impl Drop for Session {
@@ -41,6 +42,9 @@ impl Drop for Session {
         self.vault_passphrase.zeroize();
         if let Some(ref mut k) = self.identity_key {
             k.zeroize();
+        }
+        for keys in self.ratchet_keys.iter_mut() {
+            keys.zeroize();
         }
     }
 }
@@ -74,15 +78,18 @@ pub async fn restore_or_login(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
-    let identity_key = match crate::crypto::vault::decrypt_vault(
+    let (identity_key, ratchet_keys) = match crate::crypto::vault::decrypt_vault(
         &login_resp.encrypted_vault,
         &login_resp.vault_nonce,
         &passphrase,
     ) {
-        Ok(v) => Some(v.identity_key.clone()),
+        Ok(v) => (
+            Some(v.identity_key.clone()),
+            crate::crypto::ratchet::build_receiver_key_sets(&v),
+        ),
         Err(e) => {
             tracing::warn!("vault decrypt failed during restore: {}", e);
-            None
+            (None, Vec::new())
         }
     };
 
@@ -93,6 +100,7 @@ pub async fn restore_or_login(
         access_token,
         vault_passphrase: passphrase,
         identity_key,
+        ratchet_keys,
     })
 }
 
@@ -196,15 +204,18 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
-                let identity_key = match crate::crypto::vault::decrypt_vault(
+                let (identity_key, ratchet_keys) = match crate::crypto::vault::decrypt_vault(
                     &login_resp.encrypted_vault,
                     &login_resp.vault_nonce,
                     &passphrase,
                 ) {
-                    Ok(v) => Some(v.identity_key.clone()),
+                    Ok(v) => (
+                        Some(v.identity_key.clone()),
+                        crate::crypto::ratchet::build_receiver_key_sets(&v),
+                    ),
                     Err(e) => {
                         tracing::warn!("vault decrypt failed during setup: {}", e);
-                        None
+                        (None, Vec::new())
                     }
                 };
 
@@ -215,6 +226,7 @@ pub async fn first_time_setup(
                     access_token,
                     vault_passphrase: passphrase,
                     identity_key,
+                    ratchet_keys,
                 });
             }
             "expired" => {
@@ -237,6 +249,7 @@ mod tests {
             access_token: Zeroizing::new("token-abc".to_string()),
             vault_passphrase: b"passphrase-bytes".to_vec(),
             identity_key: Some("identity-key".to_string()),
+            ratchet_keys: Vec::new(),
         }
     }
 
@@ -265,6 +278,7 @@ mod tests {
             access_token: Zeroizing::new(String::new()),
             vault_passphrase: Vec::new(),
             identity_key: None,
+            ratchet_keys: Vec::new(),
         };
         drop(s);
     }

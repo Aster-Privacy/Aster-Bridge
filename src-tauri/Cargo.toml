@@ -19,7 +19,7 @@
 
 [package]
 name = "aster-bridge-desktop"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 license = "AGPL-3.0-or-later"
@@ -58,6 +58,7 @@ percent-encoding = "2"
 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+p256 = { version = "0.13", features = ["ecdh"] }
 ml-kem = "0.2"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"

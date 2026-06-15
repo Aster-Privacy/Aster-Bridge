@@ -293,11 +293,7 @@ fn cache_mail_item(
         Err(_) => serde_json::Value::Null,
     };
 
-    let is_ratchet_envelope = parsed
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t.starts_with("double_ratchet"))
-        .unwrap_or(false);
+    let is_ratchet_envelope = crate::crypto::ratchet::find_ratchet_object(&parsed).is_some();
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -362,6 +358,49 @@ fn cache_mail_item(
     was_new
 }
 
+fn looks_like_html(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    trimmed.starts_with('<') || (s.contains('<') && s.contains("</"))
+}
+
+async fn try_decrypt_internal_mail(
+    item: &MailItem,
+    our_email: &str,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    ratchet_keys: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    sync_key: Option<&[u8; 32]>,
+    client: &ApiClient,
+    access_token: &str,
+) -> Option<String> {
+    if ratchet_keys.is_empty() {
+        return None;
+    }
+
+    let plaintext_env = decrypt_envelope(
+        &item.encrypted_envelope,
+        Some(&item.envelope_nonce),
+        passphrase,
+        identity_key,
+    )
+    .ok()?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&plaintext_env).ok()?;
+    let ratchet_obj = crate::crypto::ratchet::find_ratchet_object(&parsed)?;
+    let mut msg = crate::crypto::ratchet::parse_recipient_message(&ratchet_obj, our_email)?;
+
+    if let Some(key_id) = msg.pq_key_id {
+        let sk = sync_key?;
+        let resp = client.get_pq_secret(access_token, key_id).await.ok()?;
+        let secret =
+            crate::crypto::ratchet::decrypt_pq_secret(sk, &resp.encrypted_secret, &resp.secret_nonce)
+                .ok()?;
+        msg.pq_secret = Some(secret);
+    }
+
+    crate::crypto::ratchet::decrypt_with_key_sets(ratchet_keys, &msg)
+}
+
 async fn run_sync_pass(
     session: &Arc<RwLock<Session>>,
     client: &Arc<ApiClient>,
@@ -371,14 +410,17 @@ async fn run_sync_pass(
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
 
-    let (access_token, passphrase, identity_key) = {
+    let (access_token, passphrase, identity_key, our_email, ratchet_keys) = {
         let s = session.read().await;
         (
             s.access_token.clone(),
             Zeroizing::new(s.vault_passphrase.clone()),
             s.identity_key.clone(),
+            s.email.clone(),
+            s.ratchet_keys.clone(),
         )
     };
+    let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
 
     let queries = build_folder_queries();
     let total_folders = queries.len();
@@ -410,6 +452,25 @@ async fn run_sync_pass(
                         );
                         if was_new {
                             new_ids.push(item.id.clone());
+                            if let Some(plaintext) = try_decrypt_internal_mail(
+                                item,
+                                &our_email,
+                                &passphrase,
+                                identity_key.as_deref(),
+                                &ratchet_keys,
+                                sync_key.as_ref(),
+                                client,
+                                &access_token,
+                            )
+                            .await
+                            {
+                                let meta = serde_json::json!({
+                                    "is_html": looks_like_html(&plaintext),
+                                    "message_id": serde_json::Value::Null,
+                                })
+                                .to_string();
+                                let _ = db.update_cached_body(&item.id, &plaintext, Some(&meta));
+                            }
                         }
                     }
                     if !new_ids.is_empty() {

@@ -60,6 +60,36 @@ pub struct ApiClient {
     base_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PqSecretResponse {
+    pub key_id: i32,
+    pub encrypted_secret: String,
+    pub secret_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BundlePqPrekey {
+    pub key_id: u32,
+    pub public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrekeyBundle {
+    pub kem_identity_key: String,
+    pub signed_prekey: String,
+    #[serde(default)]
+    pub pq_prekey: Option<BundlePqPrekey>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMailItem<'a> {
+    pub item_type: &'a str,
+    pub encrypted_envelope: &'a str,
+    pub envelope_nonce: &'a str,
+    pub folder_token: &'a str,
+    pub content_hash: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DeviceCodeRequest {
     pub ed25519_pk: String,
@@ -286,6 +316,71 @@ impl ApiClient {
     pub async fn get_plan_info(&self, access_token: &str) -> Result<PlanInfoResponse> {
         let resp = self.client
             .get(format!("{}/core/v1/billing/plan", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<PrekeyBundle> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_mail_item_permanent(&self, access_token: &str, item_id: &str) -> Result<()> {
+        let resp = self.client
+            .delete(format!("{}/mail/v1/messages/{}", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn create_mail_item(
+        &self,
+        access_token: &str,
+        req: &CreateMailItem<'_>,
+    ) -> Result<serde_json::Value> {
+        let resp = self.client
+            .post(format!("{}/mail/v1/messages", self.base_url))
+            .bearer_auth(access_token)
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_pq_secret(&self, access_token: &str, key_id: u32) -> Result<PqSecretResponse> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/pq-secret/{}", self.base_url, key_id))
             .bearer_auth(access_token)
             .send()
             .await?;
