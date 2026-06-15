@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -14,7 +15,14 @@ use axum::response::{IntoResponse, Response};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+
+#[derive(Default)]
+struct PushFilter {
+    configured: bool,
+    enabled: bool,
+    types: HashSet<String>,
+}
 
 use super::auth::AuthedAccount;
 use super::dispatcher::{dispatch_request, DispatchError};
@@ -54,14 +62,16 @@ async fn serve(socket: WebSocket, state: AppState) {
     let (sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(64);
     let account_id = state.ctx.account_id().await;
+    let push_filter = Arc::new(Mutex::new(PushFilter::default()));
 
     let send_task = tokio::spawn(send_loop(
         sender,
         out_rx,
         state.clone(),
         account_id.clone(),
+        push_filter.clone(),
     ));
-    let recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx));
+    let recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
 
     tokio::select! {
         _ = send_task => {},
@@ -74,7 +84,9 @@ async fn send_loop(
     mut out_rx: mpsc::Receiver<Message>,
     state: AppState,
     account_id: String,
+    push_filter: Arc<Mutex<PushFilter>>,
 ) {
+    use tokio::sync::broadcast::error::RecvError;
     let mut bcast = state.ctx.broadcaster.subscribe();
     loop {
         tokio::select! {
@@ -84,10 +96,21 @@ async fn send_loop(
                 }
             }
             ev = bcast.recv() => {
-                let Ok(ch) = ev else { continue };
+                let changed = match ev {
+                    Ok(ch) => ch.changed,
+                    Err(RecvError::Lagged(_)) => snapshot_all_states(&state.ctx.db),
+                    Err(RecvError::Closed) => return,
+                };
+                let decision = {
+                    let f = push_filter.lock().await;
+                    apply_push_filter(&f, changed)
+                };
+                let Some(changed) = decision else {
+                    continue;
+                };
                 let payload = json!({
                     "@type": "StateChange",
-                    "changed": { account_id.clone(): ch.changed },
+                    "changed": { account_id.clone(): changed },
                 });
                 if sender
                     .send(Message::Text(payload.to_string()))
@@ -107,9 +130,9 @@ async fn recv_loop(
     state: AppState,
     account_id: String,
     out_tx: mpsc::Sender<Message>,
+    push_filter: Arc<Mutex<PushFilter>>,
 ) {
     let ctx = state.ctx.clone();
-    let mut push_types: HashSet<String> = HashSet::new();
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
@@ -169,7 +192,7 @@ async fn recv_loop(
                         }
                     }
                     "WebSocketPushEnable" => {
-                        push_types = parsed
+                        let types: HashSet<String> = parsed
                             .get("dataTypes")
                             .and_then(|v| v.as_array())
                             .map(|a| {
@@ -178,9 +201,15 @@ async fn recv_loop(
                                     .collect()
                             })
                             .unwrap_or_default();
+                        {
+                            let mut f = push_filter.lock().await;
+                            f.configured = true;
+                            f.enabled = true;
+                            f.types = types.clone();
+                        }
                         let mut initial = snapshot_all_states(&ctx.db);
-                        if !push_types.is_empty() {
-                            initial.retain(|k, _| push_types.contains(k));
+                        if !types.is_empty() {
+                            initial.retain(|k, _| types.contains(k));
                         }
                         let payload = json!({
                             "@type": "StateChange",
@@ -189,7 +218,10 @@ async fn recv_loop(
                         let _ = out_tx.send(Message::Text(payload.to_string())).await;
                     }
                     "WebSocketPushDisable" => {
-                        push_types.clear();
+                        let mut f = push_filter.lock().await;
+                        f.configured = true;
+                        f.enabled = false;
+                        f.types.clear();
                     }
                     _ => {
                         let _ = out_tx
@@ -211,5 +243,86 @@ async fn recv_loop(
             Message::Close(_) => return,
             _ => {}
         }
+    }
+}
+
+fn apply_push_filter(
+    filter: &PushFilter,
+    mut changed: std::collections::HashMap<String, String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    if filter.configured && !filter.enabled {
+        return None;
+    }
+    if filter.configured && !filter.types.is_empty() {
+        changed.retain(|k, _| filter.types.contains(k));
+    }
+    if changed.is_empty() {
+        None
+    } else {
+        Some(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn changed_email_mailbox() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("Email".to_string(), "5".to_string());
+        m.insert("Mailbox".to_string(), "2".to_string());
+        m
+    }
+
+    #[test]
+    fn unconfigured_filter_passes_everything() {
+        let f = PushFilter::default();
+        let out = apply_push_filter(&f, changed_email_mailbox()).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn enabled_without_types_passes_everything() {
+        let f = PushFilter {
+            configured: true,
+            enabled: true,
+            types: HashSet::new(),
+        };
+        let out = apply_push_filter(&f, changed_email_mailbox()).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn enabled_with_types_retains_only_subscribed() {
+        let f = PushFilter {
+            configured: true,
+            enabled: true,
+            types: ["Email".to_string()].into_iter().collect(),
+        };
+        let out = apply_push_filter(&f, changed_email_mailbox()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("Email"));
+        assert!(!out.contains_key("Mailbox"));
+    }
+
+    #[test]
+    fn disabled_drops_all_pushes() {
+        let f = PushFilter {
+            configured: true,
+            enabled: false,
+            types: HashSet::new(),
+        };
+        assert!(apply_push_filter(&f, changed_email_mailbox()).is_none());
+    }
+
+    #[test]
+    fn filter_removing_everything_yields_none() {
+        let f = PushFilter {
+            configured: true,
+            enabled: true,
+            types: ["Thread".to_string()].into_iter().collect(),
+        };
+        assert!(apply_push_filter(&f, changed_email_mailbox()).is_none());
     }
 }

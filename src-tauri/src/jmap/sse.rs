@@ -47,16 +47,21 @@ pub async fn eventsource(
 
     let rx = state.ctx.broadcaster.subscribe();
     let close_after_first = params.closeafter == "state";
+    let db = state.ctx.db.clone();
+    let acct = account_id.clone();
 
-    let live = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok(ch) => Some(Event::default().event("state").data(
+    let live = BroadcastStream::new(rx).map(move |msg| {
+        let changed = match msg {
+            Ok(ch) => ch.changed,
+            Err(_) => snapshot_all_states(&db),
+        };
+        Event::default().event("state").data(
             json!({
                 "@type": "StateChange",
-                "changed": { account_id.clone(): ch.changed },
+                "changed": { acct.clone(): changed },
             })
             .to_string(),
-        )),
-        Err(_) => None,
+        )
     });
 
     let stream = async_stream::stream! {
