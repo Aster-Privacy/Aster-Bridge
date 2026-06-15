@@ -2,6 +2,15 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.0 - 2026-06-15
+
+### Added
+- Internal Aster-to-Aster mail that is end-to-end encrypted now decrypts locally inside the Bridge, so your connected mail client can read it. Decryption happens entirely on your device; the server never sees your messages.
+
+### Changed
+- Redesigned the Configuration and Settings screens into clean, grouped cards that match the web app.
+- Copying a value now shows a brief confirmation toast, and hover feedback across the app is instant.
+
 ## 0.3.1 - 2026-06-15
 
 ### Fixed
