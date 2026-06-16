@@ -562,20 +562,23 @@ where
 
                 if let Some(start) = find_ci_prefix(&args, "FROM:") {
                     let from_addr = extract_addr(&args[start + 5..]);
-                    let session_email = {
+                    let (session_email, identity_ok) = {
                         let s = session.read().await;
-                        s.email.clone()
+                        let resolved = if from_addr.is_empty() {
+                            s.email.clone()
+                        } else {
+                            from_addr.clone()
+                        };
+                        let ok = resolved.eq_ignore_ascii_case(&s.email)
+                            || s.find_send_identity(&resolved)
+                                .map_or(false, |i| i.enabled);
+                        (resolved, ok)
                     };
-                    let resolved = if from_addr.is_empty() {
-                        session_email.clone()
-                    } else {
-                        from_addr.clone()
-                    };
-                    if !resolved.eq_ignore_ascii_case(&session_email) {
+                    if !identity_ok {
                         writer.write_all(b"553 5.1.8 Sender address rejected: not authenticated identity\r\n").await?;
                         continue;
                     }
-                    smtp.mail_from = Some(resolved);
+                    smtp.mail_from = Some(session_email);
                     smtp.state = SmtpState::MailFrom;
                     writer.write_all(b"250 OK\r\n").await?;
                 } else {
@@ -651,6 +654,7 @@ pub fn build_send_payload(
     from: Option<&str>,
     recipients: &[String],
     session_email: &str,
+    sender_identity: Option<&crate::auth::session::SendIdentity>,
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     use mail_parser::MessageParser;
 
@@ -729,7 +733,18 @@ pub fn build_send_payload(
         body
     };
 
-    let sender_email = from.filter(|s| !s.is_empty()).map(|s| s.to_string());
+    // For non-primary identities (alias / custom-domain) we attach the
+    // sender_email + sender_alias_hash + sender_display_name exactly like the
+    // Aster-Mail web client. For the primary address we omit the hash (and let
+    // the backend default the sender), matching the web "primary" path.
+    let non_primary = sender_identity.filter(|i| {
+        i.kind != crate::auth::session::SendIdentityKind::Primary
+    });
+
+    let sender_email = match non_primary {
+        Some(id) => Some(id.address.clone()),
+        None => from.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+    };
 
     let mut payload = serde_json::json!({
         "to": effective_to,
@@ -742,6 +757,15 @@ pub fn build_send_payload(
         "sender_email": sender_email,
         "client_source": "bridge",
     });
+
+    if let Some(id) = non_primary {
+        if let Some(ref hash) = id.auth_hash_b64 {
+            payload["sender_alias_hash"] = serde_json::json!(hash);
+        }
+        if let Some(ref dn) = id.display_name {
+            payload["sender_display_name"] = serde_json::json!(dn);
+        }
+    }
 
     if let Some(html) = body_html {
         payload["body_html"] = serde_json::json!(html);
@@ -757,15 +781,22 @@ async fn send_via_api(
     recipients: &[String],
     raw_message: &[u8],
 ) -> std::result::Result<(), crate::error::BridgeError> {
-    let session_email = {
+    let (session_email, sender_identity, access_token) = {
         let s = session.read().await;
-        s.email.clone()
+        let lookup_addr = from
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or(&s.email);
+        let identity = s.find_send_identity(lookup_addr).cloned();
+        (s.email.clone(), identity, s.access_token.clone())
     };
-    let payload = build_send_payload(raw_message, from.as_deref(), recipients, &session_email)?;
-    let access_token = {
-        let s = session.read().await;
-        s.access_token.clone()
-    };
+    let payload = build_send_payload(
+        raw_message,
+        from.as_deref(),
+        recipients,
+        &session_email,
+        sender_identity.as_ref(),
+    )?;
     client.send_mail(&access_token, &payload).await
 }
 
@@ -951,7 +982,7 @@ mod tests {
     fn build_send_payload_uses_envelope_recipients_as_bcc_when_no_headers() {
         let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\nbody here\r\n";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
         assert_eq!(payload["subject"], "hi");
         assert_eq!(payload["to"][0], "rcpt@example.com");
         assert_eq!(payload["client_source"], "bridge");
@@ -962,7 +993,7 @@ mod tests {
     fn build_send_payload_prefers_header_to() {
         let raw = b"From: sender@aster.test\r\nTo: named@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["named@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
         assert_eq!(payload["to"][0], "named@example.com");
         assert!(payload["bcc"].is_null());
     }
@@ -971,7 +1002,7 @@ mod tests {
     fn build_send_payload_envelope_only_recipient_added_as_bcc() {
         let raw = b"From: sender@aster.test\r\nTo: visible@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
         assert_eq!(payload["bcc"][0], "hidden@example.com");
     }
 
@@ -979,7 +1010,7 @@ mod tests {
     fn build_send_payload_body_is_never_empty() {
         let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\n";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test").unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
         let body = payload["body"].as_str().unwrap();
         assert!(!body.is_empty());
     }
@@ -988,7 +1019,58 @@ mod tests {
     fn build_send_payload_invalid_message_errors() {
         let raw: &[u8] = b"";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let result = build_send_payload(raw, None, &recipients, "sender@aster.test");
+        let result = build_send_payload(raw, None, &recipients, "sender@aster.test", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_send_payload_attaches_alias_hash_for_non_primary_identity() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: alias@example.com\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let identity = SendIdentity {
+            address: "alias@example.com".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: Some("Sales".to_string()),
+            kind: SendIdentityKind::Alias,
+            enabled: true,
+            sender_id: "alias-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("alias@example.com"),
+            &recipients,
+            "primary@aster.test",
+            Some(&identity),
+        )
+        .unwrap();
+        assert_eq!(payload["sender_email"], "alias@example.com");
+        assert_eq!(payload["sender_alias_hash"], "AAAA");
+        assert_eq!(payload["sender_display_name"], "Sales");
+    }
+
+    #[test]
+    fn build_send_payload_primary_identity_omits_alias_hash() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: primary@aster.test\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let identity = SendIdentity {
+            address: "primary@aster.test".to_string(),
+            auth_hash_b64: None,
+            display_name: Some("Me".to_string()),
+            kind: SendIdentityKind::Primary,
+            enabled: true,
+            sender_id: "primary".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("primary@aster.test"),
+            &recipients,
+            "primary@aster.test",
+            Some(&identity),
+        )
+        .unwrap();
+        assert!(payload.get("sender_alias_hash").is_none());
+        assert!(payload.get("sender_display_name").is_none());
     }
 }

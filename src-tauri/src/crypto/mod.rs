@@ -19,6 +19,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 #[allow(dead_code)]
+pub mod alias;
+#[allow(dead_code)]
 pub mod envelope;
 #[allow(dead_code)]
 pub mod metadata;

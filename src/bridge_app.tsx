@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo } from "@/api";
@@ -41,6 +41,7 @@ import {
   Modal,
   ModalBody,
   ModalActions,
+  Badge,
 } from "@aster/ui";
 
 type SetupState =
@@ -404,26 +405,40 @@ function ChevronRightIcon() {
   );
 }
 
-function SettingsGroup({ title, hint, children }: { title?: string; hint?: ReactNode; children: ReactNode }) {
+function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?: ReactNode; hint?: ReactNode; children: ReactNode }) {
   return (
-    <section className="mb-5">
+    <section className="mb-6">
       {title && (
-        <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-txt-tertiary px-1 mb-2">{title}</h3>
+        <div className="mb-2">
+          <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
+            {icon && <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
+            {title}
+          </h3>
+          <div className="mt-2 h-px bg-edge-secondary" />
+        </div>
       )}
-      <div
-        className="rounded-xl border border-edge-secondary overflow-hidden [&>*:not(:first-child)]:border-t [&>*:not(:first-child)]:border-edge-secondary"
-        style={{ backgroundColor: "color-mix(in srgb, var(--text-primary) 3%, var(--bg-primary))", boxShadow: "0 1px 2px rgba(0, 0, 0, 0.04)" }}
-      >
-        {children}
+      <div>{children}</div>
+      {hint && <p className="text-[12px] text-txt-muted mt-2 leading-relaxed">{hint}</p>}
+    </section>
+  );
+}
+
+function ServerCard({ icon, title, hint, children }: { icon?: ReactNode; title: string; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="rounded-xl border border-edge-primary bg-surf-primary px-5 py-4">
+      <div className="flex items-center gap-2 mb-2.5">
+        {icon && <span className="w-[17px] h-[17px] flex-shrink-0 text-txt-secondary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
+        <h3 className="text-[14px] font-semibold text-txt-primary">{title}</h3>
       </div>
-      {hint && <p className="text-[11px] text-txt-muted px-1 mt-2 leading-relaxed">{hint}</p>}
+      <div>{children}</div>
+      {hint && <p className="text-[12px] text-txt-muted mt-2.5 leading-relaxed">{hint}</p>}
     </section>
   );
 }
 
 function SettingRow({ icon, label, sublabel, danger, children }: { icon?: ReactNode; label: ReactNode; sublabel?: ReactNode; danger?: boolean; children?: ReactNode }) {
   return (
-    <div className="flex items-center gap-3 px-3.5 py-3 min-h-[52px]">
+    <div className="flex items-center gap-3 py-3">
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
         <p className={`text-[14px] leading-tight ${danger ? "text-aster-danger" : "text-txt-primary"}`}>{label}</p>
@@ -440,7 +455,7 @@ function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }:
       type="button"
       onClick={on_click}
       disabled={disabled}
-      className="group w-full flex items-center gap-3 px-3.5 py-3 min-h-[52px] text-left hover:bg-black/[0.035] dark:hover:bg-white/[0.05] disabled:opacity-50 disabled:pointer-events-none"
+      className="group w-full flex items-center gap-3 py-3 text-left hover:bg-black/[0.025] dark:hover:bg-white/[0.04] disabled:opacity-50 disabled:pointer-events-none"
     >
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
@@ -469,7 +484,7 @@ function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: 
 
 function InfoRow({ label, value, copy = true, mono = true }: { label: string; value: string; copy?: boolean; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
+    <div className="flex items-center justify-between gap-4 py-2">
       <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
       {copy
         ? <CopyValue value={value} mono={mono} />
@@ -1061,8 +1076,8 @@ function ConfigPanel({
   const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : "#6366f1";
 
   return (
-    <div className="p-5">
-      <div className="flex items-center gap-3 mb-4">
+    <div className="p-6">
+      <div className="flex items-center gap-3 mb-5">
         <div className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden">
           {profile_picture ? (
             <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
@@ -1079,8 +1094,7 @@ function ConfigPanel({
       </div>
 
       <div
-        className="rounded-xl border border-edge-secondary px-4 py-3.5 flex items-center justify-between gap-4 mb-4"
-        style={{ backgroundColor: "color-mix(in srgb, var(--text-primary) 3%, var(--bg-primary))", boxShadow: "0 1px 2px rgba(0, 0, 0, 0.04)" }}
+        className="flex items-center justify-between gap-4 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
         title={bridge_running
           ? (connected_since
               ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
@@ -1135,45 +1149,51 @@ function ConfigPanel({
         </div>
       )}
 
-      <SettingsGroup title={t("section_incoming")}>
-        <InfoRow label={t("field_protocol")} value="IMAP" copy={false} />
-        <InfoRow label={t("field_hostname")} value={imap_host} />
-        <InfoRow label={t("field_port")} value={imap_port} />
-        <InfoRow label={t("field_connection_security")} value={imap_security} copy={false} mono={false} />
-        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={imap_implicit_tls_port} />}
-        <InfoRow label={t("field_auth_method")} value={t("field_normal_password")} copy={false} mono={false} />
-        <InfoRow label={t("field_username")} value={email_value} />
-      </SettingsGroup>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+        <ServerCard title={t("section_incoming")} icon={<InboxArrowDownIcon />}>
+          <InfoRow label={t("field_protocol")} value="IMAP" copy={false} />
+          <InfoRow label={t("field_hostname")} value={imap_host} />
+          <InfoRow label={t("field_port")} value={imap_port} />
+          <InfoRow label={t("field_connection_security")} value={imap_security} copy={false} mono={false} />
+          {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={imap_implicit_tls_port} />}
+          <InfoRow label={t("field_auth_method")} value={t("field_normal_password")} copy={false} mono={false} />
+          <InfoRow label={t("field_username")} value={email_value} />
+        </ServerCard>
 
-      <SettingsGroup title={t("section_outgoing")}>
-        <InfoRow label={t("field_hostname")} value={smtp_host} />
-        <InfoRow label={t("field_port")} value={smtp_port} />
-        <InfoRow label={t("field_connection_security")} value={smtp_security} copy={false} mono={false} />
-        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={smtp_implicit_tls_port} />}
-      </SettingsGroup>
+        <ServerCard title={t("section_outgoing")} icon={<PaperAirplaneIcon />}>
+          <InfoRow label={t("field_hostname")} value={smtp_host} />
+          <InfoRow label={t("field_port")} value={smtp_port} />
+          <InfoRow label={t("field_connection_security")} value={smtp_security} copy={false} mono={false} />
+          {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={smtp_implicit_tls_port} />}
+        </ServerCard>
 
-      <SettingsGroup title={jmap_enabled ? t("section_jmap") : t("section_jmap_disabled")} hint={t("jmap_hint")}>
-        <InfoRow label={t("field_protocol")} value={t("field_jmap_protocol")} copy={false} mono={false} />
-        <InfoRow label={t("field_session_url")} value={jmap_url} />
-        <InfoRow label={t("field_hostname")} value={jmap_host} />
-        <InfoRow label={t("field_port")} value={jmap_port} />
-        <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
-        <InfoRow label={t("field_username")} value={email_value} />
-        <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
-          <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
-          <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
-        </div>
-      </SettingsGroup>
+        <ServerCard title={jmap_enabled ? t("section_jmap") : t("section_jmap_disabled")} icon={<GlobeAltIcon />} hint={t("jmap_hint")}>
+          <InfoRow label={t("field_protocol")} value={t("field_jmap_protocol")} copy={false} mono={false} />
+          <InfoRow label={t("field_session_url")} value={jmap_url} />
+          <InfoRow label={t("field_hostname")} value={jmap_host} />
+          <InfoRow label={t("field_port")} value={jmap_port} />
+          <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
+          <InfoRow label={t("field_username")} value={email_value} />
+          <div className="flex items-center justify-between gap-4 py-2">
+            <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
+            <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
+          </div>
+        </ServerCard>
 
-      <SettingsGroup title={t("section_pop3")}>
-        <InfoRow label={t("field_hostname")} value={pop3_host} />
-        <InfoRow label={t("field_port")} value={pop3_port} />
-        <InfoRow label={t("field_connection_security")} value={t("field_none")} copy={false} mono={false} />
-        {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={pop3s_port} />}
-        <InfoRow label={t("field_username")} value={email_value} />
-      </SettingsGroup>
+        <ServerCard title={t("section_pop3")} icon={<ArrowDownTrayIcon />}>
+          <InfoRow label={t("field_hostname")} value={pop3_host} />
+          <InfoRow label={t("field_port")} value={pop3_port} />
+          <InfoRow label={t("field_connection_security")} value={t("field_none")} copy={false} mono={false} />
+          {tls_enabled && <InfoRow label={t("field_implicit_tls_port")} value={pop3s_port} />}
+          <InfoRow label={t("field_username")} value={email_value} />
+        </ServerCard>
 
-      {tls_enabled && <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />}
+        {tls_enabled && (
+          <div className="xl:col-span-2">
+            <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1193,10 +1213,10 @@ function TlsInfoBlock({
   const fingerprint = tls_info?.fingerprint_sha256 || "(unavailable)";
   const cert_path = tls_info?.cert_path || "(unavailable)";
   return (
-    <SettingsGroup title={t("section_tls")} hint={t("tls_hint")}>
+    <ServerCard title={t("section_tls")} icon={<LockClosedIcon />} hint={t("tls_hint")}>
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
       <InfoRow label={t("tls_cert_sha256")} value={fingerprint} />
-      <div className="flex items-center justify-between gap-3 px-3.5 min-h-[42px] py-1.5">
+      <div className="flex items-center justify-between gap-4 py-2">
         <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
         <span className="inline-flex items-center justify-end gap-2 min-w-0">
           <span className="text-[13px] text-txt-primary font-mono truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
@@ -1210,7 +1230,7 @@ function TlsInfoBlock({
         </span>
       </div>
       <InfoRow label={t("tls_jmap_scheme")} value={jmap_https_enabled ? "https://" : "http://"} copy={false} />
-    </SettingsGroup>
+    </ServerCard>
   );
 }
 
@@ -1270,7 +1290,7 @@ function PasswordsPanel({
   };
 
   return (
-    <div className="p-5">
+    <div className="p-6 mx-auto max-w-3xl">
       <h2 className="text-base font-semibold text-txt-primary mb-0.5">{t("passwords_title")}</h2>
       <p className="text-sm text-txt-tertiary mb-4">
         {t("passwords_subtitle")}
@@ -1364,6 +1384,135 @@ function PasswordsPanel({
         </ModalActions>
       </Modal>
     </div>
+  );
+}
+
+function StarIcon({ filled }: { filled: boolean }) {
+  return (
+    <svg className="w-[15px] h-[15px]" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth={1.8}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.5a.56.56 0 0 1 1.04 0l2.12 5.11a.56.56 0 0 0 .48.34l5.52.45c.5.04.7.66.32.99l-4.2 3.6a.56.56 0 0 0-.18.56l1.28 5.38a.56.56 0 0 1-.84.61l-4.72-2.88a.56.56 0 0 0-.59 0l-4.72 2.88a.56.56 0 0 1-.84-.61l1.28-5.38a.56.56 0 0 0-.18-.56l-4.2-3.6a.56.56 0 0 1 .32-.99l5.52-.45a.56.56 0 0 0 .48-.34L11.48 3.5Z" />
+    </svg>
+  );
+}
+
+function IdentitiesGroup() {
+  const { t } = useTranslation();
+  const [identities, set_identities] = useState<api.SendIdentity[] | null>(null);
+  const [query, set_query] = useState("");
+  const [default_sender, set_default_sender_state] = useState<string | null>(null);
+  const [saving, set_saving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.list_send_identities()
+      .then((list) => { if (!cancelled) set_identities(list); })
+      .catch(() => { if (!cancelled) set_identities([]); });
+    api.get_default_sender()
+      .then((d) => { if (!cancelled) set_default_sender_state(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const enabled = (identities ?? []).filter((i) => i.enabled);
+  if (identities !== null && enabled.length <= 1) return null;
+
+  // The default send-from is the identity whose sender_id matches the stored
+  // preference; if none is stored or it no longer exists, the primary account
+  // address is the default.
+  const primary = enabled.find((i) => i.kind === "primary");
+  const resolved_default =
+    enabled.find((i) => i.sender_id === default_sender)?.sender_id
+    ?? primary?.sender_id
+    ?? null;
+
+  const make_primary = async (sid: string) => {
+    if (sid === resolved_default || saving) return;
+    const prev = default_sender;
+    set_saving(true);
+    set_default_sender_state(sid);
+    try {
+      await api.set_default_sender(sid);
+      show_toast(t("primary_address_updated"), "success");
+    } catch {
+      set_default_sender_state(prev);
+      show_toast(t("failed_to_update"), "error");
+    } finally {
+      set_saving(false);
+    }
+  };
+
+  const kind_badge = (k: string) => {
+    if (k === "primary") return <Badge color="blue">{t("identity_primary")}</Badge>;
+    if (k === "custom_domain") return <Badge color="green">{t("identity_custom_domain")}</Badge>;
+    return <Badge color="gray">{t("identity_alias")}</Badge>;
+  };
+
+  const q = query.trim().toLowerCase();
+  const filtered = q ? enabled.filter((i) => i.address.toLowerCase().includes(q)) : enabled;
+
+  const copy_all = async () => {
+    try {
+      await navigator.clipboard.writeText(enabled.map((i) => i.address).join("\n"));
+      show_toast(t("copied_to_clipboard"), "success");
+    } catch {
+      show_toast(t("failed_to_copy"), "error");
+    }
+  };
+
+  return (
+    <section className="mb-5">
+      <div className="flex items-center justify-between gap-2 px-1 mb-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-txt-tertiary">
+          {t("section_send_addresses")}
+          {identities !== null && <span className="ml-1.5 text-txt-muted normal-case tracking-normal">({enabled.length})</span>}
+        </h3>
+        {enabled.length > 3 && (
+          <button type="button" onClick={copy_all} className="text-[11px] font-medium text-txt-muted hover:text-txt-primary">
+            {t("copy_all")}
+          </button>
+        )}
+      </div>
+
+      {enabled.length > 6 && (
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => set_query(e.target.value)}
+          placeholder={t("search_addresses")}
+          className="w-full mb-2 h-8 rounded-lg border border-edge-secondary bg-surf-tertiary px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
+        />
+      )}
+
+      <div>
+        {identities === null ? (
+          <div className="py-2 text-[13px] text-txt-muted">{t("loading")}</div>
+        ) : filtered.length === 0 ? (
+          <div className="py-2 text-[13px] text-txt-muted">{t("no_matching_addresses")}</div>
+        ) : (
+          filtered.map((id) => {
+            const is_primary = id.sender_id === resolved_default;
+            return (
+              <div key={`${id.kind}:${id.address}`} className="flex items-center gap-2.5 py-2">
+                <button
+                  type="button"
+                  title={is_primary ? t("primary_send_from") : t("set_as_primary")}
+                  aria-label={is_primary ? t("primary_send_from") : t("set_as_primary")}
+                  aria-pressed={is_primary}
+                  disabled={is_primary || saving}
+                  onClick={() => make_primary(id.sender_id)}
+                  className={`flex-shrink-0 ${is_primary ? "text-brand" : "text-txt-muted hover:text-brand"} disabled:cursor-default`}
+                >
+                  <StarIcon filled={is_primary} />
+                </button>
+                <span className="flex-shrink-0">{kind_badge(id.kind)}</span>
+                <CopyValue value={id.address} />
+              </div>
+            );
+          })
+        )}
+      </div>
+      <p className="text-[11px] text-txt-muted px-1 mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
+    </section>
   );
 }
 
@@ -1593,10 +1742,10 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   };
 
   return (
-    <div className="p-5">
+    <div className="p-6 mx-auto max-w-3xl">
       <h2 className="text-base font-semibold text-txt-primary mb-4">{t("settings_title")}</h2>
 
-      <SettingsGroup title={t("section_general")}>
+      <SettingsGroup title={t("section_general")} icon={<Cog6ToothIcon />}>
         <SettingRow label={t("launch_on_startup")} sublabel={t("launch_on_startup_hint")}>
           <Toggle checked={autostart} disabled={autostart_loading} on_click={handle_toggle_autostart} />
         </SettingRow>
@@ -1605,7 +1754,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
       </SettingsGroup>
 
-      <SettingsGroup title={t("section_email_client_setup")}>
+      <IdentitiesGroup />
+
+      <SettingsGroup title={t("section_email_client_setup")} icon={<EnvelopeIcon />}>
         {["Thunderbird", "Outlook", "Apple Mail"].map((client) => (
           <ActionRow
             key={client}
@@ -1621,7 +1772,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         ))}
       </SettingsGroup>
 
-      <SettingsGroup title={t("section_support")}>
+      <SettingsGroup title={t("section_support")} icon={<LifebuoyIcon />}>
         <ActionRow
           label={t("help_center")}
           on_click={() => api.open_url("https://astermail.org/help")}
@@ -1642,7 +1793,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         />
       </SettingsGroup>
 
-      <SettingsGroup title={t("section_port_config")} hint={t("port_config_hint")}>
+      <SettingsGroup title={t("section_port_config")} icon={<ServerStackIcon />} hint={t("port_config_hint")}>
         <SettingRow label={t("imap_port")}>
           <input
             type="text"
@@ -1666,7 +1817,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           />
         </SettingRow>
         {ports_dirty && (
-          <div className="flex justify-end px-3.5 py-2.5">
+          <div className="flex justify-end py-2.5">
             <Button variant="depth" size="sm" disabled={saving_ports} onClick={handle_save_ports}>
               {saving_ports ? t("saving") : t("save")}
             </Button>
@@ -1675,9 +1826,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       </SettingsGroup>
 
       {outbox_items.length > 0 && (
-        <SettingsGroup title={t("section_outbox")} hint={t("auto_sync_note")}>
+        <SettingsGroup title={t("section_outbox")} icon={<PaperAirplaneIcon />} hint={t("auto_sync_note")}>
           {outbox_items.map((item) => (
-            <div key={item.id} className="flex items-start justify-between gap-3 px-3.5 py-3">
+            <div key={item.id} className="flex items-start justify-between gap-3 py-3">
               <div className="min-w-0 flex-1">
                 <div className="text-[14px] text-txt-primary truncate">
                   {item.subject && item.subject.trim().length > 0 ? item.subject : t("no_subject")}
@@ -1708,7 +1859,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingsGroup>
       )}
 
-      <SettingsGroup title={t("section_diagnostics")} hint={t("bundle_hint")}>
+      <SettingsGroup title={t("section_diagnostics")} icon={<WrenchScrewdriverIcon />} hint={t("bundle_hint")}>
         <SettingRow label={t("diagnostics_logs_label")} sublabel={t("diagnostics_logs_hint")}>
           <Button variant="secondary" size="sm" onClick={handle_toggle_logs}>
             {logs_open ? t("hide") : t("show")}
@@ -1724,7 +1875,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         {logs_open && (
-          <div className="px-3.5 py-3">
+          <div className="py-3">
             <div className="flex items-center justify-between mb-2">
               <span className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("show_recent_logs")}</span>
               <Button variant="ghost" size="sm" disabled={logs_loading} onClick={handle_refresh_logs}>
@@ -1746,9 +1897,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         )}
       </SettingsGroup>
 
-      <SettingsGroup title={t("section_updates")}>
+      <SettingsGroup title={t("section_updates")} icon={<ArrowDownTrayIcon />}>
         {update_info && (
-          <div className="px-3.5 py-3">
+          <div className="py-3">
             <p className="text-[14px] font-medium text-txt-primary mb-0.5">{t("update_available", { version: update_info.version })}</p>
             {update_info.notes && (
               <p className="text-[12px] text-txt-muted mb-2.5 line-clamp-3 leading-snug">{update_info.notes}</p>
@@ -1765,7 +1916,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
       </SettingsGroup>
 
-      <SettingsGroup title={t("section_advanced")}>
+      <SettingsGroup title={t("section_advanced")} icon={<AdjustmentsHorizontalIcon />}>
         {data_dir && (
           <ActionRow
             label={t("open_data_folder")}
@@ -2045,6 +2196,7 @@ function DashboardView({
           style={{ backgroundColor: "var(--bg-primary)", borderColor: "var(--border-primary)" }}
         >
           <div className="h-full overflow-y-auto">
+            <div className="mx-auto w-full max-w-5xl">
             {show_upgrade_banner && active_tab !== "settings" ? (
               <PlanGateFull on_retry={on_retry_plan} />
             ) : (
@@ -2063,6 +2215,7 @@ function DashboardView({
                 )}
               </>
             )}
+            </div>
           </div>
         </div>
       </div>

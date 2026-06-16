@@ -92,16 +92,49 @@ pub async fn set(
             }
         };
 
-        let expected_identity = format!("identity-{}", account_id);
-        if let Some(identity_id) = sub.get("identityId").and_then(|v| v.as_str()) {
-            if identity_id != expected_identity {
+        // Resolve identityId to a cached send identity. The default
+        // "identity-{account}" form (and an absent identityId) maps to primary.
+        // Non-primary ids resolve to an enabled alias / custom-domain identity.
+        let expected_primary = format!("identity-{}", account_id);
+        let requested_identity_id = sub
+            .get("identityId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let resolved_sender: Option<(String, Option<String>, Option<String>)> = {
+            let s = ctx.session.read().await;
+            match requested_identity_id.as_deref() {
+                None | Some("") => Some((s.email.clone(), None, None)),
+                Some(id) if id == expected_primary => Some((s.email.clone(), None, None)),
+                Some(id) => s
+                    .send_identities
+                    .iter()
+                    .filter(|i| {
+                        i.enabled && i.kind != crate::auth::session::SendIdentityKind::Primary
+                    })
+                    .find(|i| {
+                        crate::jmap::methods::identity::identity_id(&account_id, i) == id
+                    })
+                    .map(|i| {
+                        (
+                            i.address.clone(),
+                            i.auth_hash_b64.clone(),
+                            i.display_name.clone(),
+                        )
+                    }),
+            }
+        };
+
+        let (sender_email, sender_alias_hash, sender_display_name) = match resolved_sender {
+            Some(t) => t,
+            None => {
                 not_created.insert(
                     creation_id.clone(),
                     json!({"type": "invalidProperties", "properties": ["identityId"], "description": "unknown identityId"}),
                 );
                 continue;
             }
-        }
+        };
 
         let recipients_str = msg.recipients.clone().unwrap_or_default();
         let to_list: Vec<String> = recipients_str
@@ -109,12 +142,8 @@ pub async fn set(
             .map(|s| strip_header_chars(s.trim()))
             .filter(|s| !s.is_empty())
             .collect();
-        let sender_email = {
-            let s = ctx.session.read().await;
-            s.email.clone()
-        };
         let body_content = msg.body_text.clone().unwrap_or_default();
-        let body = json!({
+        let mut body = json!({
             "to": to_list,
             "subject": strip_header_chars(&msg.subject.clone().unwrap_or_default()),
             "body": if body_content.is_empty() { " ".to_string() } else { body_content },
@@ -122,6 +151,12 @@ pub async fn set(
             "is_e2e_encrypted": false,
             "client_source": "bridge",
         });
+        if let Some(hash) = sender_alias_hash {
+            body["sender_alias_hash"] = json!(hash);
+        }
+        if let Some(dn) = sender_display_name {
+            body["sender_display_name"] = json!(dn);
+        }
 
         match ctx.client.send_mail(&access_token, &body).await {
             Ok(_) => {
@@ -197,6 +232,7 @@ mod tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
         }));
         let client = Arc::new(crate::api_client::ApiClient::new());
         let (tx, _rx) = broadcast::channel(8);

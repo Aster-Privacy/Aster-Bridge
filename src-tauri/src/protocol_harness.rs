@@ -104,6 +104,7 @@ fn stub_session() -> Arc<RwLock<Session>> {
         vault_passphrase: Vec::new(),
         identity_key: None,
         ratchet_keys: Vec::new(),
+        send_identities: Vec::new(),
     }))
 }
 
@@ -722,6 +723,16 @@ async fn serve_real() {
     };
     println!("serve_real: logged in as {} ({})", session.email, session.user_id);
 
+    {
+        let ids = crate::auth::session::build_send_identities(
+            &client, &session.access_token, &session.email, None, &session.vault_passphrase,
+        ).await;
+        println!("serve_real: {} send identities", ids.len());
+        for id in &ids {
+            println!("IDENTITY\t{:?}\t{}", id.kind, id.address);
+        }
+    }
+
     // Diagnostic: does the inbox have items server-side, and do they decrypt?
     {
         use crate::api_client::MailListQuery;
@@ -928,6 +939,7 @@ async fn decrypt_real_internal() {
         vault_passphrase: passphrase,
         identity_key,
         ratchet_keys,
+        send_identities: Vec::new(),
     };
     println!("logged in as {}", session.email);
     println!("ratchet key sets available: {}", session.ratchet_keys.len());
@@ -1238,6 +1250,413 @@ async fn pqxdh_self_roundtrip_real() {
             println!("==== PROOF PASS: full PQXDH + double-ratchet decrypt works on the live account ====");
         }
         None => println!("==== PROOF FAIL: could not decrypt self-encrypted message ===="),
+    }
+}
+
+// Proves the alias / custom-domain send-as feature end to end on the LIVE
+// account. Logs in, prints every decrypted send identity (this alone proves the
+// Bridge fetched + DECRYPTED the user's real aliases and custom-domain
+// addresses), then performs a real backend send AS the primary, up to two
+// aliases and up to two custom-domain addresses, each addressed only to the
+// user's own primary address (a harmless self-email). It builds the exact JSON
+// the SMTP path posts (build_send_payload) and calls the same send_mail the SMTP
+// path uses, printing the precise HTTP status + body per identity. Non-2xx is
+// never fatal here: we only want to observe whether the backend accepts each
+// identity or 403s the alias/custom-domain re-check.
+//
+//   cargo test --bin aster-bridge-desktop alias_send_identities_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn alias_send_identities_real() {
+    use crate::auth::session::SendIdentityKind;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => { println!("cannot load config: {}", e); return; }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => { println!("identity load failed: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    println!(
+        "logged in as {} (user {}, key sets {})",
+        session.email, session.username, session.ratchet_keys.len()
+    );
+
+    fn redact(address: &str) -> String {
+        match address.split_once('@') {
+            Some((local, domain)) => {
+                let head: String = local.chars().take(2).collect();
+                format!("{}***@{}", head, domain)
+            }
+            None => address.to_string(),
+        }
+    }
+
+    let mut primary_count = 0usize;
+    let mut alias_count = 0usize;
+    let mut domain_count = 0usize;
+
+    println!("\n==== SEND IDENTITIES (decrypted from the live account) ====");
+    println!("total: {}", session.send_identities.len());
+    for id in &session.send_identities {
+        match id.kind {
+            SendIdentityKind::Primary => primary_count += 1,
+            SendIdentityKind::Alias => alias_count += 1,
+            SendIdentityKind::CustomDomain => domain_count += 1,
+        }
+        println!(
+            "  [{}] {} enabled={} auth_hash={} display_name={}",
+            id.kind.as_str(),
+            redact(&id.address),
+            id.enabled,
+            id.auth_hash_b64.is_some(),
+            id.display_name.as_deref().unwrap_or("<none>"),
+        );
+    }
+    println!(
+        "counts -> primary: {}, alias: {}, custom_domain: {}",
+        primary_count, alias_count, domain_count
+    );
+
+    // Pick the primary, up to 2 aliases and up to 2 custom-domain identities.
+    let primary: Vec<_> = session
+        .send_identities
+        .iter()
+        .filter(|i| i.kind == SendIdentityKind::Primary)
+        .collect();
+    let aliases: Vec<_> = session
+        .send_identities
+        .iter()
+        .filter(|i| i.kind == SendIdentityKind::Alias)
+        .take(2)
+        .collect();
+    let domains: Vec<_> = session
+        .send_identities
+        .iter()
+        .filter(|i| i.kind == SendIdentityKind::CustomDomain)
+        .take(2)
+        .collect();
+
+    let to_self = session.email.clone();
+    let access_token = session.access_token.clone();
+
+    let mut targets: Vec<&crate::auth::session::SendIdentity> = Vec::new();
+    targets.extend(primary);
+    targets.extend(aliases);
+    targets.extend(domains);
+
+    println!("\n==== REAL SEND ATTEMPTS (each addressed only to your own {}) ====", redact(&to_self));
+    for id in targets {
+        // Build the raw RFC822 the SMTP path would hand to build_send_payload.
+        // The From here is cosmetic for primary; for non-primary identities the
+        // payload's sender_email/sender_alias_hash come from the SendIdentity.
+        let subject = format!("bridge alias test {}", id.address);
+        let raw = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbridge alias/identity integration self-test - safe to ignore.\r\n",
+            id.address, to_self, subject,
+        );
+
+        let payload = match crate::smtp::server::build_send_payload(
+            raw.as_bytes(),
+            Some(&id.address),
+            std::slice::from_ref(&to_self),
+            &session.email,
+            Some(id),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  {} {}: PAYLOAD BUILD FAILED: {}", id.kind.as_str().to_uppercase(), redact(&id.address), e);
+                continue;
+            }
+        };
+
+        let verdict = match client.send_mail(&access_token, &payload).await {
+            Ok(()) => "200/OK (accepted)".to_string(),
+            Err(crate::error::BridgeError::Api(msg)) => msg,
+            Err(crate::error::BridgeError::PlanUpgradeRequired(msg)) => format!("403 plan_upgrade_required: {}", msg),
+            Err(e) => format!("ERROR: {}", e),
+        };
+        println!("  {} {}: {}", id.kind.as_str().to_uppercase(), redact(&id.address), verdict);
+    }
+
+    println!("\n==== alias_send_identities_real complete ====");
+}
+
+// Full alias send + receive round trip on the live account, spaced out to avoid
+// backend send rate limits. For every send identity it sends one message to the
+// primary inbox (proves send authorization + that the message lands in the inbox),
+// and for every alias it sends primary -> alias (proves inbound alias routing).
+// Receipt is verified by listing received items and decrypting their envelopes,
+// looking for the unique marker that each message carries in its subject. All
+// test messages are deleted afterwards. Send and receive are reported per address.
+//
+//   cargo test --bin aster-bridge-desktop alias_roundtrip_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn alias_roundtrip_real() {
+    use crate::auth::session::{SendIdentity, SendIdentityKind};
+    use crate::api_client::MailListQuery;
+    use std::collections::{HashMap, HashSet};
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => { println!("cannot load config: {}", e); return; }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => { println!("identity load failed: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let our_email = session.email.clone();
+    let token = session.access_token.clone();
+    let pass = session.vault_passphrase.clone();
+    let ik = session.identity_key.clone();
+    println!("logged in as {} ({} send identities)", our_email, session.send_identities.len());
+
+    let run: String = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        format!("{}", secs % 1_000_000)
+    };
+
+    let primary_id = session.send_identities.iter()
+        .find(|i| i.kind == SendIdentityKind::Primary)
+        .expect("primary identity present");
+    let aliases: Vec<&SendIdentity> = session.send_identities.iter()
+        .filter(|i| i.kind == SendIdentityKind::Alias || i.kind == SendIdentityKind::CustomDomain)
+        .collect();
+
+    // marker -> (kind_label, address)
+    let mut markers: HashMap<String, (String, String)> = HashMap::new();
+
+    async fn send_one(
+        client: &ApiClient, token: &str, our_email: &str,
+        from_id: &SendIdentity, to_addr: &str, marker: &str,
+    ) -> bool {
+        let raw = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nalias roundtrip self-test {} - safe to ignore\r\n",
+            from_id.address, to_addr, marker, marker,
+        );
+        let to_vec = vec![to_addr.to_string()];
+        let payload = match crate::smtp::server::build_send_payload(
+            raw.as_bytes(), Some(&from_id.address),
+            &to_vec, our_email, Some(from_id),
+        ) {
+            Ok(p) => p,
+            Err(e) => { println!("  PAYLOAD FAIL from {} to {}: {}", from_id.address, to_addr, e); return false; }
+        };
+        match client.send_mail(token, &payload).await {
+            Ok(()) => true,
+            Err(e) => { println!("  SEND FAIL from {} to {}: {}", from_id.address, to_addr, e); false }
+        }
+    }
+
+    println!("\n==== PHASE A: send AS each identity -> primary inbox ====");
+    let mut send_ok = 0usize;
+    let mut send_total = 0usize;
+    for id in &session.send_identities {
+        let marker = format!("RTSND{}{}", markers.len(), run);
+        send_total += 1;
+        let ok = send_one(&client, &token, &our_email, id, &our_email, &marker).await;
+        if ok { send_ok += 1; }
+        println!("  SEND-AS {:<32} {} -> {}", id.address, id.kind.as_str(), if ok {"accepted"} else {"FAILED"});
+        markers.insert(marker, (format!("send-as {}", id.kind.as_str()), id.address.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    }
+
+    println!("\n==== PHASE B: send primary -> each alias (inbound routing) ====");
+    for id in &aliases {
+        let marker = format!("RTRCV{}{}", markers.len(), run);
+        send_total += 1;
+        let ok = send_one(&client, &token, &our_email, primary_id, &id.address, &marker).await;
+        if ok { send_ok += 1; }
+        println!("  TO-ALIAS {:<32} -> {}", id.address, if ok {"accepted"} else {"FAILED"});
+        markers.insert(marker, ("to-alias".into(), id.address.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    }
+
+    println!("\n==== PHASE C: verify receipt via list_mail(received) + envelope decrypt ====");
+    let mut found: HashSet<String> = HashSet::new();
+    let mut found_ids: HashMap<String, String> = HashMap::new(); // marker -> item id
+    for attempt in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_secs(if attempt == 0 { 8 } else { 12 })).await;
+        let q = MailListQuery {
+            item_type: Some("received".to_string()),
+            is_trashed: None, is_archived: None, is_spam: None,
+            limit: Some(100), cursor: None,
+        };
+        match client.list_mail(&token, &q).await {
+            Ok(resp) => {
+                for item in &resp.items {
+                    if let Ok(env) = crate::crypto::envelope::decrypt_envelope(
+                        &item.encrypted_envelope, Some(&item.envelope_nonce), &pass, ik.as_deref(),
+                    ) {
+                        for marker in markers.keys() {
+                            if env.contains(marker.as_str()) {
+                                found.insert(marker.clone());
+                                found_ids.entry(marker.clone()).or_insert_with(|| item.id.clone());
+                            }
+                        }
+                    }
+                }
+                println!("  attempt {}: {}/{} markers found", attempt + 1, found.len(), markers.len());
+            }
+            Err(e) => println!("  attempt {}: list_mail error: {}", attempt + 1, e),
+        }
+        if found.len() >= markers.len() { break; }
+    }
+
+    println!("\n==== RESULTS ====");
+    println!("SEND accepted: {}/{}", send_ok, send_total);
+    let mut recv_ok = 0usize;
+    let mut sorted: Vec<(&String, &(String, String))> = markers.iter().collect();
+    sorted.sort_by(|a, b| a.1 .1.cmp(&b.1 .1));
+    for (marker, (kind, addr)) in sorted {
+        let got = found.contains(marker);
+        if got { recv_ok += 1; }
+        println!("  [{}] {:<10} {:<32} {}", if got {"RECV"} else {"MISS"}, kind, addr, marker);
+    }
+    println!("RECEIVE verified: {}/{}", recv_ok, markers.len());
+
+    println!("\n==== CLEANUP: deleting {} test messages ====", found_ids.len());
+    let mut deleted = 0usize;
+    for id in found_ids.values() {
+        if client.delete_mail_item_permanent(&token, id).await.is_ok() { deleted += 1; }
+    }
+    println!("deleted {} test messages", deleted);
+    println!("\n==== alias_roundtrip_real complete ====");
+}
+
+// Verifies the set-primary (default send-from) feature end to end against the
+// live backend default-sender preference: reads the current value, sets it to an
+// alias, confirms it persisted, sets it to "primary", confirms, then restores the
+// original. Exercises ApiClient::get_default_sender / set_default_sender.
+//
+//   cargo test --bin aster-bridge-desktop set_primary_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn set_primary_real() {
+    use crate::auth::session::SendIdentityKind;
+
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let token = session.access_token.clone();
+
+    let original = client.get_default_sender(&token).await.expect("get original");
+    println!("original default_sender: {:?}", original);
+
+    let alias = session.send_identities.iter()
+        .find(|i| i.kind == SendIdentityKind::Alias)
+        .expect("at least one alias identity");
+    let sid = alias.sender_id.clone();
+    println!("setting primary to alias {} (sender_id={})", alias.address, sid);
+
+    client.set_default_sender(&token, Some(&sid)).await.expect("set alias");
+    let after = client.get_default_sender(&token).await.expect("get after alias");
+    println!("after set-alias: {:?}", after);
+    assert_eq!(after.as_deref(), Some(sid.as_str()), "alias default did not persist");
+
+    client.set_default_sender(&token, Some("primary")).await.expect("set primary");
+    let after2 = client.get_default_sender(&token).await.expect("get after primary");
+    println!("after set-primary: {:?}", after2);
+    assert_eq!(after2.as_deref(), Some("primary"), "primary default did not persist");
+
+    client.set_default_sender(&token, original.as_deref()).await.expect("restore");
+    let restored = client.get_default_sender(&token).await.expect("get restored");
+    println!("restored to: {:?}", restored);
+    assert_eq!(restored, original, "restore mismatch");
+
+    println!("==== set_primary_real PASS (set alias, set primary, restored) ====");
+}
+
+// Dumps recent received + sent items, decrypting each envelope, and reports how
+// many carry the marker substring in ASTER_MARKER (default "629481"). Prints the
+// newest few subjects per folder so we can see what is actually arriving and how
+// internal self-addressed mail lands. Read-only; deletes nothing.
+//
+//   ASTER_MARKER=629481 cargo test --bin aster-bridge-desktop dump_inbox_markers -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn dump_inbox_markers() {
+    use crate::api_client::MailListQuery;
+
+    let marker = std::env::var("ASTER_MARKER").unwrap_or_else(|_| "629481".to_string());
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = ApiClient::new();
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let token = session.access_token.clone();
+    let pass = session.vault_passphrase.clone();
+    let ik = session.identity_key.clone();
+    println!("logged in as {}; searching for marker '{}'", session.email, marker);
+
+    fn subj_of(env: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(env).ok()
+            .and_then(|v| v.get("subject").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| "<no subject in envelope>".to_string())
+    }
+
+    for folder in ["received", "sent"] {
+        let q = MailListQuery {
+            item_type: Some(folder.to_string()),
+            is_trashed: None, is_archived: None, is_spam: None,
+            limit: Some(100), cursor: None,
+        };
+        match client.list_mail(&token, &q).await {
+            Ok(resp) => {
+                let mut hits = 0usize;
+                let mut newest: Vec<String> = Vec::new();
+                for item in &resp.items {
+                    match crate::crypto::envelope::decrypt_envelope(
+                        &item.encrypted_envelope, Some(&item.envelope_nonce), &pass, ik.as_deref(),
+                    ) {
+                        Ok(env) => {
+                            if env.contains(marker.as_str()) {
+                                hits += 1;
+                                println!("  HIT [{}] subject={}", folder, subj_of(&env));
+                            }
+                            if newest.len() < 8 { newest.push(subj_of(&env)); }
+                        }
+                        Err(_) => { if newest.len() < 8 { newest.push("<envelope decrypt failed>".into()); } }
+                    }
+                }
+                println!("== {} == total={} page={} marker_hits={}", folder, resp.total, resp.items.len(), hits);
+                for (i, s) in newest.iter().enumerate() {
+                    println!("    newest[{}] {}", i, s);
+                }
+            }
+            Err(e) => println!("== {} == list error: {}", folder, e),
+        }
     }
 }
 

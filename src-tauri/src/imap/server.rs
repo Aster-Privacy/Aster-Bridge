@@ -2212,6 +2212,7 @@ mod tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
         }));
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);

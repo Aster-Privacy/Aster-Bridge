@@ -782,6 +782,15 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 }
             };
 
+            let send_identities = auth::session::build_send_identities(
+                &guard.client,
+                &access_token,
+                &login_resp.email,
+                None,
+                &passphrase,
+            )
+            .await;
+
             let session = auth::session::Session {
                 user_id: login_resp.user_id,
                 username: login_resp.username,
@@ -790,6 +799,7 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 vault_passphrase: passphrase,
                 identity_key,
                 ratchet_keys,
+                send_identities,
             };
 
             let session_arc = Arc::new(RwLock::new(session));
@@ -847,6 +857,74 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
             done: false,
         }),
     }
+}
+
+#[derive(serde::Serialize)]
+struct SendIdentityEntry {
+    address: String,
+    kind: String,
+    display_name: Option<String>,
+    enabled: bool,
+    sender_id: String,
+}
+
+#[tauri::command]
+async fn list_send_identities(
+    state: State<'_, AppState>,
+) -> Result<Vec<SendIdentityEntry>, String> {
+    let guard = state.0.lock().await;
+    let session = guard
+        .session
+        .as_ref()
+        .ok_or_else(|| "not authenticated".to_string())?
+        .clone();
+    drop(guard);
+
+    let s = session.read().await;
+    Ok(s.send_identities
+        .iter()
+        .map(|i| SendIdentityEntry {
+            address: i.address.clone(),
+            kind: i.kind.as_str().to_string(),
+            display_name: i.display_name.clone(),
+            enabled: i.enabled,
+            sender_id: i.sender_id.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn get_default_sender(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let guard = state.0.lock().await;
+    let session_arc = match &guard.session {
+        Some(s) => s.clone(),
+        None => return Err("not authenticated".to_string()),
+    };
+    let client = guard.client.clone();
+    drop(guard);
+
+    let token = { (*session_arc.read().await.access_token).clone() };
+    client.get_default_sender(&token).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_default_sender(
+    state: State<'_, AppState>,
+    sender_id: Option<String>,
+) -> Result<(), String> {
+    let guard = state.0.lock().await;
+    let session_arc = match &guard.session {
+        Some(s) => s.clone(),
+        None => return Err("not authenticated".to_string()),
+    };
+    let client = guard.client.clone();
+    drop(guard);
+
+    let token = { (*session_arc.read().await.access_token).clone() };
+    client
+        .set_default_sender(&token, sender_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1508,6 +1586,9 @@ fn main() {
             refresh_plan_info,
             get_setup_code,
             check_setup_status,
+            list_send_identities,
+            get_default_sender,
+            set_default_sender,
             get_app_passwords,
             generate_app_password,
             delete_app_password,

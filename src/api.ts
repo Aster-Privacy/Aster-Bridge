@@ -275,3 +275,23 @@ export async function outbox_retry_now(id: number): Promise<void> {
 export async function open_tls_cert(): Promise<void> {
   return tauri_invoke("open_tls_cert");
 }
+
+export interface SendIdentity {
+  address: string;
+  kind: "primary" | "alias" | "custom_domain";
+  display_name: string | null;
+  enabled: boolean;
+  sender_id: string;
+}
+
+export async function list_send_identities(): Promise<SendIdentity[]> {
+  return tauri_invoke<SendIdentity[]>("list_send_identities");
+}
+
+export async function get_default_sender(): Promise<string | null> {
+  return tauri_invoke<string | null>("get_default_sender");
+}
+
+export async function set_default_sender(sender_id: string | null): Promise<void> {
+  return tauri_invoke("set_default_sender", { sender_id });
+}

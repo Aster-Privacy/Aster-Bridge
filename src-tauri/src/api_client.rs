@@ -196,6 +196,84 @@ pub struct MailItem {
     pub is_spam: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct AliasResponse {
+    pub id: String,
+    pub encrypted_local_part: String,
+    pub local_part_nonce: String,
+    #[serde(default)]
+    pub encrypted_display_name: Option<String>,
+    #[serde(default)]
+    pub display_name_nonce: Option<String>,
+    pub alias_address_hash: String,
+    pub domain: String,
+    pub is_enabled: bool,
+    pub is_random: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct AliasListResponse {
+    pub aliases: Vec<AliasResponse>,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub max_aliases: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct CustomDomainResponse {
+    pub id: String,
+    pub domain_name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DomainListResponse {
+    pub domains: Vec<CustomDomainResponse>,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub max_domains: i64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct DomainAddressResponse {
+    pub id: String,
+    pub domain_id: String,
+    pub encrypted_local_part: String,
+    pub local_part_nonce: String,
+    pub local_part_hash: String,
+    #[serde(default)]
+    pub encrypted_display_name: Option<String>,
+    #[serde(default)]
+    pub display_name_nonce: Option<String>,
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DomainAddressListResponse {
+    pub addresses: Vec<DomainAddressResponse>,
+    #[serde(default)]
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DefaultSenderResponse {
+    #[serde(default)]
+    pub sender_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MailListQuery {
     pub item_type: Option<String>,
@@ -325,6 +403,36 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {
+        let resp = self.client
+            .get(format!("{}/settings/v1/preferences/default-sender", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: DefaultSenderResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.sender_id)
+    }
+
+    pub async fn set_default_sender(&self, access_token: &str, sender_id: Option<&str>) -> Result<()> {
+        let resp = self.client
+            .put(format!("{}/settings/v1/preferences/default-sender", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "sender_id": sender_id }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
     }
 
     pub async fn get_prekey_bundle(
@@ -533,6 +641,78 @@ impl ApiClient {
     pub async fn get_mail_stats(&self, access_token: &str) -> Result<serde_json::Value> {
         let resp = self.client
             .get(format!("{}/bridge/v1/messages/stats", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_aliases_page(
+        &self,
+        access_token: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<AliasListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/aliases", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    // Mirrors list_all_aliases (aliases.ts): paginate until has_more is false.
+    pub async fn list_all_aliases(&self, access_token: &str) -> Result<Vec<AliasResponse>> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 100;
+        let mut aliases: Vec<AliasResponse> = Vec::new();
+        let mut offset = 0u32;
+
+        for _ in 0..MAX_PAGES {
+            let page = self.list_aliases_page(access_token, PAGE_SIZE, offset).await?;
+            let count = page.aliases.len();
+            aliases.extend(page.aliases);
+            if !page.has_more || count == 0 {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+
+        Ok(aliases)
+    }
+
+    pub async fn list_domains(&self, access_token: &str) -> Result<DomainListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/domains", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_domain_addresses(
+        &self,
+        access_token: &str,
+        domain_id: &str,
+    ) -> Result<DomainAddressListResponse> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/domains/{}/addresses", self.base_url, domain_id))
             .bearer_auth(access_token)
             .send()
             .await?;
