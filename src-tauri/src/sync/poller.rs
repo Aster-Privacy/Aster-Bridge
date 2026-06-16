@@ -423,9 +423,8 @@ async fn run_sync_pass(
     let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
 
     let queries = build_folder_queries();
-    let total_folders = queries.len();
-    for (folder_idx, folder_query) in queries.iter().enumerate() {
-        emit_sync_progress(folder_query.label, folder_idx, total_folders);
+    for folder_query in queries.iter() {
+        emit_sync_progress(folder_query.label, 0, 0);
         let mut cursor: Option<String> = None;
         let mut total_fetched = 0usize;
         let max_per_folder = 2000usize;
@@ -480,11 +479,17 @@ async fn run_sync_pass(
                     }
                     total_fetched += resp.items.len();
                     let page_all_cached = !resp.items.is_empty() && new_ids.is_empty();
-                    if !resp.has_more
+                    let folder_total = (resp.total.max(0) as usize).max(total_fetched);
+                    let done_with_folder = !resp.has_more
                         || resp.next_cursor.is_none()
                         || total_fetched >= max_per_folder
-                        || page_all_cached
-                    {
+                        || page_all_cached;
+                    emit_sync_progress(
+                        folder_query.label,
+                        if done_with_folder { folder_total } else { total_fetched.min(folder_total) },
+                        folder_total,
+                    );
+                    if done_with_folder {
                         break;
                     }
                     cursor = resp.next_cursor;
