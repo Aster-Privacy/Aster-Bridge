@@ -19,7 +19,7 @@
 
 [package]
 name = "aster-bridge-desktop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 license = "AGPL-3.0-or-later"

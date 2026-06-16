@@ -2,6 +2,13 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.1 - 2026-06-16
+
+### Changed
+- Refreshed the Configuration and Settings screens: a clearer connection status with a colored status icon, a larger Connect/Disconnect button, and tidier cards.
+- Toast notifications now match the web app, copying a value shows a toast instead of changing color, and hover feedback is instant with a pointer cursor on controls.
+- Setup guide popups no longer flicker when closing.
+
 ## 0.4.0 - 2026-06-15
 
 ### Added
