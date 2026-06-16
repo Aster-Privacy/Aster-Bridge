@@ -22,6 +22,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { motion, AnimatePresence } from "framer-motion";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo } from "@/api";
@@ -124,6 +126,14 @@ function format_relative_time(unix_ts: number): string {
   return new Date(unix_ts * 1000).toLocaleDateString();
 }
 
+// Holds the last non-null value so modal content stays rendered through the
+// close animation instead of clearing the instant the trigger state goes null.
+function use_frozen<T>(value: T | null): T | null {
+  const ref = useRef<T | null>(value);
+  if (value != null) ref.current = value;
+  return value != null ? value : ref.current;
+}
+
 function use_theme() {
   const [is_dark, set_is_dark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -144,31 +154,44 @@ interface ToastState {
   id: string;
   message: string;
   type: ToastType;
-  exiting?: boolean;
 }
+
+const MAX_TOASTS = 5;
 
 let toast_listeners: ((toasts: ToastState[]) => void)[] = [];
 let toast_stack: ToastState[] = [];
+const toast_timeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 function dismiss_toast(id: string) {
-  toast_stack = toast_stack.map((t) => t.id === id ? { ...t, exiting: true } : t);
+  const existing = toast_timeouts.get(id);
+  if (existing) { clearTimeout(existing); toast_timeouts.delete(id); }
+  toast_stack = toast_stack.filter((t) => t.id !== id);
   toast_listeners.forEach((l) => l([...toast_stack]));
-  setTimeout(() => {
-    toast_stack = toast_stack.filter((t) => t.id !== id);
-    toast_listeners.forEach((l) => l([...toast_stack]));
-  }, 150);
 }
 
-function show_toast(message: string, type: ToastType = "info") {
+function show_toast(message: string, type: ToastType = "info", duration = 2000) {
   const id = Math.random().toString(36).slice(2);
   const new_toast: ToastState = { id, message, type };
-  toast_stack = [new_toast, ...toast_stack].slice(0, 5);
+  toast_stack = [new_toast, ...toast_stack].slice(0, MAX_TOASTS);
   toast_listeners.forEach((l) => l([...toast_stack]));
-  setTimeout(() => dismiss_toast(id), 2500);
+  const timeout = setTimeout(() => {
+    toast_timeouts.delete(id);
+    toast_stack = toast_stack.filter((t) => t.id !== id);
+    toast_listeners.forEach((l) => l([...toast_stack]));
+  }, duration);
+  toast_timeouts.set(id, timeout);
+}
+
+function get_toast_icon(type: ToastType) {
+  const c = "w-4 h-4";
+  if (type === "success") return <CheckIcon className={c} />;
+  if (type === "error") return <XMarkIcon className={c} />;
+  return <InformationCircleIcon className={c} />;
 }
 
 function ToastContainer() {
   const [toasts, set_toasts] = useState<ToastState[]>([]);
+  const reduce_motion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   useEffect(() => {
     const listener = (new_toasts: ToastState[]) => set_toasts(new_toasts);
@@ -178,51 +201,43 @@ function ToastContainer() {
     };
   }, []);
 
-  if (toasts.length === 0) return null;
-
   return (
-    <div className="fixed left-1/2 -translate-x-1/2 bottom-6 z-[100] flex flex-col-reverse gap-2 pointer-events-none">
-      {toasts.map((toast) => (
-        <div
-          key={toast.id}
-          className={`pointer-events-auto pl-3.5 pr-4 py-2.5 rounded-2xl flex items-center gap-2.5 border cursor-pointer backdrop-blur-xl ${toast.exiting ? "animate-toast-out" : "animate-toast-in"}`}
-          onClick={() => dismiss_toast(toast.id)}
-          style={{
-            backgroundColor: "var(--modal-bg)",
-            borderColor: "var(--border-secondary)",
-            boxShadow: "0 12px 32px -12px rgba(0,0,0,0.3), 0 4px 10px -6px rgba(0,0,0,0.18)",
-          }}
-        >
-          <span
-            className={`flex-shrink-0 ${
-              toast.type === "success"
-                ? "text-emerald-500"
-                : toast.type === "error"
-                ? "text-rose-500"
-                : "text-brand"
-            }`}
+    <div
+      aria-atomic="false"
+      aria-live="polite"
+      role="status"
+      className="fixed left-1/2 -translate-x-1/2 z-[100] flex flex-col-reverse gap-2 pointer-events-none"
+      style={{ bottom: "24px" }}
+    >
+      <AnimatePresence>
+        {toasts.map((toast) => (
+          <motion.div
+            key={toast.id}
+            className="pointer-events-auto"
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            initial={reduce_motion ? false : { opacity: 0, y: 20, scale: 0.95 }}
+            layout={!reduce_motion}
+            transition={{ duration: reduce_motion ? 0 : 0.15 }}
           >
-            {toast.type === "success" && (
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
-                <path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            )}
-            {toast.type === "error" && (
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
-                <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            )}
-            {toast.type === "info" && (
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                <path d="M11.25 11.25l.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0zm-9-3.75h.008v.008H12V8.25z" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            )}
-          </span>
-          <span className="text-sm font-medium text-txt-primary">
-            {toast.message}
-          </span>
-        </div>
-      ))}
+            <div className="px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 bg-modal-bg border border-edge-secondary">
+              <span className="flex-shrink-0 text-txt-primary">
+                {get_toast_icon(toast.type)}
+              </span>
+              <span className="text-[13px] font-medium text-txt-primary whitespace-nowrap">
+                {toast.message}
+              </span>
+              <button
+                aria-label={i18next.t("dismiss")}
+                className="ml-1 flex-shrink-0 text-txt-muted hover:text-txt-primary"
+                onClick={() => dismiss_toast(toast.id)}
+              >
+                <XMarkIcon className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
     </div>
   );
 }
@@ -273,26 +288,43 @@ function UpdateBanner() {
 
   return (
     <div
-      className="fixed bottom-4 right-4 z-[110] max-w-xs rounded-2xl border p-3.5 backdrop-blur-xl"
+      className="fixed bottom-4 right-4 z-[9999] max-w-sm rounded-xl border shadow-2xl p-3"
       style={{
-        backgroundColor: "var(--modal-bg)",
-        borderColor: "var(--border-secondary)",
-        boxShadow: "0 12px 32px -12px rgba(0,0,0,0.3), 0 4px 10px -6px rgba(0,0,0,0.18)",
+        backgroundColor: "var(--bg-primary)",
+        borderColor: "var(--border-primary)",
+        color: "var(--text-primary)",
       }}
     >
-      <p className="text-sm font-medium text-txt-primary">
-        {i18next.t("update_available", { version: info.version })}
-      </p>
-      {info.notes && (
-        <p className="text-[11px] text-txt-muted mt-1 line-clamp-3">{info.notes}</p>
-      )}
-      <div className="flex items-center gap-2 mt-3">
-        <Button variant="depth" size="sm" disabled={installing} onClick={handle_install}>
-          {installing ? i18next.t("update_installing") : i18next.t("update_install")}
-        </Button>
-        <Button variant="ghost" size="sm" disabled={installing} onClick={handle_dismiss}>
-          {i18next.t("update_dismiss")}
-        </Button>
+      <div className="flex items-start gap-3">
+        <ArrowDownTrayIcon className="w-5 h-5 mt-0.5 text-txt-primary flex-shrink-0" />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-txt-primary">
+            {i18next.t("update_available", { version: info.version })}
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              className="h-7 px-3 rounded-lg bg-indigo-600 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={installing}
+              onClick={handle_install}
+            >
+              {installing ? i18next.t("update_installing") : i18next.t("update_install")}
+            </button>
+            <button
+              className="h-7 px-3 rounded-lg border border-edge-secondary bg-surf-tertiary text-xs font-medium text-txt-primary hover:opacity-80"
+              disabled={installing}
+              onClick={handle_dismiss}
+            >
+              {i18next.t("update_dismiss")}
+            </button>
+          </div>
+        </div>
+        <button
+          aria-label={i18next.t("dismiss")}
+          className="p-1 text-txt-muted hover:text-txt-primary"
+          onClick={handle_dismiss}
+        >
+          <XMarkIcon className="w-4 h-4" />
+        </button>
       </div>
     </div>
   );
@@ -340,13 +372,10 @@ function CopyIcon({ copied }: { copied: boolean }) {
 
 function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
   const { t } = useTranslation();
-  const [copied, set_copied] = useState(false);
   const on_copy = async () => {
     try {
       await navigator.clipboard.writeText(value);
-      set_copied(true);
       show_toast(t("copied_to_clipboard"), "success");
-      setTimeout(() => set_copied(false), 1200);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -360,8 +389,8 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 rounded-md px-2 py-1 cursor-pointer hover:bg-black/[0.05] dark:hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
     >
       <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
-      <span className={`flex-shrink-0 ${copied ? "text-emerald-500" : "text-txt-muted group-hover:text-txt-primary"}`}>
-        <CopyIcon copied={copied} />
+      <span className="flex-shrink-0 text-txt-muted group-hover:text-txt-primary">
+        <CopyIcon copied={false} />
       </span>
     </button>
   );
@@ -1028,88 +1057,59 @@ function ConfigPanel({
 
   const email_value = email || "-";
 
-  const handle_copy_all = async () => {
-    const text = [
-      `IMAP`,
-      `  Host:     ${imap_host}`,
-      `  Port:     ${imap_port}`,
-      `  Security: ${imap_security}`,
-      `  Username: ${email_value}`,
-      `  Password: (from App Passwords tab)`,
-      ``,
-      `SMTP`,
-      `  Host:     ${smtp_host}`,
-      `  Port:     ${smtp_port}`,
-      `  Security: ${smtp_security}`,
-      `  Username: ${email_value}`,
-      `  Password: (from App Passwords tab)`,
-      ``,
-      `JMAP`,
-      `  Session URL: ${jmap_url}`,
-      `  Username:    ${email_value}`,
-      `  Password:    (from App Passwords tab)`,
-    ].join("\n");
-    try {
-      await navigator.clipboard.writeText(text);
-      show_toast(t("settings_copied"), "success");
-    } catch {
-      show_toast(t("failed_to_copy"), "error");
-    }
-  };
-
   const avatar_letter = (display_name || email || "?")[0].toUpperCase();
   const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : "#6366f1";
 
   return (
     <div className="p-5">
-      <div className="flex items-start justify-between gap-3 mb-4">
+      <div className="flex items-center gap-3 mb-4">
+        <div className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden">
+          {profile_picture ? (
+            <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center text-white font-semibold text-sm" style={{ backgroundColor: avatar_bg }}>
+              {avatar_letter}
+            </div>
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold text-txt-primary truncate">{display_name || email?.split("@")[0] || "-"}</p>
+          <p className="text-[11px] text-txt-muted truncate">{email_value}</p>
+        </div>
+      </div>
+
+      <div
+        className="rounded-xl border border-edge-secondary px-4 py-3.5 flex items-center justify-between gap-4 mb-4"
+        style={{ backgroundColor: "color-mix(in srgb, var(--text-primary) 3%, var(--bg-primary))", boxShadow: "0 1px 2px rgba(0, 0, 0, 0.04)" }}
+        title={bridge_running
+          ? (connected_since
+              ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
+              : t("connected_tooltip_servers"))
+          : t("not_connected_tooltip")}
+      >
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden">
-            {profile_picture ? (
-              <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center text-white font-semibold text-sm" style={{ backgroundColor: avatar_bg }}>
-                {avatar_letter}
-              </div>
+          <span
+            className="flex-shrink-0"
+            style={{ color: bridge_running ? "var(--accent-color)" : "var(--color-danger)" }}
+          >
+            {bridge_running
+              ? <SignalIcon className="w-6 h-6" />
+              : <SignalSlashIcon className="w-6 h-6" />}
+          </span>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-txt-primary leading-tight truncate">
+              {bridge_running ? t("connected") : t("not_connected")}
+            </p>
+            {bridge_running && connected_since && (
+              <p className="text-[12px] text-txt-muted leading-tight mt-0.5 tabular-nums">
+                <UptimeCounter since={connected_since} />
+              </p>
             )}
           </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-txt-primary truncate">{display_name || email?.split("@")[0] || "-"}</p>
-            <p className="text-[11px] text-txt-muted truncate">{email_value}</p>
-            <div
-              className="flex items-center gap-1.5 mt-0.5 cursor-default w-fit"
-              title={bridge_running
-                ? (connected_since
-                    ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
-                    : t("connected_tooltip_servers"))
-                : t("not_connected_tooltip")}
-            >
-              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${bridge_running ? "" : "bg-txt-muted/30"}`} style={bridge_running ? { backgroundColor: "var(--color-success)" } : undefined} />
-              <span className={`text-[13px] font-medium ${bridge_running ? "" : "text-txt-muted"}`} style={bridge_running ? { color: "var(--color-success)" } : undefined}>
-                {bridge_running
-                  ? connected_since
-                    ? <>{t("connected_for")} <UptimeCounter since={connected_since} /></>
-                    : t("connected")
-                  : t("not_connected")}
-              </span>
-            </div>
-          </div>
         </div>
-        <div className="flex items-center gap-1.5 flex-shrink-0 pt-0.5">
-          <button
-            title={t("copy_all_settings")}
-            className="p-1.5 rounded-md text-txt-muted hover:text-txt-primary transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-            onClick={handle_copy_all}
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-              <rect height="13" rx="2" width="13" x="9" y="9" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
-          <Button variant={bridge_running ? "destructive" : "depth"} size="sm" onClick={on_toggle_bridge}>
-            {bridge_running ? t("disconnect") : t("connect")}
-          </Button>
-        </div>
+        <Button variant={bridge_running ? "destructive" : "depth"} size="lg" className="flex-shrink-0" onClick={on_toggle_bridge}>
+          {bridge_running ? t("disconnect") : t("connect")}
+        </Button>
       </div>
 
       {bridge_running && sync_progress && (
@@ -1122,9 +1122,8 @@ function ConfigPanel({
               </svg>
               <span className="truncate">{t("syncing_folder", { folder: sync_progress.folder })}</span>
             </span>
-            <span className="text-base font-semibold text-txt-primary tabular-nums flex-shrink-0 leading-none">
-              {sync_progress.done.toLocaleString()}
-              <span className="text-txt-muted font-normal"> / {sync_progress.total.toLocaleString()}</span>
+            <span className="text-xs font-normal text-txt-muted tabular-nums flex-shrink-0 leading-none">
+              {sync_progress.done.toLocaleString()} / {sync_progress.total.toLocaleString()}
             </span>
           </div>
           <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
@@ -1133,13 +1132,6 @@ function ConfigPanel({
               style={{ width: `${sync_progress.total > 0 ? (sync_progress.done / sync_progress.total) * 100 : 0}%` }}
             />
           </div>
-        </div>
-      )}
-
-      {!bridge_running && (
-        <div className="mb-4 rounded-xl px-4 py-3 flex items-center justify-between gap-3" style={{ backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-secondary)" }}>
-          <span className="text-sm text-txt-muted">{t("start_bridge_cta")}</span>
-          <Button variant="depth" size="sm" className="flex-shrink-0" onClick={on_toggle_bridge}>{t("connect")}</Button>
         </div>
       )}
 
@@ -1238,6 +1230,7 @@ function PasswordsPanel({
   const [generating, set_generating] = useState(false);
   const [banner_copied, set_banner_copied] = useState(false);
   const [delete_target, set_delete_target] = useState<{ id: string; label: string } | null>(null);
+  const delete_display = use_frozen(delete_target);
   const [deleting, set_deleting] = useState(false);
 
   useEffect(() => {
@@ -1363,7 +1356,7 @@ function PasswordsPanel({
       <Modal open={!!delete_target} on_close={() => set_delete_target(null)}>
         <p className="text-base font-semibold text-txt-primary">{t("delete_password_title")}</p>
         <ModalBody>
-          <span>{t("delete_password_confirm", { label: delete_target?.label ?? "" })}</span>
+          <span>{t("delete_password_confirm", { label: delete_display?.label ?? "" })}</span>
         </ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_delete_target(null)}>{t("cancel")}</Button>
@@ -1392,6 +1385,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [saving_ports, set_saving_ports] = useState(false);
   const [data_dir, set_data_dir] = useState("");
   const [setup_client, set_setup_client] = useState<string | null>(null);
+  const setup_display = use_frozen(setup_client);
   const [show_repair_modal, set_show_repair_modal] = useState(false);
   const [repairing, set_repairing] = useState(false);
   const [logs_open, set_logs_open] = useState(false);
@@ -1837,10 +1831,10 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       </Modal>
 
       <Modal open={!!setup_client} on_close={() => set_setup_client(null)} size="lg">
-        <p className="text-base font-semibold text-txt-primary">{t("setup_with_client", { client: setup_client ?? "" })}</p>
+        <p className="text-base font-semibold text-txt-primary">{t("setup_with_client", { client: setup_display ?? "" })}</p>
         <ModalBody>
-          <div className="space-y-5 animate-panel-in">
-            {setup_client === "Thunderbird" && (
+          <div className="space-y-5">
+            {setup_display === "Thunderbird" && (
               <>
                 <SetupStep n={1} title={t("tb_step1_title")}>
                   <SetupNote>{t("tb_step1_desc")}</SetupNote>
@@ -1875,7 +1869,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                 </SetupStep>
               </>
             )}
-            {setup_client === "Outlook" && (
+            {setup_display === "Outlook" && (
               <>
                 <SetupStep n={1} title={t("ol_step1_title")}>
                   <SetupNote>{t("ol_step1_desc")}</SetupNote>
@@ -1901,7 +1895,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                 </SetupStep>
               </>
             )}
-            {setup_client === "Apple Mail" && (
+            {setup_display === "Apple Mail" && (
               <>
                 <SetupStep n={1} title={t("am_step1_title")}>
                   <SetupNote>{t("am_step1_desc")}</SetupNote>
@@ -1929,9 +1923,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                 </SetupStep>
               </>
             )}
-            <div className="flex gap-2.5 pt-1">
-              <svg className="w-4 h-4 text-brand flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-                <path d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" strokeLinecap="round" strokeLinejoin="round" />
+            <div className="flex gap-3 items-start rounded-xl border border-edge-secondary bg-surf-tertiary px-3.5 py-3">
+              <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
+                <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
               <p className="text-[13px] leading-relaxed text-txt-tertiary">{t("setup_guide_no_encryption_note")}</p>
             </div>
@@ -2091,6 +2085,7 @@ export function BridgeApp() {
   const [has_bridge_access, set_has_bridge_access] = useState(false);
   const [plan_info_loaded, set_plan_info_loaded] = useState(false);
   const [provision_label, set_provision_label] = useState<string | null>(null);
+  const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
   const [sync_progress, set_sync_progress] = useState<{ folder: string; done: number; total: number } | null>(null);
@@ -2390,7 +2385,7 @@ export function BridgeApp() {
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>
         <ModalBody>
-          <span>{i18next.t("provision_confirm", { label: provision_label ?? "" })}</span>
+          <span>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</span>
         </ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_provision_label(null)}>{i18next.t("cancel")}</Button>

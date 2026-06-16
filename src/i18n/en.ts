@@ -22,6 +22,7 @@ const en = {
   copied: "Copied",
   failed_to_copy: "Failed to copy to clipboard",
   cancel: "Cancel",
+  dismiss: "Dismiss",
   done: "Done",
   delete: "Delete",
   loading: "Loading...",

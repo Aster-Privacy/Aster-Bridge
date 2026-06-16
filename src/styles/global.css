@@ -152,6 +152,26 @@ button,
   transition: none !important;
 }
 
+/*
+ * Clickable controls show the hand/pointer cursor on hover. Buttons do not get
+ * this from the browser by default. Disabled controls keep the default arrow.
+ */
+button,
+[role="button"],
+[role="switch"],
+[class*="aster_btn"],
+a[href] {
+  cursor: pointer;
+}
+
+button:disabled,
+button[disabled],
+[role="button"][aria-disabled="true"],
+[class*="aster_btn"]:disabled,
+[class*="aster_btn"][aria-disabled="true"] {
+  cursor: default;
+}
+
 input,
 textarea,
 select {
