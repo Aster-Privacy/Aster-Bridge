@@ -1389,7 +1389,7 @@ function PasswordsPanel({
 
 function StarIcon({ filled }: { filled: boolean }) {
   return (
-    <svg className="w-[15px] h-[15px]" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth={1.8}>
+    <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth={1.8}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.5a.56.56 0 0 1 1.04 0l2.12 5.11a.56.56 0 0 0 .48.34l5.52.45c.5.04.7.66.32.99l-4.2 3.6a.56.56 0 0 0-.18.56l1.28 5.38a.56.56 0 0 1-.84.61l-4.72-2.88a.56.56 0 0 0-.59 0l-4.72 2.88a.56.56 0 0 1-.84-.61l1.28-5.38a.56.56 0 0 0-.18-.56l-4.2-3.6a.56.56 0 0 1 .32-.99l5.52-.45a.56.56 0 0 0 .48-.34L11.48 3.5Z" />
     </svg>
   );
@@ -1500,7 +1500,7 @@ function IdentitiesGroup() {
                   aria-pressed={is_primary}
                   disabled={is_primary || saving}
                   onClick={() => make_primary(id.sender_id)}
-                  className={`flex-shrink-0 ${is_primary ? "text-brand" : "text-txt-muted hover:text-brand"} disabled:cursor-default`}
+                  className={`flex-shrink-0 inline-flex items-center justify-center w-9 h-9 -ml-2 ${is_primary ? "text-brand" : "text-txt-muted"} disabled:cursor-default`}
                 >
                   <StarIcon filled={is_primary} />
                 </button>
