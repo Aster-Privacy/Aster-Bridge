@@ -822,7 +822,7 @@ async fn serve_real() {
         tokio::spawn(async move { crate::outbox::run_outbox_loop(s, c, d, obx_rx).await; });
     }
 
-    let (imap, smtp, jmap) = (11430u16, 11250u16, 11080u16);
+    let (imap, smtp, jmap, pop3) = (11430u16, 11250u16, 11080u16, 11100u16);
     {
         let (s, d, c, p, b) = (session.clone(), db.clone(), client.clone(), passwords.clone(), broadcaster.clone());
         let addr = format!("127.0.0.1:{}", imap);
@@ -838,14 +838,21 @@ async fn serve_real() {
         let addr = format!("127.0.0.1:{}", jmap);
         tokio::spawn(async move { let _ = crate::jmap::server::run(&addr, s, d, c, p, b, None).await; });
     }
+    {
+        let (s, d, p) = (session.clone(), db.clone(), passwords.clone());
+        let addr = format!("127.0.0.1:{}", pop3);
+        tokio::spawn(async move { let _ = crate::pop3::server::run(&addr, s, d, p, None).await; });
+    }
     wait_listening(imap).await;
     wait_listening(smtp).await;
     wait_listening(jmap).await;
+    wait_listening(pop3).await;
 
     let email = session.read().await.email.clone();
     println!("\n============ ASTER BRIDGE - REAL ACCOUNT (no TLS) ============");
     println!("  IMAP : 127.0.0.1:{}", imap);
     println!("  SMTP : 127.0.0.1:{}", smtp);
+    println!("  POP3 : 127.0.0.1:{}", pop3);
     println!("  JMAP : http://127.0.0.1:{}/jmap/session", jmap);
     println!("  user : {}", email);
     println!("  pass : {}", app_pw);
