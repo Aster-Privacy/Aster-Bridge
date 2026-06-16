@@ -709,6 +709,13 @@ async fn serve_real() {
         return;
     }
 
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "info,aster_bridge_desktop::smtp=debug,aster_bridge_desktop::imap=debug",
+        ))
+        .with_test_writer()
+        .try_init();
+
     crate::tls::install_default_crypto_provider();
     let client = Arc::new(ApiClient::new());
 
@@ -808,6 +815,13 @@ async fn serve_real() {
         println!("  {} = {} messages", label, n);
     }
 
+    let _ = db.outbox_reset_stale_sending();
+    {
+        let (s, c, d) = (session.clone(), client.clone(), db.clone());
+        let (_obx_tx, obx_rx) = crate::outbox::outbox_trigger_channel();
+        tokio::spawn(async move { crate::outbox::run_outbox_loop(s, c, d, obx_rx).await; });
+    }
+
     let (imap, smtp, jmap) = (11430u16, 11250u16, 11080u16);
     {
         let (s, d, c, p, b) = (session.clone(), db.clone(), client.clone(), passwords.clone(), broadcaster.clone());
@@ -835,10 +849,10 @@ async fn serve_real() {
     println!("  JMAP : http://127.0.0.1:{}/jmap/session", jmap);
     println!("  user : {}", email);
     println!("  pass : {}", app_pw);
-    println!("  (real bridge.db untouched; serving ~240s)");
+    println!("  (real bridge.db untouched; serving ~300s)");
     println!("==============================================================\n");
 
-    tokio::time::sleep(Duration::from_secs(240)).await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
     println!("serve_real: shutting down");
 }
 
