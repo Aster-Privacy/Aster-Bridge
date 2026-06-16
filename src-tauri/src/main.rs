@@ -1613,9 +1613,6 @@ fn main() {
         .setup(move |app| {
             sync::poller::set_global_app_handle(Some(app.handle().clone()));
 
-            #[cfg(target_os = "macos")]
-            let icon_bytes = include_bytes!("../icons/icon.icns");
-            #[cfg(not(target_os = "macos"))]
             let icon_bytes = include_bytes!("../icons/128x128.png");
 
             let icon =
