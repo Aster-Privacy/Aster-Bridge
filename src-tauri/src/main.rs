@@ -624,7 +624,7 @@ async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> R
     let _ = guard.db.clear_all_user_data();
 
     let data_dir = guard.config.data_dir.clone();
-    let _ = auth::device_identity::clear_device_id(&data_dir);
+    auth::device_identity::clear_identity(&data_dir);
     auth::device_identity::clear_passphrase(&data_dir);
     guard.identity.device_id = None;
 
