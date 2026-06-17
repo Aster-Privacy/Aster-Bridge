@@ -907,7 +907,7 @@ async fn get_default_sender(state: State<'_, AppState>) -> Result<Option<String>
     client.get_default_sender(&token).await.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn set_default_sender(
     state: State<'_, AppState>,
     sender_id: Option<String>,
@@ -1106,7 +1106,7 @@ async fn open_data_directory(
     open::that(&canonical).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn update_connection_settings(
     state: State<'_, AppState>,
     imap_port: u16,

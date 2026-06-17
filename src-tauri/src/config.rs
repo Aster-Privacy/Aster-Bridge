@@ -214,6 +214,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_ports_accepts_distinct_custom_ports() {
+        let mut c = BridgeConfig::default();
+        c.imap_port = 1145;
+        validate_ports(&c).expect("distinct custom ports must validate");
+    }
+
+    #[test]
     fn validate_ports_rejects_duplicate_ports() {
         let mut c = BridgeConfig::default();
         c.smtp_port = c.imap_port;

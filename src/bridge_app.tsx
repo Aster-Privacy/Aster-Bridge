@@ -1744,8 +1744,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       await api.update_connection_settings(imap, smtp);
       set_ports_dirty(false);
       show_toast(t("toast_ports_updated"), "success");
-    } catch {
-      show_toast(t("toast_ports_failed"), "error");
+    } catch (e) {
+      const detail = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+      show_toast(`${t("toast_ports_failed")}: ${detail}`, "error");
     }
     set_saving_ports(false);
   };
