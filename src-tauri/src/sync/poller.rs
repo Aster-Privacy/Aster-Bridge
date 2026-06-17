@@ -423,12 +423,11 @@ async fn run_sync_pass(
     let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
 
     let queries = build_folder_queries();
-    let mut grand_done = 0usize;
-    let mut grand_total = 0usize;
-    for folder_query in queries.iter() {
+    let total_folders = queries.len();
+    for (folder_idx, folder_query) in queries.iter().enumerate() {
+        emit_sync_progress(folder_query.label, folder_idx, total_folders);
         let mut cursor: Option<String> = None;
         let mut total_fetched = 0usize;
-        let mut folder_total = 0usize;
         let max_per_folder = 2000usize;
         loop {
             let mut q = folder_query.query.clone();
@@ -479,27 +478,12 @@ async fn run_sync_pass(
                         let id_refs: Vec<&str> = new_ids.iter().map(|s| s.as_str()).collect();
                         let _ = db.jmap_record_sync_batch("Email", &id_refs);
                     }
-                    if folder_total == 0 {
-                        folder_total = resp.total.max(0) as usize;
-                        grand_total += folder_total;
-                    }
                     total_fetched += resp.items.len();
-                    grand_done += resp.items.len();
                     let page_all_cached = !resp.items.is_empty() && new_ids.is_empty();
                     let done_with_folder = !resp.has_more
                         || resp.next_cursor.is_none()
                         || total_fetched >= max_per_folder
                         || page_all_cached;
-                    if done_with_folder && folder_total > total_fetched {
-                        grand_done += folder_total - total_fetched;
-                    }
-                    if grand_total > 0 {
-                        emit_sync_progress(
-                            folder_query.label,
-                            grand_done.min(grand_total),
-                            grand_total,
-                        );
-                    }
                     if done_with_folder {
                         break;
                     }
