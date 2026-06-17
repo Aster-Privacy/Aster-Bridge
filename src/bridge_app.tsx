@@ -35,6 +35,7 @@ import {
   mark_version_notified,
   type UpdateInfo,
 } from "./updater";
+import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Button,
   UpgradeBtn,
@@ -75,15 +76,34 @@ const GRADIENT_CONFIGS: Record<
   "#6b7280": { top_left: "#9ca3af", bottom_right: "#111827" },
 };
 
+// Write to the clipboard via the native pasteboard (Tauri plugin), falling back
+// to the web clipboard API. The plugin path does not depend on webview
+// transient user-activation, so it works even after an intervening await (the
+// web API rejects with NotAllowedError in that case).
+async function copy_text(value: string): Promise<void> {
+  try {
+    await clipboard_write_text(value);
+  } catch {
+    await navigator.clipboard.writeText(value);
+  }
+}
+
+async function read_clipboard_text(): Promise<string> {
+  try {
+    return await clipboard_read_text();
+  } catch {
+    return await navigator.clipboard.readText();
+  }
+}
+
 // Wipe a copied secret from the clipboard after 30s, but only if the user has
 // not since copied something else (avoids clobbering an unrelated later copy).
 function clear_clipboard_if_unchanged(value: string): void {
   window.setTimeout(() => {
-    navigator.clipboard
-      .readText()
+    read_clipboard_text()
       .then((current) => {
         if (current === value) {
-          navigator.clipboard.writeText("").catch(() => {});
+          copy_text("").catch(() => {});
         }
       })
       .catch(() => {});
@@ -375,7 +395,7 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
   const { t } = useTranslation();
   const on_copy = async () => {
     try {
-      await navigator.clipboard.writeText(value);
+      await copy_text(value);
       show_toast(t("copied_to_clipboard"), "success");
     } catch {
       show_toast(t("failed_to_copy"), "error");
@@ -680,7 +700,7 @@ function SetupView({
   const handle_copy_code = async () => {
     if (!code) return;
     try {
-      await navigator.clipboard.writeText(code.replace(/-/g, ""));
+      await copy_text(code.replace(/-/g, ""));
       show_toast(t("copied_to_clipboard"), "success");
       set_code_copied(true);
       setTimeout(() => set_code_copied(false), 1500);
@@ -1626,7 +1646,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     try {
       const blob = await api.copy_diagnostic_bundle();
       try {
-        await navigator.clipboard.writeText(blob);
+        await copy_text(blob);
         show_toast(t("toast_bundle_copied"), "success");
       } catch {
         show_toast(t("toast_bundle_clipboard_failed"), "error");

@@ -1114,10 +1114,11 @@ async fn update_connection_settings(
 ) -> Result<(), String> {
     validate_port(imap_port).map_err(|e| format!("imap_port: {}", e))?;
     validate_port(smtp_port).map_err(|e| format!("smtp_port: {}", e))?;
-    if imap_port == smtp_port {
-        return Err("imap_port and smtp_port must differ".to_string());
-    }
     let mut guard = state.0.lock().await;
+    let mut candidate = guard.config.clone();
+    candidate.imap_port = imap_port;
+    candidate.smtp_port = smtp_port;
+    config::validate_ports(&candidate)?;
     guard.config.imap_port = imap_port;
     guard.config.smtp_port = smtp_port;
     config::save_config(&guard.config)
@@ -1575,6 +1576,7 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState(bridge_state))
         .manage(TrayState(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![

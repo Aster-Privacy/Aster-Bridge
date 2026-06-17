@@ -126,7 +126,17 @@ pub fn load_config() -> Result<BridgeConfig, String> {
     };
 
     config.data_dir = dir;
-    validate_ports(&config)?;
+    if let Err(e) = validate_ports(&config) {
+        eprintln!(
+            "invalid port configuration ({}); resetting imap/smtp ports to defaults",
+            e
+        );
+        let defaults = BridgeConfig::default();
+        config.imap_port = defaults.imap_port;
+        config.smtp_port = defaults.smtp_port;
+        validate_ports(&config)?;
+        save_config(&config)?;
+    }
 
     const MIN_POLL_INTERVAL_SECS: u64 = 5;
     const MAX_POLL_INTERVAL_SECS: u64 = 86_400;
@@ -144,7 +154,7 @@ pub fn load_config() -> Result<BridgeConfig, String> {
     Ok(config)
 }
 
-fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
+pub(crate) fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
     for (name, port) in [
         ("imap_port", c.imap_port),
         ("imap_implicit_tls_port", c.imap_implicit_tls_port),
@@ -207,6 +217,19 @@ mod tests {
     fn validate_ports_rejects_duplicate_ports() {
         let mut c = BridgeConfig::default();
         c.smtp_port = c.imap_port;
+        let err = validate_ports(&c).unwrap_err();
+        assert!(err.contains("multiple protocols"));
+    }
+
+    #[test]
+    fn validate_ports_rejects_collision_with_reserved_port() {
+        let mut c = BridgeConfig::default();
+        c.imap_port = c.imap_implicit_tls_port;
+        let err = validate_ports(&c).unwrap_err();
+        assert!(err.contains("multiple protocols"));
+
+        let mut c = BridgeConfig::default();
+        c.smtp_port = c.pop3s_port;
         let err = validate_ports(&c).unwrap_err();
         assert!(err.contains("multiple protocols"));
     }
