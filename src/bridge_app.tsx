@@ -455,7 +455,7 @@ function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }:
       type="button"
       onClick={on_click}
       disabled={disabled}
-      className="group w-full flex items-center gap-3 py-3 text-left hover:bg-black/[0.025] dark:hover:bg-white/[0.04] disabled:opacity-50 disabled:pointer-events-none"
+      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-lg text-left transition-colors duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] disabled:opacity-50 disabled:pointer-events-none"
     >
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
