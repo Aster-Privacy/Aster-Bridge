@@ -55,7 +55,13 @@ pub fn set_global_app_handle(handle: Option<tauri::AppHandle>) {
     }
 }
 
-fn emit_sync_progress(folder: &str, done: usize, total: usize) {
+fn emit_sync_progress(
+    folder: &str,
+    done: usize,
+    total: usize,
+    folder_done: usize,
+    folder_total: usize,
+) {
     let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
     let handle_opt = cell.lock().ok().and_then(|g| g.clone());
     let Some(handle) = handle_opt else { return; };
@@ -63,6 +69,8 @@ fn emit_sync_progress(folder: &str, done: usize, total: usize) {
         "folder": folder,
         "done": done,
         "total": total,
+        "folder_done": folder_done,
+        "folder_total": folder_total,
     }));
 }
 
@@ -425,7 +433,7 @@ async fn run_sync_pass(
     let queries = build_folder_queries();
     let total_folders = queries.len();
     for (folder_idx, folder_query) in queries.iter().enumerate() {
-        emit_sync_progress(folder_query.label, folder_idx, total_folders);
+        emit_sync_progress(folder_query.label, folder_idx, total_folders, 0, 0);
         let mut cursor: Option<String> = None;
         let mut total_fetched = 0usize;
         let max_per_folder = 2000usize;
@@ -434,6 +442,7 @@ async fn run_sync_pass(
             q.cursor = cursor.clone();
             match client.list_mail(&access_token, &q).await {
                 Ok(resp) => {
+                    let folder_total = (resp.total as usize).min(max_per_folder);
                     tracing::debug!(
                         "Synced {} page - {} items (total: {}, has_more: {})",
                         folder_query.label,
@@ -479,6 +488,13 @@ async fn run_sync_pass(
                         let _ = db.jmap_record_sync_batch("Email", &id_refs);
                     }
                     total_fetched += resp.items.len();
+                    emit_sync_progress(
+                        folder_query.label,
+                        folder_idx,
+                        total_folders,
+                        total_fetched.min(folder_total),
+                        folder_total,
+                    );
                     let page_all_cached = !resp.items.is_empty() && new_ids.is_empty();
                     let done_with_folder = !resp.has_more
                         || resp.next_cursor.is_none()

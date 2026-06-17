@@ -45,6 +45,23 @@ import {
   Badge,
 } from "@aster/ui";
 
+type SyncProgress = {
+  folder: string;
+  done: number;
+  total: number;
+  folder_done?: number;
+  folder_total?: number;
+};
+
+function sync_bar_fraction(p: SyncProgress): number {
+  if (p.total <= 0) return 0;
+  const within =
+    p.folder_total && p.folder_total > 0
+      ? Math.min(p.folder_done ?? 0, p.folder_total) / p.folder_total
+      : 0;
+  return Math.min(1, (p.done + within) / p.total);
+}
+
 type SetupState =
   | "idle"
   | "requesting_code"
@@ -1069,7 +1086,7 @@ function ConfigPanel({
   bridge_running: boolean;
   on_toggle_bridge: () => void;
   connected_since: number | null;
-  sync_progress: { folder: string; done: number; total: number } | null;
+  sync_progress: SyncProgress | null;
 }) {
   const { t } = useTranslation();
   const imap_host = conn_info?.imap_host || "127.0.0.1";
@@ -1157,13 +1174,15 @@ function ConfigPanel({
               <span className="truncate">{t("syncing_folder", { folder: sync_progress.folder })}</span>
             </span>
             <span className="text-xs font-normal text-txt-muted tabular-nums flex-shrink-0 leading-none">
-              {sync_progress.done.toLocaleString()} / {sync_progress.total.toLocaleString()}
+              {sync_progress.folder_total && sync_progress.folder_total > 0
+                ? `${(sync_progress.folder_done ?? 0).toLocaleString()} / ${sync_progress.folder_total.toLocaleString()}`
+                : `${sync_progress.done.toLocaleString()} / ${sync_progress.total.toLocaleString()}`}
             </span>
           </div>
           <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
             <div
               className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
-              style={{ width: `${sync_progress.total > 0 ? (sync_progress.done / sync_progress.total) * 100 : 0}%` }}
+              style={{ width: `${sync_bar_fraction(sync_progress) * 100}%` }}
             />
           </div>
         </div>
@@ -2171,7 +2190,7 @@ function DashboardView({
   plan_info_loaded: boolean;
   outbox_count: number;
   connected_since: number | null;
-  sync_progress: { folder: string; done: number; total: number } | null;
+  sync_progress: SyncProgress | null;
   is_online: boolean;
 }) {
   const { t } = useTranslation();
@@ -2261,11 +2280,11 @@ export function BridgeApp() {
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
-  const [sync_progress, set_sync_progress] = useState<{ folder: string; done: number; total: number } | null>(null);
+  const [sync_progress, set_sync_progress] = useState<SyncProgress | null>(null);
   const sync_show_timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sync_hide_timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sync_visible = useRef(false);
-  const latest_sync = useRef<{ folder: string; done: number; total: number } | null>(null);
+  const latest_sync = useRef<SyncProgress | null>(null);
   const [is_online, set_is_online] = useState(() => typeof navigator !== "undefined" ? navigator.onLine : true);
 
   const load_state = useCallback(async () => {
@@ -2329,7 +2348,7 @@ export function BridgeApp() {
     let cleanup: (() => void) | null = null;
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      const unlisten_progress = await listen<{ folder: string; done: number; total: number }>("sync_progress", (e) => {
+      const unlisten_progress = await listen<SyncProgress>("sync_progress", (e) => {
         latest_sync.current = e.payload;
         if (sync_hide_timer.current) { clearTimeout(sync_hide_timer.current); sync_hide_timer.current = null; }
         if (sync_visible.current) {
