@@ -1,0 +1,93 @@
+name: Verify Release Download Assets
+
+# The Aster Bridge in-app downloads (Settings -> Bridge tab) and the website hit
+# /api/bridge/v1/download/<platform>, which redirects to FIXED, version-less asset
+# names under releases/latest/download/. Tauri produces VERSIONED names, so a release
+# cut outside release.yml (or with a failed macOS leg) leaves the bridge download
+# buttons 404ing. This guard runs on every publish/promotion, self-heals the fixed
+# names from their versioned counterparts, carries the dmg over from a prior release
+# when a macOS build is missing, and fails loudly if any required asset is absent.
+
+on:
+  release:
+    types: [released, published]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.release.draft == false && github.event.release.prerelease == false
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Ensure bridge download assets exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          V="${TAG#v}"
+          TMP="$(mktemp -d)"
+
+          REQUIRED=(
+            Aster-Bridge-x64-setup.exe
+            Aster-Bridge-x64.msi
+            Aster-Bridge-x86_64.AppImage
+            Aster-Bridge-amd64.deb
+            Aster-Bridge-x86_64.rpm
+            Aster-Bridge-universal.dmg
+          )
+
+          declare -A SRC=(
+            [Aster-Bridge-x64-setup.exe]="Aster.Bridge_${V}_x64-setup.exe"
+            [Aster-Bridge-x64.msi]="Aster.Bridge_${V}_x64_en-US.msi"
+            [Aster-Bridge-x86_64.AppImage]="Aster.Bridge_${V}_amd64.AppImage"
+            [Aster-Bridge-amd64.deb]="Aster.Bridge_${V}_amd64.deb"
+            [Aster-Bridge-x86_64.rpm]="Aster.Bridge-${V}-1.x86_64.rpm"
+            [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
+          )
+
+          assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
+          has() { assets | grep -qxF "$1"; }
+
+          for name in "${REQUIRED[@]}"; do
+            if has "$name"; then echo "ok: $name"; continue; fi
+
+            src="${SRC[$name]:-}"
+            if [ -n "$src" ] && has "$src"; then
+              echo "::notice::self-healing $name from $src on $TAG"
+              gh release download "$TAG" --repo "$REPO" --pattern "$src" --dir "$TMP" --clobber
+              mv "$TMP/$src" "$TMP/$name"
+              gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
+              continue
+            fi
+
+            if [ "$name" = "Aster-Bridge-universal.dmg" ]; then
+              echo "::warning::no macOS build on $TAG; carrying over the dmg from the most recent release that has one"
+              for prev in $(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName'); do
+                [ "$prev" = "$TAG" ] && continue
+                if gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name' | grep -qxF "Aster-Bridge-universal.dmg"; then
+                  gh release download "$prev" --repo "$REPO" --pattern "Aster-Bridge-universal.dmg" --dir "$TMP" --clobber
+                  gh release upload "$TAG" "$TMP/Aster-Bridge-universal.dmg" --repo "$REPO" --clobber
+                  echo "::warning::carried over Aster-Bridge-universal.dmg from $prev - cut a fresh macOS build to replace it"
+                  break
+                fi
+              done
+              continue
+            fi
+          done
+
+          MISSING=()
+          for name in "${REQUIRED[@]}"; do
+            has "$name" || MISSING+=("$name")
+          done
+
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo "::error::Latest release $TAG is missing bridge download assets: ${MISSING[*]}"
+            echo "The in-app Bridge downloads (/api/bridge/v1/download/<platform>) for these will 404. See the parent CLAUDE.md 'Website Download Assets'."
+            exit 1
+          fi
+
+          echo "All 6 bridge download assets present on $TAG."
