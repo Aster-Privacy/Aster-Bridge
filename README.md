@@ -1,4 +1,4 @@
-<img width="200" alt="aster_horizontalv2" src="https://github.com/user-attachments/assets/a337e975-996d-4672-a92b-b809591f389a" />
+<img width="200" alt="Aster Bridge" src="bridge_logo.png" />
 
 # Aster Bridge
 
