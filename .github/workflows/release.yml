@@ -185,3 +185,83 @@ jobs:
             -e "s|Aster\.Bridge_${V}_universal\.app\.tar\.gz|Aster-Bridge-universal.app.tar.gz|g" \
             "$TMP/latest.json"
           gh release upload "$TAG" "$TMP/latest.json" --clobber
+
+  ensure_download_assets:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Ensure fixed-name bridge download assets exist
+        # release.yml builds Windows + Linux only; the verify_release_assets.yml guard
+        # cannot fire on a release created by GITHUB_TOKEN, so carry the macOS dmg over
+        # from a prior release here, in-run, to stop /api/bridge/v1/download/macos-dmg 404ing.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          V=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+          if [ -z "$V" ]; then V="${GITHUB_REF_NAME#v}"; fi
+          TAG="v${V}"
+          TMP="$(mktemp -d)"
+
+          REQUIRED=(
+            Aster-Bridge-x64-setup.exe
+            Aster-Bridge-x64.msi
+            Aster-Bridge-x86_64.AppImage
+            Aster-Bridge-amd64.deb
+            Aster-Bridge-x86_64.rpm
+            Aster-Bridge-universal.dmg
+          )
+
+          declare -A SRC=(
+            [Aster-Bridge-x64-setup.exe]="Aster.Bridge_${V}_x64-setup.exe"
+            [Aster-Bridge-x64.msi]="Aster.Bridge_${V}_x64_en-US.msi"
+            [Aster-Bridge-x86_64.AppImage]="Aster.Bridge_${V}_amd64.AppImage"
+            [Aster-Bridge-amd64.deb]="Aster.Bridge_${V}_amd64.deb"
+            [Aster-Bridge-x86_64.rpm]="Aster.Bridge-${V}-1.x86_64.rpm"
+            [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
+          )
+
+          assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
+          has() { assets | grep -qxF "$1"; }
+
+          for name in "${REQUIRED[@]}"; do
+            if has "$name"; then echo "ok: $name"; continue; fi
+
+            src="${SRC[$name]:-}"
+            if [ -n "$src" ] && has "$src"; then
+              echo "::notice::self-healing $name from $src on $TAG"
+              gh release download "$TAG" --repo "$REPO" --pattern "$src" --dir "$TMP" --clobber
+              mv "$TMP/$src" "$TMP/$name"
+              gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
+              continue
+            fi
+
+            if [ "$name" = "Aster-Bridge-universal.dmg" ]; then
+              echo "::warning::no macOS build on $TAG; carrying over the dmg from the most recent release that has one"
+              for prev in $(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName'); do
+                [ "$prev" = "$TAG" ] && continue
+                if gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name' | grep -qxF "Aster-Bridge-universal.dmg"; then
+                  gh release download "$prev" --repo "$REPO" --pattern "Aster-Bridge-universal.dmg" --dir "$TMP" --clobber
+                  gh release upload "$TAG" "$TMP/Aster-Bridge-universal.dmg" --repo "$REPO" --clobber
+                  echo "::warning::carried over Aster-Bridge-universal.dmg from $prev - cut a fresh macOS build to replace it"
+                  break
+                fi
+              done
+              continue
+            fi
+          done
+
+          MISSING=()
+          for name in "${REQUIRED[@]}"; do
+            has "$name" || MISSING+=("$name")
+          done
+
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo "::error::Release $TAG is missing bridge download assets: ${MISSING[*]}"
+            echo "The in-app Bridge downloads (/api/bridge/v1/download/<platform>) for these will 404. See the parent CLAUDE.md 'Website Download Assets'."
+            exit 1
+          fi
+
+          echo "All 6 bridge download assets present on $TAG."
