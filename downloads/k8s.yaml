@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bridge-downloads-nginx
+  namespace: astermail
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        location = /health {
+            return 200 'ok';
+            add_header Content-Type text/plain;
+        }
+
+        location = /download/bridge/ {
+            return 302 https://github.com/Aster-Privacy/Aster-Bridge/releases/latest;
+        }
+
+        location ~ ^/download/bridge/(.+)$ {
+            add_header X-Content-Type-Options nosniff;
+            return 302 https://github.com/Aster-Privacy/Aster-Bridge/releases/latest/download/$1;
+        }
+
+        location / {
+            return 404;
+        }
+    }
