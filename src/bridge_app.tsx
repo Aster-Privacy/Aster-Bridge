@@ -23,10 +23,22 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo } from "@/api";
+import {
+  apply_preferences,
+  normalize_preferences,
+  read_cached_preferences,
+  write_cached_preferences,
+  clear_cached_preferences,
+  default_resolved_preferences,
+  get_toast_position,
+  on_toast_position_change,
+  invalidate_preferences_sync,
+  current_sync_generation,
+} from "@/lib/theme_sync";
 import {
   check_for_update,
   download_and_install,
@@ -74,7 +86,7 @@ const UPGRADE_URL = "https://app.astermail.org/settings/billing";
 
 type View = "loading" | "setup" | "dashboard";
 type Tab = "status" | "passwords" | "settings";
-type ToastType = "success" | "error" | "info";
+type ToastType = "success" | "error" | "info" | "warning";
 
 const LINK_DEVICE_URL = "https://app.astermail.org/link-device";
 
@@ -173,19 +185,48 @@ function use_frozen<T>(value: T | null): T | null {
 }
 
 function use_theme() {
-  const [is_dark, set_is_dark] = useState(() =>
-    typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent) => set_is_dark(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
+  const sync_theme = useCallback(async () => {
+    const generation = current_sync_generation();
+    try {
+      const raw = await api.get_user_preferences();
+      if (generation !== current_sync_generation()) return;
+      const resolved = normalize_preferences(raw);
+      if (resolved) {
+        apply_preferences(resolved);
+        write_cached_preferences(resolved);
+      } else {
+        clear_cached_preferences();
+        apply_preferences(default_resolved_preferences());
+      }
+    } catch {
+      /* keep whatever preferences are currently applied */
+    }
   }, []);
+
   useEffect(() => {
-    document.documentElement.classList.toggle("dark", is_dark);
-  }, [is_dark]);
-  return is_dark;
+    apply_preferences(read_cached_preferences() ?? default_resolved_preferences());
+    sync_theme();
+
+    const on_focus = () => { sync_theme(); };
+    window.addEventListener("focus", on_focus);
+
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const on_os_change = () => {
+      const current = read_cached_preferences() ?? default_resolved_preferences();
+      if (current.theme === "system") apply_preferences(current);
+    };
+    mq.addEventListener("change", on_os_change);
+
+    const interval = setInterval(() => { sync_theme(); }, 60000);
+
+    return () => {
+      window.removeEventListener("focus", on_focus);
+      mq.removeEventListener("change", on_os_change);
+      clearInterval(interval);
+    };
+  }, [sync_theme]);
+
+  return sync_theme;
 }
 
 interface ToastState {
@@ -194,7 +235,7 @@ interface ToastState {
   type: ToastType;
 }
 
-const MAX_TOASTS = 5;
+const MAX_TOASTS = 3;
 
 let toast_listeners: ((toasts: ToastState[]) => void)[] = [];
 let toast_stack: ToastState[] = [];
@@ -207,11 +248,7 @@ function dismiss_toast(id: string) {
   toast_listeners.forEach((l) => l([...toast_stack]));
 }
 
-function show_toast(message: string, type: ToastType = "info", duration = 2000) {
-  const id = Math.random().toString(36).slice(2);
-  const new_toast: ToastState = { id, message, type };
-  toast_stack = [new_toast, ...toast_stack].slice(0, MAX_TOASTS);
-  toast_listeners.forEach((l) => l([...toast_stack]));
+function schedule_toast_dismissal(id: string, duration: number) {
   const timeout = setTimeout(() => {
     toast_timeouts.delete(id);
     toast_stack = toast_stack.filter((t) => t.id !== id);
@@ -220,32 +257,79 @@ function show_toast(message: string, type: ToastType = "info", duration = 2000) 
   toast_timeouts.set(id, timeout);
 }
 
+function show_toast(message: string, type: ToastType = "info", duration = 2000) {
+  const existing = toast_stack.find((t) => t.message === message && t.type === type);
+  if (existing) {
+    const prior = toast_timeouts.get(existing.id);
+    if (prior) clearTimeout(prior);
+    schedule_toast_dismissal(existing.id, duration);
+    return;
+  }
+
+  const id = Math.random().toString(36).slice(2);
+  const new_toast: ToastState = { id, message, type };
+  const trimmed = [new_toast, ...toast_stack].slice(0, MAX_TOASTS);
+  for (const dropped of toast_stack) {
+    if (!trimmed.includes(dropped)) {
+      const t = toast_timeouts.get(dropped.id);
+      if (t) { clearTimeout(t); toast_timeouts.delete(dropped.id); }
+    }
+  }
+  toast_stack = trimmed;
+  toast_listeners.forEach((l) => l([...toast_stack]));
+  schedule_toast_dismissal(id, duration);
+}
+
 function get_toast_icon(type: ToastType) {
   const c = "w-4 h-4";
   if (type === "success") return <CheckIcon className={c} />;
+  if (type === "warning") return <ExclamationTriangleIcon className={c} />;
   if (type === "error") return <XMarkIcon className={c} />;
   return <InformationCircleIcon className={c} />;
 }
 
+function toast_layout(position: string) {
+  const is_top = position.startsWith("top");
+  const is_center = position === "top" || position === "bottom";
+  const is_left = position.endsWith("-left");
+  const style: Record<string, string> = {};
+  if (is_top) style.top = "calc(env(safe-area-inset-top, 0px) + 12px)";
+  else style.bottom = "24px";
+  if (is_center) { style.left = "50%"; style.transform = "translateX(-50%)"; }
+  else if (is_left) style.left = "16px";
+  else style.right = "16px";
+  const column = is_top ? "flex-col" : "flex-col-reverse";
+  const align = is_center ? "items-center" : is_left ? "items-start" : "items-end";
+  return { style, column, align, is_top };
+}
+
 function ToastContainer() {
   const [toasts, set_toasts] = useState<ToastState[]>([]);
-  const reduce_motion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const [position, set_position] = useState<string>(() => get_toast_position());
+  const reduce_motion =
+    (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) ||
+    (typeof document !== "undefined" && document.documentElement.classList.contains("reduce-motion"));
 
   useEffect(() => {
     const listener = (new_toasts: ToastState[]) => set_toasts(new_toasts);
     toast_listeners.push(listener);
+    const off_position = on_toast_position_change(() => set_position(get_toast_position()));
     return () => {
       toast_listeners = toast_listeners.filter((l) => l !== listener);
+      off_position();
     };
   }, []);
+
+  const { style, column, align, is_top } = toast_layout(position);
+  const y_offset = is_top ? -20 : 20;
 
   return (
     <div
       aria-atomic="false"
       aria-live="polite"
       role="status"
-      className="fixed left-1/2 -translate-x-1/2 z-[100] flex flex-col-reverse gap-2 pointer-events-none"
-      style={{ bottom: "24px" }}
+      className={`fixed z-[100] flex ${column} ${align} gap-2 pointer-events-none`}
+      style={style}
     >
       <AnimatePresence>
         {toasts.map((toast) => (
@@ -254,9 +338,9 @@ function ToastContainer() {
             className="pointer-events-auto"
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            initial={reduce_motion ? false : { opacity: 0, y: 20, scale: 0.95 }}
-            layout={!reduce_motion}
-            transition={{ duration: reduce_motion ? 0 : 0.15 }}
+            initial={reduce_motion ? false : { opacity: 0, y: y_offset, scale: 0.95 }}
+            layout={reduce_motion ? false : "position"}
+            transition={{ duration: reduce_motion ? 0 : 0.15, layout: { duration: 0.2 } }}
           >
             <div className="px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 bg-modal-bg border border-edge-secondary">
               <span className="flex-shrink-0 text-txt-primary">
@@ -267,7 +351,7 @@ function ToastContainer() {
               </span>
               <button
                 aria-label={i18next.t("dismiss")}
-                className="ml-1 flex-shrink-0 text-txt-muted hover:text-txt-primary"
+                className="flex-shrink-0 text-txt-muted hover:text-txt-primary transition-colors p-1.5 -m-1.5"
                 onClick={() => dismiss_toast(toast.id)}
               >
                 <XMarkIcon className="w-3.5 h-3.5" />
@@ -2264,7 +2348,7 @@ function DashboardView({
 }
 
 export function BridgeApp() {
-  use_theme();
+  const sync_theme = use_theme();
 
   const [view, set_view] = useState<View>("loading");
   const [email, set_email] = useState<string | null>(null);
@@ -2306,13 +2390,14 @@ export function BridgeApp() {
         set_has_bridge_access(state.has_bridge_access);
         set_plan_info_loaded(state.plan_info_loaded);
         set_was_enrolled(true);
+        sync_theme();
       } else {
         set_view("setup");
       }
     } catch {
       set_view("setup");
     }
-  }, []);
+  }, [sync_theme]);
 
   useEffect(() => {
     let cleanup: (() => void) | null = null;
@@ -2489,14 +2574,20 @@ export function BridgeApp() {
   }, [force_link_device]);
 
   const handle_sign_out = async () => {
+    invalidate_preferences_sync();
     try { await api.sign_out(); } catch { /* ignore */ }
+    clear_cached_preferences();
+    apply_preferences(default_resolved_preferences());
     show_toast(i18next.t("toast_signed_out"), "success");
     force_link_device();
   };
 
   const handle_reset = async () => {
+    invalidate_preferences_sync();
     await api.reset_bridge_data();
     try { await api.sign_out(); } catch { /* ignore */ }
+    clear_cached_preferences();
+    apply_preferences(default_resolved_preferences());
     force_link_device();
   };
 

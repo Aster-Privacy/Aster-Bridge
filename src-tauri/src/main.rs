@@ -122,6 +122,27 @@ struct BridgeStatusResponse {
     plan_info_loaded: bool,
 }
 
+#[derive(serde::Serialize, Default)]
+struct UserPreferencesResponse {
+    theme: Option<String>,
+    color_theme: Option<String>,
+    accent_color: Option<String>,
+    accent_color_hover: Option<String>,
+    custom_theme_seed: Option<String>,
+    custom_theme_overrides: std::collections::HashMap<String, String>,
+    font_choice: Option<String>,
+    font_size_scale: Option<serde_json::Value>,
+    reduce_motion: Option<bool>,
+    compact_mode: Option<bool>,
+    high_contrast: Option<bool>,
+    reduce_transparency: Option<bool>,
+    link_underlines: Option<bool>,
+    dyslexia_font: Option<bool>,
+    text_spacing: Option<bool>,
+    color_vision_mode: Option<String>,
+    toast_position: Option<String>,
+}
+
 #[derive(serde::Serialize)]
 struct SetupStatusResponse {
     status: String,
@@ -675,6 +696,64 @@ async fn refresh_plan_info(state: State<'_, AppState>) -> Result<(), String> {
     guard.plan_info_loaded = true;
 
     Ok(())
+}
+
+#[tauri::command]
+async fn get_user_preferences(state: State<'_, AppState>) -> Result<UserPreferencesResponse, String> {
+    let guard = state.0.lock().await;
+    let session_arc = match &guard.session {
+        Some(s) => s.clone(),
+        None => return Ok(UserPreferencesResponse::default()),
+    };
+    let client = guard.client.clone();
+    drop(guard);
+
+    let (token, identity_key) = {
+        let s = session_arc.read().await;
+        match &s.identity_key {
+            Some(k) => ((*s.access_token).clone(), k.clone()),
+            None => return Ok(UserPreferencesResponse::default()),
+        }
+    };
+
+    let prefs = match client.get_preferences(&token).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("get_user_preferences: preferences fetch failed: {}", e);
+            return Ok(UserPreferencesResponse::default());
+        }
+    };
+
+    let (encrypted, nonce) = match (prefs.encrypted_preferences, prefs.preferences_nonce) {
+        (Some(e), Some(n)) if !e.is_empty() && !n.is_empty() => (e, n),
+        _ => return Ok(UserPreferencesResponse::default()),
+    };
+
+    match crypto::preferences::decrypt_preferences(&identity_key, &encrypted, &nonce) {
+        Ok(p) => Ok(UserPreferencesResponse {
+            theme: p.theme,
+            color_theme: p.color_theme,
+            accent_color: p.accent_color,
+            accent_color_hover: p.accent_color_hover,
+            custom_theme_seed: p.custom_theme_seed,
+            custom_theme_overrides: p.custom_theme_overrides,
+            font_choice: p.font_choice,
+            font_size_scale: p.font_size_scale,
+            reduce_motion: p.reduce_motion,
+            compact_mode: p.compact_mode,
+            high_contrast: p.high_contrast,
+            reduce_transparency: p.reduce_transparency,
+            link_underlines: p.link_underlines,
+            dyslexia_font: p.dyslexia_font,
+            text_spacing: p.text_spacing,
+            color_vision_mode: p.color_vision_mode,
+            toast_position: p.toast_position,
+        }),
+        Err(e) => {
+            tracing::warn!("get_user_preferences: preferences decrypt failed: {}", e);
+            Ok(UserPreferencesResponse::default())
+        }
+    }
 }
 
 #[tauri::command]
@@ -1586,6 +1665,7 @@ fn main() {
             sign_out,
             reset_bridge_data,
             refresh_plan_info,
+            get_user_preferences,
             get_setup_code,
             check_setup_status,
             list_send_identities,

@@ -88,6 +88,30 @@ export async function get_bridge_state(): Promise<BridgeState> {
   };
 }
 
+export interface UserPreferences {
+  theme: string | null;
+  color_theme: string | null;
+  accent_color: string | null;
+  accent_color_hover: string | null;
+  custom_theme_seed: string | null;
+  custom_theme_overrides: Record<string, string>;
+  font_choice: string | null;
+  font_size_scale: number | string | null;
+  reduce_motion: boolean | null;
+  compact_mode: boolean | null;
+  high_contrast: boolean | null;
+  reduce_transparency: boolean | null;
+  link_underlines: boolean | null;
+  dyslexia_font: boolean | null;
+  text_spacing: boolean | null;
+  color_vision_mode: string | null;
+  toast_position: string | null;
+}
+
+export async function get_user_preferences(): Promise<UserPreferences> {
+  return tauri_invoke<UserPreferences>("get_user_preferences");
+}
+
 export async function get_setup_code(): Promise<string> {
   return tauri_invoke<string>("get_setup_code");
 }

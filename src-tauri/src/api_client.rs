@@ -161,6 +161,12 @@ pub struct PlanInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PreferencesResponse {
+    pub encrypted_preferences: Option<String>,
+    pub preferences_nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct MailListResponse {
     pub items: Vec<MailItem>,
@@ -394,6 +400,20 @@ impl ApiClient {
     pub async fn get_plan_info(&self, access_token: &str) -> Result<PlanInfoResponse> {
         let resp = self.client
             .get(format!("{}/core/v1/billing/plan", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_preferences(&self, access_token: &str) -> Result<PreferencesResponse> {
+        let resp = self.client
+            .get(format!("{}/settings/v1/preferences", self.base_url))
             .bearer_auth(access_token)
             .send()
             .await?;

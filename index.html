@@ -7,6 +7,35 @@
     <style>
       html, body { background: #0a0a0a; }
     </style>
+    <script>
+      (function () {
+        try {
+          var pref = "system";
+          var raw = localStorage.getItem("aster_bridge_theme_cache");
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            if (parsed && (parsed.theme === "light" || parsed.theme === "dark" || parsed.theme === "system")) {
+              pref = parsed.theme;
+            }
+          }
+          var is_dark = pref === "system"
+            ? !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches)
+            : pref === "dark";
+          var root = document.documentElement;
+          if (is_dark) root.classList.add("dark");
+          else root.classList.remove("dark");
+          root.style.background = is_dark ? "#0a0a0a" : "#f5f5f5";
+          if (parsed) {
+            var scale = (typeof parsed.font_size_scale === "number" && parsed.font_size_scale > 0) ? parsed.font_size_scale : 15;
+            root.style.setProperty("--font-scale", String(Math.max(1, Math.round(scale)) / 15));
+            var toggles = [["reduce_motion", "reduce-motion"], ["compact_mode", "compact-mode"], ["high_contrast", "high-contrast"], ["reduce_transparency", "reduce-transparency"], ["link_underlines", "link-underlines"], ["dyslexia_font", "dyslexia-font"], ["text_spacing", "text-spacing"]];
+            for (var i = 0; i < toggles.length; i++) {
+              if (parsed[toggles[i][0]] === true) root.classList.add(toggles[i][1]);
+            }
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
