@@ -37,7 +37,7 @@ Aster Bridge decrypts your mail locally on your machine using keys derived from 
 | Aster Bridge - Aster Backend | TLS 1.2+ (HTTPS), bearer token auth with Ed25519 device keys |
 | Bridge - Mail Client (local) | Plaintext or self-signed TLS on loopback only |
 | Aster → Aster mail | X3DH + Double Ratchet with ML-KEM-768 (post-quantum) |
-| Aster → External mail | RSA-4096 OpenPGP |
+| Aster → External mail | Ed25519 OpenPGP |
 
 App passwords are stored in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service). Access tokens are zeroed from memory on drop.
 
