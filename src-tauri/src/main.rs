@@ -458,7 +458,7 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
         }
     });
 
-    let _ = db.outbox_reset_stale_sending();
+    let _ = db.outbox_reset_stale_sending(0);
 
     let outbox_session = session.clone();
     let outbox_client = client.clone();
@@ -2040,7 +2040,7 @@ fn main() {
                                 }
                             });
 
-                            let _ = db.outbox_reset_stale_sending();
+                            let _ = db.outbox_reset_stale_sending(0);
 
                             let outbox_session = session_arc.clone();
                             let outbox_client = client.clone();

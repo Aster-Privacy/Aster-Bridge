@@ -878,7 +878,7 @@ where
             }
             "FETCH" => {
                 require_selected!(conn, writer, tag);
-                handle_fetch(&mut writer, &db, &conn, &tag, &args, false).await?;
+                handle_fetch(&mut writer, &db, &client, &session, &conn, &tag, &args, false).await?;
             }
             "UID" => {
                 require_auth!(conn, writer, tag);
@@ -900,7 +900,7 @@ where
                             write_no(&mut writer, &tag, "No mailbox selected").await?;
                             continue;
                         }
-                        handle_fetch(&mut writer, &db, &conn, &tag, subargs, true).await?;
+                        handle_fetch(&mut writer, &db, &client, &session, &conn, &tag, subargs, true).await?;
                     }
                     "SEARCH" => {
                         if conn.state != ImapState::Selected {
@@ -1150,19 +1150,19 @@ where
                 require_auth!(conn, writer, tag);
                 writer.write_all(b"+ idling\r\n").await?;
 
-                let mut idle_uids: Vec<u32> = conn
+                let mut idle_msgs: Vec<(u32, i64)> = conn
                     .selected_folder
                     .as_deref()
                     .and_then(|f| db.list_cached_message_meta(f).ok())
-                    .map(|v| v.iter().map(|m| m.imap_uid).collect())
+                    .map(|v| v.iter().map(|m| (m.imap_uid, m.flags)).collect())
                     .unwrap_or_default();
                 if conn.state == ImapState::Selected
-                    && idle_uids.len() as u32 != conn.message_count
+                    && idle_msgs.len() as u32 != conn.message_count
                 {
                     writer
-                        .write_all(format!("* {} EXISTS\r\n", idle_uids.len()).as_bytes())
+                        .write_all(format!("* {} EXISTS\r\n", idle_msgs.len()).as_bytes())
                         .await?;
-                    conn.message_count = idle_uids.len() as u32;
+                    conn.message_count = idle_msgs.len() as u32;
                 }
 
                 let mut rx = broadcaster.subscribe();
@@ -1214,14 +1214,16 @@ where
                                         Some(f) => f.to_string(),
                                         None => continue,
                                     };
-                                    let current: Vec<u32> = db
+                                    let current: Vec<(u32, i64)> = db
                                         .list_cached_message_meta(&folder)
-                                        .map(|v| v.iter().map(|m| m.imap_uid).collect())
-                                        .unwrap_or_else(|_| idle_uids.clone());
+                                        .map(|v| v.iter().map(|m| (m.imap_uid, m.flags)).collect())
+                                        .unwrap_or_else(|_| idle_msgs.clone());
                                     let current_set: std::collections::HashSet<u32> =
-                                        current.iter().copied().collect();
+                                        current.iter().map(|(u, _)| *u).collect();
+                                    let old_flags: std::collections::HashMap<u32, i64> =
+                                        idle_msgs.iter().copied().collect();
                                     let mut adjustment: usize = 0;
-                                    for (i, uid) in idle_uids.iter().enumerate() {
+                                    for (i, (uid, _)) in idle_msgs.iter().enumerate() {
                                         if !current_set.contains(uid) {
                                             let seq = i + 1 - adjustment;
                                             writer
@@ -1236,20 +1238,37 @@ where
                                             .write_all(format!("* {} EXISTS\r\n", current.len()).as_bytes())
                                             .await?;
                                     }
+                                    for (i, (uid, flags)) in current.iter().enumerate() {
+                                        if let Some(old) = old_flags.get(uid) {
+                                            if old != flags {
+                                                writer
+                                                    .write_all(
+                                                        format!(
+                                                            "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                                            i + 1,
+                                                            uid,
+                                                            flags_to_str(*flags as u32)
+                                                        )
+                                                        .as_bytes(),
+                                                    )
+                                                    .await?;
+                                            }
+                                        }
+                                    }
                                     conn.message_count = current.len() as u32;
-                                    idle_uids = current;
+                                    idle_msgs = current;
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => {
                                     if let Some(folder) = conn.selected_folder.as_deref() {
-                                        let current: Vec<u32> = db
+                                        let current: Vec<(u32, i64)> = db
                                             .list_cached_message_meta(folder)
-                                            .map(|v| v.iter().map(|m| m.imap_uid).collect())
-                                            .unwrap_or_else(|_| idle_uids.clone());
+                                            .map(|v| v.iter().map(|m| (m.imap_uid, m.flags)).collect())
+                                            .unwrap_or_else(|_| idle_msgs.clone());
                                         writer
                                             .write_all(format!("* {} EXISTS\r\n", current.len()).as_bytes())
                                             .await?;
                                         conn.message_count = current.len() as u32;
-                                        idle_uids = current;
+                                        idle_msgs = current;
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
@@ -1960,9 +1979,16 @@ fn imap_address_list(addr_str: Option<&str>) -> String {
     }
 }
 
+pub fn date_header_rfc2822(s: &str) -> String {
+    match parse_datetime_lenient(s) {
+        Some(d) => d.format("%a, %d %b %Y %H:%M:%S %z").to_string(),
+        None => s.to_string(),
+    }
+}
+
 pub fn build_rfc822(msg: &CachedMessage) -> String {
     let mut out = String::new();
-    let date = sanitize_header(msg.date.as_deref().unwrap_or(""));
+    let date = sanitize_header(&date_header_rfc2822(msg.date.as_deref().unwrap_or("")));
     let from = sanitize_header(msg.sender.as_deref().unwrap_or("unknown@astermail.org"));
     let to = sanitize_header(msg.recipients.as_deref().unwrap_or(""));
     let subject = sanitize_header(msg.subject.as_deref().unwrap_or(""));
@@ -2156,12 +2182,15 @@ fn parse_set(spec: &str, max: u32) -> Vec<u32> {
 async fn handle_fetch(
     writer: &mut (impl AsyncWrite + Unpin),
     db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
     conn: &ImapConnection,
     tag: &str,
     args: &str,
     uid_command: bool,
 ) -> std::io::Result<()> {
     let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
+    let mut fetch_seen_pushes: Vec<String> = Vec::new();
 
     let (range_spec, fetch_parts) = args
         .split_once(' ')
@@ -2253,7 +2282,7 @@ async fn handle_fetch(
         }
 
         if wants_envelope {
-            let date = msg.date.clone().unwrap_or_default();
+            let date = date_header_rfc2822(&msg.date.clone().unwrap_or_default());
             let subject = msg.subject.clone().unwrap_or_default();
             let from_list = imap_address_list(msg.sender.as_deref());
             let to_list = imap_address_list(msg.recipients.as_deref());
@@ -2330,6 +2359,7 @@ async fn handle_fetch(
                 if current_flags & 1 == 0 {
                     let new_flags = current_flags | 1;
                     let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
+                    fetch_seen_pushes.push(msg.aster_id.clone());
                     out.extend_from_slice(
                         format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
                     );
@@ -2366,6 +2396,7 @@ async fn handle_fetch(
                 if current_flags & 1 == 0 {
                     let new_flags = current_flags | 1;
                     let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
+                    fetch_seen_pushes.push(msg.aster_id.clone());
                     out.extend_from_slice(
                         format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
                     );
@@ -2393,6 +2424,7 @@ async fn handle_fetch(
                 if current_flags & 1 == 0 {
                     let new_flags = current_flags | 1;
                     let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
+                    fetch_seen_pushes.push(msg.aster_id.clone());
                     out.extend_from_slice(
                         format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
                     );
@@ -2410,6 +2442,18 @@ async fn handle_fetch(
 
     if !out.is_empty() {
         writer.write_all(&out).await?;
+    }
+    if !fetch_seen_pushes.is_empty() {
+        let client = client.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            let token = session.read().await.access_token.to_string();
+            for aster_id in fetch_seen_pushes {
+                if let Err(e) = client.set_read_status(&token, &aster_id, true).await {
+                    tracing::warn!("read-status sync failed for {}: {}", aster_id, e);
+                }
+            }
+        });
     }
     write_ok(writer, tag, "FETCH completed").await
 }
@@ -3074,6 +3118,118 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pushed, "UID STORE \\Seen must reach the backend");
+    }
+
+    #[test]
+    fn date_header_rfc2822_from_rfc3339() {
+        let d = date_header_rfc2822("2026-05-21T10:30:00+00:00");
+        assert!(d.contains("21 May 2026"), "got {}", d);
+        assert!(d.contains("10:30:00"), "got {}", d);
+        assert!(!d.contains("T10:30"), "must not be rfc3339: {}", d);
+        assert_eq!(date_header_rfc2822("garbage"), "garbage");
+    }
+
+    #[test]
+    fn build_rfc822_emits_rfc2822_date_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_cached_message(
+            "d-1",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("2026-05-21T10:30:00+00:00"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "d-1");
+        let m = db.get_cached_message("d-1").unwrap().unwrap();
+        let rfc = build_rfc822(&m);
+        let date_line = rfc.lines().find(|l| l.starts_with("Date:")).unwrap();
+        assert!(date_line.contains("21 May 2026"), "got {}", date_line);
+        assert!(!date_line.contains("2026-05-21T"), "rfc3339 leaked: {}", date_line);
+    }
+
+    #[tokio::test]
+    async fn nonpeek_body_fetch_pushes_read_status() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "fs-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (BODY[])").await;
+        assert!(resp.contains("f1 OK"));
+        assert!(resp.contains("\\Seen"), "untagged FLAGS expected: {}", resp);
+
+        let mut pushed = false;
+        for _ in 0..40 {
+            if calls
+                .lock()
+                .await
+                .iter()
+                .any(|(m, id)| m == "PATCH" && id == "fs-1")
+            {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(pushed, "non-peek fetch must push read status to backend");
+    }
+
+    #[tokio::test]
+    async fn peek_fetch_does_not_push_read_status() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "fs-2", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (BODY.PEEK[])").await;
+        assert!(resp.contains("f1 OK"));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            calls.lock().await.is_empty(),
+            "peek fetch must not mark read"
+        );
+        let m = db.get_cached_message("fs-2").unwrap().unwrap();
+        assert_eq!(m.flags & 1, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_flag_changes() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        seed(&db, "fl-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        db.set_message_flags_by_id("fl-1", 1).unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "5".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let read_fut = async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        };
+        let line = tokio::time::timeout(Duration::from_secs(2), read_fut)
+            .await
+            .expect("flag change not delivered");
+        assert!(
+            line.contains("FETCH") && line.contains("\\Seen"),
+            "expected untagged FETCH FLAGS, got: {}",
+            line
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let _ = read_until_tag(&mut reader, "i1").await;
     }
 
     #[tokio::test]

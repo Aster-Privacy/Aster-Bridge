@@ -816,6 +816,29 @@ impl Database {
         })
     }
 
+    pub fn list_non_rfc3339_dates(&self) -> Result<Vec<(String, String)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, date FROM message_cache
+                 WHERE date IS NOT NULL AND date NOT LIKE '____-__-__T%'",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn set_message_date(&self, aster_id: &str, date: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET date = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, date],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn list_all_cached_id_folders(&self) -> Result<Vec<(String, String)>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT aster_id, folder FROM message_cache")?;
@@ -1280,15 +1303,6 @@ pub struct OutboxStats {
 }
 
 impl Database {
-    pub fn outbox_reset_stale_sending(&self) -> Result<usize, String> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE outbox SET status = 'pending' WHERE status = 'sending'",
-                [],
-            )
-        })
-    }
-
     pub fn outbox_insert(
         &self,
         raw_mime: &[u8],
@@ -1363,10 +1377,31 @@ impl Database {
     }
 
     pub fn outbox_mark_sending(&self, id: i64) -> Result<usize, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.with_conn(|conn| {
             let n = conn.execute(
-                "UPDATE outbox SET status = 'sending' WHERE id = ?1 AND status IN ('pending', 'failed')",
-                [id],
+                "UPDATE outbox SET status = 'sending', last_attempt_at = ?2 WHERE id = ?1 AND status IN ('pending', 'failed')",
+                rusqlite::params![id, now],
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn outbox_reset_stale_sending(&self, older_than_secs: i64) -> Result<usize, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now - older_than_secs;
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE outbox SET status = 'pending' WHERE status = 'sending' AND COALESCE(last_attempt_at, queued_at) <= ?1",
+                [cutoff],
             )?;
             Ok(n)
         })
@@ -2250,11 +2285,11 @@ mod db_tests {
     }
 
     #[test]
-    fn outbox_reset_stale_sending() {
+    fn outbox_reset_stale_sending_reclaims_row() {
         let (_d, db) = open_db();
         let id = db.outbox_insert(b"a", "f", "t").unwrap();
         db.outbox_mark_sending(id).unwrap();
-        let n = db.outbox_reset_stale_sending().unwrap();
+        let n = db.outbox_reset_stale_sending(0).unwrap();
         assert_eq!(n, 1);
         assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "pending");
     }

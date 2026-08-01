@@ -851,7 +851,7 @@ async fn serve_real() {
         println!("  {} = {} messages", label, n);
     }
 
-    let _ = db.outbox_reset_stale_sending();
+    let _ = db.outbox_reset_stale_sending(0);
     {
         let (s, c, d) = (session.clone(), client.clone(), db.clone());
         let (_obx_tx, obx_rx) = crate::outbox::outbox_trigger_channel();

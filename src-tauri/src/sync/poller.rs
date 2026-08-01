@@ -634,6 +634,23 @@ async fn run_sync_pass(
 
 const PLAN_CHECK_INTERVAL: u32 = 20;
 
+fn migrate_legacy_dates(db: &Arc<Database>) {
+    let rows = match db.list_non_rfc3339_dates() {
+        Ok(r) if !r.is_empty() => r,
+        _ => return,
+    };
+    let mut fixed = 0usize;
+    for (id, date) in rows {
+        let normalized = normalize_date_rfc3339(&date);
+        if normalized != date && db.set_message_date(&id, &normalized).is_ok() {
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        tracing::info!("sync: normalized {} legacy cached date(s)", fixed);
+    }
+}
+
 pub async fn run_poll_loop(
     session: Arc<RwLock<Session>>,
     client: Arc<ApiClient>,
@@ -642,6 +659,7 @@ pub async fn run_poll_loop(
     mut trigger_rx: SyncTriggerRx,
     poll_interval_secs: Option<u64>,
 ) {
+    migrate_legacy_dates(&db);
     let interval_secs = poll_interval_secs.filter(|&v| v >= 5).unwrap_or(POLL_INTERVAL_SECS);
     let interval_dur = std::time::Duration::from_secs(interval_secs);
     let mut interval = tokio::time::interval(interval_dur);
@@ -1017,6 +1035,47 @@ mod tests {
             "stored date not rfc3339: {}",
             stored
         );
+    }
+
+    #[test]
+    fn migrate_legacy_dates_normalizes_rfc2822_rows() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        db.upsert_cached_message(
+            "legacy-1",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("Thu, 21 May 2026 10:00:00 +0000"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        db.upsert_cached_message(
+            "modern-1",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("2026-05-22T09:00:00+00:00"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+
+        migrate_legacy_dates(&db);
+
+        let legacy = db.get_cached_message("legacy-1").unwrap().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(legacy.date.as_deref().unwrap()).is_ok(),
+            "legacy date not migrated: {:?}",
+            legacy.date
+        );
+        let modern = db.get_cached_message("modern-1").unwrap().unwrap();
+        assert_eq!(modern.date.as_deref(), Some("2026-05-22T09:00:00+00:00"));
     }
 
     #[test]

@@ -2,6 +2,19 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.15 - 2026-08-01
+
+### Fixed
+- Message dates now render correctly in connected mail clients (a 0.4.14 regression could show malformed Date headers).
+- Opening a message in a mail client now marks it read in your Aster account, not just locally.
+- Queued sends interrupted by a crash or shutdown are picked up again on restart instead of being silently dropped.
+- Send retries no longer deliver duplicates when the first attempt actually went through.
+- Existing caches migrate their stored message dates so search and sorting work on mail synced by older versions.
+- Read and flag changes made elsewhere now appear immediately in clients that keep an open connection.
+
+### Security
+- Updated bundled dependencies (quinn-proto).
+
 ## 0.4.14 - 2026-08-01
 
 ### Fixed

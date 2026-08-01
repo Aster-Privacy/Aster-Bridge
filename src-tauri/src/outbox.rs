@@ -30,6 +30,7 @@ use crate::smtp::server::{build_send_payload, is_transient_send_error};
 
 const TICK_SECS: u64 = 30;
 const MAX_ATTEMPTS: i64 = 7;
+const STALE_SENDING_SECS: i64 = 600;
 
 const BACKOFF_SECS: [i64; 7] = [30, 60, 120, 300, 900, 1800, 3600];
 
@@ -82,6 +83,49 @@ pub async fn try_send_row(
     client.send_mail(&access_token, &payload).await
 }
 
+pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
+    use mail_parser::MessageParser;
+    let Some(parsed) = MessageParser::default().parse(&row.raw_mime) else {
+        return false;
+    };
+    let Some(subject) = parsed.subject().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let envelope_addrs: Vec<String> = row
+        .envelope_to
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Ok(sent) = db.list_cached_message_meta("sent") else {
+        return false;
+    };
+    sent.iter().any(|m| {
+        let subject_matches = m.subject.as_deref().map(|s| s.trim()) == Some(subject.as_str());
+        if !subject_matches {
+            return false;
+        }
+        let recent_enough = m
+            .date
+            .as_deref()
+            .and_then(crate::imap::server::parse_datetime_lenient)
+            .map(|d| d.timestamp() >= row.queued_at - 60)
+            .unwrap_or(false);
+        if !recent_enough {
+            return false;
+        }
+        match m.recipients.as_deref() {
+            Some(r) => {
+                let r_lower = r.to_lowercase();
+                envelope_addrs.is_empty()
+                    || envelope_addrs.iter().any(|a| r_lower.contains(a.as_str()))
+            }
+            None => true,
+        }
+    })
+}
+
 async fn process_one(
     row: &OutboxRow,
     session: &Arc<RwLock<Session>>,
@@ -98,6 +142,16 @@ async fn process_one(
             tracing::warn!("outbox mark_sending failed for {}: {}", row.id, e);
             return;
         }
+    }
+    if row.attempts > 0 && sent_copy_exists(db, row) {
+        tracing::info!(
+            "outbox id={} already delivered (sent copy found), skipping resend",
+            row.id
+        );
+        if let Err(e) = db.outbox_mark_sent(row.id) {
+            tracing::warn!("outbox mark_sent failed for {}: {}", row.id, e);
+        }
+        return;
     }
     match try_send_row(row, session, client).await {
         Ok(()) => {
@@ -131,10 +185,20 @@ pub async fn run_outbox_loop(
     db: Arc<Database>,
     mut trigger_rx: tokio::sync::mpsc::Receiver<i64>,
 ) {
+    match db.outbox_reset_stale_sending(0) {
+        Ok(n) if n > 0 => tracing::info!("outbox: reclaimed {} interrupted send(s) from previous run", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("outbox: stale reclaim failed: {}", e),
+    }
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(TICK_SECS));
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                if let Ok(n) = db.outbox_reset_stale_sending(STALE_SENDING_SECS) {
+                    if n > 0 {
+                        tracing::warn!("outbox: reset {} stuck sending row(s)", n);
+                    }
+                }
                 let rows = match db.outbox_list_pending() {
                     Ok(r) => r,
                     Err(e) => { tracing::warn!("outbox list failed: {}", e); continue; }
@@ -333,6 +397,84 @@ mod tests {
     fn get_missing_id_returns_none() {
         let (_dir, db) = test_db();
         assert!(db.outbox_get(99999).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_sending_rows_are_reclaimable() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 1);
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 0, "sending row unclaimable");
+
+        assert_eq!(db.outbox_reset_stale_sending(600).unwrap(), 0, "fresh row must not reset");
+        assert_eq!(db.outbox_reset_stale_sending(0).unwrap(), 1, "age 0 reclaims");
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 1, "claimable after reclaim");
+    }
+
+    fn seed_sent(db: &Database, id: &str, subject: &str, recipients: &str, date: &str) {
+        db.upsert_cached_message(
+            id,
+            "sent",
+            Some(subject),
+            Some("me@aster.test"),
+            Some(recipients),
+            Some(date),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("sent", id);
+    }
+
+    fn outbox_row_for(subject: &str, to: &str, queued_at: i64) -> OutboxRow {
+        let mime = format!("From: me@aster.test\r\nTo: {}\r\nSubject: {}\r\n\r\nbody", to, subject);
+        OutboxRow {
+            id: 1,
+            raw_mime: mime.into_bytes(),
+            envelope_from: "me@aster.test".to_string(),
+            envelope_to: to.to_string(),
+            queued_at,
+            attempts: 1,
+            last_attempt_at: None,
+            last_error: None,
+            status: "pending".to_string(),
+        }
+    }
+
+    #[test]
+    fn sent_copy_exists_matches_subject_recipient_and_time() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        seed_sent(&db, "sc-1", "quarterly numbers", "bob@example.com", "2026-08-01T10:00:30+00:00");
+        let row = outbox_row_for("quarterly numbers", "bob@example.com", queued);
+        assert!(sent_copy_exists(&db, &row));
+    }
+
+    #[test]
+    fn sent_copy_exists_rejects_older_copy_and_wrong_subject() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        seed_sent(&db, "sc-2", "quarterly numbers", "bob@example.com", "2026-07-01T10:00:00+00:00");
+        let row = outbox_row_for("quarterly numbers", "bob@example.com", queued);
+        assert!(!sent_copy_exists(&db, &row), "old copy must not dedupe");
+        let row2 = outbox_row_for("different subject", "bob@example.com", queued);
+        assert!(!sent_copy_exists(&db, &row2));
+    }
+
+    #[test]
+    fn sent_copy_exists_rejects_wrong_recipient() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        seed_sent(&db, "sc-3", "hello", "carol@example.com", "2026-08-01T10:00:30+00:00");
+        let row = outbox_row_for("hello", "bob@example.com", queued);
+        assert!(!sent_copy_exists(&db, &row));
     }
 
     #[tokio::test]
