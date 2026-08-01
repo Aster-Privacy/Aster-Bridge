@@ -561,6 +561,214 @@ pub async fn changes(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, Metho
     }))
 }
 
+fn keyword_bit(kw: &str) -> u32 {
+    match kw {
+        "$seen" => 1,
+        "$answered" => 2,
+        "$flagged" => 4,
+        "$deleted" => 8,
+        "$draft" => 16,
+        "$forwarded" => 32,
+        _ => 0,
+    }
+}
+
+fn move_flags_for_label(label: &str) -> Option<Value> {
+    match label {
+        "archive" => Some(json!({"is_archived": true, "is_trashed": false, "is_spam": false})),
+        "trash" => Some(json!({"is_trashed": true, "is_archived": false})),
+        "spam" => Some(json!({"is_spam": true, "is_archived": false, "is_trashed": false})),
+        "inbox" => Some(json!({"is_archived": false, "is_trashed": false, "is_spam": false})),
+        _ => None,
+    }
+}
+
+enum PatchOutcome {
+    Applied,
+    Rejected(Value),
+}
+
+async fn apply_update_patch(
+    ctx: &Arc<JmapContext>,
+    access_token: &str,
+    id_to_label: &HashMap<String, String>,
+    id: &str,
+    patch: &Value,
+    mailbox_counts_touched: &mut bool,
+) -> PatchOutcome {
+    let Some(patch_obj) = patch.as_object() else {
+        return PatchOutcome::Rejected(
+            json!({"type": "invalidPatch", "description": "patch must be an object"}),
+        );
+    };
+
+    for k in patch_obj.keys() {
+        let supported = k == "keywords"
+            || k.starts_with("/keywords/")
+            || k == "mailboxIds"
+            || k.starts_with("/mailboxIds/");
+        if !supported {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": [k],
+                "description": "only keywords and mailboxIds updates are supported"
+            }));
+        }
+    }
+
+    let existing = match ctx.db.get_cached_message(id) {
+        Ok(Some(m)) => m,
+        _ => {
+            return PatchOutcome::Rejected(json!({"type": "notFound"}));
+        }
+    };
+
+    let mut move_target: Option<String> = None;
+    if let Some(mb_obj) = patch_obj.get("mailboxIds").and_then(|v| v.as_object()) {
+        let targets: Vec<&String> = mb_obj
+            .iter()
+            .filter(|(_, v)| v.as_bool().unwrap_or(false))
+            .map(|(k, _)| k)
+            .collect();
+        if targets.len() != 1 {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+        match id_to_label.get(targets[0]) {
+            Some(l) => move_target = Some(l.clone()),
+            None => {
+                return PatchOutcome::Rejected(json!({
+                    "type": "invalidProperties",
+                    "properties": ["mailboxIds"],
+                    "description": "unknown mailbox id"
+                }));
+            }
+        }
+    } else {
+        let adds: Vec<String> = patch_obj
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("/mailboxIds/")
+                    .filter(|_| v.as_bool().unwrap_or(false))
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        if adds.len() > 1 {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+        if let Some(mbid) = adds.first() {
+            match id_to_label.get(mbid) {
+                Some(l) => move_target = Some(l.clone()),
+                None => {
+                    return PatchOutcome::Rejected(json!({
+                        "type": "invalidProperties",
+                        "properties": ["mailboxIds"],
+                        "description": "unknown mailbox id"
+                    }));
+                }
+            }
+        } else if patch_obj.keys().any(|k| k.starts_with("/mailboxIds/")) {
+            return PatchOutcome::Rejected(json!({
+                "type": "invalidProperties",
+                "properties": ["mailboxIds"],
+                "description": "message must belong to exactly one mailbox"
+            }));
+        }
+    }
+
+    if let Some(target) = &move_target {
+        if target != &existing.folder {
+            let Some(backend_flags) = move_flags_for_label(target) else {
+                return PatchOutcome::Rejected(json!({
+                    "type": "invalidProperties",
+                    "properties": ["mailboxIds"],
+                    "description": "cannot move messages into that mailbox"
+                }));
+            };
+            if let Err(e) = ctx
+                .client
+                .set_mailbox_flags(access_token, id, backend_flags)
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+            let _ = ctx.db.set_folder_if_changed(id, target);
+            let _ = ctx.db.assign_uid_if_missing(target, id);
+            *mailbox_counts_touched = true;
+        }
+    }
+
+    let old_flags = ctx.db.get_message_flags_by_id(id).unwrap_or(existing.flags) as u32;
+    let mut new_flags = old_flags;
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        new_flags = 0;
+        for (k, v) in kw_obj {
+            if v.as_bool().unwrap_or(false) {
+                new_flags |= keyword_bit(k);
+            }
+        }
+    } else {
+        for (k, v) in patch_obj {
+            if let Some(kw) = k.strip_prefix("/keywords/") {
+                let bit = keyword_bit(kw);
+                if bit != 0 {
+                    if v.as_bool().unwrap_or(false) {
+                        new_flags |= bit;
+                    } else {
+                        new_flags &= !bit;
+                    }
+                }
+            }
+        }
+    }
+
+    if new_flags != old_flags {
+        let seen_changed = (old_flags & 1) != (new_flags & 1);
+        let star_changed = (old_flags & 4) != (new_flags & 4);
+        if seen_changed {
+            if let Err(e) = ctx
+                .client
+                .set_read_status(access_token, id, (new_flags & 1) != 0)
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+            *mailbox_counts_touched = true;
+        }
+        if star_changed {
+            if let Err(e) = ctx
+                .client
+                .set_mailbox_flags(
+                    access_token,
+                    id,
+                    json!({"is_starred": (new_flags & 4) != 0}),
+                )
+                .await
+            {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
+        }
+        if let Err(e) = ctx.db.set_message_flags_by_id(id, new_flags as i64) {
+            return PatchOutcome::Rejected(json!({"type": "serverFail", "description": e}));
+        }
+    }
+
+    PatchOutcome::Applied
+}
+
 pub async fn set(
     ctx: &Arc<JmapContext>,
     args: Value,
@@ -569,6 +777,7 @@ pub async fn set(
     let account_id = ctx.require_account(&args).await?;
     let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
 
+    let creates = args.get("create").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let updates = args.get("update").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let destroys: Vec<String> = args
         .get("destroy")
@@ -576,81 +785,95 @@ pub async fn set(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
+    if updates.len() + destroys.len() + creates.len() > 500 {
+        return Err(MethodError::new(
+            "requestTooLarge",
+            "exceeds maxObjectsInSet (500)",
+        ));
+    }
+
+    let access_token = ctx.session.read().await.access_token.clone();
+    let id_to_label = store::mailbox_id_to_label_map(&ctx.db);
+
+    let mut not_created = serde_json::Map::new();
+    for (creation_id, _) in &creates {
+        not_created.insert(
+            creation_id.clone(),
+            json!({
+                "type": "forbidden",
+                "description": "creating messages through the bridge is not supported; use the Aster app"
+            }),
+        );
+    }
+
     let mut updated = serde_json::Map::new();
     let mut not_updated = serde_json::Map::new();
     let mut destroyed: Vec<String> = Vec::new();
     let mut not_destroyed = serde_json::Map::new();
+    let mut mailbox_counts_touched = false;
 
     for (id, patch) in &updates {
-        let kw_obj_opt = patch.get("keywords")
-            .or_else(|| patch.pointer("/keywords"))
-            .and_then(|v| v.as_object());
-
-        let has_per_kw_patch = patch.as_object()
-            .map(|o| o.keys().any(|k| k.starts_with("/keywords/")))
-            .unwrap_or(false);
-
-        if let Some(kw_obj) = kw_obj_opt {
-            let mut flags: u32 = 0;
-            for (k, v) in kw_obj {
-                if v.as_bool().unwrap_or(false) {
-                    match k.as_str() {
-                        "$seen"      => flags |= 1,
-                        "$answered"  => flags |= 2,
-                        "$flagged"   => flags |= 4,
-                        "$deleted"   => flags |= 8,
-                        "$draft"     => flags |= 16,
-                        "$forwarded" => flags |= 32,
-                        _ => {}
-                    }
-                }
+        match apply_update_patch(
+            ctx,
+            &access_token,
+            &id_to_label,
+            id,
+            patch,
+            &mut mailbox_counts_touched,
+        )
+        .await
+        {
+            PatchOutcome::Applied => {
+                updated.insert(id.clone(), Value::Null);
             }
-            match ctx.db.set_message_flags_by_id(id, flags as i64) {
-                Ok(_) => { updated.insert(id.clone(), Value::Null); }
-                Err(e) => { not_updated.insert(id.clone(), json!({"type": "serverFail", "description": e})); }
+            PatchOutcome::Rejected(err) => {
+                not_updated.insert(id.clone(), err);
             }
-        } else if has_per_kw_patch {
-            let current = ctx.db.get_message_flags_by_id(id).unwrap_or(0) as u32;
-            let mut flags = current;
-            if let Some(obj) = patch.as_object() {
-                for (k, v) in obj {
-                    if let Some(kw) = k.strip_prefix("/keywords/") {
-                        let bit = match kw {
-                            "$seen"      => 1u32,
-                            "$answered"  => 2,
-                            "$flagged"   => 4,
-                            "$deleted"   => 8,
-                            "$draft"     => 16,
-                            "$forwarded" => 32,
-                            _ => 0,
-                        };
-                        if bit != 0 {
-                            if v.as_bool().unwrap_or(false) { flags |= bit; } else { flags &= !bit; }
-                        }
-                    }
-                }
-            }
-            match ctx.db.set_message_flags_by_id(id, flags as i64) {
-                Ok(_) => { updated.insert(id.clone(), Value::Null); }
-                Err(e) => { not_updated.insert(id.clone(), json!({"type": "serverFail", "description": e})); }
-            }
-        } else {
-            not_updated.insert(id.clone(), json!({"type": "invalidProperties", "description": "only keywords updates are supported"}));
         }
     }
 
     for id in &destroys {
-        match ctx.db.delete_message_by_aster_id(id) {
-            Ok(_) => { destroyed.push(id.clone()); }
-            Err(e) => { not_destroyed.insert(id.clone(), json!({"type": "serverFail", "description": e})); }
+        if ctx.db.get_cached_message(id).ok().flatten().is_none() {
+            not_destroyed.insert(id.clone(), json!({"type": "notFound"}));
+            continue;
+        }
+        match ctx.client.delete_mail_item_permanent(&access_token, id).await {
+            Ok(_) => {
+                let _ = ctx.db.delete_message_by_aster_id(id);
+                destroyed.push(id.clone());
+                mailbox_counts_touched = true;
+            }
+            Err(e) => {
+                not_destroyed.insert(
+                    id.clone(),
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
         }
     }
 
-    if !updated.is_empty() || !destroyed.is_empty() {
-        let _ = ctx.db.jmap_state_bump("Email");
+    if !updated.is_empty() {
+        let refs: Vec<&str> = updated.keys().map(|s| s.as_str()).collect();
+        let _ = ctx.db.jmap_record_updated_batch("Email", &refs);
+    }
+    if !destroyed.is_empty() {
+        let refs: Vec<&str> = destroyed.iter().map(|s| s.as_str()).collect();
+        let _ = ctx.db.jmap_record_destroyed_batch("Email", &refs);
     }
 
     let new_state = ctx.db.jmap_state_get("Email").unwrap_or(old_state);
+    if !updated.is_empty() || !destroyed.is_empty() {
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), new_state.to_string());
+        if mailbox_counts_touched {
+            let mailbox_state = ctx.db.jmap_state_bump("Mailbox").unwrap_or(0);
+            changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+        }
+        let _ = ctx
+            .broadcaster
+            .send(crate::jmap::state::StateChange { changed });
+    }
+
     Ok(json!({
         "accountId": account_id,
         "oldState": old_state.to_string(),
@@ -658,7 +881,7 @@ pub async fn set(
         "created": null,
         "updated": updated,
         "destroyed": destroyed,
-        "notCreated": null,
+        "notCreated": if not_created.is_empty() { Value::Null } else { Value::Object(not_created) },
         "notUpdated": not_updated,
         "notDestroyed": not_destroyed,
     }))
@@ -1013,9 +1236,81 @@ mod tests {
         assert!(res["updated"].as_array().unwrap().is_empty());
     }
 
+    type CapturedCalls = Arc<tokio::sync::Mutex<Vec<(String, String, Value)>>>;
+
+    async fn spawn_mock_backend(fail: bool) -> (String, CapturedCalls) {
+        use axum::extract::Path as AxumPath;
+        use axum::{routing::delete, routing::patch, Json, Router};
+        let calls: CapturedCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages/:id/metadata",
+                patch(move |AxumPath(id): AxumPath<String>, Json(body): Json<Value>| {
+                    let calls = c1.clone();
+                    async move {
+                        calls.lock().await.push(("PATCH".to_string(), id, body));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/messages/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c2.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("DELETE".to_string(), id, Value::Null));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    use axum::response::IntoResponse;
+
+    async fn test_ctx_with_backend(
+        fail: bool,
+    ) -> (Arc<JmapContext>, CapturedCalls, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        db.seed_jmap_mailboxes().unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }));
+        let (base, calls) = spawn_mock_backend(fail).await;
+        let client = Arc::new(crate::api_client::ApiClient::new_with_base_url(&base));
+        let (tx, _rx) = broadcast::channel(8);
+        (JmapContext::new(session, db, client, tx), calls, dir)
+    }
+
     #[tokio::test]
     async fn set_updates_keywords_via_full_object() {
-        let (ctx, _d) = test_ctx();
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
         let mut m = cached("s1", "inbox");
         m.flags = 0;
         insert_msg(&ctx, &m);
@@ -1024,17 +1319,37 @@ mod tests {
         assert!(res["updated"].as_object().unwrap().contains_key("s1"));
         let flags = ctx.db.get_message_flags_by_id("s1").unwrap();
         assert_eq!(flags, 1 | 4);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id, body)| m == "PATCH" && id == "s1" && body["is_read"] == json!(true)),
+            "read state must be pushed to backend: {:?}",
+            captured
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id, body)| m == "PATCH" && id == "s1" && body["is_starred"] == json!(true)),
+            "star state must be pushed to backend: {:?}",
+            captured
+        );
     }
 
     #[tokio::test]
     async fn set_patch_per_keyword_toggle() {
-        let (ctx, _d) = test_ctx();
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
         let mut m = cached("s2", "inbox");
         m.flags = 1;
         insert_msg(&ctx, &m);
         let args = json!({"update": {"s2": {"/keywords/$seen": false}}});
         ok(set(&ctx, args, &mut HashMap::new()).await);
         assert_eq!(ctx.db.get_message_flags_by_id("s2").unwrap(), 0);
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, body)| m == "PATCH" && id == "s2" && body["is_read"] == json!(false)));
     }
 
     #[tokio::test]
@@ -1047,12 +1362,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_destroys_message() {
-        let (ctx, _d) = test_ctx();
+    async fn set_destroys_message_on_backend_and_locally() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
         insert_msg(&ctx, &cached("s4", "inbox"));
         let args = json!({"destroy": ["s4"]});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert_eq!(res["destroyed"], json!(["s4"]));
         assert!(ctx.db.get_cached_message("s4").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, _)| m == "DELETE" && id == "s4"));
+    }
+
+    #[tokio::test]
+    async fn set_destroy_backend_failure_keeps_local_copy() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(true).await;
+        insert_msg(&ctx, &cached("s5", "inbox"));
+        let args = json!({"destroy": ["s5"]});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["destroyed"].as_array().unwrap().is_empty());
+        assert_eq!(res["notDestroyed"]["s5"]["type"], json!("serverFail"));
+        assert!(ctx.db.get_cached_message("s5").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_destroy_missing_message_not_found() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let args = json!({"destroy": ["ghost"]});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notDestroyed"]["ghost"]["type"], json!("notFound"));
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_moves_message_via_full_mailbox_ids() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv1", "inbox"));
+        let args = json!({"update": {"mv1": {"mailboxIds": {"mbx_archive": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("mv1"));
+        assert_eq!(
+            ctx.db.get_cached_message("mv1").unwrap().unwrap().folder,
+            "archive"
+        );
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id, body)| m == "PATCH"
+            && id == "mv1"
+            && body["is_archived"] == json!(true)));
+    }
+
+    #[tokio::test]
+    async fn set_moves_message_via_per_key_patch() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv2", "inbox"));
+        let args = json!({"update": {"mv2": {
+            "/mailboxIds/mbx_trash": true,
+            "/mailboxIds/mbx_inbox": Value::Null
+        }}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(
+            res["updated"].as_object().unwrap().contains_key("mv2"),
+            "move rejected: {}",
+            res["notUpdated"]
+        );
+        assert_eq!(
+            ctx.db.get_cached_message("mv2").unwrap().unwrap().folder,
+            "trash"
+        );
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id, body)| m == "PATCH"
+            && id == "mv2"
+            && body["is_trashed"] == json!(true)));
+    }
+
+    #[tokio::test]
+    async fn set_move_to_drafts_rejected() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv3", "inbox"));
+        let args = json!({"update": {"mv3": {"mailboxIds": {"mbx_drafts": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv3"]["type"], json!("invalidProperties"));
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(
+            ctx.db.get_cached_message("mv3").unwrap().unwrap().folder,
+            "inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_move_to_unknown_mailbox_rejected() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        insert_msg(&ctx, &cached("mv4", "inbox"));
+        let args = json!({"update": {"mv4": {"mailboxIds": {"mbx_ghost": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv4"]["type"], json!("invalidProperties"));
+    }
+
+    #[tokio::test]
+    async fn set_move_backend_failure_keeps_folder() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(true).await;
+        insert_msg(&ctx, &cached("mv5", "inbox"));
+        let args = json!({"update": {"mv5": {"mailboxIds": {"mbx_archive": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notUpdated"]["mv5"]["type"], json!("serverFail"));
+        assert_eq!(
+            ctx.db.get_cached_message("mv5").unwrap().unwrap().folder,
+            "inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_create_reports_not_created() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let args = json!({"create": {"draft1": {"subject": "x"}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["notCreated"]["draft1"]["type"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn set_records_changes_and_broadcasts() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut rx = ctx.broadcaster.subscribe();
+        let mut m = cached("bc1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        insert_msg(&ctx, &cached("bc2", "inbox"));
+        let args = json!({
+            "update": {"bc1": {"/keywords/$seen": true}},
+            "destroy": ["bc2"]
+        });
+        let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+        ok(set(&ctx, args, &mut HashMap::new()).await);
+
+        let change = rx.try_recv().expect("state change must broadcast");
+        assert!(change.changed.contains_key("Email"));
+        assert!(change.changed.contains_key("Mailbox"));
+
+        let res = ok(changes(&ctx, json!({"sinceState": old_state.to_string()})).await);
+        assert!(res["updated"].as_array().unwrap().contains(&json!("bc1")));
+        assert!(res["destroyed"].as_array().unwrap().contains(&json!("bc2")));
     }
 }
