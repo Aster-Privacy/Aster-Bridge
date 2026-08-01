@@ -213,6 +213,17 @@ fn json_str(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+fn normalize_date_rfc3339(s: &str) -> String {
+    let trimmed = s.trim();
+    if chrono::DateTime::parse_from_rfc3339(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    match crate::imap::server::parse_datetime_lenient(trimmed) {
+        Some(d) => d.to_rfc3339(),
+        None => trimmed.to_string(),
+    }
+}
+
 fn extract_from_field(v: &serde_json::Value) -> Option<String> {
     let from = v.get("from")?;
     if let Some(s) = from.as_str() {
@@ -345,7 +356,9 @@ fn cache_mail_item(
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
     let recipients = extract_recipients(&parsed, "to");
-    let date = json_str(&parsed, "date").or_else(|| Some(item.created_at.clone()));
+    let date = json_str(&parsed, "date")
+        .map(|d| normalize_date_rfc3339(&d))
+        .or_else(|| Some(normalize_date_rfc3339(&item.created_at)));
     let body_html = json_str(&parsed, "body_html")
         .or_else(|| json_str(&parsed, "html_body"))
         .or_else(|| json_str(&parsed, "html"));
@@ -867,7 +880,7 @@ mod tests {
         assert_eq!(cached.subject.as_deref(), Some("Hello"));
         assert_eq!(cached.sender.as_deref(), Some("Alice <alice@example.com>"));
         assert_eq!(cached.recipients.as_deref(), Some("bob@example.com"));
-        assert_eq!(cached.date.as_deref(), Some("Wed, 21 May 2026 10:00:00 +0000"));
+        assert_eq!(cached.date.as_deref(), Some("2026-05-21T10:00:00+00:00"));
         assert_eq!(cached.body_text.as_deref(), Some("<p>hi</p>"));
         assert!(cached.imap_uid >= 1);
         let raw = cached.raw_headers.unwrap();
@@ -976,6 +989,33 @@ mod tests {
             db.replay_check_and_record("msg-replay", &STANDARD.encode([0x02u8])).unwrap(),
             false,
             "different nonce for same id is a replay/rollback"
+        );
+    }
+
+    #[test]
+    fn normalize_date_converts_rfc2822_to_rfc3339() {
+        let out = normalize_date_rfc3339("Wed, 21 May 2026 10:00:00 +0000");
+        assert!(chrono::DateTime::parse_from_rfc3339(&out).is_ok(), "got {}", out);
+        assert_eq!(normalize_date_rfc3339("2026-05-21T10:00:00Z"), "2026-05-21T10:00:00Z");
+        assert_eq!(normalize_date_rfc3339("not a date"), "not a date");
+    }
+
+    #[test]
+    fn cache_mail_item_normalizes_rfc2822_dates() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({
+            "subject": "s",
+            "body_text": "b",
+            "date": "Wed, 21 May 2026 10:00:00 +0000"
+        });
+        let item = item_with_envelope("msg-date-norm", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        let cached = db.get_cached_message("msg-date-norm").unwrap().unwrap();
+        let stored = cached.date.unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&stored).is_ok(),
+            "stored date not rfc3339: {}",
+            stored
         );
     }
 

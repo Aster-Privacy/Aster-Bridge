@@ -2,6 +2,18 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.14 - 2026-08-01
+
+### Fixed
+- Apple Mail no longer errors with "APPEND not supported" when saving sent messages, and send retries no longer deliver duplicates; saves to Sent are matched against the copy already stored in your account.
+- Deleting messages over IMAP, POP3, or JMAP now deletes them in your Aster account as well, so deleted mail no longer comes back.
+- Messages deleted, moved, read, or starred in the web and mobile apps now sync down to connected mail clients.
+- Marking mail read or unread in Apple Mail now reliably syncs to your account.
+- Moving, flagging, and deleting messages from JMAP clients now works and syncs everywhere.
+- Read-only mailbox sessions can no longer modify or expunge messages, and UID EXPUNGE only removes the messages it names.
+- Quoted-phrase searches and date-based searches now return correct results, and message dates display correctly in every client.
+- Mailbox updates while a client is idling now report the exact removed message, keeping message lists consistent.
+
 ## 0.4.1 - 2026-06-16
 
 ### Changed

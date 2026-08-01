@@ -9,6 +9,7 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
+use crate::api_client::ApiClient;
 use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
 use crate::db::Database;
@@ -62,8 +63,9 @@ where
 
 pub async fn run(
     addr: &str,
-    _session: Arc<RwLock<Session>>,
+    session: Arc<RwLock<Session>>,
     db: Arc<Database>,
+    client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
     _tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
@@ -92,10 +94,12 @@ pub async fn run(
         };
         let db = db.clone();
         let passwords = passwords.clone();
+        let session = session.clone();
+        let client = client.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = run_session(stream, db, passwords).await {
+            if let Err(e) = run_session(stream, session, db, client, passwords).await {
                 tracing::error!("POP3 connection error: {}", e);
             }
         });
@@ -104,8 +108,9 @@ pub async fn run(
 
 pub async fn run_implicit_tls(
     addr: &str,
-    _session: Arc<RwLock<Session>>,
+    session: Arc<RwLock<Session>>,
     db: Arc<Database>,
+    client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
@@ -136,6 +141,8 @@ pub async fn run_implicit_tls(
         };
         let db = db.clone();
         let passwords = passwords.clone();
+        let session = session.clone();
+        let client = client.clone();
         let acceptor = acceptor.clone();
 
         tokio::spawn(async move {
@@ -147,7 +154,7 @@ pub async fn run_implicit_tls(
                     return;
                 }
             };
-            if let Err(e) = run_session(tls_stream, db, passwords).await {
+            if let Err(e) = run_session(tls_stream, session, db, client, passwords).await {
                 tracing::error!("POP3S connection error: {}", e);
             }
         });
@@ -156,7 +163,9 @@ pub async fn run_implicit_tls(
 
 async fn run_session<S>(
     stream: S,
+    session: Arc<RwLock<Session>>,
     db: Arc<Database>,
+    client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
 ) -> Result<()>
 where
@@ -393,10 +402,24 @@ where
                 writer.write_all(b"+OK Capability list follows\r\nUSER\r\nUIDL\r\nTOP\r\nRESP-CODES\r\nEXPIRE NEVER\r\nIMPLEMENTATION Aster Bridge\r\n.\r\n").await?;
             }
             "QUIT" => {
+                let token = session.read().await.access_token.to_string();
                 for (i, del) in deleted.iter().enumerate() {
                     if *del {
                         if let Some(msg) = messages.get(i) {
-                            let _ = db.delete_message_by_aster_id(&msg.aster_id);
+                            let server_gone = match client
+                                .delete_mail_item_permanent(&token, &msg.aster_id)
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(crate::error::BridgeError::Api(ref m)) if m.starts_with("404") => true,
+                                Err(e) => {
+                                    tracing::warn!("POP3 server delete failed for {}: {}", msg.aster_id, e);
+                                    false
+                                }
+                            };
+                            if server_gone {
+                                let _ = db.delete_message_by_aster_id(&msg.aster_id);
+                            }
                         }
                     }
                 }
@@ -598,5 +621,116 @@ mod tests {
             .sum();
         assert_eq!(count, 1);
         assert_eq!(total_octets, pop3_size(&messages[0]));
+    }
+
+    type BackendCalls = Arc<tokio::sync::Mutex<Vec<String>>>;
+
+    async fn spawn_mock_backend() -> (String, BackendCalls) {
+        use axum::extract::Path as AxumPath;
+        use axum::{routing::delete, Json, Router};
+        let calls: BackendCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let cap = calls.clone();
+        let app = Router::new().route(
+            "/mail/v1/messages/:id",
+            delete(move |AxumPath(id): AxumPath<String>| {
+                let cap = cap.clone();
+                async move {
+                    cap.lock().await.push(id);
+                    Json(serde_json::json!({"success": true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    #[tokio::test]
+    async fn dele_quit_deletes_on_server_and_locally() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        db.upsert_cached_message(
+            "pop-1",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("2026-01-01T00:00:00Z"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "pop-1");
+
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }));
+        let (base, calls) = spawn_mock_backend().await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+        let _g = crate::port_picker::TEST_SERVER_START.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let addr_str = format!("127.0.0.1:{}", addr.port());
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let _ = run(&addr_str, session, db_clone, client, passwords, None).await;
+        });
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"));
+
+        for cmd in [
+            "USER tester@aster.test",
+            "PASS abcd-efgh-ijkl-mnop",
+            "DELE 1",
+        ] {
+            w.write_all(format!("{}\r\n", cmd).as_bytes()).await.unwrap();
+            w.flush().await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("+OK"), "{} failed: {}", cmd, line);
+        }
+        w.write_all(b"QUIT\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"));
+
+        for _ in 0..40 {
+            if db.get_cached_message("pop-1").unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(db.get_cached_message("pop-1").unwrap().is_none());
+        assert_eq!(calls.lock().await.clone(), vec!["pop-1".to_string()]);
     }
 }

@@ -400,11 +400,12 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
     let pop3_handle = if pop3_port != 0 {
         let p3_session = session.clone();
         let p3_db = db.clone();
+        let p3_client = client.clone();
         let p3_passwords = passwords.clone();
         let p3_tls = tls_cfg_opt.clone();
         let p3_addr = format!("{}:{}", host, pop3_port);
         Some(tokio::spawn(async move {
-            if let Err(e) = pop3::server::run(&p3_addr, p3_session, p3_db, p3_passwords, p3_tls).await {
+            if let Err(e) = pop3::server::run(&p3_addr, p3_session, p3_db, p3_client, p3_passwords, p3_tls).await {
                 tracing::error!("POP3 server error: {}", e);
             }
         }))
@@ -414,10 +415,11 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
         if pop3s_port != 0 {
             let p3s_session = session.clone();
             let p3s_db = db.clone();
+            let p3s_client = client.clone();
             let p3s_passwords = passwords.clone();
             let p3s_addr = format!("{}:{}", host, pop3s_port);
             Some(tokio::spawn(async move {
-                if let Err(e) = pop3::server::run_implicit_tls(&p3s_addr, p3s_session, p3s_db, p3s_passwords, cfg).await {
+                if let Err(e) = pop3::server::run_implicit_tls(&p3s_addr, p3s_session, p3s_db, p3s_client, p3s_passwords, cfg).await {
                     tracing::error!("POP3S server error: {}", e);
                 }
             }))
@@ -2059,11 +2061,12 @@ fn main() {
                             let pop3_handle = if pop3_port != 0 {
                                 let p3_session = session_arc.clone();
                                 let p3_db = db.clone();
+                                let p3_client = client.clone();
                                 let p3_passwords = passwords.clone();
                                 let p3_tls = tls_cfg_opt.clone();
                                 let p3_addr = format!("{}:{}", host, pop3_port);
                                 Some(tokio::spawn(async move {
-                                    if let Err(e) = pop3::server::run(&p3_addr, p3_session, p3_db, p3_passwords, p3_tls).await {
+                                    if let Err(e) = pop3::server::run(&p3_addr, p3_session, p3_db, p3_client, p3_passwords, p3_tls).await {
                                         tracing::error!("POP3 server error: {}", e);
                                     }
                                 }))
@@ -2073,10 +2076,11 @@ fn main() {
                                 if pop3s_port != 0 {
                                     let p3s_session = session_arc.clone();
                                     let p3s_db = db.clone();
+                                    let p3s_client = client.clone();
                                     let p3s_passwords = passwords.clone();
                                     let p3s_addr = format!("{}:{}", host, pop3s_port);
                                     Some(tokio::spawn(async move {
-                                        if let Err(e) = pop3::server::run_implicit_tls(&p3s_addr, p3s_session, p3s_db, p3s_passwords, cfg).await {
+                                        if let Err(e) = pop3::server::run_implicit_tls(&p3s_addr, p3s_session, p3s_db, p3s_client, p3s_passwords, cfg).await {
                                             tracing::error!("POP3S server error: {}", e);
                                         }
                                     }))

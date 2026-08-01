@@ -100,7 +100,16 @@ fn serialize_email(
 
     let received_at = m
         .date
-        .clone()
+        .as_deref()
+        .map(|d| {
+            if chrono::DateTime::parse_from_rfc3339(d).is_ok() {
+                d.to_string()
+            } else if let Some(p) = crate::imap::server::parse_datetime_lenient(d) {
+                p.to_rfc3339()
+            } else {
+                chrono::Utc::now().to_rfc3339()
+            }
+        })
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
     let from = parse_from(&m.sender);

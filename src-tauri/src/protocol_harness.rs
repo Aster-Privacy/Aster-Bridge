@@ -398,6 +398,12 @@ async fn protocol_feature_matrix() {
             sent_resp.trim().to_string(),
         );
 
+        let reselect = imap_cmd(&mut reader, &mut w, "rw1", "SELECT INBOX").await;
+        cl.check(
+            "IMAP re-SELECT after EXAMINE (read-write)",
+            reselect.contains("READ-WRITE") && reselect.contains("rw1 OK"),
+            "read-write restored",
+        );
         let copy = imap_cmd(&mut reader, &mut w, "cp1", "UID COPY 1 Archive").await;
         cl.check(
             "IMAP UID COPY to Archive (COPYUID)",
@@ -869,9 +875,9 @@ async fn serve_real() {
         tokio::spawn(async move { let _ = crate::jmap::server::run(&addr, s, d, c, p, b, None).await; });
     }
     {
-        let (s, d, p) = (session.clone(), db.clone(), passwords.clone());
+        let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
         let addr = format!("127.0.0.1:{}", pop3);
-        tokio::spawn(async move { let _ = crate::pop3::server::run(&addr, s, d, p, None).await; });
+        tokio::spawn(async move { let _ = crate::pop3::server::run(&addr, s, d, c, p, None).await; });
     }
     wait_listening(imap).await;
     wait_listening(smtp).await;
