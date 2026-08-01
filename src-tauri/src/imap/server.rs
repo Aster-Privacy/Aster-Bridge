@@ -1223,6 +1223,11 @@ where
             }
             "APPEND" => {
                 require_auth!(conn, writer, tag);
+                let (mailbox, _) = parse_imap_atom_or_quoted(&args);
+                let target_folder = IMAP_FOLDERS
+                    .iter()
+                    .find(|(imap, _, _)| imap.eq_ignore_ascii_case(&mailbox))
+                    .map(|(_, f, _)| *f);
                 let literal_info = args.rfind('{').and_then(|s| {
                     let rest = &args[s + 1..];
                     rest.find('}').and_then(|e| {
@@ -1250,12 +1255,39 @@ where
                         }
                         let mut trailer = [0u8; 2];
                         let _ = reader.read_exact(&mut trailer).await;
-                        write_no(
-                            &mut writer,
-                            &tag,
-                            "[CANNOT] APPEND not supported - use SMTP submission",
-                        )
-                        .await?;
+                        match target_folder {
+                            None => {
+                                write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
+                            }
+                            Some("sent") => {
+                                match find_appended_sent_copy(&db, &buf) {
+                                    Some(uid) => {
+                                        write_ok(
+                                            &mut writer,
+                                            &tag,
+                                            &format!(
+                                                "[APPENDUID {} {}] APPEND completed",
+                                                uid_validity(&db),
+                                                uid
+                                            ),
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        crate::sync::poller::try_kick_sync();
+                                        write_ok(&mut writer, &tag, "APPEND completed").await?;
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                write_no(
+                                    &mut writer,
+                                    &tag,
+                                    "[CANNOT] APPEND is only supported for Sent; folders mirror your Aster account",
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     None => {
                         write_bad(&mut writer, &tag, "APPEND missing literal").await?;
@@ -1290,6 +1322,37 @@ macro_rules! require_selected {
     };
 }
 use require_selected;
+
+fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
+    use mail_parser::MessageParser;
+    let parsed = MessageParser::default().parse(raw_message)?;
+    let message_id = parsed
+        .message_id()
+        .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
+        .filter(|s| !s.is_empty());
+    let subject = parsed.subject().map(|s| s.to_string());
+    let messages = db.list_cached_message_meta("sent").ok()?;
+    if let Some(mid) = message_id {
+        if let Some(m) = messages.iter().rev().find(|m| {
+            m.raw_headers
+                .as_deref()
+                .map_or(false, |rh| rh.contains(mid.as_str()))
+        }) {
+            return Some(m.imap_uid);
+        }
+    }
+    if let Some(subj) = subject {
+        if let Some(m) = messages
+            .iter()
+            .rev()
+            .take(20)
+            .find(|m| m.subject.as_deref() == Some(subj.as_str()))
+        {
+            return Some(m.imap_uid);
+        }
+    }
+    None
+}
 
 async fn write_ok(
     writer: &mut (impl AsyncWrite + Unpin),
@@ -2475,6 +2538,99 @@ mod tests {
             combined
         );
         assert!(combined.contains("a3 OK"));
+    }
+
+    #[test]
+    fn find_appended_sent_copy_matches_by_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-1", "sent", "totally different subject");
+        let raw = b"Message-ID: <sent-1@test>\r\nSubject: whatever\r\n\r\nbody";
+        let uid = find_appended_sent_copy(&db, raw);
+        assert!(uid.is_some());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_falls_back_to_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-2", "sent", "quarterly report");
+        let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: quarterly report\r\n\r\nbody";
+        let uid = find_appended_sent_copy(&db, raw);
+        assert!(uid.is_some());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_none_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-3", "sent", "subject a");
+        let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: subject b\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    async fn append_literal(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        mailbox: &str,
+        literal: &[u8],
+    ) -> String {
+        writer
+            .write_all(format!("{} APPEND {} {{{}}}\r\n", tag, mailbox, literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected continuation, got {}", cont);
+        writer.write_all(literal).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        read_until_tag(reader, tag).await.join("\n")
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_dedupes_against_server_copy() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "sent-e2e", "sent", "hello from apple mail");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <sent-e2e@test>\r\nSubject: hello from apple mail\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap1", "Sent", raw).await;
+        assert!(resp.contains("ap1 OK"), "append not accepted: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_sent_without_match_still_succeeds() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <fresh@apple-mail>\r\nSubject: brand new\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap2", "Sent", raw).await;
+        assert!(resp.contains("ap2 OK"), "append not accepted: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_inbox_still_rejected() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: x\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap3", "INBOX", raw).await;
+        assert!(resp.contains("ap3 NO"), "expected NO: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_unknown_mailbox_gets_trycreate() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: x\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap4", "Nonexistent", raw).await;
+        assert!(resp.contains("ap4 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TRYCREATE"), "expected TRYCREATE: {}", resp);
     }
 
     #[tokio::test]

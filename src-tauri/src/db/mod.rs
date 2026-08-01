@@ -816,6 +816,16 @@ impl Database {
         })
     }
 
+    pub fn list_all_cached_id_folders(&self) -> Result<Vec<(String, String)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT aster_id, folder FROM message_cache")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn list_all_message_ids(&self) -> Result<Vec<String>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT aster_id FROM message_cache ORDER BY created_at DESC LIMIT 500")?;
@@ -1437,6 +1447,18 @@ impl Database {
     }
 
     pub fn jmap_record_sync_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "created")
+    }
+
+    pub fn jmap_record_destroyed_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "destroyed")
+    }
+
+    pub fn jmap_record_updated_batch(&self, ty: &str, ids: &[&str]) -> Result<i64, String> {
+        self.jmap_record_batch(ty, ids, "updated")
+    }
+
+    fn jmap_record_batch(&self, ty: &str, ids: &[&str], op: &str) -> Result<i64, String> {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO jmap_state (type, counter) VALUES (?1, 1)
@@ -1455,8 +1477,8 @@ impl Database {
                 .unwrap_or(0) as i64;
             for id in ids {
                 let _ = conn.execute(
-                    "INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES (?1, ?2, ?3, 'created', ?4)",
-                    rusqlite::params![ty, new_state, id, now],
+                    "INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![ty, new_state, id, op, now],
                 );
             }
             let _ = conn.execute(

@@ -200,6 +200,8 @@ pub struct MailItem {
     pub expires_at: Option<String>,
     pub expiry_type: Option<String>,
     pub is_spam: Option<bool>,
+    pub is_read: Option<bool>,
+    pub is_starred: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

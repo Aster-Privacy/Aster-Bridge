@@ -33,6 +33,7 @@ use crate::error::BridgeError;
 use crate::jmap::state::StateChange;
 
 const POLL_INTERVAL_SECS: u64 = 30;
+const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
 
 pub struct SyncTrigger {
     pub done: oneshot::Sender<Result<(), String>>,
@@ -253,29 +254,67 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheOutcome {
+    was_new: bool,
+    flags_changed: bool,
+}
+
+fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
+    if item.is_read.is_none() && item.is_starred.is_none() {
+        return false;
+    }
+    let current = match db.get_message_flags_by_id(&item.id) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut new_flags = current;
+    if let Some(read) = item.is_read {
+        if read {
+            new_flags |= 1;
+        } else {
+            new_flags &= !1;
+        }
+    }
+    if let Some(starred) = item.is_starred {
+        if starred {
+            new_flags |= 4;
+        } else {
+            new_flags &= !4;
+        }
+    }
+    if new_flags == current {
+        return false;
+    }
+    db.set_message_flags_by_id(&item.id, new_flags).is_ok()
+}
+
 fn cache_mail_item(
     db: &Database,
     folder: &str,
     item: &MailItem,
     passphrase: &[u8],
     identity_key: Option<&str>,
-) -> bool {
+) -> CacheOutcome {
     if !is_valid_item_id(&item.id) {
         tracing::warn!("rejecting message with invalid id format");
-        return false;
+        return CacheOutcome::default();
     }
 
     if db.body_cached(&item.id) {
         let _ = db.set_folder_if_changed(&item.id, folder);
         let _ = db.assign_uid_if_missing(folder, &item.id);
-        return false;
+        return CacheOutcome {
+            was_new: false,
+            flags_changed: reconcile_server_flags(db, item),
+        };
     }
 
     if !item.envelope_nonce.is_empty() {
         match db.replay_check_and_record(&item.id, &item.envelope_nonce) {
             Ok(false) => {
                 tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
-                return false;
+                return CacheOutcome::default();
             }
             _ => {}
         }
@@ -292,7 +331,7 @@ fn cache_mail_item(
         Ok(p) => p,
         Err(_) => {
             tracing::debug!("envelope decrypt skipped");
-            return false;
+            return CacheOutcome::default();
         }
     };
 
@@ -357,13 +396,17 @@ fn cache_mail_item(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("cache upsert failed for {}: {}", item.id, e);
-            return false;
+            return CacheOutcome::default();
         }
     };
     if let Err(e) = db.assign_uid_if_missing(folder, &item.id) {
         tracing::warn!("uid assign failed for {}: {}", item.id, e);
     }
-    was_new
+    let flags_changed = reconcile_server_flags(db, item);
+    CacheOutcome {
+        was_new,
+        flags_changed: flags_changed && !was_new,
+    }
 }
 
 fn looks_like_html(s: &str) -> bool {
@@ -414,9 +457,13 @@ async fn run_sync_pass(
     client: &Arc<ApiClient>,
     db: &Arc<Database>,
     jmap_broadcaster: Option<&broadcast::Sender<StateChange>>,
+    deep: bool,
 ) -> Result<(), String> {
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut updated_ids: Vec<String> = Vec::new();
+    let mut all_folders_complete = true;
 
     let (access_token, passphrase, identity_key, our_email, ratchet_keys) = {
         let s = session.read().await;
@@ -452,14 +499,18 @@ async fn run_sync_pass(
                     );
                     let mut new_ids: Vec<String> = Vec::new();
                     for item in &resp.items {
-                        let was_new = cache_mail_item(
+                        seen_ids.insert(item.id.clone());
+                        let outcome = cache_mail_item(
                             db,
                             folder_query.label,
                             item,
                             &passphrase,
                             identity_key.as_deref(),
                         );
-                        if was_new {
+                        if outcome.flags_changed {
+                            updated_ids.push(item.id.clone());
+                        }
+                        if outcome.was_new {
                             new_ids.push(item.id.clone());
                             if let Some(plaintext) = try_decrypt_internal_mail(
                                 item,
@@ -496,11 +547,14 @@ async fn run_sync_pass(
                         folder_total,
                     );
                     let page_all_cached = !resp.items.is_empty() && new_ids.is_empty();
-                    let done_with_folder = !resp.has_more
-                        || resp.next_cursor.is_none()
-                        || total_fetched >= max_per_folder
-                        || page_all_cached;
+                    let reached_end = !resp.has_more || resp.next_cursor.is_none();
+                    let capped = total_fetched >= max_per_folder;
+                    let done_with_folder =
+                        reached_end || capped || (!deep && page_all_cached);
                     if done_with_folder {
+                        if !reached_end {
+                            all_folders_complete = false;
+                        }
                         break;
                     }
                     cursor = resp.next_cursor;
@@ -509,13 +563,36 @@ async fn run_sync_pass(
                     let msg = format!("failed to sync {}: {}", folder_query.label, e);
                     tracing::warn!("{}", msg);
                     last_err = Some(msg);
+                    all_folders_complete = false;
                     break;
                 }
             }
         }
     }
 
-    if any_inserted {
+    let mut destroyed_ids: Vec<String> = Vec::new();
+    if deep && all_folders_complete && last_err.is_none() {
+        if let Ok(local) = db.list_all_cached_id_folders() {
+            for (id, folder) in local {
+                if !seen_ids.contains(&id) {
+                    if db.delete_message_by_aster_id(&id).is_ok() {
+                        tracing::info!("sync: pruned {} from {} (gone on server)", id, folder);
+                        destroyed_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+    if !destroyed_ids.is_empty() {
+        let refs: Vec<&str> = destroyed_ids.iter().map(|s| s.as_str()).collect();
+        let _ = db.jmap_record_destroyed_batch("Email", &refs);
+    }
+    if !updated_ids.is_empty() {
+        let refs: Vec<&str> = updated_ids.iter().map(|s| s.as_str()).collect();
+        let _ = db.jmap_record_updated_batch("Email", &refs);
+    }
+
+    if any_inserted || !destroyed_ids.is_empty() || !updated_ids.is_empty() {
         let email_state = db.jmap_state_get("Email").unwrap_or(0);
         let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
         let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
@@ -557,6 +634,12 @@ pub async fn run_poll_loop(
     let mut interval = tokio::time::interval(interval_dur);
     let mut last_tick = tokio::time::Instant::now();
     let mut sync_count: u32 = 0;
+    let mut last_deep_at: Option<tokio::time::Instant> = None;
+    let deep_due = |last: &Option<tokio::time::Instant>| {
+        last.map_or(true, |t| {
+            t.elapsed() >= std::time::Duration::from_secs(DEEP_SYNC_INTERVAL_SECS)
+        })
+    };
 
     loop {
         tokio::select! {
@@ -575,7 +658,11 @@ pub async fn run_poll_loop(
                         return;
                     }
                 }
-                let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref()).await;
+                let deep = deep_due(&last_deep_at);
+                let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
+                if deep && result.is_ok() {
+                    last_deep_at = Some(tokio::time::Instant::now());
+                }
                 if let Err(ref e) = result {
                     if e.contains("plan_upgrade_required") {
                         tracing::warn!("sync: plan_upgrade_required from server - stopping poll loop");
@@ -587,7 +674,11 @@ pub async fn run_poll_loop(
             maybe_trigger = trigger_rx.recv() => {
                 let Some(trigger) = maybe_trigger else { return; };
                 last_tick = tokio::time::Instant::now();
-                let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref()).await;
+                let deep = deep_due(&last_deep_at);
+                let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
+                if deep && result.is_ok() {
+                    last_deep_at = Some(tokio::time::Instant::now());
+                }
                 if let Err(ref e) = result {
                     if e.contains("plan_upgrade_required") {
                         tracing::warn!("sync: plan_upgrade_required from server - stopping poll loop");
@@ -643,6 +734,8 @@ mod tests {
             expires_at: None,
             expiry_type: None,
             is_spam: None,
+            is_read: None,
+            is_starred: None,
         }
     }
 
@@ -750,7 +843,7 @@ mod tests {
         let json = serde_json::json!({"subject": "x", "body_text": "y"});
         let mut item = item_with_envelope("good", &json);
         item.id = "bad id".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         assert!(db.get_cached_message("bad id").unwrap().is_none());
     }
 
@@ -766,7 +859,7 @@ mod tests {
             "message_id": "mid-1@test"
         });
         let item = item_with_envelope("msg-new", &json);
-        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None).was_new;
         assert!(was_new);
 
         let cached = db.get_cached_message("msg-new").unwrap().unwrap();
@@ -787,7 +880,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
         let item = item_with_envelope("msg-plain", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         let cached = db.get_cached_message("msg-plain").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain words"));
         let raw = cached.raw_headers.unwrap();
@@ -803,7 +896,7 @@ mod tests {
             "body_text": "ciphertext-blob"
         });
         let item = item_with_envelope("msg-ratchet", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         let cached = db.get_cached_message("msg-ratchet").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.contains("end-to-end encrypted"));
@@ -816,12 +909,12 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-move", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         let first = db.get_cached_message("msg-move").unwrap().unwrap();
         assert_eq!(first.folder, "inbox");
         let inbox_uid = first.imap_uid;
 
-        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None);
+        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None).was_new;
         assert!(!was_new, "already-body-cached item must not count as new");
 
         let moved = db.get_cached_message("msg-move").unwrap().unwrap();
@@ -838,8 +931,8 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-dedup", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
@@ -848,7 +941,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let mut item = item_with_envelope("msg-bad-env", &serde_json::json!({"subject": "x"}));
         item.encrypted_envelope = "!!!not-base64!!!".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         assert!(db.get_cached_message("msg-bad-env").unwrap().is_none());
     }
 
@@ -858,7 +951,7 @@ mod tests {
         let big = "a".repeat(6 * 1024 * 1024);
         let json = serde_json::json!({"subject": "s", "body_text": big});
         let item = item_with_envelope("msg-big", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None));
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
         let cached = db.get_cached_message("msg-big").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.len() < 6 * 1024 * 1024);
@@ -884,5 +977,259 @@ mod tests {
             false,
             "different nonce for same id is a replay/rollback"
         );
+    }
+
+    #[test]
+    fn new_message_applies_server_read_state() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let mut item = item_with_envelope("msg-read-new", &json);
+        item.is_read = Some(true);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(outcome.was_new);
+        assert!(!outcome.flags_changed);
+        let cached = db.get_cached_message("msg-read-new").unwrap().unwrap();
+        assert_eq!(cached.flags & 1, 1);
+    }
+
+    #[test]
+    fn cached_message_read_on_server_updates_local_seen_flag() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let mut item = item_with_envelope("msg-read-sync", &json);
+        item.is_read = Some(false);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert_eq!(
+            db.get_cached_message("msg-read-sync").unwrap().unwrap().flags & 1,
+            0
+        );
+
+        item.is_read = Some(true);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(!outcome.was_new);
+        assert!(outcome.flags_changed);
+        assert_eq!(
+            db.get_cached_message("msg-read-sync").unwrap().unwrap().flags & 1,
+            1
+        );
+
+        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(!repeat.flags_changed, "no-op flag sync must not report change");
+    }
+
+    #[test]
+    fn cached_message_starred_on_server_updates_local_flagged_bit() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let mut item = item_with_envelope("msg-star-sync", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+
+        item.is_starred = Some(true);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(outcome.flags_changed);
+        assert_eq!(
+            db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
+            4
+        );
+
+        item.is_starred = Some(false);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(outcome.flags_changed);
+        assert_eq!(
+            db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
+            0
+        );
+    }
+
+    #[test]
+    fn server_flags_absent_leaves_local_flags_untouched() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let item = item_with_envelope("msg-noflags", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        let uid = db.get_cached_message("msg-noflags").unwrap().unwrap().imap_uid;
+        db.update_message_flags(uid as i64, "inbox", 5).unwrap();
+
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        assert!(!outcome.flags_changed);
+        assert_eq!(db.get_cached_message("msg-noflags").unwrap().unwrap().flags, 5);
+    }
+
+    fn mock_session() -> Arc<RwLock<crate::auth::session::Session>> {
+        Arc::new(RwLock::new(crate::auth::session::Session {
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: b"pass".to_vec(),
+            identity_key: None,
+            ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }))
+    }
+
+    async fn spawn_mock_list_server(items: Vec<serde_json::Value>) -> String {
+        use axum::{routing::get, Json, Router};
+        let total = items.len();
+        let body = serde_json::json!({
+            "items": items,
+            "total": total,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn server_item_json(id: &str, subject: &str) -> serde_json::Value {
+        let env = envelope_b64(&serde_json::json!({"subject": subject, "body_text": "b"}));
+        serde_json::json!({
+            "id": id,
+            "item_type": "received",
+            "encrypted_envelope": env,
+            "envelope_nonce": "",
+            "folder_token": "tok",
+            "is_external": false,
+            "created_at": "2026-06-14T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn deep_sync_prunes_messages_deleted_on_server() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let stale = item_with_envelope(
+            "stale-1",
+            &serde_json::json!({"subject": "old", "body_text": "b"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+
+        let base = spawn_mock_list_server(vec![server_item_json("keep-1", "kept")]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+        let (tx, mut rx) = broadcast::channel(8);
+
+        run_sync_pass(&session, &client, &db, Some(&tx), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_cached_message("stale-1").unwrap().is_none(),
+            "server-deleted message must be pruned locally"
+        );
+        assert!(db.get_cached_message("keep-1").unwrap().is_some());
+
+        let destroyed: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM jmap_change_log WHERE op = 'destroyed' AND object_id = 'stale-1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(destroyed, 1);
+
+        let change = rx.try_recv().expect("state change must be broadcast");
+        assert!(change.changed.contains_key("Email"));
+    }
+
+    #[tokio::test]
+    async fn shallow_sync_does_not_prune() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let stale = item_with_envelope(
+            "stale-2",
+            &serde_json::json!({"subject": "old", "body_text": "b"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+
+        let base = spawn_mock_list_server(vec![server_item_json("keep-2", "kept")]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_cached_message("stale-2").unwrap().is_some(),
+            "shallow sync must never prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_sync_does_not_prune_when_a_folder_fails() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let stale = item_with_envelope(
+            "stale-3",
+            &serde_json::json!({"subject": "old", "body_text": "b"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/bridge/v1/messages",
+            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Arc::new(ApiClient::new_with_base_url(&format!(
+            "http://127.0.0.1:{}",
+            port
+        )));
+        let session = mock_session();
+
+        let result = run_sync_pass(&session, &client, &db, None, true).await;
+        assert!(result.is_err());
+        assert!(
+            db.get_cached_message("stale-3").unwrap().is_some(),
+            "failed sync must never prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_sync_marks_web_read_message_seen() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let unread = item_with_envelope(
+            "read-on-web",
+            &serde_json::json!({"subject": "s", "body_text": "b"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None).was_new);
+
+        let mut item = server_item_json("read-on-web", "s");
+        item["is_read"] = serde_json::json!(true);
+        let base = spawn_mock_list_server(vec![item]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+        let (tx, mut rx) = broadcast::channel(8);
+
+        run_sync_pass(&session, &client, &db, Some(&tx), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_cached_message("read-on-web").unwrap().unwrap().flags & 1,
+            1,
+            "web-read message must become \\Seen on the bridge"
+        );
+        let change = rx.try_recv().expect("flag change must broadcast state");
+        assert!(change.changed.contains_key("Email"));
     }
 }

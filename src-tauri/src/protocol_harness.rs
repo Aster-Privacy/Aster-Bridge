@@ -368,6 +368,36 @@ async fn protocol_feature_matrix() {
             appresp.trim().to_string(),
         );
 
+        let sent_literal = b"Subject: harness append\r\n\r\nhi";
+        w.write_all(
+            format!("a9 APPEND Sent {{{}}}\r\n", sent_literal.len()).as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        let mut sent_cont = String::new();
+        reader.read_line(&mut sent_cont).await.unwrap();
+        let got_sent_continuation = sent_cont.starts_with("+ ");
+        w.write_all(sent_literal).await.unwrap();
+        w.write_all(b"\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        let mut sent_resp = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            sent_resp.push_str(&l);
+            if l.starts_with("a9 ") {
+                break;
+            }
+        }
+        cl.check(
+            "IMAP APPEND to Sent accepted (dedup against server copy)",
+            got_sent_continuation && sent_resp.contains("a9 OK"),
+            sent_resp.trim().to_string(),
+        );
+
         let copy = imap_cmd(&mut reader, &mut w, "cp1", "UID COPY 1 Archive").await;
         cl.check(
             "IMAP UID COPY to Archive (COPYUID)",
