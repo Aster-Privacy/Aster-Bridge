@@ -1300,7 +1300,7 @@ where
                         .filter(|(_, m)| m.flags & 8 != 0)
                         .map(|(i, m)| (i + 1, m.imap_uid, m.aster_id.clone()))
                         .collect();
-                    expunge_targets_silent(&db, &client, &session, targets).await;
+                    expunge_targets_silent(&db, &client, &session, &folder, targets).await;
                 }
                 conn.state = ImapState::Authenticated;
                 conn.selected_mailbox = None;
@@ -1407,11 +1407,57 @@ where
                                     }
                                 }
                             }
+                            Some("drafts") => {
+                                match append_draft(&db, &client, &session, &buf).await {
+                                    Ok((uid, draft_id)) => {
+                                        let _ = db.jmap_record_sync_batch("Email", &[draft_id.as_str()]);
+                                        let email_state = db.jmap_state_get("Email").unwrap_or(0);
+                                        let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
+                                        let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert("Email".to_string(), email_state.to_string());
+                                        changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+                                        changed.insert("Thread".to_string(), thread_state.to_string());
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if conn.state == ImapState::Selected
+                                            && conn.selected_folder.as_deref() == Some("drafts")
+                                        {
+                                            let count =
+                                                db.count_cached_messages("drafts").unwrap_or(0);
+                                            writer
+                                                .write_all(
+                                                    format!("* {} EXISTS\r\n", count).as_bytes(),
+                                                )
+                                                .await?;
+                                            conn.message_count = count;
+                                        }
+                                        write_ok(
+                                            &mut writer,
+                                            &tag,
+                                            &format!(
+                                                "[APPENDUID {} {}] APPEND completed",
+                                                uid_validity(&db),
+                                                uid
+                                            ),
+                                        )
+                                        .await?;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("APPEND to Drafts failed: {}", e);
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[SERVERBUG] could not save the draft to your Aster account",
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                             Some(_) => {
                                 write_no(
                                     &mut writer,
                                     &tag,
-                                    "[CANNOT] APPEND is only supported for Sent; folders mirror your Aster account",
+                                    "[CANNOT] APPEND is only supported for Sent and Drafts; folders mirror your Aster account",
                                 )
                                 .await?;
                             }
@@ -1455,9 +1501,20 @@ async fn delete_on_server(
     db: &Arc<Database>,
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
+    folder: &str,
     aster_id: &str,
 ) -> bool {
     let token = session.read().await.access_token.to_string();
+    if folder == "drafts" {
+        match client.delete_draft(&token, aster_id).await {
+            Ok(()) => return true,
+            Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {}
+            Err(e) => {
+                tracing::warn!("server draft delete failed for {}: {}", aster_id, e);
+                return false;
+            }
+        }
+    }
     match client.delete_mail_item_permanent(&token, aster_id).await {
         Ok(()) => true,
         Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => true,
@@ -1480,7 +1537,7 @@ async fn expunge_targets(
 ) -> std::io::Result<()> {
     let mut adjustment: usize = 0;
     for (seq, uid, aster_id) in &targets {
-        if !delete_on_server(db, client, session, aster_id).await {
+        if !delete_on_server(db, client, session, folder, aster_id).await {
             continue;
         }
         let _ = db.delete_message_by_uid(*uid as i64, folder);
@@ -1498,15 +1555,147 @@ async fn expunge_targets_silent(
     db: &Arc<Database>,
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
+    folder: &str,
     targets: Vec<(usize, u32, String)>,
 ) {
     for (_, uid, aster_id) in &targets {
-        if !delete_on_server(db, client, session, aster_id).await {
+        if !delete_on_server(db, client, session, folder, aster_id).await {
             continue;
         }
         let _ = db.delete_message_by_aster_id(aster_id);
         let _ = uid;
     }
+}
+
+fn format_attachment_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn draft_content_from_mime(raw_message: &[u8]) -> Option<crate::crypto::draft::DraftContent> {
+    use mail_parser::{MessageParser, MimeHeaders};
+
+    fn addr_list(a: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+        a.map(|l| {
+            l.iter()
+                .filter_map(|x| x.address().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    let parsed = MessageParser::default().parse(raw_message)?;
+    let to_recipients = addr_list(parsed.to());
+    let cc_recipients = addr_list(parsed.cc());
+    let bcc_recipients = addr_list(parsed.bcc());
+    let subject = parsed.subject().unwrap_or("").to_string();
+    let message = parsed
+        .body_html(0)
+        .map(|s| s.to_string())
+        .or_else(|| parsed.body_text(0).map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    let mut attachments: Vec<crate::crypto::draft::DraftAttachment> = Vec::new();
+    for part in parsed.attachments() {
+        let data = part.contents();
+        if data.is_empty() {
+            continue;
+        }
+        let name = part
+            .attachment_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attachment-{}", attachments.len() + 1));
+        let mime_type = part
+            .content_type()
+            .map(|ct| match ct.subtype() {
+                Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                None => ct.ctype().to_string(),
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let content_id = part
+            .content_id()
+            .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
+            .filter(|s| !s.is_empty());
+        attachments.push(crate::crypto::draft::DraftAttachment {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            size: format_attachment_size(data.len()),
+            size_bytes: data.len() as i64,
+            mime_type,
+            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data),
+            content_id,
+        });
+    }
+
+    Some(crate::crypto::draft::DraftContent {
+        to_recipients,
+        cc_recipients,
+        bcc_recipients,
+        subject,
+        message,
+        attachments: if attachments.is_empty() {
+            None
+        } else {
+            Some(attachments)
+        },
+    })
+}
+
+pub(crate) async fn append_draft(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    raw_message: &[u8],
+) -> std::result::Result<(u32, String), String> {
+    let (token, identity_key, our_email) = {
+        let s = session.read().await;
+        (
+            s.access_token.to_string(),
+            s.identity_key.clone(),
+            s.email.clone(),
+        )
+    };
+    let identity_key =
+        identity_key.ok_or_else(|| "session has no identity key for draft encryption".to_string())?;
+
+    let content = draft_content_from_mime(raw_message)
+        .ok_or_else(|| "failed to parse draft message".to_string())?;
+
+    let (encrypted_content, content_nonce) =
+        crate::crypto::draft::encrypt_draft_content(&content, &identity_key)
+            .map_err(|e| e.to_string())?;
+    let content_hash = crate::crypto::draft::draft_content_hash(&encrypted_content);
+    let attachment_count = content
+        .attachments
+        .as_ref()
+        .map(|a| a.len() as i64)
+        .unwrap_or(0);
+    let body = crate::api_client::CreateDraftBody {
+        draft_type: "new",
+        encrypted_content: &encrypted_content,
+        content_nonce: &content_nonce,
+        content_hash: &content_hash,
+        size_bytes: encrypted_content.len() as i64,
+        has_attachments: attachment_count > 0,
+        attachment_count,
+    };
+    let created = client
+        .create_draft(&token, &body)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::sync::poller::cache_web_draft(db, &created.id, &content, &our_email, &now, created.version);
+    let uid = db.assign_uid_if_missing("drafts", &created.id)?;
+    Ok((uid, created.id))
 }
 
 fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
@@ -1806,8 +1995,18 @@ async fn handle_copy_move(
     let mut moved_seqs: Vec<usize> = Vec::new();
     for (_, m) in &selected {
         if let Err(e) = client.set_mailbox_flags(&token, &m.aster_id, flags.clone()).await {
-            tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
-            return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+            let is_missing_item = matches!(
+                &e,
+                crate::error::BridgeError::Api(msg) if msg.starts_with("404")
+            );
+            let draft_removed = is_missing_item
+                && source_folder == "drafts"
+                && is_move
+                && client.delete_draft(&token, &m.aster_id).await.is_ok();
+            if !draft_removed {
+                tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
+                return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+            }
         }
     }
     for (seq, m) in &selected {
@@ -2004,10 +2203,26 @@ pub fn build_rfc822(msg: &CachedMessage) -> String {
         .map(|s| sanitize_header(s))
         .filter(|s| !s.is_empty());
     let is_html_flag = meta.get("is_html").and_then(|v| v.as_bool());
+    let cc = meta
+        .get("cc")
+        .and_then(|v| v.as_str())
+        .map(sanitize_header)
+        .filter(|s| !s.is_empty());
+    let bcc = meta
+        .get("bcc")
+        .and_then(|v| v.as_str())
+        .map(sanitize_header)
+        .filter(|s| !s.is_empty());
     out.push_str(&format!("Date: {}\r\n", date));
     out.push_str(&format!("From: {}\r\n", from));
     if !to.is_empty() {
         out.push_str(&format!("To: {}\r\n", to));
+    }
+    if let Some(cc) = cc {
+        out.push_str(&format!("Cc: {}\r\n", cc));
+    }
+    if let Some(bcc) = bcc {
+        out.push_str(&format!("Bcc: {}\r\n", bcc));
     }
     out.push_str(&format!("Subject: {}\r\n", subject));
     match real_message_id {
@@ -2473,10 +2688,12 @@ mod tests {
     async fn spawn_mock_backend(fail: bool) -> (String, BackendCalls) {
         use axum::extract::Path as AxumPath;
         use axum::response::IntoResponse;
-        use axum::{routing::delete, routing::patch, Json, Router};
+        use axum::{routing::delete, routing::patch, routing::post, Json, Router};
         let calls: BackendCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let c1 = calls.clone();
         let c2 = calls.clone();
+        let c3 = calls.clone();
+        let c4 = calls.clone();
         let app = Router::new()
             .route(
                 "/mail/v1/messages/:id",
@@ -2497,8 +2714,49 @@ mod tests {
                 patch(move |AxumPath(id): AxumPath<String>| {
                     let calls = c2.clone();
                     async move {
-                        calls.lock().await.push(("PATCH".to_string(), id));
-                        Json(serde_json::json!({"success": true})).into_response()
+                        calls.lock().await.push(("PATCH".to_string(), id.clone()));
+                        if id.starts_with("draft-") {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c3.clone();
+                    async move {
+                        let nonce = body
+                            .get("content_nonce")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        calls.lock().await.push(("POST_DRAFT".to_string(), nonce));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(serde_json::json!({"id": "draft-created-1", "version": 1, "success": true}))
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c4.clone();
+                    async move {
+                        calls.lock().await.push(("DELETE_DRAFT".to_string(), id.clone()));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else if id.starts_with("draft-") {
+                            Json(serde_json::json!({"success": true, "deleted_count": 1}))
+                                .into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
                     }
                 }),
             );
@@ -2512,6 +2770,19 @@ mod tests {
 
     async fn start_test_server_with_backend(
         fail: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        start_test_server_with_backend_opts(fail, None).await
+    }
+
+    async fn start_test_server_with_backend_opts(
+        fail: bool,
+        identity_key: Option<&str>,
     ) -> (
         std::net::SocketAddr,
         Arc<Database>,
@@ -2533,7 +2804,7 @@ mod tests {
             email: "tester@aster.test".to_string(),
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: Vec::new(),
-            identity_key: None,
+            identity_key: identity_key.map(|s| s.to_string()),
             ratchet_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
@@ -2928,6 +3199,109 @@ mod tests {
         let raw = b"Subject: x\r\n\r\nbody";
         let resp = append_literal(&mut reader, &mut writer, "ap3", "INBOX", raw).await;
         assert!(resp.contains("ap3 NO"), "expected NO: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_creates_server_draft_and_returns_appenduid() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"To: bruno@example.com\r\nCc: copy@example.com\r\nSubject: bozza di prova\r\nContent-Type: text/plain\r\n\r\nciao";
+        let resp = append_literal(&mut reader, &mut writer, "ad1", "Drafts", raw).await;
+        assert!(resp.contains("ad1 OK"), "append not accepted: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let cached = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "drafts");
+        assert_eq!(cached.subject.as_deref(), Some("bozza di prova"));
+        assert!(cached.flags & 16 != 0, "draft flag missing: {}", cached.flags);
+        assert!(cached.imap_uid > 0);
+
+        let captured = calls.lock().await.clone();
+        let nonce = captured
+            .iter()
+            .find(|(m, _)| m == "POST_DRAFT")
+            .map(|(_, n)| n.clone())
+            .expect("draft not created on server");
+        assert!(!nonce.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_round_trips_web_compatible_encryption() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"To: a@x.com\r\nSubject: verify crypto\r\n\r\nplain body";
+        let resp = append_literal(&mut reader, &mut writer, "ad2", "Drafts", raw).await;
+        assert!(resp.contains("ad2 OK"), "append not accepted: {}", resp);
+
+        let cached = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(cached.recipients.as_deref(), Some("a@x.com"));
+        assert!(cached.body_text.unwrap_or_default().contains("plain body"));
+        assert!(!calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_to_drafts_without_identity_key_fails_cleanly() {
+        let (addr, _db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: no key\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ad3", "Drafts", raw).await;
+        assert!(resp.contains("ad3 NO"), "expected NO: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn expunge_in_drafts_deletes_via_drafts_api() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "draft-ex1", "drafts", "old draft");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d1", "SELECT Drafts").await;
+        assert!(resp.contains("d1 OK"));
+        imap_cmd_lines(&mut reader, &mut writer, "d2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "missing expunge: {}", resp);
+
+        assert!(db.get_cached_message("draft-ex1").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id)| m == "DELETE_DRAFT" && id == "draft-ex1"),
+            "draft api delete missing: {:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, _)| m == "DELETE"),
+            "must not fall through to message delete: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn move_draft_to_trash_deletes_draft_on_server() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "draft-mv1", "drafts", "moving draft");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "SELECT Drafts").await;
+        assert!(resp.contains("m1 OK"));
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m2", "MOVE 1 Trash").await;
+        assert!(resp.contains("m2 OK"), "move failed: {}", resp);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured
+                .iter()
+                .any(|(m, id)| m == "DELETE_DRAFT" && id == "draft-mv1"),
+            "draft delete missing on move: {:?}",
+            captured
+        );
     }
 
     #[tokio::test]

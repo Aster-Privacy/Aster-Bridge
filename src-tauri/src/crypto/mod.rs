@@ -21,6 +21,8 @@
 #[allow(dead_code)]
 pub mod alias;
 #[allow(dead_code)]
+pub mod draft;
+#[allow(dead_code)]
 pub mod envelope;
 #[allow(dead_code)]
 pub mod metadata;

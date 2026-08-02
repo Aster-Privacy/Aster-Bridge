@@ -422,6 +422,79 @@ fn cache_mail_item(
     }
 }
 
+pub fn cache_web_draft(
+    db: &Database,
+    draft_id: &str,
+    content: &crate::crypto::draft::DraftContent,
+    our_email: &str,
+    date: &str,
+    version: i64,
+) -> bool {
+    let recipients = if content.to_recipients.is_empty() {
+        None
+    } else {
+        Some(content.to_recipients.join(", "))
+    };
+    let cc = content.cc_recipients.join(", ");
+    let bcc = content.bcc_recipients.join(", ");
+    let meta = serde_json::json!({
+        "is_html": true,
+        "message_id": serde_json::Value::Null,
+        "draft_api": true,
+        "draft_version": version,
+        "cc": cc,
+        "bcc": bcc,
+    })
+    .to_string();
+    let subject = if content.subject.is_empty() {
+        None
+    } else {
+        Some(content.subject.as_str())
+    };
+    let body = content.message.as_str();
+    let was_new = db
+        .upsert_cached_message(
+            draft_id,
+            "drafts",
+            subject,
+            Some(our_email),
+            recipients.as_deref(),
+            Some(date),
+            body.len() as i64,
+            Some(body),
+            Some(&meta),
+        )
+        .unwrap_or(false);
+    if let Err(e) = db.assign_uid_if_missing("drafts", draft_id) {
+        tracing::warn!("draft uid assign failed for {}: {}", draft_id, e);
+    }
+    match db.get_message_flags_by_id(draft_id) {
+        Ok(f) if f & 16 == 0 => {
+            let _ = db.set_message_flags_by_id(draft_id, f | 1 | 16);
+        }
+        Err(_) => {
+            let _ = db.set_message_flags_by_id(draft_id, 1 | 16);
+        }
+        _ => {}
+    }
+    was_new
+}
+
+fn cached_draft_versions(db: &Database) -> std::collections::HashMap<String, i64> {
+    db.list_cached_message_meta("drafts")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let meta: serde_json::Value = serde_json::from_str(m.raw_headers.as_deref()?).ok()?;
+            if meta.get("draft_api").and_then(|v| v.as_bool()) != Some(true) {
+                return None;
+            }
+            let version = meta.get("draft_version").and_then(|v| v.as_i64()).unwrap_or(-1);
+            Some((m.aster_id, version))
+        })
+        .collect()
+}
+
 fn looks_like_html(s: &str) -> bool {
     let trimmed = s.trim_start();
     trimmed.starts_with('<') || (s.contains('<') && s.contains("</"))
@@ -579,6 +652,75 @@ async fn run_sync_pass(
                     all_folders_complete = false;
                     break;
                 }
+            }
+        }
+    }
+
+    match identity_key.as_deref() {
+        Some(ik) => {
+            let existing_versions = cached_draft_versions(db);
+            let mut cursor: Option<String> = None;
+            let mut fetched = 0usize;
+            let mut new_ids: Vec<String> = Vec::new();
+            loop {
+                match client.list_drafts(&access_token, 100, cursor.as_deref()).await {
+                    Ok(resp) => {
+                        for d in &resp.items {
+                            if !is_valid_item_id(&d.id) {
+                                continue;
+                            }
+                            seen_ids.insert(d.id.clone());
+                            if existing_versions.get(&d.id) == Some(&d.version) {
+                                continue;
+                            }
+                            let content = match crate::crypto::draft::decrypt_draft_content(
+                                &d.encrypted_content,
+                                &d.content_nonce,
+                                ik,
+                            ) {
+                                Ok(c) => c,
+                                Err(_) => {
+                                    tracing::debug!("web draft decrypt skipped");
+                                    continue;
+                                }
+                            };
+                            let date = normalize_date_rfc3339(&d.updated_at);
+                            let was_new =
+                                cache_web_draft(db, &d.id, &content, &our_email, &date, d.version);
+                            if was_new {
+                                new_ids.push(d.id.clone());
+                            } else {
+                                updated_ids.push(d.id.clone());
+                            }
+                        }
+                        fetched += resp.items.len();
+                        let reached_end = !resp.has_more || resp.next_cursor.is_none();
+                        if reached_end || fetched >= 1000 {
+                            if !reached_end {
+                                all_folders_complete = false;
+                            }
+                            break;
+                        }
+                        cursor = resp.next_cursor;
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to sync web drafts: {}", e);
+                        tracing::warn!("{}", msg);
+                        last_err = Some(msg);
+                        all_folders_complete = false;
+                        break;
+                    }
+                }
+            }
+            if !new_ids.is_empty() {
+                any_inserted = true;
+                let id_refs: Vec<&str> = new_ids.iter().map(|s| s.as_str()).collect();
+                let _ = db.jmap_record_sync_batch("Email", &id_refs);
+            }
+        }
+        None => {
+            for id in cached_draft_versions(db).keys() {
+                seen_ids.insert(id.clone());
             }
         }
     }
@@ -1202,6 +1344,138 @@ mod tests {
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z"
         })
+    }
+
+    async fn spawn_mock_server_with_drafts(
+        items: Vec<serde_json::Value>,
+        drafts: Vec<serde_json::Value>,
+    ) -> String {
+        use axum::{routing::get, Json, Router};
+        let total = items.len();
+        let body = serde_json::json!({
+            "items": items,
+            "total": total,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let drafts_body = serde_json::json!({
+            "items": drafts,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                get(move || {
+                    let drafts_body = drafts_body.clone();
+                    async move { Json(drafts_body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn mock_session_with_identity_key(ik: &str) -> Arc<RwLock<crate::auth::session::Session>> {
+        Arc::new(RwLock::new(crate::auth::session::Session {
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: b"pass".to_vec(),
+            identity_key: Some(ik.to_string()),
+            ratchet_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn web_drafts_sync_into_drafts_folder() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+
+        let content = crate::crypto::draft::DraftContent {
+            to_recipients: vec!["bruno@example.com".to_string()],
+            cc_recipients: vec!["copy@example.com".to_string()],
+            bcc_recipients: vec![],
+            subject: "web draft".to_string(),
+            message: "<p>bozza</p>".to_string(),
+            attachments: None,
+        };
+        let (enc, nonce) =
+            crate::crypto::draft::encrypt_draft_content(&content, "test-ik").unwrap();
+        let draft_json = serde_json::json!({
+            "id": "web-draft-1",
+            "draft_type": "new",
+            "encrypted_content": enc,
+            "content_nonce": nonce,
+            "version": 3,
+            "has_attachments": false,
+            "attachment_count": 0,
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T12:00:00Z"
+        });
+        let base = spawn_mock_server_with_drafts(vec![], vec![draft_json]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session_with_identity_key("test-ik");
+
+        run_sync_pass(&session, &client, &db, None, true)
+            .await
+            .unwrap();
+
+        let cached = db.get_cached_message("web-draft-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "drafts");
+        assert_eq!(cached.subject.as_deref(), Some("web draft"));
+        assert_eq!(cached.recipients.as_deref(), Some("bruno@example.com"));
+        assert!(cached.body_text.unwrap_or_default().contains("bozza"));
+        assert!(cached.flags & 16 != 0, "draft flag missing: {}", cached.flags);
+        assert!(cached.imap_uid > 0);
+
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("draft_api"), Some(&serde_json::json!(true)));
+        assert_eq!(meta.get("draft_version"), Some(&serde_json::json!(3)));
+        assert_eq!(meta.get("cc"), Some(&serde_json::json!("copy@example.com")));
+
+        run_sync_pass(&session, &client, &db, None, true)
+            .await
+            .unwrap();
+        assert_eq!(db.count_cached_messages("drafts").unwrap(), 1);
+        assert!(db.get_cached_message("web-draft-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn deep_sync_prunes_web_draft_deleted_on_server() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+
+        let content = crate::crypto::draft::DraftContent {
+            subject: "stale".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-gone", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1);
+        assert!(db.get_cached_message("web-draft-gone").unwrap().is_some());
+
+        let base = spawn_mock_server_with_drafts(vec![], vec![]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session_with_identity_key("test-ik");
+
+        run_sync_pass(&session, &client, &db, None, true)
+            .await
+            .unwrap();
+
+        assert!(db.get_cached_message("web-draft-gone").unwrap().is_none());
     }
 
     #[tokio::test]

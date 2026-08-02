@@ -1996,3 +1996,69 @@ async fn cleanup_test_messages() {
         }
     }
 }
+
+//   cargo test --bin aster-bridge-desktop draft_append_roundtrip_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn draft_append_roundtrip_real() {
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let token = session.access_token.clone();
+    let identity_key = match session.identity_key.clone() {
+        Some(k) => k, None => { println!("no identity_key"); return; }
+    };
+    let session = Arc::new(RwLock::new(session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+
+    let raw = b"To: bridge-draft-test@example.com\r\nCc: bridge-cc-test@example.com\r\nSubject: BRIDGE DRAFT APPEND LIVE TEST 271828\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>live draft body 271828</p>";
+    let (uid, draft_id) = match crate::imap::server::append_draft(&db, &client, &session, raw).await {
+        Ok(v) => v,
+        Err(e) => { panic!("APPEND DRAFT FAILED: {}", e); }
+    };
+    println!("created live draft {} with local uid {}", draft_id, uid);
+
+    let cached = db.get_cached_message(&draft_id).unwrap().expect("draft not cached locally");
+    assert_eq!(cached.folder, "drafts");
+    assert!(cached.flags & 16 != 0, "missing \\Draft flag");
+    let rendered = crate::imap::server::build_rfc822(&cached);
+    assert!(rendered.contains("Subject: BRIDGE DRAFT APPEND LIVE TEST 271828"), "rfc822 render missing subject");
+    assert!(rendered.contains("Cc: bridge-cc-test@example.com"), "rfc822 render missing Cc");
+
+    let listed = client.list_drafts(&token, 100, None).await.expect("list_drafts failed");
+    let found = listed.items.iter().find(|d| d.id == draft_id).expect("created draft not returned by server");
+    let content = crate::crypto::draft::decrypt_draft_content(
+        &found.encrypted_content, &found.content_nonce, &identity_key,
+    ).expect("server copy failed to decrypt with web key derivation");
+    assert_eq!(content.subject, "BRIDGE DRAFT APPEND LIVE TEST 271828");
+    assert_eq!(content.to_recipients, vec!["bridge-draft-test@example.com".to_string()]);
+    assert_eq!(content.cc_recipients, vec!["bridge-cc-test@example.com".to_string()]);
+    assert!(content.message.contains("live draft body 271828"));
+    println!("server copy decrypted ok with web-compatible key");
+
+    let mut existing_ok = 0usize;
+    let mut existing_fail = 0usize;
+    for d in &listed.items {
+        if d.id == draft_id { continue; }
+        match crate::crypto::draft::decrypt_draft_content(&d.encrypted_content, &d.content_nonce, &identity_key) {
+            Ok(c) => { existing_ok += 1; println!("existing web draft {} decrypts (subject: {:?})", d.id, c.subject); }
+            Err(e) => { existing_fail += 1; println!("existing web draft {} DECRYPT FAILED: {}", d.id, e); }
+        }
+    }
+    println!("existing web drafts: {} decrypted, {} failed", existing_ok, existing_fail);
+
+    client.delete_draft(&token, &draft_id).await.expect("delete_draft failed");
+    let after = client.list_drafts(&token, 100, None).await.expect("relist failed");
+    assert!(after.items.iter().all(|d| d.id != draft_id), "draft still on server after delete");
+    println!("==== PROOF: live APPEND->create->list->decrypt->delete draft round trip succeeded ====");
+}

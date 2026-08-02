@@ -842,9 +842,30 @@ pub async fn set(
     }
 
     for id in &destroys {
-        if ctx.db.get_cached_message(id).ok().flatten().is_none() {
-            not_destroyed.insert(id.clone(), json!({"type": "notFound"}));
-            continue;
+        let cached = match ctx.db.get_cached_message(id).ok().flatten() {
+            Some(m) => m,
+            None => {
+                not_destroyed.insert(id.clone(), json!({"type": "notFound"}));
+                continue;
+            }
+        };
+        if cached.folder == "drafts" {
+            match ctx.client.delete_draft(&access_token, id).await {
+                Ok(_) => {
+                    let _ = ctx.db.delete_message_by_aster_id(id);
+                    destroyed.push(id.clone());
+                    mailbox_counts_touched = true;
+                    continue;
+                }
+                Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {}
+                Err(e) => {
+                    not_destroyed.insert(
+                        id.clone(),
+                        json!({"type": "serverFail", "description": e.to_string()}),
+                    );
+                    continue;
+                }
+            }
         }
         match ctx.client.delete_mail_item_permanent(&access_token, id).await {
             Ok(_) => {

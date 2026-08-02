@@ -91,6 +91,49 @@ pub struct CreateMailItem<'a> {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CreateDraftBody<'a> {
+    pub draft_type: &'a str,
+    pub encrypted_content: &'a str,
+    pub content_nonce: &'a str,
+    pub content_hash: &'a str,
+    pub size_bytes: i64,
+    pub has_attachments: bool,
+    pub attachment_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DraftListItem {
+    pub id: String,
+    pub draft_type: String,
+    pub encrypted_content: String,
+    pub content_nonce: String,
+    pub version: i64,
+    #[serde(default)]
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub attachment_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DraftListResponse {
+    pub items: Vec<DraftListItem>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDraftResponse {
+    pub id: String,
+    #[serde(default)]
+    pub version: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DeviceCodeRequest {
     pub ed25519_pk: String,
     pub mlkem_pk: String,
@@ -506,6 +549,63 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_drafts(
+        &self,
+        access_token: &str,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<DraftListResponse> {
+        let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        let resp = self.client
+            .get(format!("{}/mail/v1/drafts", self.base_url))
+            .bearer_auth(access_token)
+            .query(&params)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_draft(
+        &self,
+        access_token: &str,
+        body: &CreateDraftBody<'_>,
+    ) -> Result<CreateDraftResponse> {
+        let resp = self.client
+            .post(format!("{}/mail/v1/drafts", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn delete_draft(&self, access_token: &str, draft_id: &str) -> Result<()> {
+        let resp = self.client
+            .delete(format!("{}/mail/v1/drafts/{}", self.base_url, draft_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
     }
 
     pub async fn get_pq_secret(&self, access_token: &str, key_id: u32) -> Result<PqSecretResponse> {
