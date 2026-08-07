@@ -15,9 +15,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - leg: win
+            os: windows-latest
             args: ''
-          - os: ubuntu-22.04
+          - leg: linux-x64
+            os: ubuntu-22.04
+            args: ''
+          - leg: linux-arm64
+            os: ubuntu-22.04-arm
             args: ''
     runs-on: ${{ matrix.os }}
 
@@ -34,7 +39,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.92.0"
-          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.leg == 'mac' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -42,18 +47,18 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Setup MSVC environment (Windows, for vendored OpenSSL build)
-        if: matrix.os == 'windows-latest'
+        if: matrix.leg == 'win'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
       - name: Install NASM (Windows, for vendored OpenSSL / SQLCipher)
-        if: matrix.os == 'windows-latest'
+        if: matrix.leg == 'win'
         shell: bash
         run: |
           choco install nasm -y
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
       - name: Install Linux system dependencies
-        if: matrix.os == 'ubuntu-22.04'
+        if: startsWith(matrix.leg, 'linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -66,7 +71,7 @@ jobs:
             perl
 
       - name: Import Apple certificate
-        if: matrix.os == 'macos-latest' && env.APPLE_CERTIFICATE != ''
+        if: matrix.leg == 'mac' && env.APPLE_CERTIFICATE != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -89,7 +94,7 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
 
       - name: Write Apple API key
-        if: matrix.os == 'macos-latest' && env.APPLE_API_KEY_CONTENT != ''
+        if: matrix.leg == 'mac' && env.APPLE_API_KEY_CONTENT != ''
         env:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
@@ -147,19 +152,26 @@ jobs:
             fi
           }
 
-          if [[ "${{ matrix.os }}" == "ubuntu-22.04" ]]; then
+          if [[ "${{ matrix.leg }}" == "linux-x64" ]]; then
             rename_asset "Aster.Bridge_${V}_amd64.AppImage"     "Aster-Bridge-x86_64.AppImage"
             rename_asset "Aster.Bridge_${V}_amd64.AppImage.sig" "Aster-Bridge-x86_64.AppImage.sig"
             rename_asset "Aster.Bridge_${V}_amd64.deb"          "Aster-Bridge-amd64.deb"
             rename_asset "Aster.Bridge_${V}_amd64.deb.sig"      "Aster-Bridge-amd64.deb.sig"
             rename_asset "Aster.Bridge-${V}-1.x86_64.rpm"       "Aster-Bridge-x86_64.rpm"
             rename_asset "Aster.Bridge-${V}-1.x86_64.rpm.sig"   "Aster-Bridge-x86_64.rpm.sig"
-          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          elif [[ "${{ matrix.leg }}" == "linux-arm64" ]]; then
+            rename_asset "Aster.Bridge_${V}_aarch64.AppImage"     "Aster-Bridge-aarch64.AppImage"
+            rename_asset "Aster.Bridge_${V}_aarch64.AppImage.sig" "Aster-Bridge-aarch64.AppImage.sig"
+            rename_asset "Aster.Bridge_${V}_arm64.deb"            "Aster-Bridge-arm64.deb"
+            rename_asset "Aster.Bridge_${V}_arm64.deb.sig"        "Aster-Bridge-arm64.deb.sig"
+            rename_asset "Aster.Bridge-${V}-1.aarch64.rpm"        "Aster-Bridge-aarch64.rpm"
+            rename_asset "Aster.Bridge-${V}-1.aarch64.rpm.sig"    "Aster-Bridge-aarch64.rpm.sig"
+          elif [[ "${{ matrix.leg }}" == "win" ]]; then
             rename_asset "Aster.Bridge_${V}_x64-setup.exe"     "Aster-Bridge-x64-setup.exe"
             rename_asset "Aster.Bridge_${V}_x64-setup.exe.sig" "Aster-Bridge-x64-setup.exe.sig"
             rename_asset "Aster.Bridge_${V}_x64_en-US.msi"     "Aster-Bridge-x64.msi"
             rename_asset "Aster.Bridge_${V}_x64_en-US.msi.sig" "Aster-Bridge-x64.msi.sig"
-          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+          elif [[ "${{ matrix.leg }}" == "mac" ]]; then
             rename_asset "Aster.Bridge_${V}_universal.dmg"            "Aster-Bridge-universal.dmg"
             rename_asset "Aster.Bridge_${V}_universal.dmg.sig"        "Aster-Bridge-universal.dmg.sig"
             rename_asset "Aster.Bridge_${V}_universal.app.tar.gz"     "Aster-Bridge-universal.app.tar.gz"
@@ -175,15 +187,59 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           V=$(node -p "require('./package.json').version")
           TAG="v${V}"
           TMP=$(mktemp -d)
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           gh release download "$TAG" --pattern latest.json --dir "$TMP" --clobber
           sed -i \
             -e "s|Aster\.Bridge_${V}_amd64\.AppImage|Aster-Bridge-x86_64.AppImage|g" \
+            -e "s|Aster\.Bridge_${V}_aarch64\.AppImage|Aster-Bridge-aarch64.AppImage|g" \
             -e "s|Aster\.Bridge_${V}_x64-setup\.exe|Aster-Bridge-x64-setup.exe|g" \
             -e "s|Aster\.Bridge_${V}_universal\.app\.tar\.gz|Aster-Bridge-universal.app.tar.gz|g" \
             "$TMP/latest.json"
+
+          for f in Aster-Bridge-x86_64.AppImage.sig Aster-Bridge-aarch64.AppImage.sig; do
+            gh release download "$TAG" --pattern "$f" --dir "$TMP" --clobber 2>/dev/null || true
+          done
+
+          SIGDIR="$TMP" BASE="$BASE" node -e '
+            const fs = require("fs");
+            const path = process.argv[1];
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            manifest.platforms = manifest.platforms || {};
+            const legs = {
+              "linux-x86_64": "Aster-Bridge-x86_64.AppImage",
+              "linux-aarch64": "Aster-Bridge-aarch64.AppImage",
+            };
+            for (const [key, file] of Object.entries(legs)) {
+              const sig = `${process.env.SIGDIR}/${file}.sig`;
+              if (!fs.existsSync(sig)) {
+                console.log(`::warning::${file}.sig absent; leaving ${key} untouched`);
+                continue;
+              }
+              manifest.platforms[key] = {
+                signature: fs.readFileSync(sig, "utf8").trim(),
+                url: `${process.env.BASE}/${file}`,
+              };
+            }
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
+          ' "$TMP/latest.json"
+
+          node -e '
+            const manifest = require(process.argv[1]);
+            const platforms = Object.keys(manifest.platforms || {});
+            console.log("latest.json platforms:", platforms.join(", "));
+            if (!platforms.includes("linux-x86_64")) {
+              console.log("::error::latest.json is missing linux-x86_64");
+              process.exit(1);
+            }
+            if (!platforms.includes("linux-aarch64")) {
+              console.log("::warning::latest.json is missing linux-aarch64; ARM installs will not self-update");
+            }
+          ' "$TMP/latest.json"
+
           gh release upload "$TAG" "$TMP/latest.json" --clobber
 
   ensure_download_assets:
@@ -214,19 +270,28 @@ jobs:
             Aster-Bridge-universal.dmg
           )
 
+          OPTIONAL=(
+            Aster-Bridge-aarch64.AppImage
+            Aster-Bridge-arm64.deb
+            Aster-Bridge-aarch64.rpm
+          )
+
           declare -A SRC=(
             [Aster-Bridge-x64-setup.exe]="Aster.Bridge_${V}_x64-setup.exe"
             [Aster-Bridge-x64.msi]="Aster.Bridge_${V}_x64_en-US.msi"
             [Aster-Bridge-x86_64.AppImage]="Aster.Bridge_${V}_amd64.AppImage"
             [Aster-Bridge-amd64.deb]="Aster.Bridge_${V}_amd64.deb"
             [Aster-Bridge-x86_64.rpm]="Aster.Bridge-${V}-1.x86_64.rpm"
+            [Aster-Bridge-aarch64.AppImage]="Aster.Bridge_${V}_aarch64.AppImage"
+            [Aster-Bridge-arm64.deb]="Aster.Bridge_${V}_arm64.deb"
+            [Aster-Bridge-aarch64.rpm]="Aster.Bridge-${V}-1.aarch64.rpm"
             [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
           )
 
           assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
           has() { assets | grep -qxF "$1"; }
 
-          for name in "${REQUIRED[@]}"; do
+          for name in "${REQUIRED[@]}" "${OPTIONAL[@]}"; do
             if has "$name"; then echo "ok: $name"; continue; fi
 
             src="${SRC[$name]:-}"
@@ -252,6 +317,14 @@ jobs:
               continue
             fi
           done
+
+          ABSENT_ARM=()
+          for name in "${OPTIONAL[@]}"; do
+            has "$name" || ABSENT_ARM+=("$name")
+          done
+          if [ ${#ABSENT_ARM[@]} -ne 0 ]; then
+            echo "::warning::$TAG has no Linux ARM assets: ${ABSENT_ARM[*]}. The ARM download links fall back to an older release."
+          fi
 
           MISSING=()
           for name in "${REQUIRED[@]}"; do

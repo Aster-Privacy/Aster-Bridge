@@ -16,3 +16,6 @@ downloads/files/
 src-tauri/gen/
 *.db
 *.sqlite
+updates/staging/
+updates/Dockerfile.linux_build
+updates/build_linux.sh

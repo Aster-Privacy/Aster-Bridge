@@ -40,19 +40,28 @@ jobs:
             Aster-Bridge-universal.dmg
           )
 
+          OPTIONAL=(
+            Aster-Bridge-aarch64.AppImage
+            Aster-Bridge-arm64.deb
+            Aster-Bridge-aarch64.rpm
+          )
+
           declare -A SRC=(
             [Aster-Bridge-x64-setup.exe]="Aster.Bridge_${V}_x64-setup.exe"
             [Aster-Bridge-x64.msi]="Aster.Bridge_${V}_x64_en-US.msi"
             [Aster-Bridge-x86_64.AppImage]="Aster.Bridge_${V}_amd64.AppImage"
             [Aster-Bridge-amd64.deb]="Aster.Bridge_${V}_amd64.deb"
             [Aster-Bridge-x86_64.rpm]="Aster.Bridge-${V}-1.x86_64.rpm"
+            [Aster-Bridge-aarch64.AppImage]="Aster.Bridge_${V}_aarch64.AppImage"
+            [Aster-Bridge-arm64.deb]="Aster.Bridge_${V}_arm64.deb"
+            [Aster-Bridge-aarch64.rpm]="Aster.Bridge-${V}-1.aarch64.rpm"
             [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
           )
 
           assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
           has() { assets | grep -qxF "$1"; }
 
-          for name in "${REQUIRED[@]}"; do
+          for name in "${REQUIRED[@]}" "${OPTIONAL[@]}"; do
             if has "$name"; then echo "ok: $name"; continue; fi
 
             src="${SRC[$name]:-}"
@@ -78,6 +87,14 @@ jobs:
               continue
             fi
           done
+
+          ABSENT_ARM=()
+          for name in "${OPTIONAL[@]}"; do
+            has "$name" || ABSENT_ARM+=("$name")
+          done
+          if [ ${#ABSENT_ARM[@]} -ne 0 ]; then
+            echo "::warning::$TAG has no Linux ARM assets: ${ABSENT_ARM[*]}. The ARM download links fall back to an older release."
+          fi
 
           MISSING=()
           for name in "${REQUIRED[@]}"; do
