@@ -1128,7 +1128,10 @@ impl Database {
                 .ok();
             if let Some(prev) = existing {
                 if prev != envelope_nonce {
-                    return Ok(false);
+                    conn.execute(
+                        "UPDATE envelope_nonces SET nonce = ?2, first_seen = ?3 WHERE aster_id = ?1",
+                        rusqlite::params![aster_id, envelope_nonce, now],
+                    )?;
                 }
                 return Ok(true);
             }
@@ -2159,11 +2162,12 @@ mod db_tests {
     }
 
     #[test]
-    fn replay_check_records_and_detects() {
+    fn replay_check_records_and_tracks_re_encryption() {
         let (_d, db) = open_db();
         assert!(db.replay_check_and_record("a1", "nonce1").unwrap());
         assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "same nonce is allowed");
-        assert!(!db.replay_check_and_record("a1", "nonce2").unwrap(), "different nonce is a replay");
+        assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "re-encryption rotates the nonce and must not lock the item out");
+        assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "the rotated nonce becomes the recorded one");
     }
 
     #[test]

@@ -64,7 +64,7 @@ pub struct RatchetMessage {
     pub pq_secret: Option<Vec<u8>>,
 }
 
-fn ecdh_p256(secret_d: &[u8], public_sec1: &[u8]) -> Result<[u8; 32], String> {
+pub(crate) fn ecdh_p256(secret_d: &[u8], public_sec1: &[u8]) -> Result<[u8; 32], String> {
     let sk = SecretKey::from_slice(secret_d).map_err(|e| format!("p256 secret: {}", e))?;
     let pk = PublicKey::from_sec1_bytes(public_sec1).map_err(|e| format!("p256 public: {}", e))?;
     let shared = diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
@@ -80,7 +80,7 @@ fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Result<V
     Ok(okm)
 }
 
-fn ml_kem768_decapsulate(ct_bytes: &[u8], sk_bytes: &[u8]) -> Result<[u8; 32], String> {
+pub(crate) fn ml_kem768_decapsulate(ct_bytes: &[u8], sk_bytes: &[u8]) -> Result<[u8; 32], String> {
     let encoded = ml_kem::Encoded::<MlKemDecapKey>::try_from(sk_bytes)
         .map_err(|e| format!("mlkem secret size: {:?}", e))?;
     let dk = MlKemDecapKey::from_bytes(&encoded);
@@ -174,7 +174,7 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     STANDARD.decode(s.trim()).map_err(|e| format!("base64 decode: {}", e))
 }
 
-fn jwk_d_bytes(jwk_string: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn jwk_d_bytes(jwk_string: &str) -> Result<Vec<u8>, String> {
     let jwk: Value = serde_json::from_str(jwk_string).map_err(|e| format!("jwk parse: {}", e))?;
     let d = jwk
         .get("d")

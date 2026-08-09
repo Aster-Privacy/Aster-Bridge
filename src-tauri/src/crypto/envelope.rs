@@ -26,6 +26,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
+use crate::crypto::inbound::{
+    decrypt_inbound_envelope, InboundKeyCandidate, INBOUND_ECDH_MARKER, INBOUND_PQ_HYBRID_MARKER,
+};
 use crate::error::{BridgeError, Result};
 
 const PBKDF2_ITERATIONS: u32 = 310_000;
@@ -39,6 +42,7 @@ pub fn decrypt_envelope(
     nonce_b64: Option<&str>,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    inbound_keys: &[InboundKeyCandidate],
 ) -> Result<String> {
     let nonce_bytes = match nonce_b64 {
         Some(n) if !n.is_empty() => STANDARD
@@ -53,6 +57,19 @@ pub fn decrypt_envelope(
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
         return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase);
+    }
+
+    if nonce_bytes.len() == NONCE_LEN && !inbound_keys.is_empty() {
+        if let Ok(data) = STANDARD.decode(encrypted_data_b64) {
+            if matches!(
+                data.first(),
+                Some(&INBOUND_ECDH_MARKER) | Some(&INBOUND_PQ_HYBRID_MARKER)
+            ) {
+                if let Ok(result) = decrypt_inbound_envelope(&data, &nonce_bytes, inbound_keys) {
+                    return Ok(result);
+                }
+            }
+        }
     }
 
     if let Some(ik) = identity_key {
@@ -194,7 +211,7 @@ mod tests {
     fn empty_nonce_plaintext_json_envelope_returns_as_is() {
         let json = r#"{"subject":"hello","body_text":"world"}"#;
         let b64 = STANDARD.encode(json.as_bytes());
-        let out = decrypt_envelope(&b64, Some(""), b"unused-pass", None).unwrap();
+        let out = decrypt_envelope(&b64, Some(""), b"unused-pass", None, &[]).unwrap();
         assert_eq!(out, json);
     }
 
@@ -202,7 +219,7 @@ mod tests {
     fn empty_nonce_non_pgp_with_identity_key_still_returns_plaintext() {
         let json = r#"{"subject":"x"}"#;
         let b64 = STANDARD.encode(json.as_bytes());
-        let out = decrypt_envelope(&b64, None, b"p", Some("ignored-ik")).unwrap();
+        let out = decrypt_envelope(&b64, None, b"p", Some("ignored-ik"), &[]).unwrap();
         assert_eq!(out, json);
     }
 
@@ -239,14 +256,14 @@ mod tests {
         let plaintext = r#"{"subject":"secret","body":"hello"}"#;
         let pass = b"correct horse battery staple";
         let data = build_pbkdf2_envelope(plaintext.as_bytes(), pass);
-        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None).unwrap();
+        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None, &[]).unwrap();
         assert_eq!(out, plaintext);
     }
 
     #[test]
     fn pbkdf2_envelope_wrong_passphrase_fails_without_panic() {
         let data = build_pbkdf2_envelope(b"top secret", b"right-pass");
-        let err = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), b"wrong-pass", None);
+        let err = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), b"wrong-pass", None, &[]);
         assert!(err.is_err());
     }
 
@@ -254,7 +271,7 @@ mod tests {
     fn pbkdf2_envelope_empty_plaintext_round_trips() {
         let pass = b"p";
         let data = build_pbkdf2_envelope(b"", pass);
-        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None).unwrap();
+        let out = decrypt_envelope(&data, Some(&pbkdf2_nonce_marker()), pass, None, &[]).unwrap();
         assert_eq!(out, "");
     }
 
@@ -266,21 +283,21 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xff;
         let tampered = STANDARD.encode(&raw);
-        let err = decrypt_envelope(&tampered, Some(&pbkdf2_nonce_marker()), pass, None);
+        let err = decrypt_envelope(&tampered, Some(&pbkdf2_nonce_marker()), pass, None, &[]);
         assert!(err.is_err());
     }
 
     #[test]
     fn pbkdf2_envelope_too_short_is_rejected() {
         let short = STANDARD.encode([0u8; 8]);
-        let err = decrypt_envelope(&short, Some(&pbkdf2_nonce_marker()), b"p", None);
+        let err = decrypt_envelope(&short, Some(&pbkdf2_nonce_marker()), b"p", None, &[]);
         assert!(err.is_err());
     }
 
     #[test]
     fn nonce_decode_failure_is_error_not_panic() {
         let data = STANDARD.encode(b"whatever");
-        let err = decrypt_envelope(&data, Some("not valid base64 !!!"), b"p", None);
+        let err = decrypt_envelope(&data, Some("not valid base64 !!!"), b"p", None, &[]);
         assert!(err.is_err());
     }
 
@@ -289,7 +306,7 @@ mod tests {
         let plaintext = r#"{"subject":"ik"}"#;
         let ik = "my-identity-key-material";
         let (data, nonce) = build_identity_envelope(plaintext.as_bytes(), ik, ENVELOPE_VERSIONS[0].as_bytes());
-        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik)).unwrap();
+        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik), &[]).unwrap();
         assert_eq!(out, plaintext);
     }
 
@@ -298,7 +315,7 @@ mod tests {
         let plaintext = "import payload";
         let ik = "another-identity-key";
         let (data, nonce) = build_identity_envelope(plaintext.as_bytes(), ik, ENVELOPE_VERSIONS[1].as_bytes());
-        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik)).unwrap();
+        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik), &[]).unwrap();
         assert_eq!(out, plaintext);
     }
 
@@ -306,7 +323,7 @@ mod tests {
     fn identity_key_envelope_wrong_key_falls_back_and_errors() {
         let ik = "right-identity-key";
         let (data, nonce) = build_identity_envelope(b"hidden", ik, ENVELOPE_VERSIONS[0].as_bytes());
-        let err = decrypt_envelope(&data, Some(&nonce), b"wrong-pass", Some("wrong-identity-key"));
+        let err = decrypt_envelope(&data, Some(&nonce), b"wrong-pass", Some("wrong-identity-key"), &[]);
         assert!(err.is_err());
     }
 
@@ -314,8 +331,69 @@ mod tests {
     fn identity_key_envelope_bad_nonce_length_falls_through_to_pbkdf2() {
         let bad_nonce = STANDARD.encode([0u8; 8]);
         let data = STANDARD.encode(b"junk");
-        let err = decrypt_envelope(&data, Some(&bad_nonce), b"pass", Some("ik"));
+        let err = decrypt_envelope(&data, Some(&bad_nonce), b"pass", Some("ik"), &[]);
         assert!(err.is_err());
+    }
+
+    fn sample_inbound_candidates() -> Vec<InboundKeyCandidate> {
+        use rand_core::OsRng;
+        let sk = p256::SecretKey::random(&mut OsRng);
+        vec![InboundKeyCandidate {
+            ecdh_secret_d: sk.to_bytes().to_vec(),
+            pq_decap_key: None,
+        }]
+    }
+
+    #[test]
+    fn pbkdf2_envelope_starting_with_inbound_marker_falls_through_to_legacy_path() {
+        let plaintext = r#"{"subject":"legacy"}"#;
+        let pass = b"legacy-pass";
+        let salt = {
+            let mut s = [7u8; SALT_LEN];
+            s[0] = 0x03;
+            s
+        };
+        let nonce_bytes = [9u8; NONCE_LEN];
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(pass, &salt, PBKDF2_ITERATIONS, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .unwrap();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&salt);
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        let data = STANDARD.encode(&combined);
+        let envelope_nonce = STANDARD.encode([2u8; NONCE_LEN]);
+        let candidates = sample_inbound_candidates();
+        let out = decrypt_envelope(&data, Some(&envelope_nonce), pass, None, &candidates).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn identity_envelope_starting_with_inbound_marker_falls_through_to_legacy_path() {
+        let ik = "identity-key-material";
+        let candidates = sample_inbound_candidates();
+        let plaintext = r#"{"subject":"marker probe"}"#;
+        let key = derive_envelope_key(ik.as_bytes(), ENVELOPE_VERSIONS[0].as_bytes()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        for i in 0u32..4096 {
+            let mut nonce_bytes = [0u8; NONCE_LEN];
+            nonce_bytes[..4].copy_from_slice(&i.to_be_bytes());
+            let ciphertext = cipher
+                .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+                .unwrap();
+            if ciphertext[0] != 0x03 && ciphertext[0] != 0x04 {
+                continue;
+            }
+            let data = STANDARD.encode(&ciphertext);
+            let nonce = STANDARD.encode(nonce_bytes);
+            let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik), &candidates).unwrap();
+            assert_eq!(out, plaintext);
+            return;
+        }
+        panic!("no probe produced an inbound marker first byte");
     }
 
     #[test]

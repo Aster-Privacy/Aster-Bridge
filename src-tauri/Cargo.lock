@@ -176,6 +176,7 @@ dependencies = [
  "hmac",
  "keyring",
  "mail-parser",
+ "miniz_oxide",
  "ml-kem",
  "open",
  "p256",

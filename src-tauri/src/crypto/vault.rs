@@ -37,6 +37,8 @@ pub struct RatchetKeySet {
     pub ratchet_identity_public: Option<String>,
     pub ratchet_signed_prekey: Option<String>,
     pub ratchet_signed_prekey_public: Option<String>,
+    pub ratchet_pq_identity_key: Option<String>,
+    pub ratchet_pq_identity_seed: Option<String>,
 }
 
 #[derive(Deserialize, ZeroizeOnDrop)]
@@ -50,6 +52,8 @@ pub struct VaultContents {
     pub ratchet_identity_public: Option<String>,
     pub ratchet_signed_prekey: Option<String>,
     pub ratchet_signed_prekey_public: Option<String>,
+    pub ratchet_pq_identity_key: Option<String>,
+    pub ratchet_pq_identity_seed: Option<String>,
     pub ratchet_previous_keys: Option<Vec<RatchetKeySet>>,
 }
 

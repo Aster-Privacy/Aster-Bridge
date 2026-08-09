@@ -82,6 +82,22 @@ pub struct PrekeyBundle {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ReportEnvelopeCapability<'a> {
+    pub client_id: &'a str,
+    pub max_envelope_marker: i16,
+    pub platform: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnvelopeCapabilityResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub min_supported_marker: Option<i16>,
+    #[serde(default)]
+    pub pq_hybrid_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CreateMailItem<'a> {
     pub item_type: &'a str,
     pub encrypted_envelope: &'a str,
@@ -510,6 +526,25 @@ impl ApiClient {
             .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
             .query(&[("email", email)])
             .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn report_envelope_capability(
+        &self,
+        access_token: &str,
+        body: &ReportEnvelopeCapability<'_>,
+    ) -> Result<EnvelopeCapabilityResponse> {
+        let resp = self.client
+            .post(format!("{}/crypto/v1/ratchet/envelope-capability", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
             .send()
             .await?;
 

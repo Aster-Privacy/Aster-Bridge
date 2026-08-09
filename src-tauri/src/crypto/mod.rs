@@ -25,6 +25,10 @@ pub mod draft;
 #[allow(dead_code)]
 pub mod envelope;
 #[allow(dead_code)]
+pub mod envelope_capability;
+#[allow(dead_code)]
+pub mod inbound;
+#[allow(dead_code)]
 pub mod metadata;
 #[allow(dead_code)]
 pub mod preferences;
