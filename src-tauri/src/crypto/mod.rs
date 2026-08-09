@@ -18,21 +18,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-#[allow(dead_code)]
 pub mod alias;
-#[allow(dead_code)]
 pub mod draft;
-#[allow(dead_code)]
 pub mod envelope;
-#[allow(dead_code)]
 pub mod envelope_capability;
-#[allow(dead_code)]
 pub mod inbound;
 #[allow(dead_code)]
 pub mod metadata;
-#[allow(dead_code)]
 pub mod preferences;
-#[allow(dead_code)]
 pub mod ratchet;
-#[allow(dead_code)]
 pub mod vault;

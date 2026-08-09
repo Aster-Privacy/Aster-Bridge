@@ -31,9 +31,12 @@ use crate::error::{BridgeError, Result};
 
 const DERIVED_KEY_INFO: &[u8] = b"aster-storage-encryption-key-v1";
 const SALT_DERIVATION_PREFIX: &[u8] = b"aster-hkdf-salt-v1:";
+#[allow(dead_code)]
 const ALIAS_HMAC_INFO: &[u8] = b"astermail-alias-hmac-v1";
+#[allow(dead_code)]
 const DOMAIN_HMAC_INFO: &[u8] = b"astermail-domain-address-hmac-v1";
 
+#[allow(dead_code)]
 type HmacSha256 = Hmac<Sha256>;
 
 // Mirrors the web client's derive_encryption_key_from_passphrase
@@ -56,6 +59,7 @@ pub fn derive_storage_key(passphrase: &[u8]) -> [u8; 32] {
 
 // Mirrors get_alias_hmac_key / get_domain_hmac_key:
 //   hmac_key = SHA-256(derived_key || info)
+#[allow(dead_code)]
 fn hmac_key_from(derived_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(derived_key.len() + info.len());
     buf.extend_from_slice(derived_key);
@@ -69,6 +73,7 @@ fn hmac_key_from(derived_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
 
 // Alias normalization (normalize_local_part): lowercase + strip ALL dots.
 // Domain is NOT lowercased in the alias path (matches compute_alias_hash).
+#[allow(dead_code)]
 fn normalize_local_part(local_part: &str) -> String {
     local_part.to_lowercase().replace('.', "")
 }
@@ -137,6 +142,7 @@ pub fn decrypt_display_name(
 //   HMAC-SHA256(key = SHA-256(derived_key || "astermail-alias-hmac-v1"),
 //               data = normalize(local) + "@" + domain)
 // Result is base64. Note: domain is NOT lowercased here (matches the web client).
+#[allow(dead_code)]
 pub fn compute_alias_hash(derived_key: &[u8; 32], local_part: &str, domain: &str) -> String {
     let key = hmac_key_from(derived_key, ALIAS_HMAC_INFO);
     let full = format!("{}@{}", normalize_local_part(local_part), domain);
@@ -150,6 +156,7 @@ pub fn compute_alias_hash(derived_key: &[u8; 32], local_part: &str, domain: &str
 //   HMAC-SHA256(key = SHA-256(derived_key || "astermail-domain-address-hmac-v1"),
 //               data = normalize(local) + "@" + lower(domain))
 // Result is base64. The domain IS lowercased here (differs from the alias path).
+#[allow(dead_code)]
 pub fn compute_address_hash(derived_key: &[u8; 32], local_part: &str, domain: &str) -> String {
     let key = hmac_key_from(derived_key, DOMAIN_HMAC_INFO);
     let full = format!("{}@{}", normalize_local_part(local_part), domain.to_lowercase());

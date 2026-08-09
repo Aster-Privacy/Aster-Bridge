@@ -348,6 +348,7 @@ pub fn decrypt_with_key_sets(key_sets: &[RatchetReceiverKeys], msg: &RatchetMess
     None
 }
 
+#[allow(dead_code)]
 pub fn encrypt_bootstrap(
     sender_identity_secret_d: &[u8],
     recipient_identity_public: &[u8],

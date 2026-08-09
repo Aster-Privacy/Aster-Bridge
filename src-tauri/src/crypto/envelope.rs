@@ -185,6 +185,7 @@ fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> 
     Ok(okm)
 }
 
+#[allow(dead_code)]
 pub fn encrypt_identity_key_envelope(plaintext: &str, identity_key: &str) -> Result<(String, String)> {
     use rand_core::{OsRng, RngCore};
 
