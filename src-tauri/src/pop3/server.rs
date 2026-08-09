@@ -679,6 +679,7 @@ mod tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
         let (base, calls) = spawn_mock_backend().await;

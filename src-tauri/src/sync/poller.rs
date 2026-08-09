@@ -213,6 +213,161 @@ fn json_str(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+const DEFAULT_ATTACHMENT_CONTENT_TYPE: &str = "application/octet-stream";
+const ATTACHMENT_PLACEHOLDER_NAME: &str = "Attachment";
+
+#[derive(Debug, Clone, PartialEq)]
+struct EnvelopeAttachment {
+    seq: Option<i64>,
+    filename: Option<String>,
+    content_type: String,
+    content_id: Option<String>,
+    size: Option<i64>,
+}
+
+fn json_trimmed_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn normalize_content_type(raw: Option<String>) -> String {
+    match raw {
+        Some(s) if s.contains('/') => s.to_ascii_lowercase(),
+        _ => DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
+    }
+}
+
+fn parse_envelope_attachments(v: &serde_json::Value) -> Vec<EnvelopeAttachment> {
+    let Some(entries) = v.get("attachment_keys").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut seen_seq: Vec<i64> = Vec::new();
+    let mut keyed: Vec<EnvelopeAttachment> = Vec::new();
+    let mut unkeyed: Vec<EnvelopeAttachment> = Vec::new();
+    for entry in entries {
+        if !entry.is_object() {
+            continue;
+        }
+        let seq = entry.get("seq").and_then(|x| x.as_i64());
+        let parsed = EnvelopeAttachment {
+            seq,
+            filename: json_trimmed_string(entry, "filename"),
+            content_type: normalize_content_type(json_trimmed_string(entry, "content_type")),
+            content_id: json_trimmed_string(entry, "content_id"),
+            size: entry.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
+        };
+        match seq {
+            Some(s) => {
+                if seen_seq.contains(&s) {
+                    continue;
+                }
+                seen_seq.push(s);
+                keyed.push(parsed);
+            }
+            None => unkeyed.push(parsed),
+        }
+    }
+    keyed.sort_by_key(|a| a.seq.unwrap_or(0));
+    keyed.extend(unkeyed);
+    keyed
+}
+
+fn attachment_display_name(a: &EnvelopeAttachment) -> String {
+    a.filename
+        .clone()
+        .unwrap_or_else(|| ATTACHMENT_PLACEHOLDER_NAME.to_string())
+}
+
+fn format_attachment_bytes(bytes: i64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn describe_attachment(a: &EnvelopeAttachment) -> String {
+    let mut details = vec![a.content_type.clone()];
+    if let Some(size) = a.size {
+        details.push(format_attachment_bytes(size));
+    }
+    format!("{} ({})", attachment_display_name(a), details.join(", "))
+}
+
+fn attachment_unavailable_note(attachments: &[EnvelopeAttachment]) -> String {
+    let count = attachments.len();
+    let described: Vec<String> = attachments
+        .iter()
+        .filter(|a| a.filename.is_some() || a.size.is_some())
+        .map(describe_attachment)
+        .collect();
+    if described.len() != count || count == 0 {
+        return if count == 1 {
+            "[This message has 1 attachment. Aster Bridge cannot download attachments yet. \
+             Open the message in the Aster web or mobile app to get it.]"
+                .to_string()
+        } else {
+            format!(
+                "[This message has {} attachments. Aster Bridge cannot download attachments yet. \
+                 Open the message in the Aster web or mobile app to get them.]",
+                count
+            )
+        };
+    }
+    if count == 1 {
+        format!(
+            "[This message has 1 attachment that Aster Bridge cannot download yet: {}. \
+             To get it, open the message in the Aster web or mobile app.]",
+            described[0]
+        )
+    } else {
+        format!(
+            "[This message has {} attachments that Aster Bridge cannot download yet: {}. \
+             To get them, open the message in the Aster web or mobile app.]",
+            count,
+            described.join(", ")
+        )
+    }
+}
+
+fn attachment_meta_json(attachments: &[EnvelopeAttachment]) -> serde_json::Value {
+    serde_json::Value::Array(
+        attachments
+            .iter()
+            .map(|a| {
+                let mut map = serde_json::Map::new();
+                if let Some(seq) = a.seq {
+                    map.insert("seq".to_string(), serde_json::json!(seq));
+                }
+                map.insert("name".to_string(), serde_json::json!(attachment_display_name(a)));
+                map.insert("type".to_string(), serde_json::json!(a.content_type));
+                if let Some(size) = a.size {
+                    map.insert("size".to_string(), serde_json::json!(size));
+                }
+                if let Some(cid) = &a.content_id {
+                    map.insert("cid".to_string(), serde_json::json!(cid));
+                }
+                serde_json::Value::Object(map)
+            })
+            .collect(),
+    )
+}
+
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn normalize_date_rfc3339(s: &str) -> String {
     let trimmed = s.trim();
     if chrono::DateTime::parse_from_rfc3339(trimmed).is_ok() {
@@ -306,6 +461,7 @@ fn cache_mail_item(
     item: &MailItem,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> CacheOutcome {
     if !is_valid_item_id(&item.id) {
         tracing::warn!("rejecting message with invalid id format");
@@ -336,12 +492,26 @@ fn cache_mail_item(
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
+        inbound_keys,
     );
 
     let plaintext = match plaintext_result {
         Ok(p) => p,
         Err(_) => {
-            tracing::debug!("envelope decrypt skipped");
+            if crate::crypto::inbound::is_inbound_payload(
+                &item.encrypted_envelope,
+                &item.envelope_nonce,
+            ) {
+                if inbound_keys.is_empty() {
+                    tracing::error!(
+                        "encrypted mail received but no inbound keys are loaded; sign in again to restore them"
+                    );
+                } else {
+                    tracing::warn!("inbound envelope decrypt failed; item left uncached for retry");
+                }
+            } else {
+                tracing::debug!("envelope decrypt skipped");
+            }
             return CacheOutcome::default();
         }
     };
@@ -376,6 +546,22 @@ fn cache_mail_item(
         );
         is_html = false;
     }
+    let attachments = parse_envelope_attachments(&parsed);
+    let attachment_count = attachments.len();
+    if attachment_count > 0 {
+        let note = attachment_unavailable_note(&attachments);
+        match body_text.as_mut() {
+            Some(b) => {
+                if is_html {
+                    b.push_str(&format!("<p>{}</p>", escape_html_text(&note)));
+                } else {
+                    b.push_str("\n\n");
+                    b.push_str(&note);
+                }
+            }
+            None => body_text = Some(note),
+        }
+    }
     const MAX_CACHED_BODY_BYTES: usize = 5 * 1024 * 1024;
     if let Some(b) = body_text.as_mut() {
         if b.len() > MAX_CACHED_BODY_BYTES {
@@ -389,11 +575,20 @@ fn cache_mail_item(
     }
     let size = body_text.as_ref().map(|b| b.len() as i64).unwrap_or(0);
     let message_id = json_str(&parsed, "message_id").or_else(|| json_str(&parsed, "messageId"));
-    let raw_headers_meta = serde_json::json!({
-        "is_html": is_html,
-        "message_id": message_id,
-    })
-    .to_string();
+    let mut raw_headers_map = serde_json::Map::new();
+    raw_headers_map.insert("is_html".to_string(), serde_json::json!(is_html));
+    raw_headers_map.insert("message_id".to_string(), serde_json::json!(message_id));
+    raw_headers_map.insert(
+        "attachment_count".to_string(),
+        serde_json::json!(attachment_count),
+    );
+    if attachment_count > 0 {
+        raw_headers_map.insert(
+            "attachments".to_string(),
+            attachment_meta_json(&attachments),
+        );
+    }
+    let raw_headers_meta = serde_json::Value::Object(raw_headers_map).to_string();
 
     let was_new = match db.upsert_cached_message(
         &item.id,
@@ -506,6 +701,7 @@ async fn try_decrypt_internal_mail(
     passphrase: &[u8],
     identity_key: Option<&str>,
     ratchet_keys: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
     sync_key: Option<&[u8; 32]>,
     client: &ApiClient,
     access_token: &str,
@@ -519,6 +715,7 @@ async fn try_decrypt_internal_mail(
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
+        inbound_keys,
     )
     .ok()?;
 
@@ -551,7 +748,7 @@ async fn run_sync_pass(
     let mut updated_ids: Vec<String> = Vec::new();
     let mut all_folders_complete = true;
 
-    let (access_token, passphrase, identity_key, our_email, ratchet_keys) = {
+    let (access_token, passphrase, identity_key, our_email, ratchet_keys, inbound_keys) = {
         let s = session.read().await;
         (
             s.access_token.clone(),
@@ -559,6 +756,7 @@ async fn run_sync_pass(
             s.identity_key.clone(),
             s.email.clone(),
             s.ratchet_keys.clone(),
+            s.inbound_keys.clone(),
         )
     };
     let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
@@ -592,6 +790,7 @@ async fn run_sync_pass(
                             item,
                             &passphrase,
                             identity_key.as_deref(),
+                            &inbound_keys,
                         );
                         if outcome.flags_changed {
                             updated_ids.push(item.id.clone());
@@ -604,6 +803,7 @@ async fn run_sync_pass(
                                 &passphrase,
                                 identity_key.as_deref(),
                                 &ratchet_keys,
+                                &inbound_keys,
                                 sync_key.as_ref(),
                                 client,
                                 &access_token,
@@ -793,6 +993,23 @@ fn migrate_legacy_dates(db: &Arc<Database>) {
     }
 }
 
+async fn report_envelope_capability(session: &Arc<RwLock<Session>>, client: &Arc<ApiClient>) {
+    let Ok(data_dir) = crate::config::data_dir() else {
+        return;
+    };
+    let (access_token, user_id) = {
+        let guard = session.read().await;
+        (guard.access_token.to_string(), guard.user_id.to_string())
+    };
+    crate::crypto::envelope_capability::report_if_due(
+        client,
+        &access_token,
+        &user_id,
+        &data_dir,
+    )
+    .await;
+}
+
 pub async fn run_poll_loop(
     session: Arc<RwLock<Session>>,
     client: Arc<ApiClient>,
@@ -802,6 +1019,7 @@ pub async fn run_poll_loop(
     poll_interval_secs: Option<u64>,
 ) {
     migrate_legacy_dates(&db);
+    report_envelope_capability(&session, &client).await;
     let interval_secs = poll_interval_secs.filter(|&v| v >= 5).unwrap_or(POLL_INTERVAL_SECS);
     let interval_dur = std::time::Duration::from_secs(interval_secs);
     let mut interval = tokio::time::interval(interval_dur);
@@ -835,6 +1053,7 @@ pub async fn run_poll_loop(
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
+                    report_envelope_capability(&session, &client).await;
                 }
                 if let Err(ref e) = result {
                     if e.contains("plan_upgrade_required") {
@@ -1016,7 +1235,7 @@ mod tests {
         let json = serde_json::json!({"subject": "x", "body_text": "y"});
         let mut item = item_with_envelope("good", &json);
         item.id = "bad id".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         assert!(db.get_cached_message("bad id").unwrap().is_none());
     }
 
@@ -1032,7 +1251,7 @@ mod tests {
             "message_id": "mid-1@test"
         });
         let item = item_with_envelope("msg-new", &json);
-        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None).was_new;
+        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new;
         assert!(was_new);
 
         let cached = db.get_cached_message("msg-new").unwrap().unwrap();
@@ -1053,7 +1272,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
         let item = item_with_envelope("msg-plain", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let cached = db.get_cached_message("msg-plain").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain words"));
         let raw = cached.raw_headers.unwrap();
@@ -1069,7 +1288,7 @@ mod tests {
             "body_text": "ciphertext-blob"
         });
         let item = item_with_envelope("msg-ratchet", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let cached = db.get_cached_message("msg-ratchet").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.contains("end-to-end encrypted"));
@@ -1082,12 +1301,12 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-move", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let first = db.get_cached_message("msg-move").unwrap().unwrap();
         assert_eq!(first.folder, "inbox");
         let inbox_uid = first.imap_uid;
 
-        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None).was_new;
+        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None, &[]).was_new;
         assert!(!was_new, "already-body-cached item must not count as new");
 
         let moved = db.get_cached_message("msg-move").unwrap().unwrap();
@@ -1104,8 +1323,8 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-dedup", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
@@ -1114,7 +1333,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let mut item = item_with_envelope("msg-bad-env", &serde_json::json!({"subject": "x"}));
         item.encrypted_envelope = "!!!not-base64!!!".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         assert!(db.get_cached_message("msg-bad-env").unwrap().is_none());
     }
 
@@ -1124,7 +1343,7 @@ mod tests {
         let big = "a".repeat(6 * 1024 * 1024);
         let json = serde_json::json!({"subject": "s", "body_text": big});
         let item = item_with_envelope("msg-big", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let cached = db.get_cached_message("msg-big").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.len() < 6 * 1024 * 1024);
@@ -1132,14 +1351,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_mail_item_records_envelope_nonce_replay() {
+    fn cache_mail_item_records_envelope_nonce_and_survives_re_encryption() {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let nonce_pbkdf2 = STANDARD.encode([0x01u8]);
 
         let mut first = item_with_envelope("msg-replay", &json);
         first.envelope_nonce = nonce_pbkdf2.clone();
-        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None);
+        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None, &[]);
         assert_eq!(
             db.replay_check_and_record("msg-replay", &nonce_pbkdf2).unwrap(),
             true,
@@ -1147,8 +1366,54 @@ mod tests {
         );
         assert_eq!(
             db.replay_check_and_record("msg-replay", &STANDARD.encode([0x02u8])).unwrap(),
-            false,
-            "different nonce for same id is a replay/rollback"
+            true,
+            "a server-side re-encryption rotates the nonce and must not lock the item out"
+        );
+    }
+
+    #[test]
+    fn cache_mail_item_still_caches_an_item_whose_nonce_rotated_before_first_decrypt() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "rotated", "body_text": "b"});
+
+        let mut undecryptable = item_with_envelope("msg-rotate", &json);
+        undecryptable.envelope_nonce = STANDARD.encode([0x09u8]);
+        undecryptable.encrypted_envelope = STANDARD.encode(b"not decryptable");
+        let first = cache_mail_item(&db, "inbox", &undecryptable, b"pass", None, &[]);
+        assert!(!first.was_new, "an undecryptable item must not be cached");
+        assert!(!db.body_cached("msg-rotate"));
+
+        let re_encrypted = item_with_envelope("msg-rotate", &json);
+        assert!(
+            cache_mail_item(&db, "inbox", &re_encrypted, b"pass", None, &[]).was_new,
+            "the re-encrypted copy must still be accepted after the nonce changed"
+        );
+        assert!(db.body_cached("msg-rotate"));
+    }
+
+    #[test]
+    fn cache_mail_item_leaves_inbound_mail_uncached_when_no_inbound_keys_are_loaded() {
+        let (_dir, db) = temp_db();
+        let mut item = item_with_envelope("msg-no-keys", &serde_json::json!({"subject": "s"}));
+        let mut envelope = vec![crate::crypto::inbound::INBOUND_ECDH_MARKER];
+        envelope.extend_from_slice(&[0x04u8; 96]);
+        item.encrypted_envelope = STANDARD.encode(&envelope);
+        item.envelope_nonce = STANDARD.encode([0x01u8; 12]);
+
+        assert!(
+            crate::crypto::inbound::is_inbound_payload(
+                &item.encrypted_envelope,
+                &item.envelope_nonce
+            ),
+            "the fixture must be recognized as inbound so the no-keys branch is reached"
+        );
+
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+
+        assert!(!outcome.was_new, "inbound mail must not be cached without keys");
+        assert!(
+            !db.body_cached("msg-no-keys"),
+            "no blank body may be written when the inbound keys are missing"
         );
     }
 
@@ -1169,7 +1434,7 @@ mod tests {
             "date": "Wed, 21 May 2026 10:00:00 +0000"
         });
         let item = item_with_envelope("msg-date-norm", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let cached = db.get_cached_message("msg-date-norm").unwrap().unwrap();
         let stored = cached.date.unwrap();
         assert!(
@@ -1226,7 +1491,7 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-new", &json);
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(outcome.was_new);
         assert!(!outcome.flags_changed);
         let cached = db.get_cached_message("msg-read-new").unwrap().unwrap();
@@ -1239,14 +1504,14 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-sync", &json);
         item.is_read = Some(false);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         assert_eq!(
             db.get_cached_message("msg-read-sync").unwrap().unwrap().flags & 1,
             0
         );
 
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(!outcome.was_new);
         assert!(outcome.flags_changed);
         assert_eq!(
@@ -1254,7 +1519,7 @@ mod tests {
             1
         );
 
-        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(!repeat.flags_changed, "no-op flag sync must not report change");
     }
 
@@ -1263,10 +1528,10 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-star-sync", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
 
         item.is_starred = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -1274,7 +1539,7 @@ mod tests {
         );
 
         item.is_starred = Some(false);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -1287,11 +1552,11 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-noflags", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
         let uid = db.get_cached_message("msg-noflags").unwrap().unwrap().imap_uid;
         db.update_message_flags(uid as i64, "inbox", 5).unwrap();
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
         assert!(!outcome.flags_changed);
         assert_eq!(db.get_cached_message("msg-noflags").unwrap().unwrap().flags, 5);
     }
@@ -1305,6 +1570,7 @@ mod tests {
             vault_passphrase: b"pass".to_vec(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }))
     }
@@ -1395,6 +1661,7 @@ mod tests {
             vault_passphrase: b"pass".to_vec(),
             identity_key: Some(ik.to_string()),
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }))
     }
@@ -1486,7 +1753,7 @@ mod tests {
             "stale-1",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-1", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -1526,7 +1793,7 @@ mod tests {
             "stale-2",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-2", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -1550,7 +1817,7 @@ mod tests {
             "stale-3",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
 
         use axum::{routing::get, Router};
         let app = Router::new().route(
@@ -1584,7 +1851,7 @@ mod tests {
             "read-on-web",
             &serde_json::json!({"subject": "s", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None).was_new);
+        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None, &[]).was_new);
 
         let mut item = server_item_json("read-on-web", "s");
         item["is_read"] = serde_json::json!(true);
@@ -1604,5 +1871,301 @@ mod tests {
         );
         let change = rx.try_recv().expect("flag change must broadcast state");
         assert!(change.changed.contains_key("Email"));
+    }
+
+    #[test]
+    fn envelope_attachment_count_reads_the_key_list() {
+        let v = serde_json::json!({"attachment_keys": [{"seq": 0, "key": "k0"}, {"seq": 1, "key": "k1"}]});
+        assert_eq!(parse_envelope_attachments(&v).len(), 2);
+    }
+
+    #[test]
+    fn envelope_attachment_count_is_zero_when_absent_or_wrong_type() {
+        assert_eq!(parse_envelope_attachments(&serde_json::json!({})).len(), 0);
+        assert_eq!(
+            parse_envelope_attachments(&serde_json::json!({"attachment_keys": null})).len(),
+            0
+        );
+        assert_eq!(
+            parse_envelope_attachments(&serde_json::json!({"attachment_keys": "two"})).len(),
+            0
+        );
+        assert_eq!(
+            parse_envelope_attachments(&serde_json::json!({"attachment_keys": ["k0", 3]})).len(),
+            0
+        );
+    }
+
+    fn legacy_entries(count: usize) -> Vec<EnvelopeAttachment> {
+        (0..count)
+            .map(|i| EnvelopeAttachment {
+                seq: Some(i as i64),
+                filename: None,
+                content_type: DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
+                content_id: None,
+                size: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_attachment_note_agrees_in_number() {
+        assert!(attachment_unavailable_note(&legacy_entries(1)).contains("1 attachment."));
+        assert!(attachment_unavailable_note(&legacy_entries(1)).contains("to get it."));
+        assert!(attachment_unavailable_note(&legacy_entries(3)).contains("3 attachments."));
+        assert!(attachment_unavailable_note(&legacy_entries(3)).contains("to get them."));
+    }
+
+    #[test]
+    fn attachment_entries_are_matched_by_seq_not_by_position() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 2, "key": "k2", "filename": "third.txt", "content_type": "text/plain", "size": 3},
+            {"seq": 0, "key": "k0", "filename": "first.pdf", "content_type": "application/pdf", "size": 1},
+            {"seq": 1, "key": "k1", "filename": "second.png", "content_type": "image/png", "size": 2}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        let names: Vec<String> = parsed.iter().map(attachment_display_name).collect();
+        assert_eq!(names, vec!["first.pdf", "second.png", "third.txt"]);
+        assert_eq!(
+            parsed.iter().map(|a| a.seq).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_repeated_seq_is_counted_once() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "keep.txt"},
+            {"seq": 0, "key": "k0b", "filename": "drop.txt"}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].filename.as_deref(), Some("keep.txt"));
+    }
+
+    #[test]
+    fn a_missing_filename_falls_back_to_the_placeholder() {
+        let v = serde_json::json!({"attachment_keys": [{"seq": 0, "key": "k0"}]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed[0].filename, None);
+        assert_eq!(attachment_display_name(&parsed[0]), "Attachment");
+    }
+
+    #[test]
+    fn a_missing_or_malformed_content_type_falls_back_to_octet_stream() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0"},
+            {"seq": 1, "key": "k1", "content_type": "   "},
+            {"seq": 2, "key": "k2", "content_type": "notamimetype"},
+            {"seq": 3, "key": "k3", "content_type": "Application/PDF"}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed[0].content_type, "application/octet-stream");
+        assert_eq!(parsed[1].content_type, "application/octet-stream");
+        assert_eq!(parsed[2].content_type, "application/octet-stream");
+        assert_eq!(parsed[3].content_type, "application/pdf");
+    }
+
+    #[test]
+    fn a_missing_content_id_is_never_synthesized() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "a.pdf"},
+            {"seq": 1, "key": "k1", "filename": "b.png", "content_id": "cid-42"}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed[0].content_id, None);
+        assert_eq!(parsed[1].content_id.as_deref(), Some("cid-42"));
+    }
+
+    #[test]
+    fn a_missing_or_negative_size_is_dropped_from_the_description() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf"},
+            {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": -4},
+            {"seq": 2, "key": "k2", "filename": "c.bin", "content_type": "text/plain", "size": 2048}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed[0].size, None);
+        assert_eq!(parsed[1].size, None);
+        assert_eq!(describe_attachment(&parsed[0]), "a.pdf (application/pdf)");
+        assert_eq!(describe_attachment(&parsed[2]), "c.bin (text/plain, 2.0 KB)");
+    }
+
+    #[test]
+    fn the_note_names_attachments_when_the_envelope_describes_them() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": 2},
+            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11}
+        ]});
+        let note = attachment_unavailable_note(&parse_envelope_attachments(&v));
+        assert!(note.contains("2 attachments that Aster Bridge cannot download yet"));
+        assert!(note.contains("a.pdf (application/pdf, 11 B), b.png (image/png, 2 B)"));
+        assert!(note.contains("To get them, open the message"));
+    }
+
+    #[test]
+    fn a_partly_described_list_keeps_the_plain_count_note() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11},
+            {"seq": 1, "key": "k1"}
+        ]});
+        let note = attachment_unavailable_note(&parse_envelope_attachments(&v));
+        assert!(note.contains("2 attachments."));
+        assert!(!note.contains("a.pdf"));
+    }
+
+    #[test]
+    fn an_attacker_named_file_cannot_inject_markup_into_an_html_body() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "html-injection",
+            &serde_json::json!({
+                "subject": "report",
+                "body_html": "<p>hello</p>",
+                "attachment_keys": [{
+                    "seq": 0,
+                    "key": "k0",
+                    "filename": "<img src=x onerror=alert(1)>.png",
+                    "content_type": "image/png",
+                    "size": 4
+                }]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let body = db
+            .get_cached_message("html-injection")
+            .unwrap()
+            .unwrap()
+            .body_text
+            .unwrap();
+        assert!(!body.contains("<img src=x"));
+        assert!(body.contains("&lt;img src=x onerror=alert(1)&gt;.png"));
+    }
+
+    #[test]
+    fn cached_attachment_metadata_is_persisted_for_jmap() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "described-attachments",
+            &serde_json::json!({
+                "subject": "invoice",
+                "body_text": "see attached",
+                "attachment_keys": [
+                    {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": 2, "content_id": "cid-9"},
+                    {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11}
+                ]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let cached = db.get_cached_message("described-attachments").unwrap().unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(2));
+        let list = meta.get("attachments").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].get("name").and_then(|v| v.as_str()), Some("a.pdf"));
+        assert_eq!(list[0].get("seq").and_then(|v| v.as_i64()), Some(0));
+        assert!(list[0].get("cid").is_none());
+        assert_eq!(list[1].get("cid").and_then(|v| v.as_str()), Some("cid-9"));
+        assert_eq!(list[1].get("size").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn a_message_without_attachments_stores_no_attachment_list() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "no-attachment-list",
+            &serde_json::json!({"subject": "hi", "body_text": "plain"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        let cached = db.get_cached_message("no-attachment-list").unwrap().unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert!(meta.get("attachments").is_none());
+    }
+
+    #[test]
+    fn cached_message_reports_attachments_instead_of_hiding_them() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "with-attachments",
+            &serde_json::json!({
+                "subject": "invoice",
+                "body_text": "see attached",
+                "attachment_keys": [{"seq": 0, "key": "k0"}, {"seq": 1, "key": "k1"}]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let cached = db.get_cached_message("with-attachments").unwrap().unwrap();
+        let body = cached.body_text.unwrap();
+        assert!(body.starts_with("see attached"));
+        assert!(body.contains("2 attachments."));
+
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn a_message_without_attachments_keeps_its_body_untouched() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "no-attachments",
+            &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let cached = db.get_cached_message("no-attachments").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("plain body"));
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn an_html_body_carries_the_note_as_markup() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "html-attachments",
+            &serde_json::json!({
+                "subject": "report",
+                "body_html": "<p>hello</p>",
+                "attachment_keys": [{"seq": 0, "key": "k0"}]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let body = db
+            .get_cached_message("html-attachments")
+            .unwrap()
+            .unwrap()
+            .body_text
+            .unwrap();
+        assert!(body.starts_with("<p>hello</p>"));
+        assert!(body.contains("<p>[This message has 1 attachment."));
+    }
+
+    #[test]
+    fn a_body_less_message_still_announces_its_attachments() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "only-attachments",
+            &serde_json::json!({
+                "subject": "scan",
+                "attachment_keys": [{"seq": 0, "key": "k0"}]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let body = db
+            .get_cached_message("only-attachments")
+            .unwrap()
+            .unwrap()
+            .body_text
+            .unwrap();
+        assert!(body.contains("1 attachment."));
     }
 }

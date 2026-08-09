@@ -104,6 +104,7 @@ fn stub_session() -> Arc<RwLock<Session>> {
         vault_passphrase: Vec::new(),
         identity_key: None,
         ratchet_keys: Vec::new(),
+        inbound_keys: Vec::new(),
         send_identities: Vec::new(),
     }))
 }
@@ -802,6 +803,7 @@ async fn serve_real() {
                             Some(&item.envelope_nonce),
                             &pass,
                             ik.as_deref(),
+                            &session.inbound_keys,
                         ) {
                             Ok(pt) if pt.contains("double_ratchet") => ratchet += 1,
                             Ok(_) => ok += 1,
@@ -974,7 +976,7 @@ async fn decrypt_real_internal() {
         }
     };
     let access_token = zeroize::Zeroizing::new(login_resp.access_token.clone().unwrap_or_default());
-    let (identity_key, ratchet_keys) = match crate::crypto::vault::decrypt_vault(
+    let (identity_key, ratchet_keys, inbound_keys) = match crate::crypto::vault::decrypt_vault(
         &login_resp.encrypted_vault,
         &login_resp.vault_nonce,
         &passphrase,
@@ -982,10 +984,11 @@ async fn decrypt_real_internal() {
         Ok(v) => (
             Some(v.identity_key.clone()),
             crate::crypto::ratchet::build_receiver_key_sets(&v),
+            crate::crypto::inbound::build_inbound_key_candidates(&v),
         ),
         Err(e) => {
             println!("vault decrypt FAILED: {}", e);
-            (None, Vec::new())
+            (None, Vec::new(), Vec::new())
         }
     };
     let session = crate::auth::session::Session {
@@ -996,6 +999,7 @@ async fn decrypt_real_internal() {
         vault_passphrase: passphrase,
         identity_key,
         ratchet_keys,
+        inbound_keys,
         send_identities: Vec::new(),
     };
     println!("logged in as {}", session.email);
@@ -1029,6 +1033,7 @@ async fn decrypt_real_internal() {
                 Some(&item.envelope_nonce),
                 &session.vault_passphrase,
                 session.identity_key.as_deref(),
+                &session.inbound_keys,
             ) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -1122,6 +1127,7 @@ async fn report_internal_decrypt(client: &ApiClient, session: &crate::auth::sess
                 Some(&item.envelope_nonce),
                 &session.vault_passphrase,
                 session.identity_key.as_deref(),
+                &session.inbound_keys,
             ) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -1563,6 +1569,7 @@ async fn alias_roundtrip_real() {
                 for item in &resp.items {
                     if let Ok(env) = crate::crypto::envelope::decrypt_envelope(
                         &item.encrypted_envelope, Some(&item.envelope_nonce), &pass, ik.as_deref(),
+                        &session.inbound_keys,
                     ) {
                         for marker in markers.keys() {
                             if env.contains(marker.as_str()) {
@@ -1696,6 +1703,7 @@ async fn dump_inbox_markers() {
                 for item in &resp.items {
                     match crate::crypto::envelope::decrypt_envelope(
                         &item.encrypted_envelope, Some(&item.envelope_nonce), &pass, ik.as_deref(),
+                        &session.inbound_keys,
                     ) {
                         Ok(env) => {
                             if env.contains(marker.as_str()) {
@@ -1757,6 +1765,7 @@ async fn poll_for_fresh_decrypt() {
                 let env = match crate::crypto::envelope::decrypt_envelope(
                     &item.encrypted_envelope, Some(&item.envelope_nonce),
                     &session.vault_passphrase, session.identity_key.as_deref(),
+                    &session.inbound_keys,
                 ) { Ok(v) => v, Err(_) => continue };
                 let parsed: serde_json::Value = match serde_json::from_str(&env) { Ok(v) => v, Err(_) => continue };
                 let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) { Some(v) => v, None => continue };
@@ -1886,7 +1895,7 @@ async fn self_deliver_and_decrypt() {
     let item = match client.fetch_mail_item(&token, &item_id).await {
         Ok(i) => i, Err(e) => { println!("FETCH FAILED: {}", e); return; }
     };
-    let env = match crate::crypto::envelope::decrypt_envelope(&item.encrypted_envelope, Some(&item.envelope_nonce), &session.vault_passphrase, session.identity_key.as_deref()) {
+    let env = match crate::crypto::envelope::decrypt_envelope(&item.encrypted_envelope, Some(&item.envelope_nonce), &session.vault_passphrase, session.identity_key.as_deref(), &session.inbound_keys) {
         Ok(v) => v, Err(e) => { println!("ENVELOPE DECRYPT FAILED: {}", e); return; }
     };
     println!("at-rest envelope decrypted ok ({} chars)", env.len());

@@ -97,6 +97,10 @@ fn serialize_email(
         .unwrap_or(json!({}));
     let is_html = meta.get("is_html").and_then(|v| v.as_bool()).unwrap_or(false);
     let message_id = meta.get("message_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let attachment_count = meta
+        .get("attachment_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let received_at = m
         .date
@@ -167,7 +171,7 @@ fn serialize_email(
     full_map.insert("replyTo".to_string(), Value::Null);
     full_map.insert("subject".to_string(), json!(subject));
     full_map.insert("sentAt".to_string(), json!(received_at));
-    full_map.insert("hasAttachment".to_string(), json!(false));
+    full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0));
     full_map.insert("preview".to_string(), json!(preview_of(m.body_text.as_deref())));
     if include_body_values {
         full_map.insert("bodyValues".to_string(), Value::Object(body_values));
@@ -955,6 +959,7 @@ mod tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
         let client = Arc::new(crate::api_client::ApiClient::new());
@@ -1105,6 +1110,29 @@ mod tests {
         let v = serialize_email(&m, &HashMap::new(), &None, false);
         assert!(v.get("htmlBody").unwrap().as_array().unwrap().len() == 1);
         assert!(v.get("textBody").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn serialize_email_reports_attachments_when_the_envelope_had_them() {
+        let mut m = cached("e5a", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "attachment_count": 2}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, false);
+        assert_eq!(v.get("hasAttachment"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn serialize_email_reports_no_attachments_when_there_are_none() {
+        let mut m = cached("e5b", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "attachment_count": 0}).to_string());
+        assert_eq!(
+            serialize_email(&m, &HashMap::new(), &None, false).get("hasAttachment"),
+            Some(&json!(false))
+        );
+        let legacy = cached("e5c", "inbox");
+        assert_eq!(
+            serialize_email(&legacy, &HashMap::new(), &None, false).get("hasAttachment"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -1330,6 +1358,7 @@ mod tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
         let (base, calls) = spawn_mock_backend(fail).await;

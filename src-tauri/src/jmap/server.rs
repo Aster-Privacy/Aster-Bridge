@@ -219,6 +219,7 @@ mod e2e_tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
 
@@ -395,6 +396,7 @@ mod e2e_tests {
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
             send_identities: Vec::new(),
         }));
         let client = Arc::new(ApiClient::new());
