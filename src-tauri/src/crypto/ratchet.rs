@@ -38,10 +38,13 @@ type MlKemDecapKey = <MlKem768 as KemCore>::DecapsulationKey;
 
 const X3DH_INFO_CLASSICAL: &[u8] = b"Aster Mail_X3DH_v1";
 const X3DH_INFO_PQ: &[u8] = b"Aster Mail_PQXDH_v1";
+const X3DH_INFO_PQ_IDENTITY: &[u8] = b"Aster Mail_PQXDH_identity_v1";
 const KDF_INFO_ROOT: &[u8] = b"Aster Mail_Root_KDF";
 const KDF_INFO_CHAIN: &[u8] = b"Aster Mail_Chain_KDF";
 const RATCHET_HEADER_AD_PREFIX: &[u8] = b"astermail-ratchet-header-v2";
 const ZERO_SALT_32: [u8; 32] = [0u8; 32];
+
+pub const PQ_IDENTITY_KEY_ID: i32 = -1;
 
 #[derive(Zeroize, Clone)]
 pub struct RatchetReceiverKeys {
@@ -60,7 +63,7 @@ pub struct RatchetMessage {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub pq_ciphertext: Option<Vec<u8>>,
-    pub pq_key_id: Option<u32>,
+    pub pq_key_id: Option<i32>,
     pub pq_secret: Option<Vec<u8>>,
 }
 
@@ -123,7 +126,11 @@ pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Re
             let mut pq_ss = ml_kem768_decapsulate(ct, sk)?;
             ikm.extend_from_slice(&pq_ss);
             pq_ss.zeroize();
-            X3DH_INFO_PQ
+            if msg.pq_key_id == Some(PQ_IDENTITY_KEY_ID) {
+                X3DH_INFO_PQ_IDENTITY
+            } else {
+                X3DH_INFO_PQ
+            }
         }
         _ => X3DH_INFO_CLASSICAL,
     };
@@ -322,7 +329,7 @@ pub fn parse_recipient_message(ratchet: &Value, our_email: &str) -> Option<Ratch
         .get("pq_ciphertext")
         .and_then(|v| v.as_str())
         .and_then(|s| b64_decode(s).ok());
-    let pq_key_id = rec.get("pq_key_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let pq_key_id = rec.get("pq_key_id").and_then(|v| v.as_i64()).map(|v| v as i32);
 
     Some(RatchetMessage {
         sender_identity_public,
@@ -354,7 +361,7 @@ pub fn encrypt_bootstrap(
     recipient_identity_public: &[u8],
     recipient_signed_prekey_public: &[u8],
     recipient_pq_public: Option<&[u8]>,
-    pq_key_id: Option<u32>,
+    pq_key_id: Option<i32>,
     plaintext: &str,
 ) -> Result<RatchetMessage, String> {
     use ml_kem::kem::Encapsulate;
@@ -387,7 +394,7 @@ pub fn encrypt_bootstrap(
     ikm.extend_from_slice(&dh2);
     ikm.extend_from_slice(&dh3);
 
-    let (pq_ciphertext, out_key_id, info): (Option<Vec<u8>>, Option<u32>, &[u8]) =
+    let (pq_ciphertext, out_key_id, info): (Option<Vec<u8>>, Option<i32>, &[u8]) =
         match (recipient_pq_public, pq_key_id) {
             (Some(pq_pub), Some(kid)) => {
                 let encoded = ml_kem::Encoded::<EncapKey>::try_from(pq_pub)
@@ -397,7 +404,12 @@ pub fn encrypt_bootstrap(
                     .encapsulate(&mut OsRng)
                     .map_err(|e| format!("encapsulate: {:?}", e))?;
                 ikm.extend_from_slice(ss.as_slice());
-                (Some(ct.as_slice().to_vec()), Some(kid), X3DH_INFO_PQ)
+                let selected = if kid == PQ_IDENTITY_KEY_ID {
+                    X3DH_INFO_PQ_IDENTITY
+                } else {
+                    X3DH_INFO_PQ
+                };
+                (Some(ct.as_slice().to_vec()), Some(kid), selected)
             }
             _ => (None, None, X3DH_INFO_CLASSICAL),
         };
@@ -687,6 +699,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, secret);
+    }
+
+    const PQ_IDENTITY_INTEROP_VECTORS: &str = include_str!("pq_identity_interop_vectors.json");
+
+    fn pq_identity_vector() -> Value {
+        let root: Value = serde_json::from_str(PQ_IDENTITY_INTEROP_VECTORS).unwrap();
+        root["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "pq_identity_bootstrap")
+            .unwrap()
+            .clone()
+    }
+
+    fn pq_identity_vector_parts() -> (Value, Vec<RatchetReceiverKeys>, RatchetMessage) {
+        let case = pq_identity_vector();
+
+        let vault_json = json!({
+            "identity_key": "pgp-not-used-here",
+            "ratchet_identity_key": case["recipient_identity_jwk"].as_str().unwrap(),
+            "ratchet_identity_public": case["recipient_identity_public"].as_str().unwrap(),
+            "ratchet_signed_prekey": case["recipient_signed_prekey_jwk"].as_str().unwrap(),
+            "ratchet_signed_prekey_public": case["recipient_signed_prekey_public"].as_str().unwrap()
+        })
+        .to_string();
+        let vault: VaultContents = serde_json::from_str(&vault_json).unwrap();
+        let key_sets = build_receiver_key_sets(&vault);
+
+        let ratchet_obj = find_ratchet_object(&case["envelope"]).expect("web envelope detected");
+        let our_email = case["our_email"].as_str().unwrap();
+        let mut msg = parse_recipient_message(&ratchet_obj, our_email).expect("parsed");
+        msg.pq_secret =
+            Some(b64_decode(case["recipient_pq_identity_secret"].as_str().unwrap()).unwrap());
+
+        (case, key_sets, msg)
+    }
+
+    #[test]
+    fn decrypts_web_sealed_pq_identity_bootstrap() {
+        let (case, key_sets, msg) = pq_identity_vector_parts();
+
+        assert_eq!(msg.pq_key_id, Some(PQ_IDENTITY_KEY_ID));
+        assert_eq!(key_sets.len(), 1);
+
+        let plaintext = decrypt_with_key_sets(&key_sets, &msg).expect("decrypted");
+        assert_eq!(plaintext, case["plaintext"].as_str().unwrap());
+    }
+
+    #[test]
+    fn pq_identity_vector_fails_with_the_one_time_prekey_info() {
+        let (_, key_sets, mut msg) = pq_identity_vector_parts();
+
+        msg.pq_key_id = Some(436178);
+
+        assert!(decrypt_with_key_sets(&key_sets, &msg).is_none());
+    }
+
+    #[test]
+    fn pq_identity_seed_derives_the_vector_decapsulation_key() {
+        let case = pq_identity_vector();
+        let seed = b64_decode(case["recipient_pq_identity_seed"].as_str().unwrap()).unwrap();
+        let expected = b64_decode(case["recipient_pq_identity_secret"].as_str().unwrap()).unwrap();
+
+        let d = Array::try_from(&seed[..32]).unwrap();
+        let z = Array::try_from(&seed[32..]).unwrap();
+        let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+
+        assert_eq!(dk.as_bytes().to_vec(), expected);
+        assert_eq!(
+            ek.as_bytes().to_vec(),
+            b64_decode(case["recipient_pq_identity_public"].as_str().unwrap()).unwrap()
+        );
     }
 
     #[test]

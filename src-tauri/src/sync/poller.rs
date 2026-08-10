@@ -724,8 +724,25 @@ async fn try_decrypt_internal_mail(
     let mut msg = crate::crypto::ratchet::parse_recipient_message(&ratchet_obj, our_email)?;
 
     if let Some(key_id) = msg.pq_key_id {
+        if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
+            for candidate in inbound_keys {
+                let Some(pq_identity_secret) = candidate.pq_decap_key.as_ref() else {
+                    continue;
+                };
+                msg.pq_secret = Some(pq_identity_secret.clone());
+                if let Some(plaintext) =
+                    crate::crypto::ratchet::decrypt_with_key_sets(ratchet_keys, &msg)
+                {
+                    return Some(plaintext);
+                }
+            }
+            return None;
+        }
         let sk = sync_key?;
-        let resp = client.get_pq_secret(access_token, key_id).await.ok()?;
+        let resp = client
+            .get_pq_secret(access_token, u32::try_from(key_id).ok()?)
+            .await
+            .ok()?;
         let secret =
             crate::crypto::ratchet::decrypt_pq_secret(sk, &resp.encrypted_secret, &resp.secret_nonce)
                 .ok()?;

@@ -43,6 +43,24 @@ use crate::auth::session::Session;
 use crate::db::Database;
 
 const APP_PW: &str = "abcd-efgh-ijkl-mnop";
+
+async fn resolve_pq_secret(
+    client: &ApiClient,
+    token: &str,
+    sync_key: Option<&[u8; 32]>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    key_id: i32,
+) -> Option<Vec<u8>> {
+    if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
+        return inbound_keys.iter().find_map(|c| c.pq_decap_key.clone());
+    }
+    let sk = sync_key?;
+    let resp = client
+        .get_pq_secret(token, u32::try_from(key_id).ok()?)
+        .await
+        .ok()?;
+    crate::crypto::ratchet::decrypt_pq_secret(sk, &resp.encrypted_secret, &resp.secret_nonce).ok()
+}
 const EMAIL: &str = "tester@aster.test";
 
 fn b64(s: &[u8]) -> String {
@@ -1056,22 +1074,11 @@ async fn decrypt_real_internal() {
                 }
             };
             if let Some(kid) = msg.pq_key_id {
-                let Some(sk) = sync_key.as_ref() else {
-                    failed += 1;
-                    continue;
-                };
-                match client.get_pq_secret(&token, kid).await {
-                    Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
-                        Ok(s) => msg.pq_secret = Some(s),
-                        Err(e) => {
-                            failed += 1;
-                            println!("  [FAIL pq-decrypt kid={}] {}", kid, e);
-                            continue;
-                        }
-                    },
-                    Err(_) => {
+                match resolve_pq_secret(&client, &token, sync_key.as_ref(), &session.inbound_keys, kid).await {
+                    Some(s) => msg.pq_secret = Some(s),
+                    None => {
                         failed += 1;
-                        println!("  [SKIP pq-fetch kid={}] secret gone (already opened on another device)", kid);
+                        println!("  [SKIP pq-secret kid={}] secret unavailable", kid);
                         continue;
                     }
                 }
@@ -1150,22 +1157,11 @@ async fn report_internal_decrypt(client: &ApiClient, session: &crate::auth::sess
                 }
             };
             if let Some(kid) = msg.pq_key_id {
-                let Some(sk) = sync_key.as_ref() else {
-                    failed += 1;
-                    continue;
-                };
-                match client.get_pq_secret(&token, kid).await {
-                    Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
-                        Ok(s) => msg.pq_secret = Some(s),
-                        Err(e) => {
-                            failed += 1;
-                            println!("  [FAIL pq-decrypt kid={}] {}", kid, e);
-                            continue;
-                        }
-                    },
-                    Err(_) => {
+                match resolve_pq_secret(&client, &token, sync_key.as_ref(), &session.inbound_keys, kid).await {
+                    Some(s) => msg.pq_secret = Some(s),
+                    None => {
                         failed += 1;
-                        println!("  [SKIP pq kid={}] secret gone (opened on another device)", kid);
+                        println!("  [SKIP pq kid={}] secret unavailable", kid);
                         continue;
                     }
                 }
@@ -1273,7 +1269,7 @@ async fn pqxdh_self_roundtrip_real() {
     let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("kem_identity b64");
     let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("signed_prekey b64");
     let (pq_pub, pq_kid) = match &bundle.pq_prekey {
-        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq pub b64")), Some(p.key_id)),
+        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq pub b64")), Some(p.key_id as i32)),
         None => { println!("WARNING: bundle has no PQ prekey; testing classical path only"); (None, None) }
     };
 
@@ -1297,12 +1293,9 @@ async fn pqxdh_self_roundtrip_real() {
     };
 
     if let Some(kid) = msg.pq_key_id {
-        match client.get_pq_secret(&token, kid).await {
-            Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(&sync_key, &r.encrypted_secret, &r.secret_nonce) {
-                Ok(secret) => msg.pq_secret = Some(secret),
-                Err(e) => { println!("PQ SECRET DECRYPT FAILED (kid={}): {}", kid, e); return; }
-            },
-            Err(e) => { println!("PQ SECRET FETCH FAILED (kid={}): {}", kid, e); return; }
+        match resolve_pq_secret(&client, &token, Some(&sync_key), &session.inbound_keys, kid).await {
+            Some(secret) => msg.pq_secret = Some(secret),
+            None => { println!("PQ SECRET UNAVAILABLE (kid={})", kid); return; }
         }
     }
 
@@ -1771,13 +1764,9 @@ async fn poll_for_fresh_decrypt() {
                 let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) { Some(v) => v, None => continue };
                 let mut msg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &session.email) { Some(m) => m, None => continue };
                 if let Some(kid) = msg.pq_key_id {
-                    let sk = match sync_key.as_ref() { Some(s) => s, None => continue };
-                    match client.get_pq_secret(&token, kid).await {
-                        Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(sk, &r.encrypted_secret, &r.secret_nonce) {
-                            Ok(s) => msg.pq_secret = Some(s),
-                            Err(_) => continue,
-                        },
-                        Err(_) => continue,
+                    match resolve_pq_secret(&client, &token, sync_key.as_ref(), &session.inbound_keys, kid).await {
+                        Some(s) => msg.pq_secret = Some(s),
+                        None => continue,
                     }
                 }
                 if let Some(pt) = crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &msg) {
@@ -1835,7 +1824,7 @@ async fn self_deliver_and_decrypt() {
     let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("kem_id");
     let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("spk");
     let (pq_pub, pq_kid) = match &bundle.pq_prekey {
-        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id)),
+        Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id as i32)),
         None => (None, None),
     };
 
@@ -1903,12 +1892,9 @@ async fn self_deliver_and_decrypt() {
     let ratchet = match crate::crypto::ratchet::find_ratchet_object(&parsed) { Some(v) => v, None => { println!("no ratchet object found in envelope"); return; } };
     let mut rmsg = match crate::crypto::ratchet::parse_recipient_message(&ratchet, &our_email) { Some(m) => m, None => { println!("parse_recipient_message failed"); return; } };
     if let Some(kid) = rmsg.pq_key_id {
-        match client.get_pq_secret(&token, kid).await {
-            Ok(r) => match crate::crypto::ratchet::decrypt_pq_secret(&sync_key, &r.encrypted_secret, &r.secret_nonce) {
-                Ok(s) => rmsg.pq_secret = Some(s),
-                Err(e) => { println!("pq secret decrypt failed: {}", e); return; }
-            },
-            Err(e) => { println!("pq secret fetch failed (kid={}): {}", kid, e); return; }
+        match resolve_pq_secret(&client, &token, Some(&sync_key), &session.inbound_keys, kid).await {
+            Some(s) => rmsg.pq_secret = Some(s),
+            None => { println!("pq secret unavailable (kid={})", kid); return; }
         }
     }
     match crate::crypto::ratchet::decrypt_with_key_sets(&session.ratchet_keys, &rmsg) {
@@ -1948,7 +1934,7 @@ async fn deliver_demo_message() {
     let bundle = match client.get_prekey_bundle(&token, &session.username, &our_email).await { Ok(b) => b, Err(e) => { println!("BUNDLE: {}", e); return; } };
     let recipient_id_pub = STANDARD.decode(&bundle.kem_identity_key).expect("id");
     let recipient_spk_pub = STANDARD.decode(&bundle.signed_prekey).expect("spk");
-    let (pq_pub, pq_kid) = match &bundle.pq_prekey { Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id)), None => (None, None) };
+    let (pq_pub, pq_kid) = match &bundle.pq_prekey { Some(p) => (Some(STANDARD.decode(&p.public_key).expect("pq")), Some(p.key_id as i32)), None => (None, None) };
 
     let plaintext = "If you can read this in Thunderbird, internal-mail decryption through the Bridge works. Code 271828.";
     let msg = match crate::crypto::ratchet::encrypt_bootstrap(&session.ratchet_keys[0].identity_secret_d, &recipient_id_pub, &recipient_spk_pub, pq_pub.as_deref(), pq_kid, plaintext) { Ok(m) => m, Err(e) => { println!("ENC: {}", e); return; } };
