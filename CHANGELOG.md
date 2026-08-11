@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.17 - 2026-08-11
+
+### Fixed
+- Copying mail from another provider into your Aster account now works. Any mailbox accepts copied messages, not only Sent and Drafts, and each message keeps its original date, sender, and read state.
+- Copied mail now appears in the web app and on your phone, not only in the mail client that copied it.
+- Copying the same mail twice no longer creates duplicates, so an interrupted migration is safe to run again.
+- Large migrations no longer stall partway through. Bridge waits out the account rate limit instead of dropping messages, and moving or copying more than 100 messages at once now succeeds.
+- Searching by header, cc, bcc, or keyword now returns only matching messages. Mail clients that search before copying no longer skip your mail.
+- Creating a mailbox that already exists now succeeds, so clients that set up a folder tree before copying no longer stop with an error.
+- A message larger than the 40 MB limit now fails on its own instead of disrupting the rest of the session.
+
+### Security
+- Bridge no longer shares its local IMAP, POP, and SMTP ports on Windows, so another app on your computer can't take them over.
+
 ## 0.4.15 - 2026-08-01
 
 ### Fixed
