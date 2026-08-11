@@ -141,11 +141,7 @@ pub async fn run(
     db: Arc<Database>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("SMTP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
 
     loop {
@@ -188,11 +184,7 @@ pub async fn run_implicit_tls(
     db: Arc<Database>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("SMTPS (implicit TLS) listening on {}", addr);
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);

@@ -271,6 +271,43 @@ fn tokenize_search_criteria(raw: &str) -> Vec<String> {
     out
 }
 
+fn cached_header_value(msg: &CachedMessage, field: &str) -> Option<String> {
+    let meta = || -> serde_json::Value {
+        msg.raw_headers
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let meta_string = |key: &str| {
+        meta()
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    match field {
+        "subject" => msg.subject.clone(),
+        "from" | "sender" => msg.sender.clone(),
+        "to" => msg.recipients.clone(),
+        "date" => msg.date.clone(),
+        "cc" => meta_string("cc"),
+        "bcc" => meta_string("bcc"),
+        "message-id" => meta_string("message_id"),
+        _ => None,
+    }
+}
+
+fn header_search_matches(msg: &CachedMessage, field: &str, pattern: &str) -> bool {
+    let wanted = pattern.trim().trim_matches('"');
+    match cached_header_value(msg, field) {
+        Some(value) => {
+            wanted.is_empty() || value.to_uppercase().contains(&wanted.to_uppercase())
+        }
+        None => false,
+    }
+}
+
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
@@ -372,16 +409,27 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
             let subj_lower = msg.subject.as_deref().unwrap_or("").to_lowercase();
             body_lower.contains(&pat_lower) || subj_lower.contains(&pat_lower)
         }
-        "CC" | "BCC" | "KEYWORD" | "UNKEYWORD" => {
+        field_token @ ("CC" | "BCC") => {
+            let field = field_token.to_ascii_lowercase();
+            *idx += 1;
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            header_search_matches(msg, &field, pat)
+        }
+        "KEYWORD" => {
+            *idx += 1;
+            if *idx < parts.len() { *idx += 1; }
+            false
+        }
+        "UNKEYWORD" => {
             *idx += 1;
             if *idx < parts.len() { *idx += 1; }
             true
         }
         "HEADER" => {
             *idx += 1;
-            if *idx < parts.len() { *idx += 1; }
-            if *idx < parts.len() { *idx += 1; }
-            true
+            let field = if *idx < parts.len() { let p = parts[*idx].trim_matches('"').to_ascii_lowercase(); *idx += 1; p } else { String::new() };
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            header_search_matches(msg, &field, pat)
         }
         "UID" => {
             *idx += 1;
@@ -393,7 +441,13 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
                 false
             }
         }
-        _ => { *idx += 1; true }
+        "RECENT" | "NEW" => { *idx += 1; false }
+        "OLD" => { *idx += 1; true }
+        unknown => {
+            tracing::warn!("unsupported SEARCH criterion {}", unknown);
+            *idx += 1;
+            false
+        }
     }
 }
 
@@ -467,6 +521,15 @@ const IMAP_FOLDERS: &[(&str, &str, &str)] = &[
 ];
 
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
+const MAX_DRAINABLE_APPEND_BYTES: usize = 256 * 1024 * 1024;
+
+fn existing_mailbox(name: &str) -> Option<&'static str> {
+    let cleaned = name.trim().trim_matches('"').trim_end_matches(['/', '.']);
+    IMAP_FOLDERS
+        .iter()
+        .find(|(display, _, _)| display.eq_ignore_ascii_case(cleaned))
+        .map(|(_, internal, _)| *internal)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ImapState {
@@ -492,13 +555,20 @@ pub async fn run(
     broadcaster: broadcast::Sender<StateChange>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("IMAP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
+    serve(listener, session, db, client, passwords, broadcaster, tls_config).await
+}
 
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         if !peer.ip().is_loopback() {
@@ -545,11 +615,7 @@ pub async fn run_implicit_tls(
     broadcaster: broadcast::Sender<StateChange>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("IMAPS (implicit TLS) listening on {}", addr);
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -858,7 +924,21 @@ where
                 require_auth!(conn, writer, tag);
                 write_ok(&mut writer, &tag, "completed").await?;
             }
-            "CREATE" | "DELETE" | "RENAME" => {
+            "CREATE" => {
+                require_auth!(conn, writer, tag);
+                let requested = parse_imap_atom_or_quoted(args.trim()).0;
+                if existing_mailbox(&requested).is_some() {
+                    write_ok(&mut writer, &tag, "CREATE completed").await?;
+                } else {
+                    write_no(
+                        &mut writer,
+                        &tag,
+                        "[CANNOT] folder management is not supported; folders mirror your Aster account",
+                    )
+                    .await?;
+                }
+            }
+            "DELETE" | "RENAME" => {
                 require_auth!(conn, writer, tag);
                 write_no(
                     &mut writer,
@@ -1362,6 +1442,22 @@ where
                 });
                 match command {
                     Some(cmd) if cmd.literal_len > MAX_APPEND_BYTES => {
+                        if cmd.non_sync {
+                            if cmd.literal_len > MAX_DRAINABLE_APPEND_BYTES {
+                                write_no(&mut writer, &tag, "[TOOBIG] APPEND literal too large")
+                                    .await?;
+                                break;
+                            }
+                            let mut sink = tokio::io::sink();
+                            let mut limited =
+                                tokio::io::AsyncReadExt::take(&mut reader, cmd.literal_len as u64);
+                            if tokio::io::copy(&mut limited, &mut sink).await.is_err() {
+                                break;
+                            }
+                            let mut trailer = [0u8; 2];
+                            let _ = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut trailer)
+                                .await;
+                        }
                         write_no(&mut writer, &tag, "[TOOBIG] APPEND literal too large").await?;
                     }
                     Some(cmd) => {
@@ -2002,6 +2098,52 @@ fn move_flags_for(internal: &str) -> Option<serde_json::Value> {
     }
 }
 
+async fn bulk_move_chunk(
+    client: &Arc<ApiClient>,
+    token: &str,
+    ids: &[String],
+    flags: &serde_json::Value,
+) -> bool {
+    let mut attempt = 0u32;
+    loop {
+        match client.bulk_set_mailbox_flags(token, ids, flags).await {
+            Ok(updated) => return updated as usize == ids.len(),
+            Err(e) => {
+                if crate::imap::append::is_rate_limited(&e) && attempt < 3 {
+                    let wait = crate::imap::append::rate_limit_backoff(attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+}
+
+async fn set_flags_with_backoff(
+    client: &Arc<ApiClient>,
+    token: &str,
+    id: &str,
+    flags: &serde_json::Value,
+) -> crate::error::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match client.set_mailbox_flags(token, id, flags.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if crate::imap::append::is_rate_limited(&e) && attempt < 3 {
+                    let wait = crate::imap::append::rate_limit_backoff(attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy_move(
     writer: &mut (impl AsyncWrite + Unpin),
@@ -2057,28 +2199,32 @@ async fn handle_copy_move(
     if selected.is_empty() {
         return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
-    if selected.len() > 10000 {
-        return write_no(writer, tag, "[LIMIT] too many messages in one COPY/MOVE").await;
-    }
 
     let token = session.read().await.access_token.to_string();
     let validity = uid_validity(db);
     let mut src_uids: Vec<u32> = Vec::new();
     let mut tgt_uids: Vec<u32> = Vec::new();
     let mut moved_seqs: Vec<usize> = Vec::new();
-    for (_, m) in &selected {
-        if let Err(e) = client.set_mailbox_flags(&token, &m.aster_id, flags.clone()).await {
-            let is_missing_item = matches!(
-                &e,
-                crate::error::BridgeError::Api(msg) if msg.starts_with("404")
-            );
-            let draft_removed = is_missing_item
-                && source_folder == "drafts"
-                && is_move
-                && client.delete_draft(&token, &m.aster_id).await.is_ok();
-            if !draft_removed {
-                tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
-                return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+    for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+        let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
+        if bulk_move_chunk(client, &token, &ids, &flags).await {
+            continue;
+        }
+        for (_, m) in chunk {
+            if let Err(e) = set_flags_with_backoff(client, &token, &m.aster_id, &flags).await {
+                let is_missing_item = matches!(
+                    &e,
+                    crate::error::BridgeError::Api(msg) if msg.starts_with("404")
+                );
+                let draft_removed = is_missing_item
+                    && source_folder == "drafts"
+                    && is_move
+                    && client.delete_draft(&token, &m.aster_id).await.is_ok();
+                if !draft_removed {
+                    tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
+                    return write_no(writer, tag, "[SERVERBUG] could not move message on the server")
+                        .await;
+                }
             }
         }
     }
@@ -2763,6 +2909,7 @@ mod tests {
         fail: bool,
         job_conflict: bool,
         rate_limit_first_store: bool,
+        bulk_metadata: bool,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -2770,6 +2917,7 @@ mod tests {
             fail,
             job_conflict,
             rate_limit_first_store,
+            bulk_metadata,
         } = opts;
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         use axum::extract::Path as AxumPath;
@@ -2782,6 +2930,7 @@ mod tests {
         let c4 = calls.clone();
         let c5 = calls.clone();
         let c6 = calls.clone();
+        let c7 = calls.clone();
         let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stored_writer = stored.clone();
@@ -2799,6 +2948,29 @@ mod tests {
                             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
                         } else {
                             Json(serde_json::json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/metadata",
+                patch(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c7.clone();
+                    async move {
+                        let count = body
+                            .get("items")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        calls
+                            .lock()
+                            .await
+                            .push(("BULK_PATCH".to_string(), count.to_string()));
+                        if fail || !bulk_metadata {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true, "updated_count": count}))
+                                .into_response()
                         }
                     }
                 }),
@@ -3076,16 +3248,13 @@ mod tests {
         let client = Arc::new(ApiClient::new_with_base_url(&base));
         let (tx, _rx) = broadcast::channel(16);
 
-        let _g = crate::port_picker::TEST_SERVER_START.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
-        let addr_str = format!("127.0.0.1:{}", addr.port());
         let db_clone = db.clone();
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let _ = run(&addr_str, session, db_clone, client, passwords, tx_clone, None).await;
+            let _ = serve(listener, session, db_clone, client, passwords, tx_clone, None).await;
         });
 
         for _ in 0..80 {
@@ -3125,16 +3294,13 @@ mod tests {
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);
 
-        let _g = crate::port_picker::TEST_SERVER_START.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
-        let addr_str = format!("127.0.0.1:{}", addr.port());
         let db_clone = db.clone();
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let _ = run(&addr_str, session, db_clone, client, passwords, tx_clone, None).await;
+            let _ = serve(listener, session, db_clone, client, passwords, tx_clone, None).await;
         });
 
         for _ in 0..80 {
@@ -3697,6 +3863,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_many_messages_uses_chunked_bulk_requests() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                bulk_metadata: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        for n in 1..=250 {
+            seed(&db, &format!("bulk-{}", n), "inbox", &format!("m{}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b1", "MOVE 1:250 Archive").await;
+        assert!(resp.contains("b1 OK"), "bulk move rejected: {}", resp);
+
+        let captured = calls.lock().await.clone();
+        let chunks: Vec<usize> = captured
+            .iter()
+            .filter(|(m, _)| m == "BULK_PATCH")
+            .map(|(_, n)| n.parse::<usize>().unwrap())
+            .collect();
+        assert_eq!(chunks, vec![100, 100, 50], "unexpected chunking: {:?}", chunks);
+        assert!(
+            !captured.iter().any(|(m, _)| m == "PATCH"),
+            "fell back to per-message updates: {:?}",
+            captured
+        );
+        assert_eq!(db.list_cached_messages("inbox").unwrap().len(), 0);
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 250);
+    }
+
+    #[tokio::test]
+    async fn create_accepts_an_existing_folder_and_refuses_new_ones() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "CREATE \"Archive\"").await;
+        assert!(resp.contains("c1 OK"), "existing folder refused: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "CREATE INBOX").await;
+        assert!(resp.contains("c2 OK"), "inbox refused: {}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c3", "CREATE \"Old Mail\"").await;
+        assert!(resp.contains("c3 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("CANNOT"), "expected CANNOT: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_too_big_keeps_the_connection_usable() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let oversized = MAX_APPEND_BYTES + 1;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "t1",
+            &format!("APPEND \"INBOX\" {{{}}}", oversized),
+        )
+        .await;
+        assert!(resp.contains("t1 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TOOBIG"), "expected TOOBIG: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "NOOP").await;
+        assert!(resp.contains("t2 OK"), "connection unusable after TOOBIG: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_too_big_non_sync_literal_is_drained() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let oversized = MAX_APPEND_BYTES + 1;
+        writer
+            .write_all(format!("t1 APPEND \"INBOX\" {{{}+}}\r\n", oversized).as_bytes())
+            .await
+            .unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut written = 0usize;
+        while written < oversized {
+            let take = (oversized - written).min(chunk.len());
+            writer.write_all(&chunk[..take]).await.unwrap();
+            written += take;
+        }
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let resp = read_until_tag(&mut reader, "t1").await.join("\n");
+        assert!(resp.contains("t1 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("TOOBIG"), "expected TOOBIG: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "NOOP").await;
+        assert!(
+            resp.contains("t2 OK"),
+            "oversized literal was not drained, the session desynchronized: {}",
+            resp
+        );
+        assert!(
+            !resp.contains("BAD"),
+            "literal bytes were parsed as commands: {}",
+            resp
+        );
+    }
+
+    #[tokio::test]
     async fn append_to_unknown_mailbox_gets_trycreate() {
         let (addr, _db, _tx, _dir) = start_test_server().await;
         let (mut reader, mut writer) = login_and_select(addr).await;
@@ -3744,6 +4014,58 @@ mod tests {
         assert!(search_matches(m, "SUBJECT \"ALPHA STATUS\""));
         assert!(!search_matches(m, "SUBJECT \"ALPHA OMEGA\""));
         assert!(search_matches(m, "FROM \"ALICE@EXAMPLE.COM\" SUBJECT \"PROJECT ALPHA\""));
+    }
+
+    #[test]
+    fn search_header_message_id_matches_only_that_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "hdr-1", "inbox", "first");
+        seed(&db, "hdr-2", "inbox", "second");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let one = msgs.iter().find(|m| m.aster_id == "hdr-1").unwrap();
+        let two = msgs.iter().find(|m| m.aster_id == "hdr-2").unwrap();
+
+        assert!(search_matches(one, "HEADER MESSAGE-ID \"HDR-1@TEST\""));
+        assert!(!search_matches(two, "HEADER MESSAGE-ID \"HDR-1@TEST\""));
+        assert!(!search_matches(one, "HEADER MESSAGE-ID \"NOT-PRESENT@TEST\""));
+        assert!(!search_matches(one, "HEADER X-CUSTOM-THING \"ANYTHING\""));
+        assert!(!search_matches(one, "CC \"SOMEONE@EXAMPLE.COM\""));
+        assert!(search_matches(one, "HEADER SUBJECT \"FIRST\""));
+    }
+
+    #[test]
+    fn search_unknown_criterion_matches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "unk-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(!search_matches(m, "OLDER 3600"));
+        assert!(!search_matches(m, "X-SOMETHING-ELSE"));
+        assert!(!search_matches(m, "RECENT"));
+        assert!(search_matches(m, "OLD"));
+        assert!(search_matches(m, "ALL"));
+    }
+
+    #[test]
+    fn search_keyword_does_not_match_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "kw-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(!search_matches(m, "KEYWORD $LABEL1"));
+        assert!(search_matches(m, "UNKEYWORD $LABEL1"));
+    }
+
+    #[test]
+    fn existing_mailbox_resolves_display_names() {
+        assert_eq!(existing_mailbox("INBOX"), Some("inbox"));
+        assert_eq!(existing_mailbox("\"Archive\""), Some("archive"));
+        assert_eq!(existing_mailbox("junk"), Some("spam"));
+        assert_eq!(existing_mailbox("Archive/"), Some("archive"));
+        assert_eq!(existing_mailbox("Old Mail"), None);
     }
 
     #[test]

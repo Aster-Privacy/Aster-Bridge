@@ -53,6 +53,73 @@ pub async fn run(
     broadcaster: broadcast::Sender<StateChange>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), String> {
+    let sock_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+
+    if let Some(cfg) = tls_config {
+        let app = build_app(
+            session,
+            db,
+            client,
+            passwords,
+            broadcaster,
+            sock_addr.port(),
+            true,
+        );
+        tracing::info!("JMAP server listening on https://{}", sock_addr);
+        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
+        return axum_server::bind_rustls(sock_addr, rustls_cfg)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let listener = crate::port_picker::bind_loopback_listener(addr)
+        .await
+        .map_err(|e| format!("bind {} failed: {}", sock_addr, e))?;
+
+    serve(listener, session, db, client, passwords, broadcaster).await
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+) -> Result<(), String> {
+    let sock_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let app = build_app(
+        session,
+        db,
+        client,
+        passwords,
+        broadcaster,
+        sock_addr.port(),
+        false,
+    );
+
+    tracing::info!("JMAP server listening on http://{}", sock_addr);
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+fn build_app(
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    bind_port: u16,
+    use_https: bool,
+) -> Router {
     let _ = db.seed_jmap_mailboxes();
 
     let auth = Arc::new(JmapAuth {
@@ -60,22 +127,16 @@ pub async fn run(
         session: session.clone(),
     });
 
-    let use_https = tls_config.is_some();
     let ctx = JmapContext::new(session, db, client, broadcaster);
-
-    let sock_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e: std::net::AddrParseError| e.to_string())?;
 
     let state = AppState {
         ctx,
         auth,
-        bind_port: sock_addr.port(),
+        bind_port,
         use_https,
     };
 
-    let bind_port = sock_addr.port();
-    let app = Router::new()
+    Router::new()
         .route("/.well-known/jmap", get(super::session::well_known))
         .route("/jmap/session", get(super::session::session_resource))
         .route(
@@ -94,29 +155,7 @@ pub async fn run(
         .route("/jmap/ws", get(super::ws::ws_upgrade))
         .layer(middleware::from_fn(move |req, next| host_guard(req, next, bind_port, use_https)))
         .layer(middleware::from_fn(loopback_only))
-        .with_state(state);
-
-    if let Some(cfg) = tls_config {
-        tracing::info!("JMAP server listening on https://{}", sock_addr);
-        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
-        axum_server::bind_rustls(sock_addr, rustls_cfg)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        let listener = tokio::net::TcpListener::bind(sock_addr)
-            .await
-            .map_err(|e| format!("bind {} failed: {}", sock_addr, e))?;
-
-        tracing::info!("JMAP server listening on http://{}", sock_addr);
-
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .map_err(|e| e.to_string())
-    }
+        .with_state(state)
 }
 
 async fn loopback_only(req: Request, next: Next) -> Response {
@@ -227,30 +266,20 @@ mod e2e_tests {
         let basic = base64::engine::general_purpose::STANDARD
             .encode(b"tester@aster.test:abcd-efgh-ijkl-mnop");
         let auth = format!("Basic {}", basic);
-        for _ in 0..20 {
-            let _g = crate::port_picker::TEST_SERVER_START.lock().await;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-            drop(listener);
-            let url_base = format!("http://{}", addr);
-            let (tx, _rx) = broadcast::channel(8);
-            let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
-            tokio::spawn(async move {
-                let _ = run(&addr, s, d, c, p, tx, None).await;
-            });
-            let mut ready = false;
-            for _ in 0..200 {
-                if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            if ready {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url_base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, _rx) = broadcast::channel(8);
+        let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+        tokio::spawn(async move {
+            let _ = serve(listener, s, d, c, p, tx).await;
+        });
+        for _ in 0..200 {
+            if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
                 return (url_base, auth, dir);
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("jmap test server did not become ready");
+        panic!("jmap test server did not become ready")
     }
 
     #[tokio::test]
@@ -403,28 +432,18 @@ mod e2e_tests {
         let basic = base64::engine::general_purpose::STANDARD
             .encode(b"tester@aster.test:abcd-efgh-ijkl-mnop");
         let auth = format!("Basic {}", basic);
-        for _ in 0..20 {
-            let _g = crate::port_picker::TEST_SERVER_START.lock().await;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-            drop(listener);
-            let url_base = format!("http://{}", addr);
-            let (tx, _rx) = broadcast::channel(8);
-            let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
-            tokio::spawn(async move {
-                let _ = run(&addr, s, d, c, p, tx, None).await;
-            });
-            let mut ready = false;
-            for _ in 0..200 {
-                if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            if ready {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url_base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, _rx) = broadcast::channel(8);
+        let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+        tokio::spawn(async move {
+            let _ = serve(listener, s, d, c, p, tx).await;
+        });
+        for _ in 0..200 {
+            if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
                 return (url_base, auth, db, dir);
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("jmap test server did not become ready");
     }

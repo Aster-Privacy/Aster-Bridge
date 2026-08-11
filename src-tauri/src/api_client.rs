@@ -118,6 +118,12 @@ pub struct CreateImportJobResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BulkMetadataResponse {
+    #[serde(default)]
+    pub updated_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ImportJobSummary {
     pub id: String,
     #[serde(default)]
@@ -963,6 +969,41 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub const MAX_BULK_METADATA_ITEMS: usize = 100;
+
+    pub async fn bulk_set_mailbox_flags(
+        &self,
+        access_token: &str,
+        item_ids: &[String],
+        flags: &serde_json::Value,
+    ) -> Result<u64> {
+        let items: Vec<serde_json::Value> = item_ids
+            .iter()
+            .map(|id| {
+                let mut item = flags.clone();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::json!(id));
+                }
+                item
+            })
+            .collect();
+
+        let resp = self
+            .client
+            .patch(format!("{}/bridge/v1/messages/bulk/metadata", self.base_url))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({"items": items}))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let parsed: BulkMetadataResponse = resp.json().await?;
+        Ok(parsed.updated_count.max(0) as u64)
     }
 
     pub async fn set_mailbox_flags(

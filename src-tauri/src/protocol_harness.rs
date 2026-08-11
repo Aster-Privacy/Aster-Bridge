@@ -2224,18 +2224,15 @@ async fn imap_append_live_folders_real() {
     passwords.store("migration", "abcd-efgh-ijkl-mnop").unwrap();
 
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let guard = crate::port_picker::TEST_SERVER_START.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let addr_str = format!("127.0.0.1:{}", addr.port());
     let db_srv = db.clone();
     let client_srv = client.clone();
     let session_srv = session.clone();
     let tx_srv = tx.clone();
     tokio::spawn(async move {
-        let _ = crate::imap::server::run(
-            &addr_str,
+        let _ = crate::imap::server::serve(
+            listener,
             session_srv,
             db_srv,
             client_srv,
@@ -2251,7 +2248,6 @@ async fn imap_append_live_folders_real() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    drop(guard);
 
     let sweep_queries = [
         (false, false),
@@ -2691,18 +2687,15 @@ async fn imap_append_live_bulk_migration_real() {
     passwords.store("migration", "abcd-efgh-ijkl-mnop").unwrap();
 
     let (tx, _rx) = tokio::sync::broadcast::channel(64);
-    let guard = crate::port_picker::TEST_SERVER_START.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let addr_str = format!("127.0.0.1:{}", addr.port());
     let db_srv = db.clone();
     let client_srv = client.clone();
     let session_srv = session.clone();
     let tx_srv = tx.clone();
     tokio::spawn(async move {
-        let _ = crate::imap::server::run(
-            &addr_str,
+        let _ = crate::imap::server::serve(
+            listener,
             session_srv,
             db_srv,
             client_srv,
@@ -2718,7 +2711,6 @@ async fn imap_append_live_bulk_migration_real() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    drop(guard);
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2877,5 +2869,453 @@ async fn imap_append_live_bulk_migration_real() {
             .expect("cleanup delete failed");
     }
     println!("==== PROOF: a bulk desktop-client migration lands every message once, keeps original dates, and is safe to re-run ====");
+}
+
+#[tokio::test]
+#[ignore]
+async fn imap_append_live_migration_gauntlet_real() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cfg: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("id: {}", e);
+            return;
+        }
+    };
+    if identity.device_id.is_none() {
+        println!("NOT PAIRED");
+        return;
+    }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let live_session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("LOGIN FAILED: {}", e);
+            return;
+        }
+    };
+    let token = live_session.access_token.clone();
+    let identity_key = live_session.identity_key.clone().expect("no identity_key");
+    let passphrase = live_session.vault_passphrase.clone();
+    let email = live_session.email.clone();
+    let session = Arc::new(RwLock::new(live_session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[23u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+    let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+    passwords.store("gauntlet", "abcd-efgh-ijkl-mnop").unwrap();
+
+    let (tx, _rx) = tokio::sync::broadcast::channel(64);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let db_srv = db.clone();
+    let client_srv = client.clone();
+    let session_srv = session.clone();
+    let tx_srv = tx.clone();
+    tokio::spawn(async move {
+        let _ = crate::imap::server::serve(
+            listener,
+            session_srv,
+            db_srv,
+            client_srv,
+            passwords,
+            tx_srv,
+            None,
+        )
+        .await;
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let marker = format!("GAUNTLET {}", stamp);
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+
+    async fn cmd(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        line: &str,
+    ) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        w.write_all(format!("{} {}\r\n", tag, line).as_bytes())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        let mut resp = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            resp.push_str(&l);
+            if l.starts_with(&format!("{} ", tag)) {
+                break;
+            }
+        }
+        resp
+    }
+
+    async fn append(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        mailbox: &str,
+        extra: &str,
+        raw: &str,
+        non_sync: bool,
+    ) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let literal = if non_sync {
+            format!("{{{}+}}", raw.len())
+        } else {
+            format!("{{{}}}", raw.len())
+        };
+        let head = if extra.is_empty() {
+            format!("{} APPEND \"{}\" {}\r\n", tag, mailbox, literal)
+        } else {
+            format!("{} APPEND \"{}\" {} {}\r\n", tag, mailbox, extra, literal)
+        };
+        w.write_all(head.as_bytes()).await.unwrap();
+        w.flush().await.unwrap();
+        if !non_sync {
+            let mut cont = String::new();
+            reader.read_line(&mut cont).await.unwrap();
+            assert!(cont.starts_with("+ "), "no continuation for {}: {}", tag, cont);
+        }
+        w.write_all(raw.as_bytes()).await.unwrap();
+        w.write_all(b"\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        let mut resp = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            resp.push_str(&l);
+            if l.starts_with(&format!("{} ", tag)) {
+                break;
+            }
+        }
+        resp
+    }
+
+    let login = cmd(
+        &mut reader,
+        &mut w,
+        "g0",
+        &format!("LOGIN \"{}\" \"abcd-efgh-ijkl-mnop\"", email),
+    )
+    .await;
+    assert!(login.contains("g0 OK"), "login failed: {}", login);
+    let sel = cmd(&mut reader, &mut w, "g0s", "SELECT INBOX").await;
+    assert!(sel.contains("g0s OK"), "select failed: {}", sel);
+
+    let plain = |case: &str, extra_headers: &str, body: &str| -> String {
+        format!(
+            "Message-ID: <gaunt-{}-{}@old.example>\r\nFrom: Old Provider <oldprovider@example.com>\r\nTo: {}\r\nSubject: {} {}\r\n{}Content-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+            stamp, case, email, marker, case, extra_headers, body
+        )
+    };
+    let dated = |case: &str, body: &str| -> String {
+        plain(case, "Date: Wed, 14 Feb 2018 09:15:00 +0000\r\n", body)
+    };
+
+    let cases: Vec<(&str, &str, &str, String, bool)> = vec![
+        ("no-flags", "INBOX", "", dated("no-flags", "plain body"), false),
+        (
+            "non-sync",
+            "INBOX",
+            "(\\Seen)",
+            dated("non-sync", "non synchronizing literal body"),
+            true,
+        ),
+        (
+            "unseen-flags",
+            "INBOX",
+            "(\\Flagged \\Answered)",
+            dated("unseen-flags", "flagged and answered but unread"),
+            false,
+        ),
+        (
+            "internal-date",
+            "INBOX",
+            "\"14-Feb-2018 09:15:00 +0000\"",
+            plain("internal-date", "", "no Date header, internal date only"),
+            false,
+        ),
+        (
+            "utf8",
+            "INBOX",
+            "(\\Seen)",
+            dated("utf8", "gruesse aus dem archiv, unicode mail, 日本語"),
+            false,
+        ),
+        (
+            "archive",
+            "Archive",
+            "(\\Seen)",
+            dated("archive", "archived body"),
+            false,
+        ),
+        ("junk", "Junk", "", dated("junk", "junk body"), false),
+        ("trash", "Trash", "", dated("trash", "trash body"), false),
+        ("sent", "Sent", "(\\Seen)", dated("sent", "sent body"), false),
+    ];
+
+    let mut expected: Vec<(&str, String)> = Vec::new();
+    for (n, (case, mailbox, extra, raw, non_sync)) in cases.iter().enumerate() {
+        let tag = format!("g{}", n + 1);
+        let resp = append(&mut reader, &mut w, &tag, mailbox, extra, raw, *non_sync).await;
+        assert!(
+            resp.contains(&format!("{} OK", tag)),
+            "case {} into {} failed: {}",
+            case,
+            mailbox,
+            resp
+        );
+        assert!(
+            !resp.contains("CANNOT"),
+            "case {} was refused outright: {}",
+            case,
+            resp
+        );
+        assert!(
+            resp.contains("APPENDUID"),
+            "case {} missing APPENDUID: {}",
+            case,
+            resp
+        );
+        expected.push((mailbox, format!("{} {}", marker, case)));
+    }
+    println!("all {} protocol cases accepted", cases.len());
+
+    let dup = append(
+        &mut reader,
+        &mut w,
+        "g20",
+        "INBOX",
+        "",
+        &dated("no-flags", "plain body"),
+        false,
+    )
+    .await;
+    assert!(dup.contains("g20 OK"), "duplicate append errored: {}", dup);
+
+    let unknown = append(
+        &mut reader,
+        &mut w,
+        "g21",
+        "Old Mail",
+        "",
+        &dated("unknown", "should not land"),
+        false,
+    )
+    .await;
+    assert!(unknown.contains("g21 NO"), "expected NO: {}", unknown);
+    assert!(
+        unknown.contains("TRYCREATE"),
+        "expected TRYCREATE: {}",
+        unknown
+    );
+    let alive = cmd(&mut reader, &mut w, "g22", "NOOP").await;
+    assert!(
+        alive.contains("g22 OK"),
+        "session died after an unknown mailbox: {}",
+        alive
+    );
+
+    let toobig = cmd(&mut reader, &mut w, "g23", "APPEND \"INBOX\" {41943041}").await;
+    assert!(toobig.contains("g23 NO"), "expected NO: {}", toobig);
+    assert!(toobig.contains("TOOBIG"), "expected TOOBIG: {}", toobig);
+    let alive = cmd(&mut reader, &mut w, "g24", "NOOP").await;
+    assert!(
+        alive.contains("g24 OK"),
+        "session died after an oversized literal: {}",
+        alive
+    );
+
+    let created = cmd(&mut reader, &mut w, "g25", "CREATE \"Archive\"").await;
+    assert!(
+        created.contains("g25 OK"),
+        "a migration client could not pre-create an existing folder: {}",
+        created
+    );
+
+    let sel = cmd(&mut reader, &mut w, "g26", "SELECT INBOX").await;
+    assert!(sel.contains("g26 OK"), "reselect failed: {}", sel);
+    let found = cmd(
+        &mut reader,
+        &mut w,
+        "g27",
+        &format!(
+            "UID SEARCH HEADER MESSAGE-ID \"gaunt-{}-no-flags@old.example\"",
+            stamp
+        ),
+    )
+    .await;
+    let hits: Vec<String> = found
+        .lines()
+        .find(|l| l.starts_with("* SEARCH"))
+        .map(|l| {
+            l.trim_start_matches("* SEARCH")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        1,
+        "header search should find exactly the appended message, got {:?} from {}",
+        hits,
+        found
+    );
+    let fetched = cmd(
+        &mut reader,
+        &mut w,
+        "g28",
+        &format!("UID FETCH {} (BODY.PEEK[])", hits[0]),
+    )
+    .await;
+    assert!(
+        fetched.contains(&format!("{} no-flags", marker)),
+        "appended message is not readable in the same session: {}",
+        fetched
+    );
+
+    let missing = cmd(
+        &mut reader,
+        &mut w,
+        "g29",
+        "UID SEARCH HEADER MESSAGE-ID \"definitely-not-here@old.example\"",
+    )
+    .await;
+    let none: Vec<String> = missing
+        .lines()
+        .find(|l| l.starts_with("* SEARCH"))
+        .map(|l| {
+            l.trim_start_matches("* SEARCH")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        none.is_empty(),
+        "header search matched a message it should not: {}",
+        missing
+    );
+    println!("same-session search and fetch behave correctly");
+
+    let _ = w.write_all(b"g99 LOGOUT\r\n").await;
+    let _ = w.flush().await;
+
+    use crate::api_client::MailListQuery;
+    let query = |archived: bool, spam: bool, trashed: bool| MailListQuery {
+        item_type: None,
+        is_trashed: if trashed { Some(true) } else { None },
+        is_archived: if archived { Some(true) } else { None },
+        is_spam: if spam { Some(true) } else { None },
+        limit: Some(200),
+        cursor: None,
+    };
+
+    let recent = client
+        .sync_recent_items(&token, 400)
+        .await
+        .expect("sync failed")
+        .items;
+    let archived_pool = client
+        .list_mail(&token, &query(true, false, false))
+        .await
+        .expect("archive list failed")
+        .items;
+    let junk_pool = client
+        .list_mail(&token, &query(false, true, false))
+        .await
+        .expect("junk list failed")
+        .items;
+    let trash_pool = client
+        .list_mail(&token, &query(false, false, true))
+        .await
+        .expect("trash list failed")
+        .items;
+
+    let decrypt = |item: &crate::api_client::MailItem| -> Option<String> {
+        crate::crypto::envelope::decrypt_envelope(
+            &item.encrypted_envelope,
+            Some(&item.envelope_nonce),
+            &passphrase,
+            Some(&identity_key),
+            &[],
+        )
+        .ok()
+    };
+
+    let mut cleanup: Vec<String> = Vec::new();
+    for (mailbox, subject) in &expected {
+        let pool = match *mailbox {
+            "Archive" => &archived_pool,
+            "Junk" => &junk_pool,
+            "Trash" => &trash_pool,
+            _ => &recent,
+        };
+        let mut matches: Vec<String> = Vec::new();
+        for item in pool {
+            let Some(plain) = decrypt(item) else { continue };
+            let envelope: serde_json::Value = match serde_json::from_str(&plain) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if envelope["subject"].as_str().unwrap_or_default() == subject.as_str() {
+                matches.push(item.id.clone());
+            }
+        }
+        assert_eq!(
+            matches.len(),
+            1,
+            "{} should hold exactly one copy of \"{}\", found {}",
+            mailbox,
+            subject,
+            matches.len()
+        );
+        cleanup.extend(matches);
+    }
+    println!(
+        "every one of the {} cases landed exactly once on the server, including after the duplicate copy",
+        expected.len()
+    );
+
+    for id in &cleanup {
+        client
+            .delete_mail_item_permanent(&token, id)
+            .await
+            .expect("cleanup delete failed");
+    }
+    println!("==== PROOF: the migration gauntlet passes end to end, every literal form, flag set, folder, and error case behaves ====");
 }
 

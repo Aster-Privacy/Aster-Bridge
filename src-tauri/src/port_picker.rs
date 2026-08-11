@@ -50,8 +50,37 @@ pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
     ))
 }
 
-#[cfg(test)]
-pub(crate) static TEST_SERVER_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const BIND_RETRIES: u32 = 5;
+
+pub async fn bind_loopback_listener(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let sock_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if !sock_addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to bind mail listener to non-loopback host {}",
+                sock_addr.ip()
+            ),
+        ));
+    }
+    let mut attempt = 0u32;
+    loop {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        #[cfg(not(windows))]
+        socket.set_reuseaddr(true).ok();
+        match socket.bind(sock_addr) {
+            Ok(()) => return socket.listen(1024),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < BIND_RETRIES => {
+                attempt += 1;
+                tracing::warn!("{} still in use, retrying bind ({})", addr, attempt);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

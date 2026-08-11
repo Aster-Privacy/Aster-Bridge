@@ -289,7 +289,7 @@ pub fn build_imported_message(
         .map(|d| d.with_timezone(&Utc));
     let (received_at, date_known) = match (header_date, internal_date) {
         (Some(d), _) => (d, true),
-        (None, Some(d)) => (d, true),
+        (None, Some(d)) => (d, false),
         (None, None) => (now, false),
     };
 
@@ -1100,6 +1100,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(msg.received_at, ts("2019-03-04T05:06:07Z"));
+
+        let other_internal_date = build_imported_message(
+            raw,
+            "inbox",
+            Some(ts("2021-06-07T08:09:10Z")),
+            ts("2026-08-11T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            msg.content_hash, other_internal_date.content_hash,
+            "the web importer leaves the date out of the hash when the source has no Date header, so the internal date must not enter it either"
+        );
     }
 
     #[test]

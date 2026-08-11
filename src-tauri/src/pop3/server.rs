@@ -69,14 +69,18 @@ pub async fn run(
     passwords: Arc<AppPasswords>,
     _tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("POP3 server listening on {}", addr);
+    serve(listener, session, db, client, passwords).await
+}
 
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         if !peer.ip().is_loopback() {
@@ -114,12 +118,7 @@ pub async fn run_implicit_tls(
     passwords: Arc<AppPasswords>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
-    let sock_addr: std::net::SocketAddr = addr.parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true).ok();
-    socket.bind(sock_addr)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("POP3S (implicit TLS) listening on {}", addr);
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -685,14 +684,11 @@ mod tests {
         let (base, calls) = spawn_mock_backend().await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 
-        let _g = crate::port_picker::TEST_SERVER_START.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let addr_str = format!("127.0.0.1:{}", addr.port());
         let db_clone = db.clone();
         tokio::spawn(async move {
-            let _ = run(&addr_str, session, db_clone, client, passwords, None).await;
+            let _ = serve(listener, session, db_clone, client, passwords).await;
         });
         for _ in 0..80 {
             if TcpStream::connect(addr).await.is_ok() {
