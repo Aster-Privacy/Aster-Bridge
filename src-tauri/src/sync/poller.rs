@@ -421,7 +421,7 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct CacheOutcome {
+pub(crate) struct CacheOutcome {
     was_new: bool,
     flags_changed: bool,
 }
@@ -455,7 +455,7 @@ fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
     db.set_message_flags_by_id(&item.id, new_flags).is_ok()
 }
 
-fn cache_mail_item(
+pub(crate) fn cache_mail_item(
     db: &Database,
     folder: &str,
     item: &MailItem,

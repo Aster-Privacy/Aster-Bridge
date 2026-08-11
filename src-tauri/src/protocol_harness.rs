@@ -1,4 +1,4 @@
-//
+﻿//
 // Aster Communications Inc.
 //
 // Copyright (c) 2026 Aster Communications Inc.
@@ -361,8 +361,10 @@ async fn protocol_feature_matrix() {
         cl.check("IMAP NAMESPACE", namespace.contains("* NAMESPACE") && namespace.contains("n6 OK"), "ok");
 
         // APPEND uses a literal continuation: send command, read "+", send the
-        // literal, then read the tagged response. The bridge intentionally
-        // rejects APPEND (clients submit via SMTP), so we expect a NO.
+        // literal, then read the tagged response. Mirrored folders now accept
+        // APPEND and import the message; this harness session carries no
+        // identity key, so the store fails after the folder check rather than
+        // being refused outright.
         w.write_all(b"a8 APPEND INBOX {3}\r\n").await.unwrap();
         w.flush().await.unwrap();
         let mut cont = String::new();
@@ -382,12 +384,13 @@ async fn protocol_feature_matrix() {
             }
         }
         cl.check(
-            "IMAP APPEND rejected cleanly (use SMTP)",
-            got_continuation && (appresp.contains("CANNOT") || appresp.contains("a8 NO")),
+            "IMAP APPEND to INBOX reaches the import path",
+            got_continuation && appresp.contains("a8 NO") && !appresp.contains("CANNOT"),
             appresp.trim().to_string(),
         );
 
         let sent_literal = b"Subject: harness append\r\n\r\nhi";
+        crate::imap::append::note_outgoing_message(sent_literal);
         w.write_all(
             format!("a9 APPEND Sent {{{}}}\r\n", sent_literal.len()).as_bytes(),
         )
@@ -412,8 +415,10 @@ async fn protocol_feature_matrix() {
             }
         }
         cl.check(
-            "IMAP APPEND to Sent accepted (dedup against server copy)",
-            got_sent_continuation && sent_resp.contains("a9 OK"),
+            "IMAP APPEND to Sent accepted (dedup against bridge-sent copy)",
+            got_sent_continuation
+                && sent_resp.contains("a9 OK")
+                && !sent_resp.contains("APPENDUID"),
             sent_resp.trim().to_string(),
         );
 
@@ -2057,3 +2062,820 @@ async fn draft_append_roundtrip_real() {
     assert!(after.items.iter().all(|d| d.id != draft_id), "draft still on server after delete");
     println!("==== PROOF: live APPEND->create->list->decrypt->delete draft round trip succeeded ====");
 }
+
+//   cargo test --bin aster-bridge-desktop append_import_roundtrip_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn append_import_roundtrip_real() {
+    let cfg = match crate::config::load_config() { Ok(c) => c, Err(e) => { println!("cfg: {}", e); return; } };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i, Err(e) => { println!("id: {}", e); return; }
+    };
+    if identity.device_id.is_none() { println!("NOT PAIRED"); return; }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s, Err(e) => { println!("LOGIN FAILED: {}", e); return; }
+    };
+    let token = session.access_token.clone();
+    let identity_key = match session.identity_key.clone() {
+        Some(k) => k, None => { println!("no identity_key"); return; }
+    };
+    let passphrase = session.vault_passphrase.clone();
+    let session = Arc::new(RwLock::new(session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[11u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let sweep = client.sync_recent_items(&token, 200).await.expect("sync failed");
+    for item in &sweep.items {
+        let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
+            &item.encrypted_envelope, Some(&item.envelope_nonce), &passphrase, Some(&identity_key), &[],
+        ) else { continue };
+        if plain.contains("BRIDGE APPEND IMPORT LIVE TEST") {
+            match client.delete_mail_item_permanent(&token, &item.id).await {
+                Ok(()) => println!("swept leftover test item {}", item.id),
+                Err(e) => println!("sweep of {} failed: {}", item.id, e),
+            }
+        }
+    }
+
+    let marker = format!("BRIDGE APPEND IMPORT LIVE TEST 314159 {}", stamp);
+    let raw = format!(
+        "Message-ID: <append-import-live-{}@old.example>
+From: Old Provider <oldprovider@example.com>
+To: migrating@example.com
+Subject: {}
+Date: Fri, 12 Jul 2024 13:04:05 +0000
+Content-Type: text/html; charset=utf-8
+
+<p>migrated body 314159</p>",
+        stamp, marker
+    );
+    let flags = crate::imap::append::AppendFlags { seen: true, ..Default::default() };
+
+    let outcome = crate::imap::append::append_imported_message(
+        &db, &client, &session, "inbox", raw.as_bytes(), &flags, None,
+    )
+    .await;
+    let (uid, aster_id) = match outcome {
+        Ok(crate::imap::append::AppendOutcome::Stored { uid, aster_id }) => (uid, aster_id),
+        Ok(other) => panic!("expected a stored append, got {:?}", other),
+        Err(e) => panic!("APPEND IMPORT FAILED: {}", e),
+    };
+    println!("stored live item {} with local uid {}", aster_id, uid);
+
+    let cached = db.get_cached_message(&aster_id).unwrap().expect("item not cached locally");
+    assert_eq!(cached.folder, "inbox");
+    assert_eq!(cached.subject.as_deref(), Some(marker.as_str()));
+    assert!(cached.imap_uid > 0);
+    assert!(
+        cached.date.as_deref().unwrap_or("").starts_with("2024-07-12"),
+        "original date not preserved locally: {:?}", cached.date
+    );
+    let rendered = crate::imap::server::build_rfc822(&cached);
+    assert!(rendered.contains(marker.as_str()), "rfc822 render missing subject");
+
+    let synced = client.sync_recent_items(&token, 200).await.expect("sync failed");
+    let found = synced.items.iter().find(|i| i.id == aster_id).expect("stored item not returned by the server");
+    assert!(found.is_external, "imported item must be external");
+    assert!(
+        found.message_ts.as_deref().unwrap_or("").starts_with("2024-07-12"),
+        "server message_ts not the original date: {:?}", found.message_ts
+    );
+    assert_eq!(found.item_type, "received");
+
+    let plaintext = crate::crypto::envelope::decrypt_envelope(
+        &found.encrypted_envelope, Some(&found.envelope_nonce), &passphrase, Some(&identity_key), &[],
+    )
+    .expect("server copy failed to decrypt with the canonical web key derivation");
+    let envelope: serde_json::Value = serde_json::from_str(&plaintext).expect("envelope is not json");
+    assert_eq!(envelope["subject"], marker);
+    assert_eq!(envelope["from"], "Old Provider <oldprovider@example.com>");
+    assert_eq!(envelope["date"], "2024-07-12T13:04:05.000Z");
+    assert!(envelope["body_html"].as_str().unwrap_or("").contains("migrated body 314159"));
+    println!("server copy decrypted with the web/iOS/Android key derivation and matches");
+
+    let again = crate::imap::append::append_imported_message(
+        &db, &client, &session, "inbox", raw.as_bytes(), &flags, None,
+    )
+    .await
+    .expect("retry append errored");
+    assert!(
+        matches!(again, crate::imap::append::AppendOutcome::Duplicate { .. }),
+        "a repeated append must be a duplicate, got {:?}", again
+    );
+    println!("repeated append reported as duplicate, no second copy stored");
+
+    client.delete_mail_item_permanent(&token, &aster_id).await.expect("cleanup delete failed");
+    println!("==== PROOF: live APPEND->import->list->decrypt->dedupe->delete round trip succeeded ====");
+}
+
+#[tokio::test]
+#[ignore]
+async fn imap_append_live_folders_real() {
+    use crate::api_client::MailListQuery;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cfg: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("id: {}", e);
+            return;
+        }
+    };
+    if identity.device_id.is_none() {
+        println!("NOT PAIRED");
+        return;
+    }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let live_session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("LOGIN FAILED: {}", e);
+            return;
+        }
+    };
+    let token = live_session.access_token.clone();
+    let identity_key = live_session.identity_key.clone().expect("no identity_key");
+    let passphrase = live_session.vault_passphrase.clone();
+    let email = live_session.email.clone();
+    let session = Arc::new(RwLock::new(live_session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[13u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+    let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+    passwords.store("migration", "abcd-efgh-ijkl-mnop").unwrap();
+
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let guard = crate::port_picker::TEST_SERVER_START.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let addr_str = format!("127.0.0.1:{}", addr.port());
+    let db_srv = db.clone();
+    let client_srv = client.clone();
+    let session_srv = session.clone();
+    let tx_srv = tx.clone();
+    tokio::spawn(async move {
+        let _ = crate::imap::server::run(
+            &addr_str,
+            session_srv,
+            db_srv,
+            client_srv,
+            passwords,
+            tx_srv,
+            None,
+        )
+        .await;
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(guard);
+
+    let sweep_queries = [
+        (false, false),
+        (true, false),
+        (false, true),
+    ];
+    for (archived, spam) in sweep_queries {
+        let q = MailListQuery {
+            item_type: None,
+            is_trashed: None,
+            is_archived: if archived { Some(true) } else { None },
+            is_spam: if spam { Some(true) } else { None },
+            limit: Some(200),
+            cursor: None,
+        };
+        let mut pool = client.list_mail(&token, &q).await.map(|r| r.items).unwrap_or_default();
+        if let Ok(recent) = client.sync_recent_items(&token, 200).await {
+            pool.extend(recent.items);
+        }
+        for item in pool {
+            let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
+                &item.encrypted_envelope,
+                Some(&item.envelope_nonce),
+                &passphrase,
+                Some(&identity_key),
+                &[],
+            ) else {
+                continue;
+            };
+            if plain.contains("MIGRATION PROBE") {
+                let _ = client.delete_mail_item_permanent(&token, &item.id).await;
+                println!("swept leftover test item {}", item.id);
+            }
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    assert!(greeting.contains("OK"), "greeting: {}", greeting);
+    w.write_all(format!("c1 LOGIN \"{}\" \"abcd-efgh-ijkl-mnop\"\r\n", email).as_bytes())
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    let mut login = String::new();
+    loop {
+        let mut l = String::new();
+        if reader.read_line(&mut l).await.unwrap() == 0 {
+            break;
+        }
+        login.push_str(&l);
+        if l.starts_with("c1 ") {
+            break;
+        }
+    }
+    assert!(login.contains("c1 OK"), "login failed: {}", login);
+
+    let mut created: Vec<(String, String)> = Vec::new();
+
+    let targets = [
+        ("m1", "INBOX", "MIGRATION PROBE INBOX"),
+        ("m2", "Archive", "MIGRATION PROBE ARCHIVE"),
+        ("m3", "Junk", "MIGRATION PROBE JUNK"),
+    ];
+    for (tag, mailbox, label) in targets {
+        let subject = format!("{} {}", label, stamp);
+        let raw = format!(
+            "Message-ID: <{}-{}@old.example>\r\nFrom: Old Provider <oldprovider@example.com>\r\nTo: {}\r\nSubject: {}\r\nDate: Tue, 09 Jan 2018 08:07:06 +0000\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>migrated body for {}</p>",
+            tag, stamp, email, subject, mailbox
+        );
+
+        w.write_all(format!("s{} SELECT {}\r\n", tag, mailbox).as_bytes())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            if l.starts_with(&format!("s{} ", tag)) {
+                break;
+            }
+        }
+
+        w.write_all(
+            format!(
+                "{} APPEND \"{}\" (\\Seen) \"09-Jan-2018 08:07:06 +0000\" {{{}}}\r\n",
+                tag,
+                mailbox,
+                raw.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(
+            cont.starts_with("+ "),
+            "no continuation for {}: {}",
+            mailbox,
+            cont
+        );
+        w.write_all(raw.as_bytes()).await.unwrap();
+        w.write_all(b"\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        let mut resp = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            resp.push_str(&l);
+            if l.starts_with(&format!("{} ", tag)) {
+                break;
+            }
+        }
+        assert!(
+            resp.contains(&format!("{} OK", tag)),
+            "APPEND to {} failed: {}",
+            mailbox,
+            resp
+        );
+        assert!(
+            !resp.contains("CANNOT"),
+            "APPEND to {} still rejected: {}",
+            mailbox,
+            resp
+        );
+        assert!(
+            resp.contains("APPENDUID"),
+            "APPEND to {} returned no APPENDUID: {}",
+            mailbox,
+            resp
+        );
+        println!("APPEND {} -> {}", mailbox, resp.trim());
+        created.push((mailbox.to_string(), subject));
+    }
+
+    let _ = w.write_all(b"c9 LOGOUT\r\n").await;
+    let _ = w.flush().await;
+
+    let filtered = |archived: bool, spam: bool| MailListQuery {
+        item_type: None,
+        is_trashed: None,
+        is_archived: if archived { Some(true) } else { None },
+        is_spam: if spam { Some(true) } else { None },
+        limit: Some(200),
+        cursor: None,
+    };
+
+    let mut ids: Vec<(String, String)> = Vec::new();
+    for (mailbox, subject) in &created {
+        let pool = match mailbox.as_str() {
+            "Archive" => client
+                .list_mail(&token, &filtered(true, false))
+                .await
+                .expect("archive list failed")
+                .items,
+            "Junk" => client
+                .list_mail(&token, &filtered(false, true))
+                .await
+                .expect("junk list failed")
+                .items,
+            _ => client
+                .sync_recent_items(&token, 200)
+                .await
+                .expect("sync failed")
+                .items,
+        };
+        let mut hit = None;
+        for item in &pool {
+            let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
+                &item.encrypted_envelope,
+                Some(&item.envelope_nonce),
+                &passphrase,
+                Some(&identity_key),
+                &[],
+            ) else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&plain) else {
+                continue;
+            };
+            if envelope["subject"].as_str() == Some(subject.as_str()) {
+                assert!(item.is_external, "{} item not external", mailbox);
+                assert!(
+                    item.message_ts
+                        .as_deref()
+                        .unwrap_or("")
+                        .starts_with("2018-01-09"),
+                    "{} lost its original date: {:?}",
+                    mailbox,
+                    item.message_ts
+                );
+                assert!(
+                    envelope["body_html"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("migrated body"),
+                    "{} body missing",
+                    mailbox
+                );
+                hit = Some(item.id.clone());
+                break;
+            }
+        }
+        let id = hit.unwrap_or_else(|| {
+            panic!(
+                "{} append never reached the server, or was not filed into that folder",
+                mailbox
+            )
+        });
+        println!(
+            "verified {} item {} is filed correctly server-side, decrypts with the web/iOS key, and kept its original date",
+            mailbox, id
+        );
+        ids.push((mailbox.clone(), id));
+    }
+
+    for (_, id) in &ids {
+        client
+            .delete_mail_item_permanent(&token, id)
+            .await
+            .expect("cleanup delete failed");
+    }
+    println!("==== PROOF: live desktop-client IMAP APPEND into INBOX, Archive and Junk stored, decryptable, correctly filed ====");
+}
+
+
+#[tokio::test]
+#[ignore]
+async fn imap_append_live_import_job_lifecycle_real() {
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cfg: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("id: {}", e);
+            return;
+        }
+    };
+    if identity.device_id.is_none() {
+        println!("NOT PAIRED");
+        return;
+    }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let live_session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("LOGIN FAILED: {}", e);
+            return;
+        }
+    };
+    let token = live_session.access_token.clone();
+    let email = live_session.email.clone();
+    let session = Arc::new(RwLock::new(live_session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[17u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+
+    let stale: Vec<String> = client
+        .list_import_jobs(&token)
+        .await
+        .expect("job list failed")
+        .jobs
+        .into_iter()
+        .filter(|j| j.status == "pending" || j.status == "processing")
+        .map(|j| j.id)
+        .collect();
+    for id in &stale {
+        let _ = client
+            .update_import_job(
+                &token,
+                id,
+                &crate::api_client::UpdateImportJobBody {
+                    status: "completed",
+                },
+            )
+            .await;
+        println!("closed pre-existing stale import job {}", id);
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let subject = format!("MIGRATION PROBE JOBCYCLE {}", stamp);
+    let raw = format!(
+        "Message-ID: <jobcycle-{}@old.example>\r\nFrom: Old Provider <oldprovider@example.com>\r\nTo: {}\r\nSubject: {}\r\nDate: Tue, 09 Jan 2018 08:07:06 +0000\r\nContent-Type: text/plain\r\n\r\njob cycle body",
+        stamp, email, subject
+    );
+
+    let outcome = crate::imap::append::append_imported_message(
+        &db,
+        &client,
+        &session,
+        "inbox",
+        raw.as_bytes(),
+        &crate::imap::append::AppendFlags {
+            seen: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("append failed");
+    println!("append outcome: {:?}", outcome);
+
+    let during: Vec<String> = client
+        .list_import_jobs(&token)
+        .await
+        .expect("job list failed")
+        .jobs
+        .into_iter()
+        .filter(|j| j.status == "pending" || j.status == "processing")
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(
+        during.len(),
+        1,
+        "expected exactly one active import job during the migration, got {:?}",
+        during
+    );
+    println!("exactly one active job during the migration: {}", during[0]);
+
+    println!("waiting for the idle closer, this takes about 150 seconds");
+    let mut closed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let active: Vec<String> = client
+            .list_import_jobs(&token)
+            .await
+            .map(|r| {
+                r.jobs
+                    .into_iter()
+                    .filter(|j| j.status == "pending" || j.status == "processing")
+                    .map(|j| j.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !active.contains(&during[0]) {
+            closed = true;
+            break;
+        }
+    }
+    assert!(
+        closed,
+        "the append import job was never closed out, it would eventually hit the server cap"
+    );
+    println!("job {} closed out after the migration went idle", during[0]);
+
+    let mut cleaned = false;
+    if let Ok(recent) = client.sync_recent_items(&token, 200).await {
+        for item in recent.items {
+            let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
+                &item.encrypted_envelope,
+                Some(&item.envelope_nonce),
+                &[],
+                session.read().await.identity_key.as_deref(),
+                &[],
+            ) else {
+                continue;
+            };
+            if plain.contains(&subject) {
+                let _ = client.delete_mail_item_permanent(&token, &item.id).await;
+                cleaned = true;
+            }
+        }
+    }
+    println!("test item cleaned up: {}", cleaned);
+    println!("==== PROOF: the append import job opens once, stays single, and closes when the migration goes idle ====");
+}
+
+
+#[tokio::test]
+#[ignore]
+async fn imap_append_live_bulk_migration_real() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    const BATCH: usize = 12;
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cfg: {}", e);
+            return;
+        }
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("id: {}", e);
+            return;
+        }
+    };
+    if identity.device_id.is_none() {
+        println!("NOT PAIRED");
+        return;
+    }
+    crate::tls::install_default_crypto_provider();
+    let client = Arc::new(ApiClient::new());
+    let live_session = match crate::auth::session::restore_or_login(&cfg, &identity, &client).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("LOGIN FAILED: {}", e);
+            return;
+        }
+    };
+    let token = live_session.access_token.clone();
+    let identity_key = live_session.identity_key.clone().expect("no identity_key");
+    let passphrase = live_session.vault_passphrase.clone();
+    let email = live_session.email.clone();
+    let session = Arc::new(RwLock::new(live_session));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open_with_key(dir.path(), &[19u8; 32]).unwrap());
+    let _ = db.seed_jmap_mailboxes();
+    let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+    passwords.store("migration", "abcd-efgh-ijkl-mnop").unwrap();
+
+    let (tx, _rx) = tokio::sync::broadcast::channel(64);
+    let guard = crate::port_picker::TEST_SERVER_START.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let addr_str = format!("127.0.0.1:{}", addr.port());
+    let db_srv = db.clone();
+    let client_srv = client.clone();
+    let session_srv = session.clone();
+    let tx_srv = tx.clone();
+    tokio::spawn(async move {
+        let _ = crate::imap::server::run(
+            &addr_str,
+            session_srv,
+            db_srv,
+            client_srv,
+            passwords,
+            tx_srv,
+            None,
+        )
+        .await;
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(guard);
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let marker = format!("BULK MIGRATION {}", stamp);
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    let mut greeting = String::new();
+    reader.read_line(&mut greeting).await.unwrap();
+    w.write_all(format!("c1 LOGIN \"{}\" \"abcd-efgh-ijkl-mnop\"\r\n", email).as_bytes())
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    loop {
+        let mut l = String::new();
+        if reader.read_line(&mut l).await.unwrap() == 0 {
+            break;
+        }
+        if l.starts_with("c1 ") {
+            assert!(l.contains("OK"), "login failed: {}", l);
+            break;
+        }
+    }
+
+    let build = |n: usize| -> String {
+        let subject = format!("{} item {}", marker, n);
+        if n == 3 {
+            format!(
+                "Message-ID: <bulk-{}-{}@old.example>\r\nFrom: Old Provider <oldprovider@example.com>\r\nTo: {}\r\nSubject: {}\r\nDate: Wed, 14 Feb 2018 09:{:02}:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"bnd\"\r\n\r\n--bnd\r\nContent-Type: text/plain\r\n\r\nbulk body {}\r\n--bnd\r\nContent-Type: application/pdf; name=\"legacy.pdf\"\r\nContent-Disposition: attachment; filename=\"legacy.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8gbGVnYWN5\r\n--bnd--\r\n",
+                stamp, n, email, subject, n, n
+            )
+        } else {
+            format!(
+                "Message-ID: <bulk-{}-{}@old.example>\r\nFrom: Old Provider <oldprovider@example.com>\r\nTo: {}\r\nSubject: {}\r\nDate: Wed, 14 Feb 2018 09:{:02}:00 +0000\r\nContent-Type: text/plain\r\n\r\nbulk body {}\r\n",
+                stamp, n, email, subject, n, n
+            )
+        }
+    };
+
+    async fn append_one(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        raw: &str,
+    ) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        w.write_all(
+            format!("{} APPEND \"INBOX\" (\\Seen) {{{}}}\r\n", tag, raw.len()).as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "no continuation: {}", cont);
+        w.write_all(raw.as_bytes()).await.unwrap();
+        w.write_all(b"\r\n").await.unwrap();
+        w.flush().await.unwrap();
+        let mut resp = String::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).await.unwrap() == 0 {
+                break;
+            }
+            resp.push_str(&l);
+            if l.starts_with(&format!("{} ", tag)) {
+                break;
+            }
+        }
+        resp
+    }
+
+    for n in 0..BATCH {
+        let resp = append_one(&mut reader, &mut w, &format!("b{}", n), &build(n)).await;
+        assert!(resp.contains(&format!("b{} OK", n)), "message {} failed: {}", n, resp);
+        assert!(resp.contains("APPENDUID"), "message {} missing APPENDUID: {}", n, resp);
+    }
+    println!("first pass: all {} messages accepted", BATCH);
+
+    for n in 0..BATCH {
+        let resp = append_one(&mut reader, &mut w, &format!("r{}", n), &build(n)).await;
+        assert!(
+            resp.contains(&format!("r{} OK", n)),
+            "repeat copy of message {} errored, the mail client would report a failure: {}",
+            n,
+            resp
+        );
+    }
+    println!("second pass: repeated copy accepted without errors");
+
+    let _ = w.write_all(b"c9 LOGOUT\r\n").await;
+    let _ = w.flush().await;
+
+    let synced = client
+        .sync_recent_items(&token, 400)
+        .await
+        .expect("sync failed");
+    let mut found: Vec<(String, String)> = Vec::new();
+    for item in &synced.items {
+        let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
+            &item.encrypted_envelope,
+            Some(&item.envelope_nonce),
+            &passphrase,
+            Some(&identity_key),
+            &[],
+        ) else {
+            continue;
+        };
+        if !plain.contains(&marker) {
+            continue;
+        }
+        let envelope: serde_json::Value = serde_json::from_str(&plain).expect("bad envelope json");
+        let subject = envelope["subject"].as_str().unwrap_or_default().to_string();
+        assert!(
+            item.message_ts
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2018-02-14"),
+            "{} lost its original date: {:?}",
+            subject,
+            item.message_ts
+        );
+        found.push((subject, item.id.clone()));
+    }
+
+    let mut subjects: Vec<String> = found.iter().map(|(s, _)| s.clone()).collect();
+    subjects.sort();
+    let mut unique = subjects.clone();
+    unique.dedup();
+    assert_eq!(
+        subjects.len(),
+        unique.len(),
+        "the repeated copy created duplicates: {:?}",
+        subjects
+    );
+    assert_eq!(
+        found.len(),
+        BATCH,
+        "expected {} migrated messages on the server, found {}: {:?}",
+        BATCH,
+        found.len(),
+        subjects
+    );
+    println!(
+        "server holds exactly {} migrated messages after two full copy passes, no duplicates",
+        found.len()
+    );
+
+    for (_, id) in &found {
+        client
+            .delete_mail_item_permanent(&token, id)
+            .await
+            .expect("cleanup delete failed");
+    }
+    println!("==== PROOF: a bulk desktop-client migration lands every message once, keeps original dates, and is safe to re-run ====");
+}
+

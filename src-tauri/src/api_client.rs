@@ -107,6 +107,84 @@ pub struct CreateMailItem<'a> {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CreateImportJobBody<'a> {
+    pub source: &'a str,
+    pub total_emails: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateImportJobResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportJobSummary {
+    pub id: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportJobListResponse {
+    #[serde(default)]
+    pub jobs: Vec<ImportJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateImportJobBody<'a> {
+    pub status: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportedEmail<'a> {
+    pub message_id_hash: &'a str,
+    pub encrypted_envelope: &'a str,
+    pub envelope_nonce: &'a str,
+    pub content_hash: &'a str,
+    pub item_type: &'a str,
+    pub received_at: &'a str,
+    pub has_attachments: bool,
+    pub attachment_count: i16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoreImportedEmailsBody<'a> {
+    pub emails: Vec<ImportedEmail<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct StoreImportedEmailsResponse {
+    #[serde(default)]
+    pub stored_count: i32,
+    #[serde(default)]
+    pub duplicate_count: i32,
+    #[serde(default)]
+    pub skipped_quota_count: i32,
+    #[serde(default)]
+    pub quota_exceeded: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct SyncResponse {
+    pub items: Vec<MailItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAttachmentBody<'a> {
+    pub encrypted_data: &'a str,
+    pub data_nonce: &'a str,
+    pub encrypted_meta: &'a str,
+    pub meta_nonce: &'a str,
+    pub seq_num: i16,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CreateDraftBody<'a> {
     pub draft_type: &'a str,
     pub encrypted_content: &'a str,
@@ -388,6 +466,10 @@ impl ApiClient {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn generate_device_code(&self, req: &DeviceCodeRequest) -> Result<DeviceCodeResponse> {
         let resp = self.client
             .post(format!("{}/core/v1/auth/device/code", self.base_url))
@@ -584,6 +666,133 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_import_job(
+        &self,
+        access_token: &str,
+        body: &CreateImportJobBody<'_>,
+    ) -> Result<CreateImportJobResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/email_import/jobs", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_import_jobs(&self, access_token: &str) -> Result<ImportJobListResponse> {
+        let resp = self
+            .client
+            .get(format!("{}/mail/v1/email_import/jobs", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_import_job(
+        &self,
+        access_token: &str,
+        job_id: &str,
+        body: &UpdateImportJobBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/mail/v1/email_import/jobs/{}",
+                self.base_url, job_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn store_imported_emails(
+        &self,
+        access_token: &str,
+        job_id: &str,
+        body: &StoreImportedEmailsBody<'_>,
+    ) -> Result<StoreImportedEmailsResponse> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/email_import/jobs/{}/emails",
+                self.base_url, job_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn sync_recent_items(
+        &self,
+        access_token: &str,
+        limit: i64,
+    ) -> Result<SyncResponse> {
+        let resp = self
+            .client
+            .get(format!("{}/bridge/v1/messages/sync", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[("limit", limit.to_string())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_attachment(
+        &self,
+        access_token: &str,
+        mail_id: &str,
+        body: &CreateAttachmentBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/mail/v1/attachments/by-mail/{}",
+                self.base_url, mail_id
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
     }
 
     pub async fn list_drafts(

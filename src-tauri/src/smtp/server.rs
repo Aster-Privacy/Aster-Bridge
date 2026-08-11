@@ -317,6 +317,7 @@ where
                     continue;
                 }
 
+                crate::imap::append::note_outgoing_message(&raw_message);
                 match send_via_api(&session, &client, &smtp.mail_from, &smtp.rcpt_to, &raw_message)
                     .await
                 {

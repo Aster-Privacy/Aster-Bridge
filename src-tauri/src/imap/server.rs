@@ -466,6 +466,8 @@ const IMAP_FOLDERS: &[(&str, &str, &str)] = &[
     ("Archive", "archive", "\\Archive"),
 ];
 
+const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ImapState {
     NotAuthenticated,
@@ -1351,31 +1353,24 @@ where
             }
             "APPEND" => {
                 require_auth!(conn, writer, tag);
-                let (mailbox, _) = parse_imap_atom_or_quoted(&args);
-                let target_folder = IMAP_FOLDERS
-                    .iter()
-                    .find(|(imap, _, _)| imap.eq_ignore_ascii_case(&mailbox))
-                    .map(|(_, f, _)| *f);
-                let literal_info = args.rfind('{').and_then(|s| {
-                    let rest = &args[s + 1..];
-                    rest.find('}').and_then(|e| {
-                        let inner = &rest[..e];
-                        let non_sync = inner.ends_with('+');
-                        let n = inner.trim_end_matches('+').parse::<usize>().ok()?;
-                        Some((n, non_sync))
-                    })
+                let command = crate::imap::append::parse_append_command(&args);
+                let target_folder = command.as_ref().and_then(|cmd| {
+                    IMAP_FOLDERS
+                        .iter()
+                        .find(|(imap, _, _)| imap.eq_ignore_ascii_case(&cmd.mailbox))
+                        .map(|(_, f, _)| *f)
                 });
-                match literal_info {
-                    Some((n, _)) if n > 5 * 1024 * 1024 => {
+                match command {
+                    Some(cmd) if cmd.literal_len > MAX_APPEND_BYTES => {
                         write_no(&mut writer, &tag, "[TOOBIG] APPEND literal too large").await?;
                     }
-                    Some((n, non_sync)) => {
+                    Some(cmd) => {
                         use tokio::io::AsyncReadExt;
-                        if !non_sync {
+                        if !cmd.non_sync {
                             writer.write_all(b"+ Ready for literal data\r\n").await?;
                             writer.flush().await?;
                         }
-                        let mut buf = vec![0u8; n];
+                        let mut buf = vec![0u8; cmd.literal_len];
                         if let Err(e) = reader.read_exact(&mut buf).await {
                             tracing::warn!("APPEND read failed: {}", e);
                             write_bad(&mut writer, &tag, "APPEND read failed").await?;
@@ -1386,26 +1381,6 @@ where
                         match target_folder {
                             None => {
                                 write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
-                            }
-                            Some("sent") => {
-                                match find_appended_sent_copy(&db, &buf) {
-                                    Some(uid) => {
-                                        write_ok(
-                                            &mut writer,
-                                            &tag,
-                                            &format!(
-                                                "[APPENDUID {} {}] APPEND completed",
-                                                uid_validity(&db),
-                                                uid
-                                            ),
-                                        )
-                                        .await?;
-                                    }
-                                    None => {
-                                        crate::sync::poller::try_kick_sync();
-                                        write_ok(&mut writer, &tag, "APPEND completed").await?;
-                                    }
-                                }
                             }
                             Some("drafts") => {
                                 match append_draft(&db, &client, &session, &buf).await {
@@ -1453,13 +1428,111 @@ where
                                     }
                                 }
                             }
-                            Some(_) => {
-                                write_no(
-                                    &mut writer,
-                                    &tag,
-                                    "[CANNOT] APPEND is only supported for Sent and Drafts; folders mirror your Aster account",
+                            Some(folder) => {
+                                let sent_through_bridge = folder == "sent"
+                                    && crate::imap::append::was_recently_sent(&buf);
+                                let existing = if folder == "sent" {
+                                    find_appended_sent_copy(&db, &buf)
+                                } else {
+                                    None
+                                };
+                                if sent_through_bridge && existing.is_none() {
+                                    crate::sync::poller::try_kick_sync();
+                                    write_ok(&mut writer, &tag, "APPEND completed").await?;
+                                    continue;
+                                }
+                                if let Some(uid) = existing {
+                                    write_ok(
+                                        &mut writer,
+                                        &tag,
+                                        &format!(
+                                            "[APPENDUID {} {}] APPEND completed",
+                                            uid_validity(&db),
+                                            uid
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                let outcome = crate::imap::append::append_imported_message(
+                                    &db,
+                                    &client,
+                                    &session,
+                                    folder,
+                                    &buf,
+                                    &cmd.flags,
+                                    cmd.internal_date,
                                 )
-                                .await?;
+                                .await;
+                                match outcome {
+                                    Ok(crate::imap::append::AppendOutcome::Stored {
+                                        uid,
+                                        aster_id,
+                                    }) => {
+                                        let _ = db
+                                            .jmap_record_sync_batch("Email", &[aster_id.as_str()]);
+                                        let email_state = db.jmap_state_get("Email").unwrap_or(0);
+                                        let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
+                                        let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert("Email".to_string(), email_state.to_string());
+                                        changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+                                        changed.insert("Thread".to_string(), thread_state.to_string());
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if conn.state == ImapState::Selected
+                                            && conn.selected_folder.as_deref() == Some(folder)
+                                        {
+                                            let count =
+                                                db.count_cached_messages(folder).unwrap_or(0);
+                                            writer
+                                                .write_all(
+                                                    format!("* {} EXISTS\r\n", count).as_bytes(),
+                                                )
+                                                .await?;
+                                            conn.message_count = count;
+                                        }
+                                        write_ok(
+                                            &mut writer,
+                                            &tag,
+                                            &format!(
+                                                "[APPENDUID {} {}] APPEND completed",
+                                                uid_validity(&db),
+                                                uid
+                                            ),
+                                        )
+                                        .await?;
+                                    }
+                                    Ok(crate::imap::append::AppendOutcome::Duplicate { uid }) => {
+                                        crate::sync::poller::try_kick_sync();
+                                        match uid {
+                                            Some(uid) => {
+                                                write_ok(
+                                                    &mut writer,
+                                                    &tag,
+                                                    &format!(
+                                                        "[APPENDUID {} {}] APPEND completed",
+                                                        uid_validity(&db),
+                                                        uid
+                                                    ),
+                                                )
+                                                .await?
+                                            }
+                                            None => {
+                                                write_ok(&mut writer, &tag, "APPEND completed")
+                                                    .await?
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("APPEND to {} failed: {}", folder, e);
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            &format!("[SERVERBUG] {}", e),
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1799,7 +1872,7 @@ async fn handle_login(
     }
 }
 
-fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
+pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
     let s = s.trim_start();
     if s.starts_with('"') {
         let rest = &s[1..];
@@ -2685,15 +2758,36 @@ mod tests {
 
     type BackendCalls = Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
 
-    async fn spawn_mock_backend(fail: bool) -> (String, BackendCalls) {
+    #[derive(Debug, Default, Clone, Copy)]
+    struct MockOpts {
+        fail: bool,
+        job_conflict: bool,
+        rate_limit_first_store: bool,
+    }
+
+    async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
+        let MockOpts {
+            fail,
+            job_conflict,
+            rate_limit_first_store,
+        } = opts;
+        let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         use axum::extract::Path as AxumPath;
         use axum::response::IntoResponse;
-        use axum::{routing::delete, routing::patch, routing::post, Json, Router};
+        use axum::{routing::delete, routing::get, routing::patch, routing::post, routing::put, Json, Router};
         let calls: BackendCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let c1 = calls.clone();
         let c2 = calls.clone();
         let c3 = calls.clone();
         let c4 = calls.clone();
+        let c5 = calls.clone();
+        let c6 = calls.clone();
+        let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stored_writer = stored.clone();
+        let stored_reader = stored.clone();
+        let hashes: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
         let app = Router::new()
             .route(
                 "/mail/v1/messages/:id",
@@ -2759,6 +2853,141 @@ mod tests {
                         }
                     }
                 }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs",
+                post(move || async move {
+                    if fail {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    } else if job_conflict {
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "Invalid request", "code": "CONFLICT"})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({"id": "job-1"})).into_response()
+                    }
+                })
+                .get(move || async move {
+                    let jobs = if job_conflict {
+                        serde_json::json!([
+                            {"id": "job-old", "source": "gmail", "status": "completed"},
+                            {"id": "job-adopted", "source": "eml", "status": "processing"}
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    Json(serde_json::json!({"jobs": jobs})).into_response()
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id",
+                put(move || async move {
+                    if fail {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    } else {
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id/emails",
+                post(move |AxumPath(job_id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                    let calls = c5.clone();
+                    let stored = stored_writer.clone();
+                    let hashes = hashes.clone();
+                    let store_hits = store_hits.clone();
+                    async move {
+                        let hit = store_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if rate_limit_first_store && hit == 0 {
+                            calls
+                                .lock()
+                                .await
+                                .push(("RATE_LIMITED".to_string(), job_id.clone()));
+                            return (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                "rate limit exceeded",
+                            )
+                                .into_response();
+                        }
+                        calls
+                            .lock()
+                            .await
+                            .push(("IMPORT_JOB_USED".to_string(), job_id));
+                        let email = body
+                            .get("emails")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let hash = email
+                            .get("message_id_hash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST_IMPORT_EMAILS".to_string(), hash.clone()));
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                                .into_response();
+                        }
+                        let is_new = hashes.lock().await.insert(hash);
+                        if !is_new {
+                            return Json(serde_json::json!({
+                                "stored_count": 0,
+                                "duplicate_count": 1,
+                                "skipped_quota_count": 0,
+                                "quota_exceeded": false
+                            }))
+                            .into_response();
+                        }
+                        let mut guard = stored.lock().await;
+                        let id = format!("imported-{}", guard.len() + 1);
+                        guard.push(serde_json::json!({
+                            "id": id,
+                            "item_type": email.get("item_type").cloned().unwrap_or(serde_json::json!("received")),
+                            "encrypted_envelope": email.get("encrypted_envelope").cloned().unwrap_or(serde_json::json!("")),
+                            "envelope_nonce": email.get("envelope_nonce").cloned().unwrap_or(serde_json::json!("")),
+                            "folder_token": "",
+                            "is_external": true,
+                            "created_at": email.get("received_at").cloned().unwrap_or(serde_json::json!("")),
+                            "message_ts": email.get("received_at").cloned().unwrap_or(serde_json::json!("")),
+                        }));
+                        Json(serde_json::json!({
+                            "stored_count": 1,
+                            "duplicate_count": 0,
+                            "skipped_quota_count": 0,
+                            "quota_exceeded": false
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/sync",
+                get(move || {
+                    let stored = stored_reader.clone();
+                    async move {
+                        let items = stored.lock().await.clone();
+                        Json(serde_json::json!({"items": items})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/attachments/by-mail/:mail_id",
+                post(move |AxumPath(mail_id): AxumPath<String>| {
+                    let calls = c6.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST_ATTACHMENT".to_string(), mail_id));
+                        Json(serde_json::json!({"id": "att-1", "success": true})).into_response()
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2790,7 +3019,42 @@ mod tests {
         BackendCalls,
         tempfile::TempDir,
     ) {
-        let (base, calls) = spawn_mock_backend(fail).await;
+        start_test_server_full(fail, identity_key, false).await
+    }
+
+    async fn start_test_server_full(
+        fail: bool,
+        identity_key: Option<&str>,
+        job_conflict: bool,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        start_test_server_mock(
+            MockOpts {
+                fail,
+                job_conflict,
+                ..Default::default()
+            },
+            identity_key,
+        )
+        .await
+    }
+
+    async fn start_test_server_mock(
+        opts: MockOpts,
+        identity_key: Option<&str>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Database>,
+        broadcast::Sender<StateChange>,
+        BackendCalls,
+        tempfile::TempDir,
+    ) {
+        let (base, calls) = spawn_mock_backend_full(opts).await;
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
@@ -3184,23 +3448,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_to_sent_without_match_still_succeeds() {
+    async fn append_to_sent_after_smtp_send_does_not_duplicate() {
         let (addr, _db, _tx, _dir) = start_test_server().await;
         let (mut reader, mut writer) = login_and_select(addr).await;
 
         let raw = b"Message-ID: <fresh@apple-mail>\r\nSubject: brand new\r\n\r\nbody";
+        crate::imap::append::note_outgoing_message(raw);
         let resp = append_literal(&mut reader, &mut writer, "ap2", "Sent", raw).await;
         assert!(resp.contains("ap2 OK"), "append not accepted: {}", resp);
+        assert!(
+            !resp.contains("APPENDUID"),
+            "a bridge-sent copy must not be stored again: {}",
+            resp
+        );
     }
 
     #[tokio::test]
-    async fn append_to_inbox_still_rejected() {
-        let (addr, _db, _tx, _dir) = start_test_server().await;
+    async fn append_to_inbox_is_accepted_and_stored() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
         let (mut reader, mut writer) = login_and_select(addr).await;
 
-        let raw = b"Subject: x\r\n\r\nbody";
+        let raw = b"Message-ID: <migrated-1@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nSubject: migrated mail\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nold body";
         let resp = append_literal(&mut reader, &mut writer, "ap3", "INBOX", raw).await;
-        assert!(resp.contains("ap3 NO"), "expected NO: {}", resp);
+        assert!(resp.contains("ap3 OK"), "append rejected: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
+        assert_eq!(cached.subject.as_deref(), Some("migrated mail"));
+        assert!(cached.imap_uid > 0);
+        assert!(
+            cached.date.as_deref().unwrap_or("").starts_with("2024-07-12"),
+            "original date not preserved: {:?}",
+            cached.date
+        );
+    }
+
+    #[tokio::test]
+    async fn append_to_archive_and_junk_are_accepted() {
+        let (addr, _db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, mailbox, subject) in [
+            ("aa1", "Archive", "archived mail"),
+            ("aa2", "Junk", "junk mail"),
+            ("aa3", "Trash", "trashed mail"),
+        ] {
+            let raw = format!(
+                "Message-ID: <{}@old.example>\r\nFrom: alice@old.example\r\nSubject: {}\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody",
+                tag, subject
+            );
+            let resp =
+                append_literal(&mut reader, &mut writer, tag, mailbox, raw.as_bytes()).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{} rejected: {}", mailbox, resp);
+            assert!(resp.contains("APPENDUID"), "{} missing APPENDUID: {}", mailbox, resp);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_waits_out_a_rate_limit_instead_of_losing_the_message() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                rate_limit_first_store: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <throttled-1@old.example>\r\nFrom: alice@old.example\r\nSubject: throttled\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "rl1", "INBOX", raw).await;
+        assert!(resp.contains("rl1 OK"), "throttled append lost: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, _)| m == "RATE_LIMITED"),
+            "the mock never rate limited: {:?}",
+            log
+        );
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "expected exactly one successful store after the retry: {:?}",
+            log
+        );
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_adopts_an_existing_job_when_the_server_caps_new_ones() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_full(false, Some("test-ik"), true).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <capped-1@old.example>\r\nFrom: alice@old.example\r\nSubject: capped\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "cj1", "INBOX", raw).await;
+        assert!(resp.contains("cj1 OK"), "append rejected: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let used: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "IMPORT_JOB_USED")
+            .map(|(_, id)| id.clone())
+            .collect();
+        assert_eq!(used, vec!["job-adopted".to_string()]);
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_duplicate_is_accepted_without_a_second_store() {
+        let (addr, _db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <dupe-1@old.example>\r\nFrom: alice@old.example\r\nSubject: dupe\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let first = append_literal(&mut reader, &mut writer, "dp1", "INBOX", raw).await;
+        assert!(first.contains("dp1 OK"), "first append failed: {}", first);
+
+        let second = append_literal(&mut reader, &mut writer, "dp2", "INBOX", raw).await;
+        assert!(second.contains("dp2 OK"), "retry must not fail: {}", second);
+
+        let stores = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "POST_IMPORT_EMAILS")
+            .count();
+        assert_eq!(stores, 2, "both appends should reach the import endpoint");
+    }
+
+    #[tokio::test]
+    async fn append_without_identity_key_fails_cleanly() {
+        let (addr, _db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Subject: no key\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "nk1", "INBOX", raw).await;
+        assert!(resp.contains("nk1 NO"), "expected NO: {}", resp);
     }
 
     #[tokio::test]

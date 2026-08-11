@@ -37,6 +37,9 @@ const NONCE_LEN: usize = 12;
 
 const ENVELOPE_VERSIONS: &[&str] = &["astermail-envelope-v1", "astermail-import-v1"];
 
+pub const ENVELOPE_VERSION_DEFAULT: &str = "astermail-envelope-v1";
+pub const ENVELOPE_VERSION_IMPORT: &str = "astermail-import-v1";
+
 pub fn decrypt_envelope(
     encrypted_data_b64: &str,
     nonce_b64: Option<&str>,
@@ -110,6 +113,37 @@ fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Resul
         .map_err(|e| BridgeError::Crypto(format!("utf8 decode: {}", e)))
 }
 
+pub fn encrypt_pbkdf2_envelope(plaintext: &str, passphrase: &[u8]) -> Result<String> {
+    use rand_core::{OsRng, RngCore};
+
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, &salt, PBKDF2_ITERATIONS, &mut key);
+
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
+    key.zeroize();
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+        .map_err(|_| BridgeError::Crypto("PBKDF2 envelope encrypt failed".to_string()))?;
+
+    let mut combined = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    combined.extend_from_slice(&salt);
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&ciphertext);
+
+    Ok(STANDARD.encode(&combined))
+}
+
+pub fn pbkdf2_envelope_nonce_marker() -> String {
+    STANDARD.encode([0x01u8])
+}
+
 fn decrypt_identity_key_envelope(
     encrypted_data_b64: &str,
     nonce_bytes: &[u8],
@@ -124,16 +158,21 @@ fn decrypt_identity_key_envelope(
     }
 
     for version in ENVELOPE_VERSIONS {
-        let mut key = derive_envelope_key(identity_key.as_bytes(), version.as_bytes())?;
+        let candidates = [
+            derive_envelope_key(identity_key.as_bytes(), version.as_bytes())?,
+            derive_legacy_envelope_key(identity_key.as_bytes(), version.as_bytes())?,
+        ];
 
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
-        key.zeroize();
+        for mut key in candidates {
+            let cipher = Aes256Gcm::new_from_slice(&key)
+                .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
+            key.zeroize();
 
-        let nonce = Nonce::from_slice(nonce_bytes);
-        if let Ok(plaintext) = cipher.decrypt(nonce, encrypted_bytes.as_ref()) {
-            return String::from_utf8(plaintext)
-                .map_err(|e| BridgeError::Crypto(format!("utf8 decode: {}", e)));
+            let nonce = Nonce::from_slice(nonce_bytes);
+            if let Ok(plaintext) = cipher.decrypt(nonce, encrypted_bytes.as_ref()) {
+                return String::from_utf8(plaintext)
+                    .map_err(|e| BridgeError::Crypto(format!("utf8 decode: {}", e)));
+            }
         }
     }
 
@@ -173,6 +212,15 @@ fn decrypt_pgp_or_plaintext(
 }
 
 fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> {
+    use sha2::Digest;
+
+    let mut hasher = Sha256::new();
+    hasher.update(identity_key);
+    hasher.update(version);
+    Ok(hasher.finalize().into())
+}
+
+fn derive_legacy_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> {
     let mut info = Vec::with_capacity(8 + identity_key.len() + version.len());
     info.extend_from_slice(&(identity_key.len() as u32).to_be_bytes());
     info.extend_from_slice(identity_key);
@@ -187,9 +235,17 @@ fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> 
 
 #[allow(dead_code)]
 pub fn encrypt_identity_key_envelope(plaintext: &str, identity_key: &str) -> Result<(String, String)> {
+    encrypt_identity_key_envelope_with_version(plaintext, identity_key, ENVELOPE_VERSION_DEFAULT)
+}
+
+pub fn encrypt_identity_key_envelope_with_version(
+    plaintext: &str,
+    identity_key: &str,
+    version: &str,
+) -> Result<(String, String)> {
     use rand_core::{OsRng, RngCore};
 
-    let mut key = derive_envelope_key(identity_key.as_bytes(), ENVELOPE_VERSIONS[0].as_bytes())?;
+    let mut key = derive_envelope_key(identity_key.as_bytes(), version.as_bytes())?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
     key.zeroize();
@@ -395,6 +451,82 @@ mod tests {
             return;
         }
         panic!("no probe produced an inbound marker first byte");
+    }
+
+    #[test]
+    fn pbkdf2_envelope_encrypt_round_trips_through_the_reader() {
+        let plaintext = r#"{"filename":"a.pdf","session_key":"AAAA"}"#;
+        let pass = b"vault-passphrase-bytes";
+        let data = encrypt_pbkdf2_envelope(plaintext, pass).unwrap();
+        let out = decrypt_envelope(&data, Some(&pbkdf2_envelope_nonce_marker()), pass, None, &[]).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn pbkdf2_envelope_encrypt_layout_is_salt_nonce_ciphertext() {
+        let data = encrypt_pbkdf2_envelope("x", b"p").unwrap();
+        let raw = STANDARD.decode(&data).unwrap();
+        assert!(raw.len() > SALT_LEN + NONCE_LEN);
+        let second = encrypt_pbkdf2_envelope("x", b"p").unwrap();
+        assert_ne!(data, second);
+    }
+
+    #[test]
+    fn derive_envelope_key_matches_canonical_web_scheme() {
+        use sha2::Digest;
+
+        let ik = "identity-key-material";
+        let version = ENVELOPE_VERSION_IMPORT;
+        let expected: [u8; 32] = Sha256::digest(format!("{}{}", ik, version).as_bytes()).into();
+        let actual = derive_envelope_key(ik.as_bytes(), version.as_bytes()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn identity_envelope_written_by_bridge_decrypts_with_canonical_key() {
+        use sha2::Digest;
+
+        let plaintext = r#"{"subject":"migrated"}"#;
+        let ik = "vault-identity-key";
+        let (data, nonce) =
+            encrypt_identity_key_envelope_with_version(plaintext, ik, ENVELOPE_VERSION_IMPORT)
+                .unwrap();
+
+        let key: [u8; 32] =
+            Sha256::digest(format!("{}{}", ik, ENVELOPE_VERSION_IMPORT).as_bytes()).into();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce_bytes = STANDARD.decode(&nonce).unwrap();
+        let decrypted = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                STANDARD.decode(&data).unwrap().as_ref(),
+            )
+            .unwrap();
+
+        assert_eq!(String::from_utf8(decrypted).unwrap(), plaintext);
+        let out = decrypt_envelope(&data, Some(&nonce), b"unused", Some(ik), &[]).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn legacy_hkdf_identity_envelope_still_decrypts() {
+        let plaintext = r#"{"subject":"legacy hkdf"}"#;
+        let ik = "old-bridge-identity-key";
+        let key = derive_legacy_envelope_key(ik.as_bytes(), ENVELOPE_VERSION_IMPORT.as_bytes()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce_bytes = [5u8; NONCE_LEN];
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .unwrap();
+        let out = decrypt_envelope(
+            &STANDARD.encode(&ciphertext),
+            Some(&STANDARD.encode(nonce_bytes)),
+            b"unused",
+            Some(ik),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, plaintext);
     }
 
     #[test]
