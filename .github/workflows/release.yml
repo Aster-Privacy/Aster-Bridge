@@ -107,14 +107,14 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/Aster-Privacy/aster-ui.git ../aster-ui
           cd ../aster-ui
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run build
 
       - name: Fetch aster-crypto source (Aster-Mail)
         run: git clone --depth=1 https://github.com/Aster-Privacy/Aster-Mail.git ../Aster-Mail
 
       - name: Install frontend dependencies
-        run: npm install --no-audit --no-fund --force
+        run: npm ci --no-audit --no-fund
 
       - name: Build and publish release
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
@@ -339,3 +339,37 @@ jobs:
           fi
 
           echo "All 6 bridge download assets present on $TAG."
+
+  attest_provenance:
+    needs: ensure_download_assets
+    if: always()
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download the canonical installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # Provenance ties each shipped installer to this commit, this workflow
+          # and this run. It is advisory: the job never blocks a release, so a
+          # transient signing failure cannot keep an installer off the site.
+          set -uo pipefail
+          V=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+          if [ -z "$V" ]; then V="${GITHUB_REF_NAME#v}"; fi
+          TAG="v${V}"
+          mkdir -p attest
+          for a in Aster-Bridge-x64-setup.exe Aster-Bridge-x64.msi Aster-Bridge-x86_64.AppImage Aster-Bridge-amd64.deb Aster-Bridge-x86_64.rpm Aster-Bridge-universal.dmg; do
+            gh release download "$TAG" --pattern "$a" --dir attest --clobber 2>/dev/null || \
+              echo "::warning::$a absent on $TAG, not attested"
+          done
+          ls -l attest || true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: "attest/*"
