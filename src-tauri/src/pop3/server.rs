@@ -71,15 +71,16 @@ pub async fn run(
 ) -> Result<()> {
     let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("POP3 server listening on {}", addr);
-    serve(listener, session, db, client, passwords).await
+    serve_with_tls(listener, session, db, client, passwords, _tls_config).await
 }
 
-pub async fn serve(
+pub async fn serve_with_tls(
     listener: tokio::net::TcpListener,
     session: Arc<RwLock<Session>>,
     db: Arc<Database>,
     client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -100,10 +101,11 @@ pub async fn serve(
         let passwords = passwords.clone();
         let session = session.clone();
         let client = client.clone();
+        let tls_config = tls_config.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = run_session(stream, session, db, client, passwords).await {
+            if let Err(e) = run_session(stream, session, db, client, passwords, tls_config).await {
                 tracing::error!("POP3 connection error: {}", e);
             }
         });
@@ -153,11 +155,24 @@ pub async fn run_implicit_tls(
                     return;
                 }
             };
-            if let Err(e) = run_session(tls_stream, session, db, client, passwords).await {
+            if let Err(e) = run_session(tls_stream, session, db, client, passwords, None).await {
                 tracing::error!("POP3S connection error: {}", e);
             }
         });
     }
+}
+
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
+
+async fn run_session_erased(
+    stream: Box<dyn AsyncReadWrite + Send + Unpin>,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+) -> Result<()> {
+    run_session(stream, session, db, client, passwords, None).await
 }
 
 async fn run_session<S>(
@@ -166,10 +181,12 @@ async fn run_session<S>(
     db: Arc<Database>,
     client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let stls_capable = tls_config.is_some();
     let (read_half, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
@@ -204,10 +221,40 @@ where
         if !authenticated {
             match cmd.as_str() {
                 "USER" => {
+                    if stls_capable {
+                        writer.write_all(b"-ERR [PRIVACYREQUIRED] STLS required before USER\r\n").await?;
+                        continue;
+                    }
                     user_received = true;
                     writer.write_all(b"+OK user accepted\r\n").await?;
                 }
+                "APOP" => {
+                    writer.write_all(b"-ERR APOP not supported\r\n").await?;
+                }
+                "STLS" => {
+                    let cfg = match tls_config.as_ref() {
+                        Some(c) => c.clone(),
+                        None => {
+                            writer.write_all(b"-ERR STLS not available\r\n").await?;
+                            continue;
+                        }
+                    };
+                    writer.write_all(b"+OK Begin TLS negotiation\r\n").await?;
+                    writer.flush().await?;
+                    let rejoined = tokio::io::join(reader.into_inner(), writer);
+                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                    let tls_stream = acceptor
+                        .accept(rejoined)
+                        .await
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
+                    return Box::pin(run_session_erased(erased, session, db, client, passwords)).await;
+                }
                 "PASS" => {
+                    if stls_capable {
+                        writer.write_all(b"-ERR [PRIVACYREQUIRED] STLS required before PASS\r\n").await?;
+                        continue;
+                    }
                     if !user_received {
                         writer.write_all(b"-ERR USER required first\r\n").await?;
                         continue;
@@ -233,7 +280,12 @@ where
                     }
                 }
                 "CAPA" => {
-                    writer.write_all(b"+OK Capability list follows\r\nUSER\r\nUIDL\r\nTOP\r\nRESP-CODES\r\nEXPIRE NEVER\r\nIMPLEMENTATION Aster Bridge\r\n.\r\n").await?;
+                    let capabilities: &[u8] = if stls_capable {
+                        b"+OK Capability list follows\r\nSTLS\r\nUSER\r\nUIDL\r\nTOP\r\nRESP-CODES\r\nEXPIRE NEVER\r\nIMPLEMENTATION Aster Bridge\r\n.\r\n"
+                    } else {
+                        b"+OK Capability list follows\r\nUSER\r\nUIDL\r\nTOP\r\nRESP-CODES\r\nEXPIRE NEVER\r\nIMPLEMENTATION Aster Bridge\r\n.\r\n"
+                    };
+                    writer.write_all(capabilities).await?;
                 }
                 "QUIT" => {
                     writer.write_all(b"+OK bye\r\n").await?;
@@ -677,6 +729,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: Vec::new(),
             identity_key: None,
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
@@ -688,7 +741,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let db_clone = db.clone();
         tokio::spawn(async move {
-            let _ = serve(listener, session, db_clone, client, passwords).await;
+            let _ = serve_with_tls(listener, session, db_clone, client, passwords, None).await;
         });
         for _ in 0..80 {
             if TcpStream::connect(addr).await.is_ok() {

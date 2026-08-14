@@ -1014,14 +1014,19 @@ async fn report_envelope_capability(session: &Arc<RwLock<Session>>, client: &Arc
     let Ok(data_dir) = crate::config::data_dir() else {
         return;
     };
-    let (access_token, user_id) = {
+    let (access_token, user_id, identity_public) = {
         let guard = session.read().await;
-        (guard.access_token.to_string(), guard.user_id.to_string())
+        (
+            guard.access_token.to_string(),
+            guard.user_id.to_string(),
+            guard.ratchet_identity_public.clone(),
+        )
     };
     crate::crypto::envelope_capability::report_if_due(
         client,
         &access_token,
         &user_id,
+        identity_public.as_deref(),
         &data_dir,
     )
     .await;
@@ -1586,6 +1591,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: b"pass".to_vec(),
             identity_key: None,
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
@@ -1677,6 +1683,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: b"pass".to_vec(),
             identity_key: Some(ik.to_string()),
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),

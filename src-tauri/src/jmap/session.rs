@@ -114,6 +114,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             vault_passphrase: Vec::new(),
             identity_key: None,
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),

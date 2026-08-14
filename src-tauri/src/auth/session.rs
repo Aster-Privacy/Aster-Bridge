@@ -70,6 +70,7 @@ pub struct Session {
     pub access_token: Zeroizing<String>,
     pub vault_passphrase: Vec<u8>,
     pub identity_key: Option<String>,
+    pub ratchet_identity_public: Option<String>,
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
     pub send_identities: Vec<SendIdentity>,
@@ -239,24 +240,26 @@ pub async fn restore_or_login(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
-    let (identity_key, ratchet_keys, inbound_keys) = match crate::crypto::vault::decrypt_vault(
-        &login_resp.encrypted_vault,
-        &login_resp.vault_nonce,
-        &passphrase,
-    ) {
-        Ok(v) => (
-            Some(v.identity_key.clone()),
-            crate::crypto::ratchet::build_receiver_key_sets(&v),
-            crate::crypto::inbound::build_inbound_key_candidates(&v),
-        ),
-        Err(e) => {
-            tracing::error!(
-                "vault decrypt failed during restore: {}; encrypted mail cannot be decrypted until you sign in again",
-                e
-            );
-            (None, Vec::new(), Vec::new())
-        }
-    };
+    let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+        match crate::crypto::vault::decrypt_vault(
+            &login_resp.encrypted_vault,
+            &login_resp.vault_nonce,
+            &passphrase,
+        ) {
+            Ok(v) => (
+                Some(v.identity_key.clone()),
+                v.ratchet_identity_public.clone(),
+                crate::crypto::ratchet::build_receiver_key_sets(&v),
+                crate::crypto::inbound::build_inbound_key_candidates(&v),
+            ),
+            Err(e) => {
+                tracing::error!(
+                    "vault decrypt failed during restore: {}; encrypted mail cannot be decrypted until you sign in again",
+                    e
+                );
+                (None, None, Vec::new(), Vec::new())
+            }
+        };
 
     let send_identities = build_send_identities(
         client,
@@ -274,6 +277,7 @@ pub async fn restore_or_login(
         access_token,
         vault_passphrase: passphrase,
         identity_key,
+        ratchet_identity_public,
         ratchet_keys,
         inbound_keys,
         send_identities,
@@ -380,24 +384,26 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
-                let (identity_key, ratchet_keys, inbound_keys) = match crate::crypto::vault::decrypt_vault(
-                    &login_resp.encrypted_vault,
-                    &login_resp.vault_nonce,
-                    &passphrase,
-                ) {
-                    Ok(v) => (
-                        Some(v.identity_key.clone()),
-                        crate::crypto::ratchet::build_receiver_key_sets(&v),
-                        crate::crypto::inbound::build_inbound_key_candidates(&v),
-                    ),
-                    Err(e) => {
-                        tracing::error!(
-                            "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
-                            e
-                        );
-                        (None, Vec::new(), Vec::new())
-                    }
-                };
+                let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+                    match crate::crypto::vault::decrypt_vault(
+                        &login_resp.encrypted_vault,
+                        &login_resp.vault_nonce,
+                        &passphrase,
+                    ) {
+                        Ok(v) => (
+                            Some(v.identity_key.clone()),
+                            v.ratchet_identity_public.clone(),
+                            crate::crypto::ratchet::build_receiver_key_sets(&v),
+                            crate::crypto::inbound::build_inbound_key_candidates(&v),
+                        ),
+                        Err(e) => {
+                            tracing::error!(
+                                "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
+                                e
+                            );
+                            (None, None, Vec::new(), Vec::new())
+                        }
+                    };
 
                 let send_identities = build_send_identities(
                     client,
@@ -415,6 +421,7 @@ pub async fn first_time_setup(
                     access_token,
                     vault_passphrase: passphrase,
                     identity_key,
+                    ratchet_identity_public,
                     ratchet_keys,
                     inbound_keys,
                     send_identities,
@@ -440,6 +447,7 @@ mod tests {
             access_token: Zeroizing::new("token-abc".to_string()),
             vault_passphrase: b"passphrase-bytes".to_vec(),
             identity_key: Some("identity-key".to_string()),
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
@@ -471,6 +479,7 @@ mod tests {
             access_token: Zeroizing::new(String::new()),
             vault_passphrase: Vec::new(),
             identity_key: None,
+            ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),

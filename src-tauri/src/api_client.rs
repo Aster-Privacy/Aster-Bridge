@@ -86,6 +86,7 @@ pub struct ReportEnvelopeCapability<'a> {
     pub client_id: &'a str,
     pub max_envelope_marker: i16,
     pub platform: &'a str,
+    pub identity_fingerprint: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +96,8 @@ pub struct EnvelopeCapabilityResponse {
     pub min_supported_marker: Option<i16>,
     #[serde(default)]
     pub pq_hybrid_enabled: bool,
+    #[serde(default)]
+    pub identity_verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,17 +443,12 @@ impl ApiClient {
     pub fn new() -> Self {
         let mut default_headers = reqwest::header::HeaderMap::new();
         default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .default_headers(default_headers)
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_idle_timeout(std::time::Duration::from_secs(20))
-            .tcp_keepalive(std::time::Duration::from_secs(20))
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build HTTP client");
+        let client = crate::tls_pinning::pinned_client_builder(
+            default_headers,
+            USER_AGENT,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("failed to build pinned HTTP client");
 
         Self {
             client,

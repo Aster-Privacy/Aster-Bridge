@@ -121,6 +121,7 @@ fn stub_session() -> Arc<RwLock<Session>> {
         access_token: zeroize::Zeroizing::new("stub-token".to_string()),
         vault_passphrase: Vec::new(),
         identity_key: None,
+        ratchet_identity_public: None,
         ratchet_keys: Vec::new(),
         inbound_keys: Vec::new(),
         send_identities: Vec::new(),
@@ -999,21 +1000,23 @@ async fn decrypt_real_internal() {
         }
     };
     let access_token = zeroize::Zeroizing::new(login_resp.access_token.clone().unwrap_or_default());
-    let (identity_key, ratchet_keys, inbound_keys) = match crate::crypto::vault::decrypt_vault(
-        &login_resp.encrypted_vault,
-        &login_resp.vault_nonce,
-        &passphrase,
-    ) {
-        Ok(v) => (
-            Some(v.identity_key.clone()),
-            crate::crypto::ratchet::build_receiver_key_sets(&v),
-            crate::crypto::inbound::build_inbound_key_candidates(&v),
-        ),
-        Err(e) => {
-            println!("vault decrypt FAILED: {}", e);
-            (None, Vec::new(), Vec::new())
-        }
-    };
+    let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+        match crate::crypto::vault::decrypt_vault(
+            &login_resp.encrypted_vault,
+            &login_resp.vault_nonce,
+            &passphrase,
+        ) {
+            Ok(v) => (
+                Some(v.identity_key.clone()),
+                v.ratchet_identity_public.clone(),
+                crate::crypto::ratchet::build_receiver_key_sets(&v),
+                crate::crypto::inbound::build_inbound_key_candidates(&v),
+            ),
+            Err(e) => {
+                println!("vault decrypt FAILED: {}", e);
+                (None, None, Vec::new(), Vec::new())
+            }
+        };
     let session = crate::auth::session::Session {
         user_id: login_resp.user_id,
         username: login_resp.username,
@@ -1021,6 +1024,7 @@ async fn decrypt_real_internal() {
         access_token,
         vault_passphrase: passphrase,
         identity_key,
+        ratchet_identity_public,
         ratchet_keys,
         inbound_keys,
         send_identities: Vec::new(),
