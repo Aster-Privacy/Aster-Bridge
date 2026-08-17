@@ -424,6 +424,7 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
 pub(crate) struct CacheOutcome {
     was_new: bool,
     flags_changed: bool,
+    inbound_decrypt_failed: bool,
 }
 
 fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
@@ -474,6 +475,7 @@ pub(crate) fn cache_mail_item(
         return CacheOutcome {
             was_new: false,
             flags_changed: reconcile_server_flags(db, item),
+            inbound_decrypt_failed: false,
         };
     }
 
@@ -498,10 +500,11 @@ pub(crate) fn cache_mail_item(
     let plaintext = match plaintext_result {
         Ok(p) => p,
         Err(_) => {
-            if crate::crypto::inbound::is_inbound_payload(
+            let inbound = crate::crypto::inbound::is_inbound_payload(
                 &item.encrypted_envelope,
                 &item.envelope_nonce,
-            ) {
+            );
+            if inbound {
                 if inbound_keys.is_empty() {
                     tracing::error!(
                         "encrypted mail received but no inbound keys are loaded; sign in again to restore them"
@@ -512,7 +515,10 @@ pub(crate) fn cache_mail_item(
             } else {
                 tracing::debug!("envelope decrypt skipped");
             }
-            return CacheOutcome::default();
+            return CacheOutcome {
+                inbound_decrypt_failed: inbound,
+                ..CacheOutcome::default()
+            };
         }
     };
 
@@ -614,6 +620,7 @@ pub(crate) fn cache_mail_item(
     CacheOutcome {
         was_new,
         flags_changed: flags_changed && !was_new,
+        inbound_decrypt_failed: false,
     }
 }
 
@@ -752,6 +759,89 @@ async fn try_decrypt_internal_mail(
     crate::crypto::ratchet::decrypt_with_key_sets(ratchet_keys, &msg)
 }
 
+const INBOUND_HEAL_COOLDOWN_SECS: u64 = 300;
+const INBOUND_HEAL_RETRY_CAP: usize = 500;
+
+static INBOUND_HEAL_LAST: OnceLock<StdMutex<Option<std::time::Instant>>> = OnceLock::new();
+
+fn take_heal_permit(
+    state: &StdMutex<Option<std::time::Instant>>,
+    now: std::time::Instant,
+) -> bool {
+    let Ok(mut guard) = state.lock() else {
+        return false;
+    };
+    let allowed = guard.map_or(true, |t| {
+        now.duration_since(t) >= std::time::Duration::from_secs(INBOUND_HEAL_COOLDOWN_SECS)
+    });
+    if allowed {
+        *guard = Some(now);
+    }
+    allowed
+}
+
+async fn heal_inbound_keys(session: &Arc<RwLock<Session>>, client: &Arc<ApiClient>) -> bool {
+    let state = INBOUND_HEAL_LAST.get_or_init(|| StdMutex::new(None));
+    if !take_heal_permit(state, std::time::Instant::now()) {
+        return false;
+    }
+    let old_keys = { session.read().await.inbound_keys.clone() };
+    let Ok(data_dir) = crate::config::data_dir() else {
+        return false;
+    };
+    let identity = match crate::auth::device_identity::get_or_create_identity(&data_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("inbound key heal skipped, no device identity: {}", e);
+            return false;
+        }
+    };
+    let Some(device_id) = identity.device_id else {
+        return false;
+    };
+    if let Err(e) = crate::auth::session::refresh_access_token(
+        session,
+        device_id,
+        &identity.ed25519_signing_key,
+        client,
+    )
+    .await
+    {
+        tracing::warn!("inbound key heal refresh failed: {}", e);
+        return false;
+    }
+    let changed = {
+        let s = session.read().await;
+        !crate::auth::session::inbound_keys_equal(&old_keys, &s.inbound_keys)
+    };
+    if changed {
+        tracing::info!("inbound key heal: vault delivered updated keys");
+    } else {
+        tracing::info!("inbound key heal: vault keys unchanged");
+    }
+    changed
+}
+
+fn retry_failed_inbound_items(
+    db: &Database,
+    failed: &[(&'static str, MailItem)],
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> (Vec<String>, Vec<String>) {
+    let mut new_ids = Vec::new();
+    let mut updated_ids = Vec::new();
+    for (folder, item) in failed {
+        let outcome = cache_mail_item(db, folder, item, passphrase, identity_key, inbound_keys);
+        if outcome.was_new {
+            new_ids.push(item.id.clone());
+        } else if outcome.flags_changed {
+            updated_ids.push(item.id.clone());
+        }
+    }
+    (new_ids, updated_ids)
+}
+
 async fn run_sync_pass(
     session: &Arc<RwLock<Session>>,
     client: &Arc<ApiClient>,
@@ -764,6 +854,7 @@ async fn run_sync_pass(
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut updated_ids: Vec<String> = Vec::new();
     let mut all_folders_complete = true;
+    let mut failed_inbound: Vec<(&'static str, MailItem)> = Vec::new();
 
     let (access_token, passphrase, identity_key, our_email, ratchet_keys, inbound_keys) = {
         let s = session.read().await;
@@ -811,6 +902,11 @@ async fn run_sync_pass(
                         );
                         if outcome.flags_changed {
                             updated_ids.push(item.id.clone());
+                        }
+                        if outcome.inbound_decrypt_failed
+                            && failed_inbound.len() < INBOUND_HEAL_RETRY_CAP
+                        {
+                            failed_inbound.push((folder_query.label, item.clone()));
                         }
                         if outcome.was_new {
                             new_ids.push(item.id.clone());
@@ -870,6 +966,36 @@ async fn run_sync_pass(
                     break;
                 }
             }
+        }
+    }
+
+    if !failed_inbound.is_empty() {
+        tracing::warn!(
+            "sync: {} inbound item(s) failed to decrypt; attempting key heal",
+            failed_inbound.len()
+        );
+        if heal_inbound_keys(session, client).await {
+            let (fresh_identity_key, fresh_inbound_keys) = {
+                let s = session.read().await;
+                (s.identity_key.clone(), s.inbound_keys.clone())
+            };
+            let (healed_new, healed_updated) = retry_failed_inbound_items(
+                db,
+                &failed_inbound,
+                &passphrase,
+                fresh_identity_key.as_deref(),
+                &fresh_inbound_keys,
+            );
+            if !healed_new.is_empty() {
+                tracing::info!(
+                    "sync: inbound key heal recovered {} item(s)",
+                    healed_new.len()
+                );
+                any_inserted = true;
+                let id_refs: Vec<&str> = healed_new.iter().map(|s| s.as_str()).collect();
+                let _ = db.jmap_record_sync_batch("Email", &id_refs);
+            }
+            updated_ids.extend(healed_updated);
         }
     }
 
@@ -1437,6 +1563,123 @@ mod tests {
             !db.body_cached("msg-no-keys"),
             "no blank body may be written when the inbound keys are missing"
         );
+    }
+
+    fn inbound_candidate(sk: &p256::SecretKey) -> crate::crypto::inbound::InboundKeyCandidate {
+        crate::crypto::inbound::InboundKeyCandidate {
+            ecdh_secret_d: sk.to_bytes().to_vec(),
+            pq_decap_key: None,
+        }
+    }
+
+    fn encrypt_inbound_ecdh(
+        plaintext: &[u8],
+        recipient: &p256::SecretKey,
+        nonce_bytes: &[u8; 12],
+    ) -> Vec<u8> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use hkdf::Hkdf;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use sha2::Sha256;
+        let recipient_pub = recipient.public_key().to_encoded_point(false);
+        let ephemeral = p256::SecretKey::random(&mut rand_core::OsRng);
+        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let shared_x = crate::crypto::ratchet::ecdh_p256(
+            ephemeral.to_bytes().as_slice(),
+            recipient_pub.as_bytes(),
+        )
+        .unwrap();
+        let hk = Hkdf::<Sha256>::new(None, &shared_x);
+        let mut key = [0u8; 32];
+        hk.expand(b"aster-inbound-v1", &mut key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(plaintext, 6);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(nonce_bytes), compressed.as_slice())
+            .unwrap();
+        let mut out = vec![crate::crypto::inbound::INBOUND_ECDH_MARKER];
+        out.extend_from_slice(eph_pub.as_bytes());
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    fn inbound_item(id: &str, json: &serde_json::Value, recipient: &p256::SecretKey) -> MailItem {
+        let nonce = [7u8; 12];
+        let payload = encrypt_inbound_ecdh(json.to_string().as_bytes(), recipient, &nonce);
+        let mut item = item_with_envelope(id, json);
+        item.encrypted_envelope = STANDARD.encode(&payload);
+        item.envelope_nonce = STANDARD.encode(nonce);
+        item
+    }
+
+    #[test]
+    fn heal_cooldown_prevents_repeated_refreshes() {
+        let state = StdMutex::new(None);
+        let start = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        assert!(take_heal_permit(&state, start));
+        assert!(!take_heal_permit(&state, start + secs(1)));
+        assert!(!take_heal_permit(&state, start + secs(299)));
+        assert!(take_heal_permit(&state, start + secs(300)));
+        assert!(!take_heal_permit(&state, start + secs(301)));
+    }
+
+    #[test]
+    fn failed_inbound_item_is_flagged_and_recovers_after_key_refresh() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let wrong = p256::SecretKey::random(&mut rand_core::OsRng);
+        let json = serde_json::json!({"subject": "sealed", "body_text": "inbound body"});
+        let item = inbound_item("msg-heal", &json, &recipient);
+
+        let stale_keys = [inbound_candidate(&wrong)];
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &stale_keys);
+        assert!(!outcome.was_new);
+        assert!(outcome.inbound_decrypt_failed);
+        assert!(!db.body_cached("msg-heal"));
+
+        let fresh_keys = [inbound_candidate(&recipient)];
+        let failed = vec![("inbox", item.clone())];
+        let (new_ids, updated_ids) =
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &fresh_keys);
+        assert_eq!(new_ids, vec!["msg-heal".to_string()]);
+        assert!(updated_ids.is_empty());
+        let cached = db.get_cached_message("msg-heal").unwrap().unwrap();
+        assert_eq!(cached.subject.as_deref(), Some("sealed"));
+        assert_eq!(cached.body_text.as_deref(), Some("inbound body"));
+    }
+
+    #[test]
+    fn unrecoverable_inbound_item_stays_uncached_after_retry() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let wrong = p256::SecretKey::random(&mut rand_core::OsRng);
+        let json = serde_json::json!({"subject": "sealed"});
+        let item = inbound_item("msg-unhealable", &json, &recipient);
+
+        let stale_keys = [inbound_candidate(&wrong)];
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &stale_keys);
+        assert!(outcome.inbound_decrypt_failed);
+
+        let failed = vec![("inbox", item)];
+        let (new_ids, updated_ids) =
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &stale_keys);
+        assert!(new_ids.is_empty());
+        assert!(updated_ids.is_empty());
+        assert!(!db.body_cached("msg-unhealable"));
+    }
+
+    #[test]
+    fn successful_decrypt_does_not_flag_inbound_failure() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let json = serde_json::json!({"subject": "ok", "body_text": "b"});
+        let item = inbound_item("msg-inbound-ok", &json, &recipient);
+        let keys = [inbound_candidate(&recipient)];
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &keys);
+        assert!(outcome.was_new);
+        assert!(!outcome.inbound_decrypt_failed);
     }
 
     #[test]

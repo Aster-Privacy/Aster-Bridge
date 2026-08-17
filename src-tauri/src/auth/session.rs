@@ -211,6 +211,53 @@ pub async fn build_send_identities(
     identities
 }
 
+pub struct VaultKeyMaterial {
+    pub identity_key: String,
+    pub ratchet_identity_public: Option<String>,
+    pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
+    pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
+}
+
+pub fn decrypt_vault_key_material(
+    encrypted_vault: &str,
+    vault_nonce: &str,
+    passphrase: &[u8],
+) -> Result<VaultKeyMaterial> {
+    let v = crate::crypto::vault::decrypt_vault(encrypted_vault, vault_nonce, passphrase)?;
+    Ok(VaultKeyMaterial {
+        identity_key: v.identity_key.clone(),
+        ratchet_identity_public: v.ratchet_identity_public.clone(),
+        ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
+        inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
+    })
+}
+
+pub fn inbound_keys_equal(
+    a: &[crate::crypto::inbound::InboundKeyCandidate],
+    b: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.ecdh_secret_d == y.ecdh_secret_d && x.pq_decap_key == y.pq_decap_key)
+}
+
+fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
+    if let Some(ref mut k) = session.identity_key {
+        k.zeroize();
+    }
+    for keys in session.ratchet_keys.iter_mut() {
+        keys.zeroize();
+    }
+    for keys in session.inbound_keys.iter_mut() {
+        keys.zeroize();
+    }
+    session.identity_key = Some(material.identity_key);
+    session.ratchet_identity_public = material.ratchet_identity_public;
+    session.ratchet_keys = material.ratchet_keys;
+    session.inbound_keys = material.inbound_keys;
+}
+
 pub async fn restore_or_login(
     config: &BridgeConfig,
     identity: &DeviceIdentity,
@@ -241,16 +288,16 @@ pub async fn restore_or_login(
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
     let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
-        match crate::crypto::vault::decrypt_vault(
+        match decrypt_vault_key_material(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
             &passphrase,
         ) {
-            Ok(v) => (
-                Some(v.identity_key.clone()),
-                v.ratchet_identity_public.clone(),
-                crate::crypto::ratchet::build_receiver_key_sets(&v),
-                crate::crypto::inbound::build_inbound_key_candidates(&v),
+            Ok(m) => (
+                Some(m.identity_key),
+                m.ratchet_identity_public,
+                m.ratchet_keys,
+                m.inbound_keys,
             ),
             Err(e) => {
                 tracing::error!(
@@ -302,8 +349,21 @@ pub async fn refresh_access_token(
     let access_token = Zeroizing::new(login_resp
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
+    let passphrase = Zeroizing::new(session.read().await.vault_passphrase.clone());
+    let material = decrypt_vault_key_material(
+        &login_resp.encrypted_vault,
+        &login_resp.vault_nonce,
+        &passphrase,
+    );
     let mut s = session.write().await;
     s.access_token = access_token;
+    match material {
+        Ok(m) => apply_vault_key_material(&mut s, m),
+        Err(e) => tracing::warn!(
+            "vault refresh failed during token refresh; keeping existing keys: {}",
+            e
+        ),
+    }
     Ok(())
 }
 
@@ -385,16 +445,16 @@ pub async fn first_time_setup(
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
                 let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
-                    match crate::crypto::vault::decrypt_vault(
+                    match decrypt_vault_key_material(
                         &login_resp.encrypted_vault,
                         &login_resp.vault_nonce,
                         &passphrase,
                     ) {
-                        Ok(v) => (
-                            Some(v.identity_key.clone()),
-                            v.ratchet_identity_public.clone(),
-                            crate::crypto::ratchet::build_receiver_key_sets(&v),
-                            crate::crypto::inbound::build_inbound_key_candidates(&v),
+                        Ok(m) => (
+                            Some(m.identity_key),
+                            m.ratchet_identity_public,
+                            m.ratchet_keys,
+                            m.inbound_keys,
                         ),
                         Err(e) => {
                             tracing::error!(
@@ -485,5 +545,141 @@ mod tests {
             send_identities: Vec::new(),
         };
         drop(s);
+    }
+
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+
+    fn encrypt_vault_for_test(plaintext: &[u8], passphrase: &[u8]) -> (String, String) {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use sha2::Sha256;
+        let salt = [13u8; 16];
+        let nonce_bytes = [21u8; 12];
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, &salt, 310_000, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .unwrap();
+        let mut combined = salt.to_vec();
+        combined.extend_from_slice(&ciphertext);
+        (STANDARD.encode(&combined), STANDARD.encode(nonce_bytes))
+    }
+
+    async fn spawn_device_login_server(encrypted_vault: String, vault_nonce: String) -> String {
+        use axum::{routing::post, Json, Router};
+        let challenge = serde_json::json!({
+            "challenge_id": Uuid::new_v4(),
+            "nonce": URL_SAFE_NO_PAD.encode([1u8; 32]),
+            "expires_in": 60
+        });
+        let login = serde_json::json!({
+            "user_id": Uuid::new_v4(),
+            "username": "alice",
+            "email": "alice@astermail.org",
+            "access_token": "fresh-token",
+            "encrypted_vault": encrypted_vault,
+            "vault_nonce": vault_nonce
+        });
+        let app = Router::new()
+            .route(
+                "/core/v1/auth/device/challenge",
+                post(move || {
+                    let challenge = challenge.clone();
+                    async move { Json(challenge) }
+                }),
+            )
+            .route(
+                "/core/v1/auth/device/login",
+                post(move || {
+                    let login = login.clone();
+                    async move { Json(login) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn p256_jwk(sk: &p256::SecretKey) -> String {
+        serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "d": URL_SAFE_NO_PAD.encode(sk.to_bytes().as_slice()),
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn refresh_updates_inbound_keys_when_vault_carries_new_identity() {
+        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let vault_json = serde_json::json!({
+            "identity_key": "new-ik",
+            "ratchet_identity_public": "pub-b64",
+            "ratchet_identity_key": p256_jwk(&sk),
+        })
+        .to_string();
+        let (ev, vn) = encrypt_vault_for_test(vault_json.as_bytes(), b"passphrase-bytes");
+        let base = spawn_device_login_server(ev, vn).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let session = std::sync::Arc::new(tokio::sync::RwLock::new(sample_session()));
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+        refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client)
+            .await
+            .unwrap();
+
+        let s = session.read().await;
+        assert_eq!(s.access_token.as_str(), "fresh-token");
+        assert_eq!(s.identity_key.as_deref(), Some("new-ik"));
+        assert_eq!(s.ratchet_identity_public.as_deref(), Some("pub-b64"));
+        assert_eq!(s.inbound_keys.len(), 1);
+        assert_eq!(s.inbound_keys[0].ecdh_secret_d, sk.to_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_old_keys_when_fresh_vault_does_not_decrypt() {
+        let (ev, vn) = encrypt_vault_for_test(
+            br#"{"identity_key":"unreachable"}"#,
+            b"a-different-passphrase",
+        );
+        let base = spawn_device_login_server(ev, vn).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let mut initial = sample_session();
+        initial.inbound_keys = vec![crate::crypto::inbound::InboundKeyCandidate {
+            ecdh_secret_d: vec![9u8; 32],
+            pq_decap_key: None,
+        }];
+        let session = std::sync::Arc::new(tokio::sync::RwLock::new(initial));
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+
+        refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client)
+            .await
+            .unwrap();
+
+        let s = session.read().await;
+        assert_eq!(s.access_token.as_str(), "fresh-token");
+        assert_eq!(s.identity_key.as_deref(), Some("identity-key"));
+        assert_eq!(s.inbound_keys.len(), 1);
+        assert_eq!(s.inbound_keys[0].ecdh_secret_d, vec![9u8; 32]);
+    }
+
+    #[test]
+    fn inbound_keys_equal_detects_changes() {
+        let a = vec![crate::crypto::inbound::InboundKeyCandidate {
+            ecdh_secret_d: vec![1u8; 32],
+            pq_decap_key: None,
+        }];
+        let b = vec![crate::crypto::inbound::InboundKeyCandidate {
+            ecdh_secret_d: vec![2u8; 32],
+            pq_decap_key: None,
+        }];
+        assert!(inbound_keys_equal(&a, &a.clone()));
+        assert!(!inbound_keys_equal(&a, &b));
+        assert!(!inbound_keys_equal(&a, &[]));
     }
 }
