@@ -1,50 +1,48 @@
-<img width="200" alt="aster_horizontalv2" src="https://github.com/user-attachments/assets/a337e975-996d-4672-a92b-b809591f389a" />
+<img width="200" alt="Aster" src="https://raw.githubusercontent.com/Aster-Privacy/.github/main/profile/aster_logo.png" />
 
 # Aster Security Policy
 
-## Properly Reporting a Vulnerability
+## Reporting a vulnerability
 
-**Please ensure you do not open a public GitHub issue for security-related vulnerabilities.**
+**Don't open a public GitHub issue for a security vulnerability.**
 
-Send your report to this email: security@astermail.org
+Send your report to security@astermail.org, or submit it through our vulnerability disclosure program on Bugcrowd: https://bugcrowd.com/engagements/aster-privacy-vdpc
 
-You can also submit reports through our vulnerability disclosure program on Bugcrowd: https://bugcrowd.com/engagements/aster-privacy-vdpc
-
-We will read your report within 48 hours and make sure to resolve critical vulnerabilities within seven days. We will make sure to keep you updated throughout the entire process.
+We acknowledge reports within 48 hours, prioritize fixes by severity, and keep you updated until the issue is resolved.
 
 ## Scope
 
-This security policy covers all of our Aster products and infrastructure:
+This policy covers all Aster products and infrastructure:
 
 - Aster Mail (astermail.org)
 - All repositories under github.com/Aster-Privacy
 
-## Safe Harbor
+## Safe harbor
 
-We will never pursue legal action against researchers who:
+We don't pursue legal action against researchers who:
 
 - Report vulnerabilities in good faith
-- Do not access, modify, or exfiltrate user data
-- Do not disrupt service availability or degrade user experience
-- Allow us a reasonable timeframe to respond before public disclosure
+- Don't access, modify, or exfiltrate user data
+- Don't disrupt service availability or degrade the user experience
+- Give us a reasonable amount of time to respond before public disclosure
 
-## Encryption Architecture
+## Encryption architecture
 
-Aster Bridge decrypts your mail locally on your machine using keys derived from your Aster vault. No plaintext ever leaves your device through the bridge - the local IMAP/SMTP/JMAP servers only speak to clients on 127.0.0.1.
+Aster Bridge decrypts your mail locally on your device using keys derived from your Aster vault. No plaintext leaves your device through the bridge, and the local IMAP, POP, SMTP, and JMAP servers only accept connections from clients on 127.0.0.1.
 
 | Channel | Protocol |
 |---|---|
-| Aster Bridge - Aster Backend | TLS 1.2+ (HTTPS), bearer token auth with Ed25519 device keys |
-| Bridge - Mail Client (local) | Plaintext or self-signed TLS on loopback only |
-| Aster → Aster mail | X3DH + Double Ratchet with ML-KEM-768 (post-quantum) |
-| Aster → External mail | Ed25519 OpenPGP |
+| Aster Bridge to Aster backend | TLS 1.2+ (HTTPS), bearer token auth with Ed25519 device keys |
+| Bridge to mail client (local) | Plaintext or self-signed TLS on loopback only |
+| Aster to Aster | X3DH and Double Ratchet with ML-KEM-768 (post-quantum) |
+| Aster to external recipients | Ed25519 OpenPGP, portable keys that work with any OpenPGP client |
 
 App passwords are stored in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service). Access tokens are zeroed from memory on drop.
 
-## Coordinated Disclosure
+## Coordinated disclosure
 
-We follow coordinated disclosure. Please give us adequate time to patch the vulnerability before publishing. We are happy to credit you publicly if you would like - just let us know in your report.
+We follow coordinated disclosure. Give us adequate time to patch a vulnerability before you publish it. If you would like public credit, say so in your report.
 
-## Acknowledgements
+## Acknowledgments
 
-We thank the researchers who help keep Aster secure. Credited disclosures will be listed below once we receive them.
+We thank the researchers who help keep Aster secure. Credited disclosures are listed here as we receive them.
