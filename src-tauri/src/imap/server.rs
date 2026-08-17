@@ -1624,7 +1624,11 @@ where
                                         write_no(
                                             &mut writer,
                                             &tag,
-                                            &format!("[SERVERBUG] {}", e),
+                                            &format!(
+                                                "[{}] {}",
+                                                crate::imap::append::no_response_code(&e),
+                                                e
+                                            ),
                                         )
                                         .await?;
                                     }
@@ -2910,6 +2914,7 @@ mod tests {
         job_conflict: bool,
         rate_limit_first_store: bool,
         bulk_metadata: bool,
+        gateway_blip_job_create: bool,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -2918,7 +2923,9 @@ mod tests {
             job_conflict,
             rate_limit_first_store,
             bulk_metadata,
+            gateway_blip_job_create,
         } = opts;
+        let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         use axum::extract::Path as AxumPath;
         use axum::response::IntoResponse;
@@ -2931,6 +2938,7 @@ mod tests {
         let c5 = calls.clone();
         let c6 = calls.clone();
         let c7 = calls.clone();
+        let c_blip = calls.clone();
         let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stored_writer = stored.clone();
@@ -3028,7 +3036,19 @@ mod tests {
             )
             .route(
                 "/mail/v1/email_import/jobs",
-                post(move || async move {
+                post(move || {
+                    let calls = c_blip.clone();
+                    let create_hits = create_hits.clone();
+                    async move {
+                    let hit = create_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if gateway_blip_job_create && hit == 0 {
+                        calls
+                            .lock()
+                            .await
+                            .push(("GATEWAY_BLIP".to_string(), String::new()));
+                        return (axum::http::StatusCode::BAD_GATEWAY, "error code: 502")
+                            .into_response();
+                    }
                     if fail {
                         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
                     } else if job_conflict {
@@ -3040,7 +3060,7 @@ mod tests {
                     } else {
                         Json(serde_json::json!({"id": "job-1"})).into_response()
                     }
-                })
+                }})
                 .get(move || async move {
                     let jobs = if job_conflict {
                         serde_json::json!([
@@ -3702,6 +3722,38 @@ mod tests {
             log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
             1,
             "expected exactly one successful store after the retry: {:?}",
+            log
+        );
+        assert!(db.get_cached_message("imported-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn append_rides_out_a_gateway_blip_when_creating_the_import_job() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                gateway_blip_job_create: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <blipped-1@old.example>\r\nFrom: alice@old.example\r\nSubject: blipped\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "gb1", "INBOX", raw).await;
+        assert!(resp.contains("gb1 OK"), "append lost to the blip: {}", resp);
+        assert!(resp.contains("APPENDUID"), "missing APPENDUID: {}", resp);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, _)| m == "GATEWAY_BLIP"),
+            "the mock never returned 502: {:?}",
+            log
+        );
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "expected exactly one store after the retry: {:?}",
             log
         );
         assert!(db.get_cached_message("imported-1").unwrap().is_some());

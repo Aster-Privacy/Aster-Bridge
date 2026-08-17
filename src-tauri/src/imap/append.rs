@@ -213,6 +213,39 @@ pub fn is_rate_limited(error: &crate::error::BridgeError) -> bool {
     text.contains("429") || text.to_lowercase().contains("rate limit")
 }
 
+const TRANSIENT_PHRASES: [&str; 5] = [
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "gateway time-out",
+    "network error",
+];
+
+pub fn is_transient(error: &crate::error::BridgeError) -> bool {
+    if matches!(error, crate::error::BridgeError::Network(_)) {
+        return true;
+    }
+    let text = error.to_string().to_lowercase();
+    TRANSIENT_PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+pub fn is_retryable(error: &crate::error::BridgeError) -> bool {
+    is_rate_limited(error) || is_transient(error)
+}
+
+pub fn no_response_code(message: &str) -> &'static str {
+    let text = message.to_lowercase();
+    let transient = TRANSIENT_PHRASES
+        .iter()
+        .chain(["too many requests", "rate limit"].iter())
+        .any(|phrase| text.contains(phrase));
+    if transient {
+        "UNAVAILABLE"
+    } else {
+        "SERVERBUG"
+    }
+}
+
 pub fn rate_limit_backoff(attempt: u32) -> u64 {
     match attempt {
         0 => 5,
@@ -561,16 +594,33 @@ async fn adoptable_import_job(client: &ApiClient, token: &str, same_source_only:
 }
 
 async fn start_import_job(client: &ApiClient, token: &str, job_id: &str) -> std::result::Result<(), String> {
-    client
-        .update_import_job(
-            token,
-            job_id,
-            &UpdateImportJobBody {
-                status: "processing",
-            },
-        )
-        .await
-        .map_err(|e| format!("could not start the import job: {}", e))
+    let mut attempt = 0u32;
+    loop {
+        match client
+            .update_import_job(
+                token,
+                job_id,
+                &UpdateImportJobBody {
+                    status: "processing",
+                },
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retryable(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
+                let wait = rate_limit_backoff(attempt);
+                attempt += 1;
+                tracing::warn!(
+                    error = %e,
+                    seconds = wait,
+                    "the server is temporarily unavailable, retrying the import job start"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                note_import_activity();
+            }
+            Err(e) => return Err(format!("could not start the import job: {}", e)),
+        }
+    }
 }
 
 async fn processing_import_job(client: &ApiClient, token: &str) -> std::result::Result<String, String> {
@@ -586,21 +636,38 @@ async fn processing_import_job(client: &ApiClient, token: &str) -> std::result::
         return Ok(adopted);
     }
 
-    let job_id = match client
-        .create_import_job(
-            token,
-            &CreateImportJobBody {
-                source: IMPORT_SOURCE,
-                total_emails: 0,
+    let mut attempt = 0u32;
+    let job_id = loop {
+        match client
+            .create_import_job(
+                token,
+                &CreateImportJobBody {
+                    source: IMPORT_SOURCE,
+                    total_emails: 0,
+                },
+            )
+            .await
+        {
+            Ok(created) => break created.id,
+            Err(e) if is_retryable(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
+                let wait = rate_limit_backoff(attempt);
+                attempt += 1;
+                tracing::warn!(
+                    error = %e,
+                    seconds = wait,
+                    "the server is temporarily unavailable, retrying the import job creation"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                note_import_activity();
+                if let Some(adopted) = adoptable_import_job(client, token, true).await {
+                    break adopted;
+                }
+            }
+            Err(e) => match adoptable_import_job(client, token, false).await {
+                Some(adopted) => break adopted,
+                None => return Err(format!("could not create the import job: {}", e)),
             },
-        )
-        .await
-    {
-        Ok(created) => created.id,
-        Err(e) => match adoptable_import_job(client, token, false).await {
-            Some(adopted) => adopted,
-            None => return Err(format!("could not create the import job: {}", e)),
-        },
+        }
     };
 
     start_import_job(client, token, &job_id).await?;
@@ -749,12 +816,13 @@ pub async fn append_imported_message(
 
         let Err(e) = &response else { break response };
 
-        if is_rate_limited(e) && rate_limit_waits < RATE_LIMIT_ATTEMPTS {
+        if is_retryable(e) && rate_limit_waits < RATE_LIMIT_ATTEMPTS {
             let wait = rate_limit_backoff(rate_limit_waits);
             rate_limit_waits += 1;
             tracing::warn!(
+                error = %e,
                 seconds = wait,
-                "the server is rate limiting the import, waiting before retrying"
+                "the server is temporarily unavailable, waiting before retrying the import"
             );
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             note_import_activity();
@@ -851,7 +919,7 @@ async fn locate_stored_item(
     let synced = loop {
         match client.sync_recent_items(token, SYNC_LOOKUP_LIMIT).await {
             Ok(synced) => break synced,
-            Err(e) if is_rate_limited(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
+            Err(e) if is_retryable(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
                 let wait = rate_limit_backoff(attempt);
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
@@ -1223,11 +1291,159 @@ mod tests {
     }
 
     #[test]
+    fn transient_gateway_errors_are_recognized() {
+        use crate::error::BridgeError;
+
+        assert!(is_transient(&BridgeError::Api(
+            "502 Bad Gateway: error code: 502".to_string()
+        )));
+        assert!(is_transient(&BridgeError::Api(
+            "503 Service Unavailable: upstream connect error".to_string()
+        )));
+        assert!(is_transient(&BridgeError::Api(
+            "504 Gateway Timeout: upstream timed out".to_string()
+        )));
+        assert!(!is_transient(&BridgeError::Api(
+            "409 Conflict: too many active import jobs".to_string()
+        )));
+        assert!(!is_transient(&BridgeError::Api(
+            "500 Internal Server Error: unexpected".to_string()
+        )));
+        assert!(!is_transient(&BridgeError::Api(
+            "400 Bad Request: invalid payload".to_string()
+        )));
+    }
+
+    #[test]
+    fn retryable_covers_rate_limits_and_gateway_blips() {
+        use crate::error::BridgeError;
+
+        assert!(is_retryable(&BridgeError::Api(
+            "429 Too Many Requests: rate limit exceeded".to_string()
+        )));
+        assert!(is_retryable(&BridgeError::Api(
+            "502 Bad Gateway: error code: 502".to_string()
+        )));
+        assert!(!is_retryable(&BridgeError::Api(
+            "422 Unprocessable Entity: bad envelope".to_string()
+        )));
+    }
+
+    #[test]
+    fn no_response_code_marks_transient_failures_unavailable() {
+        assert_eq!(
+            no_response_code(
+                "could not create the import job: API error: 502 Bad Gateway: error code: 502"
+            ),
+            "UNAVAILABLE"
+        );
+        assert_eq!(
+            no_response_code("could not store the message: network error: connection reset"),
+            "UNAVAILABLE"
+        );
+        assert_eq!(
+            no_response_code("could not store the message: API error: 429 Too Many Requests: slow down"),
+            "UNAVAILABLE"
+        );
+        assert_eq!(
+            no_response_code("could not parse the appended message"),
+            "SERVERBUG"
+        );
+        assert_eq!(
+            no_response_code("the server rejected the message"),
+            "SERVERBUG"
+        );
+    }
+
+    #[test]
     fn rate_limit_backoff_grows_and_stays_under_a_client_timeout() {
         let total: u64 = (0..RATE_LIMIT_ATTEMPTS).map(rate_limit_backoff).sum();
         assert!(total < 60, "cumulative backoff {} is too long", total);
         assert!(rate_limit_backoff(0) < rate_limit_backoff(1));
         assert!(rate_limit_backoff(1) < rate_limit_backoff(2));
+    }
+
+    async fn spawn_mock(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_job_creation_survives_a_gateway_blip() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, put};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let create_calls = Arc::new(AtomicU32::new(0));
+        let create_counter = create_calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/mail/v1/email_import/jobs",
+                get(|| async { axum::Json(serde_json::json!({"jobs": []})) }).post(move || {
+                    let calls = create_counter.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::BAD_GATEWAY, "error code: 502").into_response()
+                        } else {
+                            axum::Json(serde_json::json!({"id": "job-created"})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id",
+                put(|| async { StatusCode::OK }),
+            );
+
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let job_id = processing_import_job(&client, "tok").await.unwrap();
+        assert_eq!(job_id, "job-created");
+        assert_eq!(create_calls.load(Ordering::SeqCst), 2);
+        forget_import_job(&client).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_job_adopts_an_existing_job_when_creation_keeps_failing() {
+        use axum::http::StatusCode;
+        use axum::routing::{get, put};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let list_calls = Arc::new(AtomicU32::new(0));
+        let list_counter = list_calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/mail/v1/email_import/jobs",
+                get(move || {
+                    let calls = list_counter.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::Json(serde_json::json!({"jobs": []}))
+                        } else {
+                            axum::Json(serde_json::json!({
+                                "jobs": [{"id": "job-live", "source": "eml", "status": "pending"}]
+                            }))
+                        }
+                    }
+                })
+                .post(|| async { (StatusCode::BAD_GATEWAY, "error code: 502") }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id",
+                put(|| async { StatusCode::OK }),
+            );
+
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let job_id = processing_import_job(&client, "tok").await.unwrap();
+        assert_eq!(job_id, "job-live");
+        assert!(list_calls.load(Ordering::SeqCst) >= 2);
+        forget_import_job(&client).await;
     }
 
     #[test]
