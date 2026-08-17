@@ -511,6 +511,102 @@ static IMPORT_JOB_ACTIVITY: OnceLock<std::sync::Mutex<Option<std::time::Instant>
 static IMPORT_JOB_CLOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const IMPORT_JOB_IDLE_SECS: u64 = 120;
 const IMPORT_JOB_POLL_SECS: u64 = 20;
+const IMPORT_PROGRESS_EMIT_MS: u128 = 1000;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImportProgress {
+    pub active: bool,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub imported: u64,
+    pub duplicates: u64,
+}
+
+static IMPORT_PROGRESS: OnceLock<std::sync::Mutex<Option<ImportProgress>>> = OnceLock::new();
+static IMPORT_PROGRESS_EMIT: OnceLock<std::sync::Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+fn import_progress_slot() -> &'static std::sync::Mutex<Option<ImportProgress>> {
+    IMPORT_PROGRESS.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn import_progress_emit_slot() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    IMPORT_PROGRESS_EMIT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn current_import_progress() -> Option<ImportProgress> {
+    import_progress_slot().lock().ok()?.clone()
+}
+
+fn apply_import_outcome(slot: &mut Option<ImportProgress>, stored: bool, now: u64) -> ImportProgress {
+    if !slot.as_ref().map_or(false, |p| p.active) {
+        *slot = Some(ImportProgress {
+            active: true,
+            started_at_ms: now,
+            updated_at_ms: now,
+            imported: 0,
+            duplicates: 0,
+        });
+    }
+    let progress = slot.as_mut().expect("import progress slot was reset above");
+    if stored {
+        progress.imported += 1;
+    } else {
+        progress.duplicates += 1;
+    }
+    progress.updated_at_ms = now;
+    progress.clone()
+}
+
+fn apply_import_finish(slot: &mut Option<ImportProgress>, now: u64) -> Option<ImportProgress> {
+    let progress = slot.as_mut().filter(|p| p.active)?;
+    progress.active = false;
+    progress.updated_at_ms = now;
+    Some(progress.clone())
+}
+
+fn record_import_outcome(stored: bool) {
+    let snapshot = {
+        let Ok(mut guard) = import_progress_slot().lock() else {
+            return;
+        };
+        apply_import_outcome(&mut guard, stored, epoch_ms())
+    };
+    emit_import_progress_throttled(&snapshot, false);
+}
+
+fn finish_import_progress() {
+    let snapshot = {
+        let Ok(mut guard) = import_progress_slot().lock() else {
+            return;
+        };
+        apply_import_finish(&mut guard, epoch_ms())
+    };
+    if let Some(snapshot) = snapshot {
+        emit_import_progress_throttled(&snapshot, true);
+    }
+}
+
+fn emit_import_progress_throttled(progress: &ImportProgress, force: bool) {
+    if !force {
+        let Ok(mut guard) = import_progress_emit_slot().lock() else {
+            return;
+        };
+        if let Some(last) = *guard {
+            if last.elapsed().as_millis() < IMPORT_PROGRESS_EMIT_MS {
+                return;
+            }
+        }
+        *guard = Some(std::time::Instant::now());
+    }
+    crate::sync::poller::emit_import_progress(progress);
+}
 
 fn import_job_slot() -> &'static Mutex<HashMap<String, String>> {
     IMPORT_JOB.get_or_init(|| Mutex::new(HashMap::new()))
@@ -566,6 +662,7 @@ fn spawn_import_job_closer(client: Arc<ApiClient>, session: Arc<RwLock<Session>>
                     tracing::warn!(error = %e, "could not close the append import job");
                 }
             }
+            finish_import_progress();
             IMPORT_JOB_CLOSER.store(false, Ordering::SeqCst);
             return;
         }
@@ -846,6 +943,7 @@ pub async fn append_imported_message(
 
     if response.stored_count == 0 {
         if response.duplicate_count > 0 {
+            record_import_outcome(false);
             crate::sync::poller::try_kick_sync();
             return Ok(AppendOutcome::Duplicate { uid: None });
         }
@@ -905,6 +1003,7 @@ pub async fn append_imported_message(
         let _ = db.set_message_flags_by_id(&aster_id, bits);
     }
 
+    record_import_outcome(true);
     crate::sync::poller::try_kick_sync();
 
     Ok(AppendOutcome::Stored { uid, aster_id })
@@ -1353,6 +1452,35 @@ mod tests {
             no_response_code("the server rejected the message"),
             "SERVERBUG"
         );
+    }
+
+    #[test]
+    fn import_progress_counts_and_finishes_across_sessions() {
+        let mut slot: Option<ImportProgress> = None;
+
+        apply_import_outcome(&mut slot, true, 1000);
+        apply_import_outcome(&mut slot, true, 2000);
+        let live = apply_import_outcome(&mut slot, false, 3000);
+        assert!(live.active);
+        assert_eq!(live.imported, 2);
+        assert_eq!(live.duplicates, 1);
+        assert_eq!(live.started_at_ms, 1000);
+        assert_eq!(live.updated_at_ms, 3000);
+
+        let done = apply_import_finish(&mut slot, 4000).unwrap();
+        assert!(!done.active);
+        assert_eq!(done.imported, 2);
+        assert_eq!(done.duplicates, 1);
+        assert_eq!(done.updated_at_ms, 4000);
+
+        assert!(apply_import_finish(&mut slot, 5000).is_none());
+        assert!(!slot.as_ref().unwrap().active);
+
+        let fresh = apply_import_outcome(&mut slot, true, 6000);
+        assert!(fresh.active);
+        assert_eq!(fresh.imported, 1);
+        assert_eq!(fresh.duplicates, 0);
+        assert_eq!(fresh.started_at_ms, 6000);
     }
 
     #[test]

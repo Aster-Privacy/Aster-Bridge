@@ -121,6 +121,7 @@ struct BridgeStatusResponse {
     plan_code: Option<String>,
     has_bridge_access: bool,
     plan_info_loaded: bool,
+    import_progress: Option<imap::append::ImportProgress>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -219,6 +220,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         plan_code: guard.plan_code.clone(),
         has_bridge_access: guard.has_bridge_access,
         plan_info_loaded: guard.plan_info_loaded,
+        import_progress: imap::append::current_import_progress(),
     })
 }
 

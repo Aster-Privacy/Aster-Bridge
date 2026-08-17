@@ -26,7 +26,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo } from "@/api";
+import type { ConnectionInfo, ImportProgress } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -72,6 +72,87 @@ function sync_bar_fraction(p: SyncProgress): number {
       ? Math.min(p.folder_done ?? 0, p.folder_total) / p.folder_total
       : 0;
   return Math.min(1, (p.done + within) / p.total);
+}
+
+function format_elapsed(ms: number): string {
+  const total_seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total_seconds / 3600);
+  const minutes = Math.floor((total_seconds % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${total_seconds}s`;
+}
+
+function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_dismiss: () => void }) {
+  const { t } = useTranslation();
+  const [now, set_now] = useState(() => Date.now());
+  const samples = useRef<{ at: number; count: number }[]>([]);
+
+  useEffect(() => {
+    if (!progress.active) return;
+    const timer = setInterval(() => set_now(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [progress.active]);
+
+  useEffect(() => {
+    const at = Date.now();
+    const buffer = samples.current;
+    buffer.push({ at, count: progress.imported + progress.duplicates });
+    while (buffer.length > 0 && at - buffer[0].at > 120_000) buffer.shift();
+  }, [progress.imported, progress.duplicates]);
+
+  if (!progress.active) {
+    return (
+      <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <CheckIcon className="w-4 h-4 flex-shrink-0 text-brand" />
+          <p className="text-xs text-txt-primary truncate">
+            {t("import_finished_summary", { count: progress.imported })}
+            {progress.duplicates > 0 && ` ${t("import_duplicates_skipped", { count: progress.duplicates })}`}
+          </p>
+        </div>
+        <button type="button" onClick={on_dismiss} className="flex-shrink-0 text-txt-muted hover:text-txt-primary" aria-label={t("import_dismiss")}>
+          <XMarkIcon className="w-4 h-4" />
+        </button>
+      </div>
+    );
+  }
+
+  const total = progress.imported + progress.duplicates;
+  const buffer = samples.current;
+  let rate = 0;
+  if (buffer.length >= 2) {
+    const first = buffer[0];
+    const last = buffer[buffer.length - 1];
+    const span = last.at - first.at;
+    if (span >= 5000) rate = Math.round(((last.count - first.count) / span) * 60_000);
+  }
+
+  return (
+    <div className="mb-4 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+      <div className="flex items-end justify-between mb-1.5 gap-3">
+        <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
+          <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+            <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z" />
+          </svg>
+          <span className="truncate">{t("import_in_progress")}</span>
+        </span>
+        <span className="text-xs font-normal text-txt-muted tabular-nums flex-shrink-0 leading-none">
+          {t("import_messages_count", { count: total })}
+        </span>
+      </div>
+      <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
+        <div className="h-full w-full rounded-full bg-brand animate-pulse" />
+      </div>
+      <p className="text-[11px] text-txt-muted mt-1.5 tabular-nums">
+        {rate > 0 ? `${t("import_pace", { rate: rate.toLocaleString() })} · ` : ""}
+        {t("import_elapsed", { elapsed: format_elapsed(now - progress.started_at_ms) })}
+        {progress.duplicates > 0 ? ` · ${t("import_duplicates_skipped", { count: progress.duplicates })}` : ""}
+      </p>
+      <p className="text-[11px] text-txt-muted mt-1">{t("import_no_total_hint")}</p>
+    </div>
+  );
 }
 
 type SetupState =
@@ -1161,6 +1242,8 @@ function ConfigPanel({
   on_toggle_bridge,
   connected_since,
   sync_progress,
+  import_progress,
+  on_dismiss_import,
 }: {
   email: string | null;
   display_name: string | null;
@@ -1171,6 +1254,8 @@ function ConfigPanel({
   on_toggle_bridge: () => void;
   connected_since: number | null;
   sync_progress: SyncProgress | null;
+  import_progress: ImportProgress | null;
+  on_dismiss_import: () => void;
 }) {
   const { t } = useTranslation();
   const imap_host = conn_info?.imap_host || "127.0.0.1";
@@ -1270,6 +1355,10 @@ function ConfigPanel({
             />
           </div>
         </div>
+      )}
+
+      {bridge_running && import_progress && (import_progress.active || import_progress.imported > 0) && (
+        <ImportPanel progress={import_progress} on_dismiss={on_dismiss_import} />
       )}
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
@@ -2261,6 +2350,7 @@ function DashboardView({
   email, display_name, profile_picture, profile_color, bridge_running, conn_info, passwords,
   on_toggle_bridge, on_generate_password, on_delete_password, on_sign_out, on_reset, on_retry_plan,
   has_bridge_access, plan_info_loaded, outbox_count, connected_since, sync_progress, is_online,
+  import_progress, on_dismiss_import,
 }: {
   email: string | null; display_name: string | null; profile_picture: string | null;
   profile_color: string | null; bridge_running: boolean; conn_info: ConnectionInfo | null;
@@ -2277,6 +2367,8 @@ function DashboardView({
   connected_since: number | null;
   sync_progress: SyncProgress | null;
   is_online: boolean;
+  import_progress: ImportProgress | null;
+  on_dismiss_import: () => void;
 }) {
   const { t } = useTranslation();
   const show_upgrade_banner = plan_info_loaded && !has_bridge_access;
@@ -2326,7 +2418,7 @@ function DashboardView({
             ) : (
               <>
                 {active_tab === "status" && (
-                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} />
+                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} />
                 )}
                 {active_tab === "passwords" && !plan_info_loaded && (
                   <div className="p-5 text-sm text-txt-muted text-center">{t("loading")}</div>
@@ -2366,6 +2458,18 @@ export function BridgeApp() {
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
   const [sync_progress, set_sync_progress] = useState<SyncProgress | null>(null);
+  const [import_progress, set_import_progress] = useState<ImportProgress | null>(null);
+  const import_dismissed = useRef<number | null>(null);
+  const apply_import_progress = useCallback((p: ImportProgress | null) => {
+    if (p && !p.active && import_dismissed.current === p.started_at_ms) return;
+    set_import_progress(p);
+  }, []);
+  const handle_dismiss_import = useCallback(() => {
+    set_import_progress(prev => {
+      if (prev) import_dismissed.current = prev.started_at_ms;
+      return null;
+    });
+  }, []);
   const sync_show_timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sync_hide_timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sync_visible = useRef(false);
@@ -2389,6 +2493,7 @@ export function BridgeApp() {
         set_passwords(state.passwords);
         set_has_bridge_access(state.has_bridge_access);
         set_plan_info_loaded(state.plan_info_loaded);
+        apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();
       } else {
@@ -2397,7 +2502,7 @@ export function BridgeApp() {
     } catch {
       set_view("setup");
     }
-  }, [sync_theme]);
+  }, [sync_theme, apply_import_progress]);
 
   useEffect(() => {
     let cleanup: (() => void) | null = null;
@@ -2461,15 +2566,18 @@ export function BridgeApp() {
           set_sync_progress(null);
         }, e.payload.failed ? 0 : 1200);
       });
+      const unlisten_import = await listen<ImportProgress>("import_progress", (e) => {
+        apply_import_progress(e.payload);
+      });
       const unlisten_revoked = await listen("bridge_access_revoked", async () => {
         try { await api.stop_bridge(); } catch { /* ignore */ }
         show_toast(i18next.t("toast_bridge_upgrade_required"), "error");
         await load_state();
       });
-      cleanup = () => { unlisten_progress(); unlisten_done(); unlisten_revoked(); };
+      cleanup = () => { unlisten_progress(); unlisten_done(); unlisten_import(); unlisten_revoked(); };
     })();
     return () => { if (cleanup) cleanup(); };
-  }, [load_state]);
+  }, [load_state, apply_import_progress]);
 
   useEffect(() => {
     if (!bridge_running) { set_outbox_count(0); return; }
@@ -2665,6 +2773,7 @@ export function BridgeApp() {
         has_bridge_access={has_bridge_access}
         plan_info_loaded={plan_info_loaded} outbox_count={outbox_count}
         connected_since={connected_since} sync_progress={sync_progress} is_online={is_online}
+        import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
       />
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>

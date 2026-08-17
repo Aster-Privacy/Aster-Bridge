@@ -280,6 +280,17 @@ const en = {
 
   tls_open_cert_folder: "Open folder",
   syncing_folder: "Syncing {{folder}}",
+  import_in_progress: "Importing mailbox",
+  import_messages_count_one: "{{count}} message imported",
+  import_messages_count_other: "{{count}} messages imported",
+  import_pace: "About {{rate}} messages per minute",
+  import_elapsed: "Running for {{elapsed}}",
+  import_duplicates_skipped_one: "{{count}} duplicate skipped",
+  import_duplicates_skipped_other: "{{count}} duplicates skipped",
+  import_no_total_hint: "Your email app sends messages one at a time without announcing a total, so Aster Bridge shows the pace instead of a percentage.",
+  import_finished_summary_one: "Import finished. {{count}} message imported.",
+  import_finished_summary_other: "Import finished. {{count}} messages imported.",
+  import_dismiss: "Dismiss",
   offline_banner: "No internet connection",
 
   provision_title: "Allow access?",

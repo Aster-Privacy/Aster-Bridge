@@ -28,6 +28,14 @@ interface AppPassword {
   use_count: number;
 }
 
+export interface ImportProgress {
+  active: boolean;
+  started_at_ms: number;
+  updated_at_ms: number;
+  imported: number;
+  duplicates: number;
+}
+
 export interface BridgeState {
   enrolled: boolean;
   email: string | null;
@@ -39,6 +47,7 @@ export interface BridgeState {
   plan_code: string | null;
   has_bridge_access: boolean;
   plan_info_loaded: boolean;
+  import_progress: ImportProgress | null;
 }
 
 async function tauri_invoke<T>(
@@ -63,6 +72,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     plan_code: string | null;
     has_bridge_access: boolean;
     plan_info_loaded: boolean;
+    import_progress: ImportProgress | null;
   }>("get_bridge_status");
 
   let passwords: AppPassword[] = [];
@@ -85,6 +95,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     plan_code: status.plan_code,
     has_bridge_access: status.has_bridge_access,
     plan_info_loaded: status.plan_info_loaded ?? false,
+    import_progress: status.import_progress ?? null,
   };
 }
 

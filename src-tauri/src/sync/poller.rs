@@ -89,6 +89,13 @@ fn emit_bridge_access_revoked() {
     let _ = handle.emit("bridge_access_revoked", serde_json::Value::Null);
 }
 
+pub fn emit_import_progress(progress: &crate::imap::append::ImportProgress) {
+    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
+    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
+    let Some(handle) = handle_opt else { return; };
+    let _ = handle.emit("import_progress", progress.clone());
+}
+
 pub fn emit_session_expired() {
     let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
     let handle_opt = cell.lock().ok().and_then(|g| g.clone());
