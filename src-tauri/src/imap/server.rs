@@ -1479,7 +1479,12 @@ where
                                 write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
                             }
                             Some("drafts") => {
-                                match append_draft(&db, &client, &session, &buf).await {
+                                let draft_outcome = run_with_keepalive(
+                                    &mut writer,
+                                    append_draft(&db, &client, &session, &buf),
+                                )
+                                .await;
+                                match draft_outcome {
                                     Ok((uid, draft_id)) => {
                                         let _ = db.jmap_record_sync_batch("Email", &[draft_id.as_str()]);
                                         let email_state = db.jmap_state_get("Email").unwrap_or(0);
@@ -1550,14 +1555,17 @@ where
                                     .await?;
                                     continue;
                                 }
-                                let outcome = crate::imap::append::append_imported_message(
-                                    &db,
-                                    &client,
-                                    &session,
-                                    folder,
-                                    &buf,
-                                    &cmd.flags,
-                                    cmd.internal_date,
+                                let outcome = run_with_keepalive(
+                                    &mut writer,
+                                    crate::imap::append::append_imported_message(
+                                        &db,
+                                        &client,
+                                        &session,
+                                        folder,
+                                        &buf,
+                                        &cmd.flags,
+                                        cmd.internal_date,
+                                    ),
                                 )
                                 .await;
                                 match outcome {
@@ -1900,6 +1908,28 @@ fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
         }
     }
     None
+}
+
+const APPEND_KEEPALIVE_SECS: u64 = 20;
+
+async fn run_with_keepalive<T>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(fut);
+    let mut alive = true;
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(APPEND_KEEPALIVE_SECS)), if alive => {
+                let sent = writer.write_all(b"* OK APPEND in progress\r\n").await.is_ok()
+                    && writer.flush().await.is_ok();
+                if !sent {
+                    alive = false;
+                }
+            }
+        }
+    }
 }
 
 async fn write_ok(
@@ -3600,6 +3630,70 @@ mod tests {
         seed(&db, "sent-3", "sent", "subject a");
         let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: subject b\r\n\r\nbody";
         assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_emits_untagged_ok_while_a_slow_append_runs() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive(&mut out, async {
+            tokio::time::sleep(std::time::Duration::from_secs(65)).await;
+            42u32
+        })
+        .await;
+        assert_eq!(result, 42);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.matches("* OK APPEND in progress\r\n").count(),
+            3,
+            "expected a keepalive every {}s across 65s, got: {:?}",
+            APPEND_KEEPALIVE_SECS,
+            text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_stays_silent_for_a_fast_append() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive(&mut out, async { "done" }).await;
+        assert_eq!(result, "done");
+        assert!(out.is_empty());
+    }
+
+    struct DeadWriter;
+
+    impl tokio::io::AsyncWrite for DeadWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_write_failure_still_finishes_the_append() {
+        let mut out = DeadWriter;
+        let result = run_with_keepalive(&mut out, async {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            "stored"
+        })
+        .await;
+        assert_eq!(result, "stored");
     }
 
     async fn append_literal(
