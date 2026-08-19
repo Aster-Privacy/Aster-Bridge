@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.20 - 2026-08-19
+
+### Fixed
+- Copying mail into your Aster account no longer times out in mail clients that limit how long they wait for a reply. Bridge now confirms that it's still working while it stores each message, so large migrations finish instead of retrying the same message forever.
+
 ## 0.4.17 - 2026-08-11
 
 ### Fixed
