@@ -2097,7 +2097,7 @@ async fn append_import_roundtrip_real() {
         .unwrap()
         .as_secs();
 
-    let sweep = client.sync_recent_items(&token, 200).await.expect("sync failed");
+    let sweep = client.sync_recent_items(&token, 200, None).await.expect("sync failed");
     for item in &sweep.items {
         let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
             &item.encrypted_envelope, Some(&item.envelope_nonce), &passphrase, Some(&identity_key), &[],
@@ -2146,7 +2146,7 @@ Content-Type: text/html; charset=utf-8
     let rendered = crate::imap::server::build_rfc822(&cached);
     assert!(rendered.contains(marker.as_str()), "rfc822 render missing subject");
 
-    let synced = client.sync_recent_items(&token, 200).await.expect("sync failed");
+    let synced = client.sync_recent_items(&token, 200, None).await.expect("sync failed");
     let found = synced.items.iter().find(|i| i.id == aster_id).expect("stored item not returned by the server");
     assert!(found.is_external, "imported item must be external");
     assert!(
@@ -2268,7 +2268,7 @@ async fn imap_append_live_folders_real() {
             cursor: None,
         };
         let mut pool = client.list_mail(&token, &q).await.map(|r| r.items).unwrap_or_default();
-        if let Ok(recent) = client.sync_recent_items(&token, 200).await {
+        if let Ok(recent) = client.sync_recent_items(&token, 200, None).await {
             pool.extend(recent.items);
         }
         for item in pool {
@@ -2426,7 +2426,7 @@ async fn imap_append_live_folders_real() {
                 .expect("junk list failed")
                 .items,
             _ => client
-                .sync_recent_items(&token, 200)
+                .sync_recent_items(&token, 200, None)
                 .await
                 .expect("sync failed")
                 .items,
@@ -2621,7 +2621,7 @@ async fn imap_append_live_import_job_lifecycle_real() {
     println!("job {} closed out after the migration went idle", during[0]);
 
     let mut cleaned = false;
-    if let Ok(recent) = client.sync_recent_items(&token, 200).await {
+    if let Ok(recent) = client.sync_recent_items(&token, 200, None).await {
         for item in recent.items {
             let Ok(plain) = crate::crypto::envelope::decrypt_envelope(
                 &item.encrypted_envelope,
@@ -2812,7 +2812,7 @@ async fn imap_append_live_bulk_migration_real() {
     let _ = w.flush().await;
 
     let synced = client
-        .sync_recent_items(&token, 400)
+        .sync_recent_items(&token, 400, None)
         .await
         .expect("sync failed");
     let mut found: Vec<(String, String)> = Vec::new();
@@ -3249,7 +3249,7 @@ async fn imap_append_live_migration_gauntlet_real() {
     };
 
     let recent = client
-        .sync_recent_items(&token, 400)
+        .sync_recent_items(&token, 400, None)
         .await
         .expect("sync failed")
         .items;

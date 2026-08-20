@@ -1479,13 +1479,22 @@ where
                                 write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
                             }
                             Some("drafts") => {
-                                let draft_outcome = run_with_keepalive(
-                                    &mut writer,
-                                    append_draft(&db, &client, &session, &buf),
-                                )
+                                let draft_db = db.clone();
+                                let draft_client = client.clone();
+                                let draft_session = session.clone();
+                                let draft_body = std::mem::take(&mut buf);
+                                let draft_outcome = run_with_keepalive(&mut writer, async move {
+                                    append_draft(
+                                        &draft_db,
+                                        &draft_client,
+                                        &draft_session,
+                                        &draft_body,
+                                    )
+                                    .await
+                                })
                                 .await;
                                 match draft_outcome {
-                                    Ok((uid, draft_id)) => {
+                                    Some(Ok((uid, draft_id))) => {
                                         let _ = db.jmap_record_sync_batch("Email", &[draft_id.as_str()]);
                                         let email_state = db.jmap_state_get("Email").unwrap_or(0);
                                         let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
@@ -1518,12 +1527,20 @@ where
                                         )
                                         .await?;
                                     }
-                                    Err(e) => {
+                                    Some(Err(e)) => {
                                         tracing::warn!("APPEND to Drafts failed: {}", e);
                                         write_no(
                                             &mut writer,
                                             &tag,
                                             "[SERVERBUG] could not save the draft to your Aster account",
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[UNAVAILABLE] saving the draft is taking too long, try again",
                                         )
                                         .await?;
                                     }
@@ -1555,24 +1572,31 @@ where
                                     .await?;
                                     continue;
                                 }
-                                let outcome = run_with_keepalive(
-                                    &mut writer,
+                                let import_db = db.clone();
+                                let import_client = client.clone();
+                                let import_session = session.clone();
+                                let import_folder = folder.to_string();
+                                let import_flags = cmd.flags.clone();
+                                let import_date = cmd.internal_date;
+                                let import_body = std::mem::take(&mut buf);
+                                let outcome = run_with_keepalive(&mut writer, async move {
                                     crate::imap::append::append_imported_message(
-                                        &db,
-                                        &client,
-                                        &session,
-                                        folder,
-                                        &buf,
-                                        &cmd.flags,
-                                        cmd.internal_date,
-                                    ),
-                                )
+                                        &import_db,
+                                        &import_client,
+                                        &import_session,
+                                        &import_folder,
+                                        &import_body,
+                                        &import_flags,
+                                        import_date,
+                                    )
+                                    .await
+                                })
                                 .await;
                                 match outcome {
-                                    Ok(crate::imap::append::AppendOutcome::Stored {
+                                    Some(Ok(crate::imap::append::AppendOutcome::Stored {
                                         uid,
                                         aster_id,
-                                    }) => {
+                                    })) => {
                                         let _ = db
                                             .jmap_record_sync_batch("Email", &[aster_id.as_str()]);
                                         let email_state = db.jmap_state_get("Email").unwrap_or(0);
@@ -1606,7 +1630,9 @@ where
                                         )
                                         .await?;
                                     }
-                                    Ok(crate::imap::append::AppendOutcome::Duplicate { uid }) => {
+                                    Some(Ok(crate::imap::append::AppendOutcome::Duplicate {
+                                        uid,
+                                    })) => {
                                         crate::sync::poller::try_kick_sync();
                                         match uid {
                                             Some(uid) => {
@@ -1627,7 +1653,7 @@ where
                                             }
                                         }
                                     }
-                                    Err(e) => {
+                                    Some(Err(e)) => {
                                         tracing::warn!("APPEND to {} failed: {}", folder, e);
                                         write_no(
                                             &mut writer,
@@ -1637,6 +1663,14 @@ where
                                                 crate::imap::append::no_response_code(&e),
                                                 e
                                             ),
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        write_no(
+                                            &mut writer,
+                                            &tag,
+                                            "[UNAVAILABLE] the import is taking too long, try again",
                                         )
                                         .await?;
                                     }
@@ -1911,17 +1945,55 @@ fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
 }
 
 const APPEND_KEEPALIVE_SECS: u64 = 20;
+const APPEND_DEADLINE_SECS: u64 = 15 * 60;
 
 async fn run_with_keepalive<T>(
     writer: &mut (impl AsyncWrite + Unpin),
-    fut: impl std::future::Future<Output = T>,
-) -> T {
-    tokio::pin!(fut);
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    run_with_keepalive_every(
+        writer,
+        std::time::Duration::from_secs(APPEND_KEEPALIVE_SECS),
+        std::time::Duration::from_secs(APPEND_DEADLINE_SECS),
+        fut,
+    )
+    .await
+}
+
+async fn run_with_keepalive_every<T>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    every: std::time::Duration,
+    deadline: std::time::Duration,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let mut handle = tokio::spawn(fut);
+    let expires_at = tokio::time::Instant::now() + deadline;
     let mut alive = true;
     loop {
         tokio::select! {
-            out = &mut fut => return out,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(APPEND_KEEPALIVE_SECS)), if alive => {
+            joined = &mut handle => {
+                return match joined {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        tracing::error!("APPEND worker ended without a result: {}", e);
+                        None
+                    }
+                };
+            }
+            _ = tokio::time::sleep_until(expires_at) => {
+                tracing::warn!(
+                    seconds = deadline.as_secs(),
+                    "APPEND is still running past its deadline, asking the client to retry"
+                );
+                return None;
+            }
+            _ = tokio::time::sleep(every), if alive => {
                 let sent = writer.write_all(b"* OK APPEND in progress\r\n").await.is_ok()
                     && writer.flush().await.is_ok();
                 if !sent {
@@ -3640,7 +3712,7 @@ mod tests {
             42u32
         })
         .await;
-        assert_eq!(result, 42);
+        assert_eq!(result, Some(42));
         let text = String::from_utf8(out).unwrap();
         assert_eq!(
             text.matches("* OK APPEND in progress\r\n").count(),
@@ -3655,7 +3727,7 @@ mod tests {
     async fn keepalive_stays_silent_for_a_fast_append() {
         let mut out: Vec<u8> = Vec::new();
         let result = run_with_keepalive(&mut out, async { "done" }).await;
-        assert_eq!(result, "done");
+        assert_eq!(result, Some("done"));
         assert!(out.is_empty());
     }
 
@@ -3693,7 +3765,52 @@ mod tests {
             "stored"
         })
         .await;
-        assert_eq!(result, "stored");
+        assert_eq!(result, Some("stored"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_keeps_writing_while_the_append_blocks_its_thread() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive_every(
+            &mut out,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(60),
+            async {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                7u32
+            },
+        )
+        .await;
+        assert_eq!(result, Some(7));
+        let text = String::from_utf8(out).unwrap();
+        let beats = text.matches("* OK APPEND in progress\r\n").count();
+        assert!(
+            beats >= 3,
+            "a blocking append must not silence the keepalive, got {} beats: {:?}",
+            beats,
+            text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_gives_up_on_an_append_that_never_finishes() {
+        let mut out: Vec<u8> = Vec::new();
+        let result = run_with_keepalive_every(
+            &mut out,
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                "never"
+            },
+        )
+        .await;
+        assert_eq!(result, None);
+        let beats = String::from_utf8(out)
+            .unwrap()
+            .matches("* OK APPEND in progress\r\n")
+            .count();
+        assert_eq!(beats, 5, "expected keepalives right up to the deadline");
     }
 
     async fn append_literal(

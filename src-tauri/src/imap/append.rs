@@ -38,6 +38,8 @@ pub const IMPORT_SOURCE: &str = "eml";
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_ENVELOPE_CHARS: usize = 10 * 1024 * 1024;
 const SYNC_LOOKUP_LIMIT: i64 = 200;
+const SCOPED_LOOKUP_LIMIT: i64 = 25;
+const SCOPED_LOOKUP_SKEW_SECS: i64 = 120;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AppendFlags {
@@ -789,47 +791,55 @@ async fn upload_attachments(
     use rand_core::{OsRng, RngCore};
 
     for (seq, attachment) in attachments.iter().enumerate() {
-        let mut session_key = [0u8; 32];
-        OsRng.fill_bytes(&mut session_key);
-        let cipher = match Aes256Gcm::new_from_slice(&session_key) {
-            Ok(c) => c,
+        let sealed = {
+            let attachment = attachment.clone();
+            let passphrase = passphrase.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let mut session_key = [0u8; 32];
+                OsRng.fill_bytes(&mut session_key);
+                let cipher = match Aes256Gcm::new_from_slice(&session_key) {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("attachment cipher init failed: {}", e)),
+                };
+
+                let mut data_nonce = [0u8; 12];
+                OsRng.fill_bytes(&mut data_nonce);
+                let encrypted_data = cipher
+                    .encrypt(Nonce::from_slice(&data_nonce), attachment.data.as_ref())
+                    .map_err(|_| format!("attachment encrypt failed for {}", attachment.name))?;
+
+                let meta = serde_json::json!({
+                    "filename": attachment.name,
+                    "content_type": attachment.mime_type,
+                    "session_key": STANDARD.encode(session_key),
+                    "content_id": attachment.content_id,
+                    "is_inline": attachment.is_inline,
+                })
+                .to_string();
+
+                let encrypted_meta =
+                    crate::crypto::envelope::encrypt_pbkdf2_envelope(&meta, &passphrase)
+                        .map_err(|e| format!("attachment meta seal failed: {}", e))?;
+
+                let mut meta_nonce = [0u8; 12];
+                OsRng.fill_bytes(&mut meta_nonce);
+
+                Ok::<_, String>((encrypted_data, data_nonce, encrypted_meta, meta_nonce))
+            })
+            .await
+        };
+
+        let (encrypted_data, data_nonce, encrypted_meta, meta_nonce) = match sealed {
+            Ok(Ok(parts)) => parts,
+            Ok(Err(e)) => {
+                tracing::warn!("{}", e);
+                continue;
+            }
             Err(e) => {
-                tracing::warn!("attachment cipher init failed: {}", e);
+                tracing::warn!("attachment sealing did not finish: {}", e);
                 continue;
             }
         };
-
-        let mut data_nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut data_nonce);
-        let encrypted_data = match cipher.encrypt(Nonce::from_slice(&data_nonce), attachment.data.as_ref())
-        {
-            Ok(c) => c,
-            Err(_) => {
-                tracing::warn!("attachment encrypt failed for {}", attachment.name);
-                continue;
-            }
-        };
-
-        let meta = serde_json::json!({
-            "filename": attachment.name,
-            "content_type": attachment.mime_type,
-            "session_key": STANDARD.encode(session_key),
-            "content_id": attachment.content_id,
-            "is_inline": attachment.is_inline,
-        })
-        .to_string();
-
-        let encrypted_meta =
-            match crate::crypto::envelope::encrypt_pbkdf2_envelope(&meta, passphrase) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("attachment meta seal failed: {}", e);
-                    continue;
-                }
-            };
-
-        let mut meta_nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut meta_nonce);
 
         let body = CreateAttachmentBody {
             encrypted_data: &STANDARD.encode(&encrypted_data),
@@ -866,16 +876,26 @@ pub async fn append_imported_message(
     let identity_key = identity_key
         .ok_or_else(|| "session has no identity key for envelope encryption".to_string())?;
 
-    let message = build_imported_message(raw_message, folder, internal_date, Utc::now())
-        .ok_or_else(|| "could not parse the appended message".to_string())?;
-
-    let (encrypted_envelope, envelope_nonce) =
-        crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
-            &message.envelope_json,
-            &identity_key,
-            crate::crypto::envelope::ENVELOPE_VERSION_IMPORT,
-        )
-        .map_err(|e| format!("envelope encrypt failed: {}", e))?;
+    let (message, encrypted_envelope, envelope_nonce) = {
+        let raw = raw_message.to_vec();
+        let build_folder = folder.to_string();
+        let build_key = identity_key.clone();
+        let now = Utc::now();
+        tokio::task::spawn_blocking(move || {
+            let message = build_imported_message(&raw, &build_folder, internal_date, now)
+                .ok_or_else(|| "could not parse the appended message".to_string())?;
+            let (encrypted_envelope, envelope_nonce) =
+                crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
+                    &message.envelope_json,
+                    &build_key,
+                    crate::crypto::envelope::ENVELOPE_VERSION_IMPORT,
+                )
+                .map_err(|e| format!("envelope encrypt failed: {}", e))?;
+            Ok::<_, String>((message, encrypted_envelope, envelope_nonce))
+        })
+        .await
+        .map_err(|e| format!("could not prepare the message: {}", e))??
+    };
 
     if encrypted_envelope.len() > MAX_ENVELOPE_CHARS {
         return Err("the message body is too large to import".to_string());
@@ -885,6 +905,7 @@ pub async fn append_imported_message(
     let attachment_count = message.attachments.len();
 
     note_import_activity();
+    let stored_after = Utc::now();
     let mut job_id = processing_import_job(client, &token).await?;
     spawn_import_job_closer(client.clone(), session.clone());
 
@@ -950,7 +971,7 @@ pub async fn append_imported_message(
         return Err("the server rejected the message".to_string());
     }
 
-    let aster_id = locate_stored_item(client, &token, &encrypted_envelope).await?;
+    let aster_id = locate_stored_item(client, &token, &encrypted_envelope, stored_after).await?;
 
     if attachment_count > 0 {
         upload_attachments(client, &token, &passphrase, &aster_id, &message.attachments).await;
@@ -985,23 +1006,34 @@ pub async fn append_imported_message(
         is_starred: Some(flags.flagged),
     };
 
-    crate::sync::poller::cache_mail_item(
-        db,
-        folder,
-        &item,
-        &passphrase,
-        Some(&identity_key),
-        &inbound_keys,
-    );
+    let uid = {
+        let cache_db = db.clone();
+        let cache_folder = folder.to_string();
+        let cache_id = aster_id.clone();
+        let cache_bits = flags.local_bits() & !16;
+        tokio::task::spawn_blocking(move || {
+            crate::sync::poller::cache_mail_item(
+                &cache_db,
+                &cache_folder,
+                &item,
+                &passphrase,
+                Some(&identity_key),
+                &inbound_keys,
+            );
 
-    let uid = db
-        .assign_uid_if_missing(folder, &aster_id)
-        .map_err(|e| format!("could not assign a UID: {}", e))?;
+            let uid = cache_db
+                .assign_uid_if_missing(&cache_folder, &cache_id)
+                .map_err(|e| format!("could not assign a UID: {}", e))?;
 
-    let bits = flags.local_bits() & !16;
-    if bits != 0 {
-        let _ = db.set_message_flags_by_id(&aster_id, bits);
-    }
+            if cache_bits != 0 {
+                let _ = cache_db.set_message_flags_by_id(&cache_id, cache_bits);
+            }
+
+            Ok::<_, String>(uid)
+        })
+        .await
+        .map_err(|e| format!("could not store the message locally: {}", e))??
+    };
 
     record_import_outcome(true);
     crate::sync::poller::try_kick_sync();
@@ -1009,14 +1041,16 @@ pub async fn append_imported_message(
     Ok(AppendOutcome::Stored { uid, aster_id })
 }
 
-async fn locate_stored_item(
+async fn lookup_stored_item(
     client: &ApiClient,
     token: &str,
     encrypted_envelope: &str,
-) -> std::result::Result<String, String> {
+    limit: i64,
+    since: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
     let mut attempt = 0u32;
     let synced = loop {
-        match client.sync_recent_items(token, SYNC_LOOKUP_LIMIT).await {
+        match client.sync_recent_items(token, limit, since).await {
             Ok(synced) => break synced,
             Err(e) if is_retryable(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
                 let wait = rate_limit_backoff(attempt);
@@ -1030,11 +1064,39 @@ async fn locate_stored_item(
         }
     };
 
-    synced
+    Ok(synced
         .items
         .into_iter()
         .find(|item| item.encrypted_envelope == encrypted_envelope)
-        .map(|item| item.id)
+        .map(|item| item.id))
+}
+
+pub fn scoped_lookup_since(stored_after: DateTime<Utc>) -> String {
+    iso_millis(&(stored_after - chrono::Duration::seconds(SCOPED_LOOKUP_SKEW_SECS)))
+}
+
+async fn locate_stored_item(
+    client: &ApiClient,
+    token: &str,
+    encrypted_envelope: &str,
+    stored_after: DateTime<Utc>,
+) -> std::result::Result<String, String> {
+    let since = scoped_lookup_since(stored_after);
+    if let Some(id) = lookup_stored_item(
+        client,
+        token,
+        encrypted_envelope,
+        SCOPED_LOOKUP_LIMIT,
+        Some(&since),
+    )
+    .await?
+    {
+        return Ok(id);
+    }
+
+    note_import_activity();
+    lookup_stored_item(client, token, encrypted_envelope, SYNC_LOOKUP_LIMIT, None)
+        .await?
         .ok_or_else(|| "the stored message was not found on the server".to_string())
 }
 
@@ -1498,6 +1560,107 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://127.0.0.1:{}", port)
+    }
+
+    #[test]
+    fn scoped_lookup_since_reaches_back_before_the_store() {
+        let stored_after = ts("2026-08-20T12:00:00Z");
+        assert_eq!(
+            scoped_lookup_since(stored_after),
+            iso_millis(&ts("2026-08-20T11:58:00Z"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_item_lookup_asks_for_a_narrow_window_first() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = queries.clone();
+        let app = axum::Router::new().route(
+            "/bridge/v1/messages/sync",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().await.push(q);
+                    axum::Json(serde_json::json!({"items": [{
+                        "id": "mail-1",
+                        "item_type": "received",
+                        "encrypted_envelope": "sealed",
+                        "envelope_nonce": "n",
+                        "folder_token": "",
+                        "is_external": true,
+                        "created_at": "2026-08-20T12:00:00.000Z",
+                    }]}))
+                }
+            }),
+        );
+
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let id = locate_stored_item(&client, "tok", "sealed", ts("2026-08-20T12:00:00Z"))
+            .await
+            .unwrap();
+
+        assert_eq!(id, "mail-1");
+        let asked = queries.lock().await.clone();
+        assert_eq!(asked.len(), 1, "a narrow hit must not trigger a wide sweep");
+        assert_eq!(
+            asked[0].get("limit").map(String::as_str),
+            Some(SCOPED_LOOKUP_LIMIT.to_string().as_str())
+        );
+        assert!(asked[0].contains_key("since"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_item_lookup_falls_back_to_a_wide_sweep() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = queries.clone();
+        let app = axum::Router::new().route(
+            "/bridge/v1/messages/sync",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let seen = seen.clone();
+                async move {
+                    let scoped = q.contains_key("since");
+                    seen.lock().await.push(q);
+                    if scoped {
+                        return axum::Json(serde_json::json!({"items": []}));
+                    }
+                    axum::Json(serde_json::json!({"items": [{
+                        "id": "mail-9",
+                        "item_type": "received",
+                        "encrypted_envelope": "sealed",
+                        "envelope_nonce": "n",
+                        "folder_token": "",
+                        "is_external": true,
+                        "created_at": "2026-08-20T12:00:00.000Z",
+                    }]}))
+                }
+            }),
+        );
+
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let id = locate_stored_item(&client, "tok", "sealed", ts("2026-08-20T12:00:00Z"))
+            .await
+            .unwrap();
+
+        assert_eq!(id, "mail-9");
+        let asked = queries.lock().await.clone();
+        assert_eq!(asked.len(), 2);
+        assert!(!asked[1].contains_key("since"));
+        assert_eq!(
+            asked[1].get("limit").map(String::as_str),
+            Some(SYNC_LOOKUP_LIMIT.to_string().as_str())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

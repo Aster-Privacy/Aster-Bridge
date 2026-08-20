@@ -759,12 +759,17 @@ impl ApiClient {
         &self,
         access_token: &str,
         limit: i64,
+        since: Option<&str>,
     ) -> Result<SyncResponse> {
+        let mut query = vec![("limit".to_string(), limit.to_string())];
+        if let Some(since) = since {
+            query.push(("since".to_string(), since.to_string()));
+        }
         let resp = self
             .client
             .get(format!("{}/bridge/v1/messages/sync", self.base_url))
             .bearer_auth(access_token)
-            .query(&[("limit", limit.to_string())])
+            .query(&query)
             .send()
             .await?;
 
