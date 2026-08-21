@@ -268,8 +268,8 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
     };
 
     let host = "127.0.0.1";
-    let imap_port = port_picker::pick_available_port(host, guard.config.imap_port)?;
-    let smtp_port = port_picker::pick_available_port(host, guard.config.smtp_port)?;
+    let imap_port = port_picker::pick_startup_port(host, guard.config.imap_port)?;
+    let smtp_port = port_picker::pick_startup_port(host, guard.config.smtp_port)?;
     let jmap_port = port_picker::pick_available_port(host, guard.config.jmap_port)?;
     let carddav_port = port_picker::pick_available_port(host, guard.config.carddav_port)?;
     let imap_addr = format!("{}:{}", host, imap_port);
@@ -1631,6 +1631,11 @@ fn main() {
         }
     };
     let _log_guard = log_guard;
+    tracing::info!(
+        "Aster Bridge {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
 
     let mut cfg = match preliminary_cfg {
         Ok(c) => c,

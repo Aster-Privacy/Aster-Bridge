@@ -148,12 +148,9 @@ pub async fn run_implicit_tls(
 
         tokio::spawn(async move {
             let _permit = permit;
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("POP3S TLS handshake failed: {}", e);
-                    return;
-                }
+            let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "POP3S").await {
+                Some(s) => s,
+                None => return,
             };
             if let Err(e) = run_session(tls_stream, session, db, client, passwords, None).await {
                 tracing::error!("POP3S connection error: {}", e);

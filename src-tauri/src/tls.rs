@@ -252,6 +252,50 @@ mod tests {
         assert_eq!(certs1[0].as_ref(), certs2[0].as_ref());
     }
 
+    #[tokio::test]
+    async fn a_plaintext_client_on_a_tls_port_is_closed_instead_of_left_hanging() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, key) = ensure_cert(dir.path()).unwrap();
+        let config = server_config(certs, key).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_within(
+                &acceptor,
+                stream,
+                "IMAPS",
+                std::time::Duration::from_millis(1500),
+            )
+            .await
+            .is_none()
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read(&mut buf),
+        )
+        .await
+        .expect("the server must close the connection rather than leave the client waiting");
+
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "a silent client on a TLS port must be disconnected, not held open"
+        );
+        assert!(server.await.unwrap(), "the handshake must report a timeout");
+    }
+
     #[test]
     fn fingerprint_format_is_colon_hex_uppercase() {
         let dir = tempfile::tempdir().unwrap();
@@ -262,6 +306,46 @@ mod tests {
         for p in parts {
             assert_eq!(p.len(), 2);
             assert!(p.chars().all(|c| c.is_ascii_hexdigit() && (!c.is_alphabetic() || c.is_uppercase())));
+        }
+    }
+}
+
+pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
+pub async fn accept_with_timeout<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limit = std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS);
+    accept_within(acceptor, stream, protocol, limit).await
+}
+
+pub async fn accept_within<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+    limit: std::time::Duration,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, acceptor.accept(stream)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            tracing::warn!("{} TLS handshake failed: {}", protocol, e);
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{} TLS handshake timed out after {}s and the connection was closed; a client configured without encryption on an encrypted-only port looks exactly like this",
+                protocol,
+                limit.as_secs()
+            );
+            None
         }
     }
 }

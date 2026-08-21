@@ -212,12 +212,9 @@ pub async fn run_implicit_tls(
 
         tokio::spawn(async move {
             let _permit = permit;
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("SMTPS TLS handshake failed: {}", e);
-                    return;
-                }
+            let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "SMTPS").await {
+                Some(s) => s,
+                None => return,
             };
             if let Err(e) = handle_session(tls_stream, session, client, passwords, db, None, true).await {
                 tracing::error!("SMTPS connection error: {}", e);

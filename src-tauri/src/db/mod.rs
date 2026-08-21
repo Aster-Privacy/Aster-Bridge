@@ -2312,4 +2312,55 @@ mod db_tests {
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.sent_24h, 1);
     }
+
+    #[test]
+    fn a_reader_is_not_starved_by_a_sync_hammering_the_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let (dir, db) = open_db();
+        for i in 0..200 {
+            insert(&db, &format!("m{}", i), "inbox");
+        }
+        let db = Arc::new(db);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut hammers = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            let stop = stop.clone();
+            hammers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = db.with_conn(|c| {
+                        c.query_row("SELECT COUNT(*) FROM cached_messages", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                    });
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut worst = Duration::ZERO;
+        for _ in 0..40 {
+            let started = Instant::now();
+            let _ = db.count_cached_messages("inbox");
+            worst = worst.max(started.elapsed());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in hammers {
+            h.join().unwrap();
+        }
+        drop(dir);
+
+        assert!(
+            worst < Duration::from_secs(1),
+            "a connection waited {:?} for the database while a sync held it;              an IMAP client sees this as dead air and times out",
+            worst
+        );
+    }
 }

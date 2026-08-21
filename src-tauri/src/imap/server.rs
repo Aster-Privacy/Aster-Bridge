@@ -644,12 +644,9 @@ pub async fn run_implicit_tls(
 
         tokio::spawn(async move {
             let _permit = permit;
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("IMAPS TLS handshake failed: {}", e);
-                    return;
-                }
+            let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "IMAPS").await {
+                Some(s) => s,
+                None => return,
             };
             if let Err(e) = run_session(
                 tls_stream, session, db, client, passwords, broadcaster, None,
@@ -693,11 +690,11 @@ where
     let _ = client;
     let starttls_capable = tls_config.is_some();
     let greeting_cap = if starttls_capable {
-        b"* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n" as &[u8]
+        format!("* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
     } else {
-        b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge ready\r\n"
+        format!("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
     };
-    writer.write_all(greeting_cap).await?;
+    writer.write_all(greeting_cap.as_bytes()).await?;
 
     let mut conn = ImapConnection {
         state: ImapState::NotAuthenticated,
@@ -3541,7 +3538,9 @@ mod tests {
 
         let mut greeting = String::new();
         reader.read_line(&mut greeting).await.unwrap();
-        assert!(greeting.contains("Aster Bridge ready"));
+        assert!(greeting.contains("Aster Bridge"));
+        assert!(greeting.contains(env!("CARGO_PKG_VERSION")), "the greeting must name the running build so a stale copy is obvious: {}", greeting);
+        assert!(greeting.contains("ready"));
 
         writer.write_all(b"a1 CAPABILITY\r\n").await.unwrap();
         writer.flush().await.unwrap();
