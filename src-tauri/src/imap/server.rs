@@ -3798,7 +3798,7 @@ mod tests {
         let result = run_with_keepalive_every(
             &mut out,
             std::time::Duration::from_secs(20),
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(130),
             async {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 "never"
@@ -3810,7 +3810,7 @@ mod tests {
             .unwrap()
             .matches("* OK APPEND in progress\r\n")
             .count();
-        assert_eq!(beats, 5, "expected keepalives right up to the deadline");
+        assert_eq!(beats, 6, "expected keepalives right up to the deadline");
     }
 
     async fn append_literal(
