@@ -1835,6 +1835,7 @@ mod tests {
 
     fn mock_session() -> Arc<RwLock<crate::auth::session::Session>> {
         Arc::new(RwLock::new(crate::auth::session::Session {
+            data_kek: None,
             user_id: uuid::Uuid::new_v4(),
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),
@@ -1927,6 +1928,7 @@ mod tests {
 
     fn mock_session_with_identity_key(ik: &str) -> Arc<RwLock<crate::auth::session::Session>> {
         Arc::new(RwLock::new(crate::auth::session::Session {
+            data_kek: None,
             user_id: uuid::Uuid::new_v4(),
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),

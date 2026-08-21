@@ -44,6 +44,7 @@ pub struct RatchetKeySet {
 #[derive(Deserialize, ZeroizeOnDrop)]
 pub struct VaultContents {
     pub identity_key: String,
+    pub data_kek: Option<String>,
     pub signed_prekey_private: Option<String>,
     pub signed_prekey: Option<String>,
     pub recovery_codes: Option<Vec<String>>,

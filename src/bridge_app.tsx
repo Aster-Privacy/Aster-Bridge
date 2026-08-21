@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, ImportProgress } from "@/api";
@@ -1272,6 +1272,9 @@ function ConfigPanel({
   const imap_implicit_tls_port = String(conn_info?.imap_implicit_tls_port || 1993);
   const smtp_implicit_tls_port = String(conn_info?.smtp_implicit_tls_port || 1465);
   const jmap_https_enabled = conn_info?.jmap_https_enabled ?? false;
+  const carddav_port = String(conn_info?.carddav_port || 1081);
+  const carddav_url = conn_info?.carddav_url || `http://127.0.0.1:${carddav_port}/`;
+  const carddav_enabled = conn_info?.carddav_enabled ?? true;
   const pop3_host = imap_host;
   const pop3_port = String(conn_info?.pop3_port || 1110);
   const pop3s_port = String(conn_info?.pop3s_port || 1995);
@@ -1384,6 +1387,19 @@ function ConfigPanel({
           <InfoRow label={t("field_session_url")} value={jmap_url} />
           <InfoRow label={t("field_hostname")} value={jmap_host} />
           <InfoRow label={t("field_port")} value={jmap_port} />
+          <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
+          <InfoRow label={t("field_username")} value={email_value} />
+          <div className="flex items-center justify-between gap-4 py-2">
+            <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
+            <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
+          </div>
+        </ServerCard>
+
+        <ServerCard title={carddav_enabled ? t("section_carddav") : t("section_carddav_disabled")} icon={<UserGroupIcon />} hint={t("carddav_hint")}>
+          <InfoRow label={t("field_protocol")} value={t("field_carddav_protocol")} copy={false} mono={false} />
+          <InfoRow label={t("field_carddav_url")} value={carddav_url} />
+          <InfoRow label={t("field_hostname")} value="127.0.0.1" />
+          <InfoRow label={t("field_port")} value={carddav_port} />
           <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
           <InfoRow label={t("field_username")} value={email_value} />
           <div className="flex items-center justify-between gap-4 py-2">

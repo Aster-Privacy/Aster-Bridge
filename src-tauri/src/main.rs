@@ -25,6 +25,7 @@ mod auth;
 mod config;
 mod conn_limit;
 mod crypto;
+mod dav;
 mod db;
 mod diagnostics;
 mod error;
@@ -62,6 +63,7 @@ struct BridgeState {
     smtp_handle: Option<tokio::task::JoinHandle<()>>,
     smtps_handle: Option<tokio::task::JoinHandle<()>>,
     jmap_handle: Option<tokio::task::JoinHandle<()>>,
+    carddav_handle: Option<tokio::task::JoinHandle<()>>,
     pop3_handle: Option<tokio::task::JoinHandle<()>>,
     pop3s_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
@@ -73,6 +75,7 @@ struct BridgeState {
     bound_imap_port: u16,
     bound_smtp_port: u16,
     bound_jmap_port: u16,
+    bound_carddav_port: u16,
     bound_imaps_port: u16,
     bound_smtps_port: u16,
     bound_pop3_port: u16,
@@ -114,6 +117,7 @@ struct BridgeStatusResponse {
     smtp_running: bool,
     jmap_running: bool,
     pop3_running: bool,
+    carddav_running: bool,
     email: String,
     display_name: Option<String>,
     profile_picture: Option<String>,
@@ -167,6 +171,10 @@ struct ConnectionInfoResponse {
     jmap_https_enabled: bool,
     pop3_port: u16,
     pop3s_port: u16,
+    carddav_port: u16,
+    carddav_url: String,
+    carddav_enabled: bool,
+    carddav_https_enabled: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -206,6 +214,10 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
     let smtp_running = guard.smtp_handle.as_ref().map_or(false, |h| !h.is_finished());
     let jmap_running = guard.jmap_handle.as_ref().map_or(false, |h| !h.is_finished());
     let pop3_running = guard.pop3_handle.as_ref().map_or(false, |h| !h.is_finished());
+    let carddav_running = guard
+        .carddav_handle
+        .as_ref()
+        .map_or(false, |h| !h.is_finished());
 
     Ok(BridgeStatusResponse {
         connected,
@@ -213,6 +225,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         smtp_running,
         jmap_running,
         pop3_running,
+        carddav_running,
         email,
         display_name: guard.display_name.clone(),
         profile_picture: guard.profile_picture.clone(),
@@ -258,12 +271,16 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
     let imap_port = port_picker::pick_available_port(host, guard.config.imap_port)?;
     let smtp_port = port_picker::pick_available_port(host, guard.config.smtp_port)?;
     let jmap_port = port_picker::pick_available_port(host, guard.config.jmap_port)?;
+    let carddav_port = port_picker::pick_available_port(host, guard.config.carddav_port)?;
     let imap_addr = format!("{}:{}", host, imap_port);
     let smtp_addr = format!("{}:{}", host, smtp_port);
     let jmap_addr = format!("{}:{}", host, jmap_port);
+    let carddav_addr = format!("{}:{}", host, carddav_port);
     let jmap_enabled = guard.config.jmap_enabled;
+    let carddav_enabled = guard.config.carddav_enabled;
     let tls_enabled = guard.config.tls_enabled;
     let jmap_https_enabled = guard.config.jmap_https_enabled && tls_enabled;
+    let carddav_https_enabled = guard.config.carddav_https_enabled && tls_enabled;
     let poll_interval_secs = guard.config.poll_interval_secs;
 
     let mut config_dirty = false;
@@ -279,12 +296,17 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
         guard.config.jmap_port = jmap_port;
         config_dirty = true;
     }
+    if carddav_port != guard.config.carddav_port {
+        guard.config.carddav_port = carddav_port;
+        config_dirty = true;
+    }
     if config_dirty {
         let _ = config::save_config(&guard.config);
     }
     guard.bound_imap_port = imap_port;
     guard.bound_smtp_port = smtp_port;
     guard.bound_jmap_port = jmap_port;
+    guard.bound_carddav_port = carddav_port;
 
     let tls_cfg_opt: Option<Arc<rustls::ServerConfig>> = if tls_enabled {
         guard.tls_server_config.clone()
@@ -387,6 +409,27 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
             .await
             {
                 tracing::error!("JMAP server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    let carddav_handle = if carddav_enabled {
+        let dav_session = session.clone();
+        let dav_client = client.clone();
+        let dav_passwords = passwords.clone();
+        let dav_tls = if carddav_https_enabled {
+            tls_cfg_opt.clone()
+        } else {
+            None
+        };
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                dav::server::run(&carddav_addr, dav_session, dav_client, dav_passwords, dav_tls)
+                    .await
+            {
+                tracing::error!("CardDAV server error: {}", e);
             }
         }))
     } else {
@@ -515,6 +558,7 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
     guard.smtp_handle = Some(smtp_handle);
     guard.smtps_handle = smtps_handle;
     guard.jmap_handle = jmap_handle;
+    guard.carddav_handle = carddav_handle;
     guard.pop3_handle = pop3_handle;
     guard.pop3s_handle = pop3s_handle;
     guard.sync_handle = Some(sync_handle);
@@ -556,6 +600,10 @@ async fn stop_bridge(state: State<'_, AppState>) -> Result<(), String> {
     }
 
     if let Some(handle) = guard.jmap_handle.take() {
+        handle.abort();
+    }
+
+    if let Some(handle) = guard.carddav_handle.take() {
         handle.abort();
     }
 
@@ -610,6 +658,9 @@ async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> R
         handle.abort();
     }
     if let Some(handle) = guard.jmap_handle.take() {
+        handle.abort();
+    }
+    if let Some(handle) = guard.carddav_handle.take() {
         handle.abort();
     }
     if let Some(handle) = guard.pop3_handle.take() {
@@ -851,7 +902,7 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
             let token_for_profile = access_token.clone();
             let token_for_plan = access_token.clone();
 
-            let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+            let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys) =
                 match crypto::vault::decrypt_vault(
                     &login_resp.encrypted_vault,
                     &login_resp.vault_nonce,
@@ -859,13 +910,14 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 ) {
                     Ok(v) => (
                         Some(v.identity_key.clone()),
+                        v.data_kek.clone().map(zeroize::Zeroizing::new),
                         v.ratchet_identity_public.clone(),
                         crypto::ratchet::build_receiver_key_sets(&v),
                         crypto::inbound::build_inbound_key_candidates(&v),
                     ),
                     Err(e) => {
                         tracing::warn!("vault decrypt failed at setup: {}", e);
-                        (None, None, Vec::new(), Vec::new())
+                        (None, None, None, Vec::new(), Vec::new())
                     }
                 };
 
@@ -885,6 +937,7 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 access_token,
                 vault_passphrase: passphrase,
                 identity_key,
+                data_kek,
                 ratchet_identity_public,
                 ratchet_keys,
                 inbound_keys,
@@ -1087,10 +1140,15 @@ async fn get_connection_info(
     let imap_port = if guard.running { guard.bound_imap_port } else { guard.config.imap_port };
     let smtp_port = if guard.running { guard.bound_smtp_port } else { guard.config.smtp_port };
     let jmap_port = if guard.running { guard.bound_jmap_port } else { guard.config.jmap_port };
+    let carddav_port = if guard.running && guard.bound_carddav_port != 0 {
+        guard.bound_carddav_port
+    } else { guard.config.carddav_port };
 
     let tls_enabled = guard.config.tls_enabled && guard.tls_server_config.is_some();
     let jmap_https_enabled = guard.config.jmap_https_enabled && tls_enabled;
     let jmap_scheme = if jmap_https_enabled { "https" } else { "http" };
+    let carddav_https_enabled = guard.config.carddav_https_enabled && tls_enabled;
+    let carddav_scheme = if carddav_https_enabled { "https" } else { "http" };
     let pop3_port = if guard.running && guard.bound_pop3_port != 0 {
         guard.bound_pop3_port
     } else { guard.config.pop3_port };
@@ -1116,6 +1174,10 @@ async fn get_connection_info(
         jmap_https_enabled,
         pop3_port,
         pop3s_port,
+        carddav_port,
+        carddav_url: format!("{}://127.0.0.1:{}/", carddav_scheme, carddav_port),
+        carddav_enabled: guard.config.carddav_enabled,
+        carddav_https_enabled,
     })
 }
 
@@ -1226,6 +1288,9 @@ struct ProvisionBundle {
     jmap_port: u16,
     jmap_url: String,
     jmap_enabled: bool,
+    carddav_port: u16,
+    carddav_url: String,
+    carddav_enabled: bool,
 }
 
 #[tauri::command]
@@ -1252,6 +1317,9 @@ async fn provision_bundle(
     let imap_port = if guard.running { guard.bound_imap_port } else { guard.config.imap_port };
     let smtp_port = if guard.running { guard.bound_smtp_port } else { guard.config.smtp_port };
     let jmap_port = if guard.running { guard.bound_jmap_port } else { guard.config.jmap_port };
+    let carddav_port = if guard.running && guard.bound_carddav_port != 0 {
+        guard.bound_carddav_port
+    } else { guard.config.carddav_port };
 
     Ok(ProvisionBundle {
         email,
@@ -1273,6 +1341,17 @@ async fn provision_bundle(
             jmap_port
         ),
         jmap_enabled: guard.config.jmap_enabled,
+        carddav_port,
+        carddav_url: format!(
+            "{}://127.0.0.1:{}/",
+            if guard.config.carddav_https_enabled && guard.config.tls_enabled && guard.tls_server_config.is_some() {
+                "https"
+            } else {
+                "http"
+            },
+            carddav_port
+        ),
+        carddav_enabled: guard.config.carddav_enabled,
     })
 }
 
@@ -1609,6 +1688,7 @@ fn main() {
     let imap_port_initial = cfg.imap_port;
     let smtp_port_initial = cfg.smtp_port;
     let jmap_port_initial = cfg.jmap_port;
+    let carddav_port_initial = cfg.carddav_port;
     let bridge_state = Arc::new(AsyncMutex::new(BridgeState {
         config: cfg,
         session: None,
@@ -1621,6 +1701,7 @@ fn main() {
         smtp_handle: None,
         smtps_handle: None,
         jmap_handle: None,
+        carddav_handle: None,
         pop3_handle: None,
         pop3s_handle: None,
         sync_handle: None,
@@ -1631,6 +1712,7 @@ fn main() {
         bound_imap_port: imap_port_initial,
         bound_smtp_port: smtp_port_initial,
         bound_jmap_port: jmap_port_initial,
+        bound_carddav_port: carddav_port_initial,
         bound_imaps_port: 0,
         bound_smtps_port: 0,
         bound_pop3_port: 0,
@@ -1886,15 +1968,20 @@ fn main() {
                             let imap_addr = format!("{}:{}", host, imap_port);
                             let smtp_addr = format!("{}:{}", host, smtp_port);
                             let jmap_addr = format!("{}:{}", host, jmap_port);
+                            let carddav_port = port_picker::pick_available_port(host, guard.config.carddav_port).unwrap_or(0);
+                            let carddav_addr = format!("{}:{}", host, carddav_port);
                             let mut config_dirty = false;
                             if imap_port != guard.config.imap_port { guard.config.imap_port = imap_port; config_dirty = true; }
                             if smtp_port != guard.config.smtp_port { guard.config.smtp_port = smtp_port; config_dirty = true; }
                             if jmap_port != guard.config.jmap_port { guard.config.jmap_port = jmap_port; config_dirty = true; }
+                            if carddav_port != 0 && carddav_port != guard.config.carddav_port { guard.config.carddav_port = carddav_port; config_dirty = true; }
                             if config_dirty { let _ = config::save_config(&guard.config); }
                             guard.bound_imap_port = imap_port;
                             guard.bound_smtp_port = smtp_port;
                             guard.bound_jmap_port = jmap_port;
+                            guard.bound_carddav_port = carddav_port;
                             let jmap_enabled = guard.config.jmap_enabled;
+                            let carddav_enabled = guard.config.carddav_enabled && carddav_port != 0;
                             let poll_interval_secs_inner = guard.config.poll_interval_secs;
                             let db = guard.db.clone();
                             let client = guard.client.clone();
@@ -1903,6 +1990,7 @@ fn main() {
 
                             let tls_enabled = guard.config.tls_enabled;
                             let jmap_https_enabled = guard.config.jmap_https_enabled && tls_enabled;
+                            let carddav_https_enabled = guard.config.carddav_https_enabled && tls_enabled;
                             let tls_cfg_opt: Option<Arc<rustls::ServerConfig>> = if tls_enabled {
                                 guard.tls_server_config.clone()
                             } else {
@@ -2010,6 +2098,28 @@ fn main() {
                                     .await
                                     {
                                         tracing::error!("JMAP server error: {}", e);
+                                    }
+                                }))
+                            } else {
+                                None
+                            };
+
+                            let carddav_handle = if carddav_enabled {
+                                let dav_session = session_arc.clone();
+                                let dav_client = client.clone();
+                                let dav_passwords = passwords.clone();
+                                let dav_tls = if carddav_https_enabled { tls_cfg_opt.clone() } else { None };
+                                Some(tokio::spawn(async move {
+                                    if let Err(e) = dav::server::run(
+                                        &carddav_addr,
+                                        dav_session,
+                                        dav_client,
+                                        dav_passwords,
+                                        dav_tls,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!("CardDAV server error: {}", e);
                                     }
                                 }))
                             } else {
@@ -2133,6 +2243,7 @@ fn main() {
                             guard.smtp_handle = Some(smtp_handle);
                             guard.smtps_handle = smtps_handle;
                             guard.jmap_handle = jmap_handle;
+                            guard.carddav_handle = carddav_handle;
                             guard.pop3_handle = pop3_handle;
                             guard.pop3s_handle = pop3s_handle;
                             guard.sync_handle = Some(sync_handle);
@@ -2171,6 +2282,7 @@ fn main() {
                                 if let Some(h) = guard.smtp_handle.take() { h.abort(); }
                                 if let Some(h) = guard.smtps_handle.take() { h.abort(); }
                                 if let Some(h) = guard.jmap_handle.take() { h.abort(); }
+                                if let Some(h) = guard.carddav_handle.take() { h.abort(); }
                                 if let Some(h) = guard.pop3_handle.take() { h.abort(); }
                                 if let Some(h) = guard.pop3s_handle.take() { h.abort(); }
                                 if let Some(h) = guard.sync_handle.take() { h.abort(); }

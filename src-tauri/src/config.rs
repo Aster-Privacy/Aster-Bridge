@@ -45,6 +45,12 @@ pub struct BridgeConfig {
     pub pop3_port: u16,
     #[serde(default = "default_pop3s_port")]
     pub pop3s_port: u16,
+    #[serde(default = "default_carddav_port")]
+    pub carddav_port: u16,
+    #[serde(default = "default_carddav_enabled")]
+    pub carddav_enabled: bool,
+    #[serde(default = "default_carddav_https_enabled")]
+    pub carddav_https_enabled: bool,
     pub poll_interval_secs: u64,
     #[serde(skip)]
     pub data_dir: PathBuf,
@@ -82,6 +88,18 @@ fn default_pop3s_port() -> u16 {
     1995
 }
 
+fn default_carddav_port() -> u16 {
+    1081
+}
+
+fn default_carddav_enabled() -> bool {
+    true
+}
+
+fn default_carddav_https_enabled() -> bool {
+    true
+}
+
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +115,9 @@ impl Default for BridgeConfig {
             jmap_https_enabled: default_jmap_https_enabled(),
             pop3_port: default_pop3_port(),
             pop3s_port: default_pop3s_port(),
+            carddav_port: default_carddav_port(),
+            carddav_enabled: default_carddav_enabled(),
+            carddav_https_enabled: default_carddav_https_enabled(),
             poll_interval_secs: 30,
             data_dir: PathBuf::new(),
         }
@@ -163,6 +184,7 @@ pub(crate) fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
         ("jmap_port", c.jmap_port),
         ("pop3_port", c.pop3_port),
         ("pop3s_port", c.pop3s_port),
+        ("carddav_port", c.carddav_port),
     ] {
         if port < 1024 {
             return Err(format!("{} must be >= 1024 (got {})", name, port));
@@ -170,7 +192,7 @@ pub(crate) fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
     }
     let mut ports = [
         c.imap_port, c.imap_implicit_tls_port, c.smtp_port, c.smtp_implicit_tls_port,
-        c.jmap_port, c.pop3_port, c.pop3s_port,
+        c.jmap_port, c.pop3_port, c.pop3s_port, c.carddav_port,
     ];
     ports.sort();
     for i in 0..ports.len() - 1 {

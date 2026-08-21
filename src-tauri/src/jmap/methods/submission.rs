@@ -225,6 +225,7 @@ mod tests {
         db.seed_jmap_mailboxes().unwrap();
         let account = Uuid::new_v4();
         let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
             user_id: account,
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),

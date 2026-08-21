@@ -36,6 +36,10 @@ async fn err_body(resp: reqwest::Response) -> String {
     format!("{}: {}", status, truncated)
 }
 
+fn urlencoding_path(segment: &str) -> String {
+    percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -53,6 +57,62 @@ async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     }
     let truncated: String = body.chars().take(ERR_BODY_MAX).collect();
     BridgeError::Api(format!("{}: {}", status, truncated))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContactRecord {
+    pub id: String,
+    pub contact_token: String,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    #[serde(default)]
+    pub integrity_hash: Option<String>,
+    #[serde(default)]
+    pub data_version: Option<u32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContactListResponse {
+    pub items: Vec<ContactRecord>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateContactRequest {
+    pub contact_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_search_token: Option<String>,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub integrity_hash: String,
+    pub data_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateContactResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateContactRequest {
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub integrity_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_search_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_search_token: Option<String>,
 }
 
 pub struct ApiClient {
@@ -1132,6 +1192,114 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn list_contacts(
+        &self,
+        access_token: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<ContactListResponse> {
+        let mut request = self
+            .client
+            .get(format!("{}/contacts/v1/", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[("limit", limit.to_string())]);
+
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+
+        let resp = request.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_contact(&self, access_token: &str, contact_id: &str) -> Result<ContactRecord> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn create_contact(
+        &self,
+        access_token: &str,
+        body: &CreateContactRequest,
+    ) -> Result<CreateContactResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/contacts/v1/", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn update_contact(
+        &self,
+        access_token: &str,
+        contact_id: &str,
+        body: &UpdateContactRequest,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_contact(&self, access_token: &str, contact_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/contacts/v1/{}",
+                self.base_url,
+                urlencoding_path(contact_id)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
     }
 }
 

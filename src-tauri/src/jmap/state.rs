@@ -98,6 +98,7 @@ mod tests {
     fn ctx_with_account(account: Uuid, email: &str) -> (Arc<JmapContext>, tempfile::TempDir) {
         let (db, dir) = test_db();
         let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
             user_id: account,
             username: "tester".to_string(),
             email: email.to_string(),

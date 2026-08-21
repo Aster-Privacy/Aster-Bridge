@@ -251,6 +251,7 @@ mod e2e_tests {
         let _id = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
 
         let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
             user_id: Uuid::new_v4(),
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),
@@ -419,6 +420,7 @@ mod e2e_tests {
         let passwords = Arc::new(AppPasswords::new(db.clone()));
         let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
         let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
             user_id: Uuid::new_v4(),
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),

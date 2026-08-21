@@ -115,6 +115,7 @@ async fn start_mock_backend() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
 
 fn stub_session() -> Arc<RwLock<Session>> {
     Arc::new(RwLock::new(Session {
+        data_kek: None,
         user_id: Uuid::new_v4(),
         username: "tester".to_string(),
         email: EMAIL.to_string(),
@@ -1018,6 +1019,7 @@ async fn decrypt_real_internal() {
             }
         };
     let session = crate::auth::session::Session {
+        data_kek: None,
         user_id: login_resp.user_id,
         username: login_resp.username,
         email: login_resp.email,

@@ -66,6 +66,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     smtp_running: boolean;
     jmap_running: boolean;
     pop3_running: boolean;
+    carddav_running: boolean;
     display_name: string | null;
     profile_picture: string | null;
     profile_color: string | null;
@@ -87,7 +88,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
   return {
     enrolled: status.connected,
     email: status.email || null,
-    running: status.imap_running || status.smtp_running || (status.jmap_running ?? false) || (status.pop3_running ?? false),
+    running: status.imap_running || status.smtp_running || (status.jmap_running ?? false) || (status.pop3_running ?? false) || (status.carddav_running ?? false),
     passwords,
     display_name: status.display_name,
     profile_picture: status.profile_picture,
@@ -179,6 +180,10 @@ export interface ConnectionInfo {
   jmap_https_enabled: boolean;
   pop3_port: number;
   pop3s_port: number;
+  carddav_port: number;
+  carddav_url: string;
+  carddav_enabled: boolean;
+  carddav_https_enabled: boolean;
 }
 
 export async function get_connection_info(): Promise<ConnectionInfo> {
@@ -248,6 +253,9 @@ export interface ProvisionBundle {
   jmap_port: number;
   jmap_url: string;
   jmap_enabled: boolean;
+  carddav_port: number;
+  carddav_url: string;
+  carddav_enabled: boolean;
 }
 
 export async function provision_bundle(label: string): Promise<ProvisionBundle> {

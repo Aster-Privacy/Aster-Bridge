@@ -70,6 +70,7 @@ pub struct Session {
     pub access_token: Zeroizing<String>,
     pub vault_passphrase: Vec<u8>,
     pub identity_key: Option<String>,
+    pub data_kek: Option<Zeroizing<String>>,
     pub ratchet_identity_public: Option<String>,
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
@@ -213,6 +214,7 @@ pub async fn build_send_identities(
 
 pub struct VaultKeyMaterial {
     pub identity_key: String,
+    pub data_kek: Option<Zeroizing<String>>,
     pub ratchet_identity_public: Option<String>,
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
@@ -226,6 +228,7 @@ pub fn decrypt_vault_key_material(
     let v = crate::crypto::vault::decrypt_vault(encrypted_vault, vault_nonce, passphrase)?;
     Ok(VaultKeyMaterial {
         identity_key: v.identity_key.clone(),
+        data_kek: v.data_kek.clone().map(Zeroizing::new),
         ratchet_identity_public: v.ratchet_identity_public.clone(),
         ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
@@ -253,6 +256,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
         keys.zeroize();
     }
     session.identity_key = Some(material.identity_key);
+    session.data_kek = material.data_kek;
     session.ratchet_identity_public = material.ratchet_identity_public;
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
@@ -287,7 +291,7 @@ pub async fn restore_or_login(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
-    let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+    let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys) =
         match decrypt_vault_key_material(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
@@ -295,6 +299,7 @@ pub async fn restore_or_login(
         ) {
             Ok(m) => (
                 Some(m.identity_key),
+                m.data_kek,
                 m.ratchet_identity_public,
                 m.ratchet_keys,
                 m.inbound_keys,
@@ -304,7 +309,7 @@ pub async fn restore_or_login(
                     "vault decrypt failed during restore: {}; encrypted mail cannot be decrypted until you sign in again",
                     e
                 );
-                (None, None, Vec::new(), Vec::new())
+                (None, None, None, Vec::new(), Vec::new())
             }
         };
 
@@ -324,6 +329,7 @@ pub async fn restore_or_login(
         access_token,
         vault_passphrase: passphrase,
         identity_key,
+        data_kek,
         ratchet_identity_public,
         ratchet_keys,
         inbound_keys,
@@ -444,7 +450,7 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
-                let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
+                let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys) =
                     match decrypt_vault_key_material(
                         &login_resp.encrypted_vault,
                         &login_resp.vault_nonce,
@@ -452,6 +458,7 @@ pub async fn first_time_setup(
                     ) {
                         Ok(m) => (
                             Some(m.identity_key),
+                            m.data_kek,
                             m.ratchet_identity_public,
                             m.ratchet_keys,
                             m.inbound_keys,
@@ -461,7 +468,7 @@ pub async fn first_time_setup(
                                 "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
                                 e
                             );
-                            (None, None, Vec::new(), Vec::new())
+                            (None, None, None, Vec::new(), Vec::new())
                         }
                     };
 
@@ -481,6 +488,7 @@ pub async fn first_time_setup(
                     access_token,
                     vault_passphrase: passphrase,
                     identity_key,
+                    data_kek,
                     ratchet_identity_public,
                     ratchet_keys,
                     inbound_keys,
@@ -501,6 +509,7 @@ mod tests {
 
     fn sample_session() -> Session {
         Session {
+            data_kek: None,
             user_id: Uuid::new_v4(),
             username: "alice".to_string(),
             email: "alice@astermail.org".to_string(),
@@ -533,6 +542,7 @@ mod tests {
     #[test]
     fn dropping_session_without_identity_key_does_not_panic() {
         let s = Session {
+            data_kek: None,
             user_id: Uuid::new_v4(),
             username: "bob".to_string(),
             email: "bob@astermail.org".to_string(),

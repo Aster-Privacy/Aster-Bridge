@@ -723,6 +723,7 @@ mod tests {
         let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
         let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
         let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
             user_id: uuid::Uuid::new_v4(),
             username: "tester".to_string(),
             email: "tester@aster.test".to_string(),

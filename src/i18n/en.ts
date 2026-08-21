@@ -75,6 +75,11 @@ const en = {
   field_authentication: "Authentication",
   field_http_basic: "HTTP Basic",
   jmap_hint: "Point a JMAP-capable client (ltt.rs, jmap-jam, Thunderbird JMAP) at the Session URL above.",
+  section_carddav: "CardDAV Server",
+  section_carddav_disabled: "CardDAV Server (disabled)",
+  field_carddav_protocol: "CardDAV (RFC 6352)",
+  field_carddav_url: "Account URL",
+  carddav_hint: "To sync your contacts, add the account URL above as a CardDAV account in your contacts app. Your contacts are decrypted on this device only.",
   section_pop3: "POP3 Server",
   field_none: "None",
 
