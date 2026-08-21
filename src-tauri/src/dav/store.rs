@@ -378,7 +378,7 @@ mod tests {
             collection_ctag(&[second.clone(), first.clone()])
         );
         assert_ne!(
-            collection_ctag(&[first.clone()]),
+            collection_ctag(std::slice::from_ref(&first)),
             collection_ctag(&[first, second])
         );
     }

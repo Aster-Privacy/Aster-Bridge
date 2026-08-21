@@ -1226,8 +1226,8 @@ mod e2e_tests {
         assert_eq!(rows.lock().unwrap().len(), 1);
 
         let stored = rows.lock().unwrap().values().next().unwrap().clone();
-        assert!(stored["encrypted_data"].as_str().unwrap().len() > 0);
-        let blob = format!("{}", stored);
+        assert!(!stored["encrypted_data"].as_str().unwrap().is_empty());
+        let blob = stored.to_string();
         assert!(!blob.contains("Lovelace"));
         assert!(!blob.contains("ada@example.com"));
 

@@ -2,15 +2,15 @@
 
 # Aster Bridge
 
-Aster Bridge is a free, open-source local mail relay for Aster Mail. It lets any standard desktop email client connect to your Aster account over IMAP, SMTP, and JMAP.
+Aster Bridge is a free, open-source local mail relay for Aster Mail. It lets any standard desktop email client connect to your Aster account over IMAP, SMTP, and JMAP, and lets any contacts app sync your address book over CardDAV.
 
-Your mail stays end-to-end encrypted on Aster's servers. The bridge decrypts it locally on your machine so your client can read it, and re-encrypts what you send before it leaves your device. We have no way to read your mail and we never will.
+Your mail and contacts stay end-to-end encrypted on Aster's servers. The bridge decrypts them locally on your machine so your client can read them, and re-encrypts what you send before it leaves your device. We have no way to read your mail and we never will.
 
 You can sign up at [astermail.org](https://astermail.org). Aster Bridge requires a Star plan or higher.
 
 ## How it works
 
-The bridge runs silently in the background and exposes local IMAP, SMTP, and JMAP servers on 127.0.0.1. Your mail client connects to these local ports using an app password you generate inside the bridge. All encryption and decryption happens locally, and no plaintext travels over the network.
+The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. All encryption and decryption happens locally, and no plaintext travels over the network.
 
 | Protocol | Default port |
 |---|---|
@@ -18,6 +18,9 @@ The bridge runs silently in the background and exposes local IMAP, SMTP, and JMA
 | IMAP (implicit TLS) | 1993 |
 | SMTP (STARTTLS) | 1025 |
 | JMAP | 1080 |
+| CardDAV | 1081 |
+| POP3 | 1110 |
+| POP3 (implicit TLS) | 1995 |
 
 Ports shift automatically if something else is using them. The bridge UI always shows the actual ports in use.
 
@@ -28,8 +31,11 @@ Ports shift automatically if something else is using them. The bridge UI always 
 3. Enter the code at [app.astermail.org/link-device](https://app.astermail.org/link-device) to link your account
 4. Go to the **App Passwords** tab and generate a password for your mail client
 5. Add an IMAP/SMTP account in your client pointing at `127.0.0.1` with the ports and app password shown in the bridge
+6. To sync contacts, add a CardDAV account in your contacts app using the account URL shown on the **CardDAV Server** card, with the same username and app password
 
-TLS is on by default using a self-signed certificate generated on your machine. Your client warns the first time you connect; accept the certificate to continue. The bridge shows the certificate path and SHA-256 fingerprint on the TLS screen so you can verify it.
+CardDAV works with any client that speaks RFC 6352, including Contacts on macOS and iOS, DAVx5 on Android, and Thunderbird. Your contacts are decrypted on your device only, and the bridge serves them over the loopback interface, so they never travel over the network.
+
+TLS is on by default using a self-signed certificate generated on your machine. Your mail client or contacts app warns the first time you connect; accept the certificate to continue. The bridge shows the certificate path and SHA-256 fingerprint on the TLS screen so you can verify it.
 
 ## Documentation
 

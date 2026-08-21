@@ -74,6 +74,92 @@ async fn free_port() -> u16 {
     p
 }
 
+fn mock_contacts_routes() -> axum::Router {
+    use axum::extract::Path;
+    use axum::http::StatusCode;
+    use axum::{Json, Router};
+    use std::collections::HashMap;
+
+    let rows: Arc<Mutex<HashMap<String, serde_json::Value>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (list, create, update, remove) = (rows.clone(), rows.clone(), rows.clone(), rows.clone());
+
+    Router::new()
+        .route(
+            "/contacts/v1/",
+            axum::routing::get(move || {
+                let rows = list.clone();
+                async move {
+                    let items: Vec<serde_json::Value> =
+                        rows.lock().await.values().cloned().collect();
+                    Json(serde_json::json!({
+                        "items": items,
+                        "next_cursor": serde_json::Value::Null,
+                        "has_more": false,
+                    }))
+                }
+            })
+            .post(move |Json(body): Json<serde_json::Value>| {
+                let rows = create.clone();
+                async move {
+                    let id = Uuid::new_v4().to_string();
+                    let mut record = body;
+                    let object = record.as_object_mut().unwrap();
+                    object.insert("id".to_string(), serde_json::Value::from(id.clone()));
+                    object.insert(
+                        "created_at".to_string(),
+                        serde_json::Value::from("2026-01-01T00:00:00Z"),
+                    );
+                    object.insert(
+                        "updated_at".to_string(),
+                        serde_json::Value::from("2026-01-01T00:00:00Z"),
+                    );
+                    rows.lock().await.insert(id.clone(), record);
+                    Json(serde_json::json!({ "id": id }))
+                }
+            }),
+        )
+        .route(
+            "/contacts/v1/:id",
+            axum::routing::put(
+                move |Path(id): Path<String>, Json(body): Json<serde_json::Value>| {
+                    let rows = update.clone();
+                    async move {
+                        let mut guard = rows.lock().await;
+                        match guard.get_mut(&id) {
+                            Some(existing) => {
+                                let target = existing.as_object_mut().unwrap();
+                                for (key, value) in body.as_object().unwrap() {
+                                    target.insert(key.clone(), value.clone());
+                                }
+                                StatusCode::OK
+                            }
+                            None => StatusCode::NOT_FOUND,
+                        }
+                    }
+                },
+            )
+            .delete(move |Path(id): Path<String>| {
+                let rows = remove.clone();
+                async move {
+                    match rows.lock().await.remove(&id) {
+                        Some(_) => StatusCode::OK,
+                        None => StatusCode::NOT_FOUND,
+                    }
+                }
+            }),
+        )
+}
+
+async fn stub_session_with_kek() -> Arc<RwLock<Session>> {
+    use base64::Engine as _;
+    let session = stub_session();
+    session.write().await.data_kek = Some(zeroize::Zeroizing::new(
+        base64::engine::general_purpose::STANDARD.encode([3u8; 32]),
+    ));
+    session
+}
+
 async fn wait_listening(port: u16) {
     for _ in 0..80 {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -104,7 +190,8 @@ async fn start_mock_backend() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         .route(
             "/bridge/v1/messages/:id/metadata",
             axum::routing::patch(|| async { Json(serde_json::json!({"success": true})) }),
-        );
+        )
+        .merge(mock_contacts_routes());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -617,8 +704,9 @@ async fn protocol_feature_matrix() {
 //
 //   cargo test --bin aster-bridge-desktop serve_local -- --ignored --nocapture
 //
-// Listens for ~150s on IMAP 11430, SMTP 11250, JMAP 11080. Login user is the
-// account email; password is the app password printed below.
+// Listens for ~150s on IMAP 11430, SMTP 11250, JMAP 11080, CardDAV 11081. Login
+// user is the account email; password is the app password printed below. Point a
+// real contacts app at the CardDAV URL to check client behavior on any OS.
 #[tokio::test]
 #[ignore]
 async fn serve_local() {
@@ -638,6 +726,7 @@ async fn serve_local() {
     let imap_port: u16 = 11430;
     let smtp_port: u16 = 11250;
     let jmap_port: u16 = 11080;
+    let carddav_port: u16 = 11081;
 
     {
         let (s, d, c, p, b) = (stub_session(), db.clone(), client.clone(), passwords.clone(), broadcaster.clone());
@@ -661,14 +750,28 @@ async fn serve_local() {
         });
     }
 
+    {
+        let (s, c, p) = (
+            stub_session_with_kek().await,
+            client.clone(),
+            passwords.clone(),
+        );
+        let addr = format!("127.0.0.1:{}", carddav_port);
+        tokio::spawn(async move {
+            let _ = crate::dav::server::run(&addr, s, c, p, None).await;
+        });
+    }
+
     wait_listening(imap_port).await;
     wait_listening(smtp_port).await;
     wait_listening(jmap_port).await;
+    wait_listening(carddav_port).await;
 
     println!("\n================ ASTER BRIDGE LOCAL SERVER (no TLS) ================");
     println!("  IMAP : 127.0.0.1:{}", imap_port);
     println!("  SMTP : 127.0.0.1:{}", smtp_port);
     println!("  JMAP : http://127.0.0.1:{}/jmap/session", jmap_port);
+    println!("  DAV  : http://127.0.0.1:{}/", carddav_port);
     println!("  user : {}", EMAIL);
     println!("  pass : {}", APP_PW);
     println!("  inbox: 2 seeded messages");

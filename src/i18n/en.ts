@@ -89,7 +89,7 @@ const en = {
   tls_cert_sha256: "Certificate SHA-256",
   tls_cert_path: "Certificate path",
   tls_jmap_scheme: "JMAP scheme",
-  tls_hint: "Trust this certificate in your mail client, or pin via the SHA-256 fingerprint.",
+  tls_hint: "Trust this certificate in your mail client or contacts app, or pin it using the SHA-256 fingerprint.",
 
   passwords_title: "App Passwords",
   passwords_subtitle: "Create a separate password for each mail app you connect, like Thunderbird, Outlook, or Apple Mail, so you can revoke any one of them without touching the rest.",

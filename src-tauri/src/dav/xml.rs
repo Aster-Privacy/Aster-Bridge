@@ -112,9 +112,9 @@ impl<'a> Walker<'a> {
                 self.stack.pop();
                 Ok(Node::Close(local_name(e.name().as_ref())))
             }
-            Ok(Event::Text(e)) => match e.unescape() {
+            Ok(Event::Text(e)) => match e.xml10_content() {
                 Ok(text) => Ok(Node::Text(text.to_string())),
-                Err(_) => Err("unresolvable entity reference".to_string()),
+                Err(_) => Err("text could not be decoded".to_string()),
             },
             Ok(Event::CData(_)) => Ok(Node::Text(String::new())),
             Ok(Event::Eof) => Ok(Node::End),
@@ -129,7 +129,38 @@ impl<'a> Walker<'a> {
     }
 }
 
+fn is_predefined_entity(name: &str) -> bool {
+    if matches!(name, "amp" | "lt" | "gt" | "quot" | "apos") {
+        return true;
+    }
+    if let Some(digits) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some(digits) = name.strip_prefix('#') {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+fn reject_unknown_entities(body: &str) -> Result<(), String> {
+    let mut index = 0;
+    while let Some(offset) = body[index..].find('&') {
+        let start = index + offset + 1;
+        let end = match body[start..].find(';') {
+            Some(found) => start + found,
+            None => return Err("unterminated entity reference".to_string()),
+        };
+        if !is_predefined_entity(&body[start..end]) {
+            return Err("unresolvable entity reference".to_string());
+        }
+        index = end + 1;
+    }
+    Ok(())
+}
+
 fn collect(body: &str) -> Result<(PropRequest, Vec<String>, Option<String>), String> {
+    reject_unknown_entities(body)?;
+
     let mut props = PropRequest::default();
     let mut hrefs = Vec::new();
     let mut root: Option<String> = None;
@@ -148,10 +179,11 @@ fn collect(body: &str) -> Result<(PropRequest, Vec<String>, Option<String>), Str
                     "propname" => props.propname = true,
                     "href" => current_href.clear(),
                     _ => {
-                        if walker.in_element("prop") && name != "prop" {
-                            if !props.names.contains(&name) {
-                                props.names.push(name);
-                            }
+                        if walker.in_element("prop")
+                            && name != "prop"
+                            && !props.names.contains(&name)
+                        {
+                            props.names.push(name);
                         }
                     }
                 }
@@ -302,6 +334,20 @@ mod tests {
     #[test]
     fn rejects_malformed_xml() {
         assert!(parse_propfind("<propfind><prop></propfind>").is_err());
+    }
+
+    #[test]
+    fn accepts_predefined_and_numeric_character_references() {
+        let body = r#"<D:propfind xmlns:D="DAV:"><D:prop><D:displayname>&amp;&lt;&gt;&quot;&apos;&#65;&#x42;</D:displayname></D:prop></D:propfind>"#;
+
+        assert!(parse_propfind(body).unwrap().wants("displayname"));
+    }
+
+    #[test]
+    fn rejects_an_unterminated_entity_reference() {
+        let body = r#"<D:propfind xmlns:D="DAV:"><D:prop><D:displayname>a &amp b</D:displayname></D:prop></D:propfind>"#;
+
+        assert!(parse_propfind(body).is_err());
     }
 
     #[test]
