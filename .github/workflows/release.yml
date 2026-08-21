@@ -181,6 +181,10 @@ jobs:
 
   update_latest_json:
     needs: build
+    # Runs even when a leg fails: the legs that DID succeed have already published
+    # their own partial latest.json, so skipping here would leave that partial file
+    # standing as the manifest. Running always means the guard below still fires.
+    if: always()
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -198,6 +202,11 @@ jobs:
           TAG="v${V}"
           TMP=$(mktemp -d)
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::no release $TAG to build a manifest for; the build legs did not publish"
+            exit 1
+          fi
 
           gh release download "$TAG" --pattern latest.json --dir "$TMP" --clobber
           gh release download "$TAG" --pattern '*.sig' --dir "$TMP" --clobber || true
