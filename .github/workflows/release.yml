@@ -184,7 +184,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Rewrite latest.json with canonical asset URLs
+      - name: Rebuild latest.json from every leg's signatures
+        # Each build leg's tauri-action uploads its own latest.json with --clobber,
+        # so the last leg to finish wins and the others' platforms vanish. v0.4.21
+        # shipped with only linux-aarch64 and Windows installs never saw the update.
+        # Rebuild the manifest from the signatures actually on the release instead
+        # of patching whichever partial file survived.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -193,52 +198,70 @@ jobs:
           TAG="v${V}"
           TMP=$(mktemp -d)
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
           gh release download "$TAG" --pattern latest.json --dir "$TMP" --clobber
-          sed -i \
-            -e "s|Aster\.Bridge_${V}_amd64\.AppImage|Aster-Bridge-x86_64.AppImage|g" \
-            -e "s|Aster\.Bridge_${V}_aarch64\.AppImage|Aster-Bridge-aarch64.AppImage|g" \
-            -e "s|Aster\.Bridge_${V}_x64-setup\.exe|Aster-Bridge-x64-setup.exe|g" \
-            -e "s|Aster\.Bridge_${V}_universal\.app\.tar\.gz|Aster-Bridge-universal.app.tar.gz|g" \
-            "$TMP/latest.json"
+          gh release download "$TAG" --pattern '*.sig' --dir "$TMP" --clobber || true
 
-          for f in Aster-Bridge-x86_64.AppImage.sig Aster-Bridge-aarch64.AppImage.sig; do
-            gh release download "$TAG" --pattern "$f" --dir "$TMP" --clobber 2>/dev/null || true
-          done
-
-          SIGDIR="$TMP" BASE="$BASE" node -e '
+          SIGDIR="$TMP" BASE="$BASE" V="$V" node -e '
             const fs = require("fs");
             const path = process.argv[1];
-            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
-            manifest.platforms = manifest.platforms || {};
+            const dir = process.env.SIGDIR;
+            const base = process.env.BASE;
+            const v = process.env.V;
+            const prior = JSON.parse(fs.readFileSync(path, "utf8"));
+
             const legs = {
-              "linux-x86_64": "Aster-Bridge-x86_64.AppImage",
-              "linux-aarch64": "Aster-Bridge-aarch64.AppImage",
+              "windows-x86_64":         ["Aster-Bridge-x64-setup.exe", `Aster.Bridge_${v}_x64-setup.exe`],
+              "windows-x86_64-nsis":    ["Aster-Bridge-x64-setup.exe", `Aster.Bridge_${v}_x64-setup.exe`],
+              "windows-x86_64-msi":     [`Aster.Bridge_${v}_x64_en-US.msi`],
+              "linux-x86_64":           ["Aster-Bridge-x86_64.AppImage", `Aster.Bridge_${v}_amd64.AppImage`],
+              "linux-x86_64-appimage":  ["Aster-Bridge-x86_64.AppImage", `Aster.Bridge_${v}_amd64.AppImage`],
+              "linux-x86_64-deb":       [`Aster.Bridge_${v}_amd64.deb`],
+              "linux-x86_64-rpm":       [`Aster.Bridge-${v}-1.x86_64.rpm`],
+              "linux-aarch64":          ["Aster-Bridge-aarch64.AppImage", `Aster.Bridge_${v}_aarch64.AppImage`],
+              "linux-aarch64-appimage": ["Aster-Bridge-aarch64.AppImage", `Aster.Bridge_${v}_aarch64.AppImage`],
+              "linux-aarch64-deb":      [`Aster.Bridge_${v}_arm64.deb`],
+              "linux-aarch64-rpm":      [`Aster.Bridge-${v}-1.aarch64.rpm`],
+              "darwin-aarch64":         ["Aster-Bridge-universal.app.tar.gz", `Aster.Bridge_${v}_universal.app.tar.gz`],
+              "darwin-x86_64":          ["Aster-Bridge-universal.app.tar.gz", `Aster.Bridge_${v}_universal.app.tar.gz`],
             };
-            for (const [key, file] of Object.entries(legs)) {
-              const sig = `${process.env.SIGDIR}/${file}.sig`;
-              if (!fs.existsSync(sig)) {
-                console.log(`::warning::${file}.sig absent; leaving ${key} untouched`);
+
+            const manifest = {
+              version: prior.version || v,
+              notes: prior.notes || "",
+              pub_date: prior.pub_date || new Date().toISOString(),
+              platforms: {},
+            };
+
+            for (const [key, candidates] of Object.entries(legs)) {
+              const hit = candidates.find((f) => fs.existsSync(`${dir}/${f}.sig`));
+              if (!hit) {
+                console.log(`::warning::no signature for ${key} on this release; installs on that platform will not self-update`);
                 continue;
               }
               manifest.platforms[key] = {
-                signature: fs.readFileSync(sig, "utf8").trim(),
-                url: `${process.env.BASE}/${file}`,
+                signature: fs.readFileSync(`${dir}/${hit}.sig`, "utf8").trim(),
+                url: `${base}/${hit}`,
               };
             }
-            fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
-          ' "$TMP/latest.json"
 
-          node -e '
-            const manifest = require(process.argv[1]);
-            const platforms = Object.keys(manifest.platforms || {});
+            const platforms = Object.keys(manifest.platforms);
             console.log("latest.json platforms:", platforms.join(", "));
-            if (!platforms.includes("linux-x86_64")) {
-              console.log("::error::latest.json is missing linux-x86_64");
+
+            const required = ["windows-x86_64", "linux-x86_64"];
+            const missing = required.filter((k) => !platforms.includes(k));
+            if (missing.length) {
+              console.log(`::error::latest.json is missing ${missing.join(", ")} - those installs would never self-update`);
               process.exit(1);
             }
             if (!platforms.includes("linux-aarch64")) {
               console.log("::warning::latest.json is missing linux-aarch64; ARM installs will not self-update");
             }
+            if (!platforms.includes("darwin-aarch64")) {
+              console.log("::warning::no macOS build on this release; Mac installs stay on their current version");
+            }
+
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
           ' "$TMP/latest.json"
 
           gh release upload "$TAG" "$TMP/latest.json" --clobber
