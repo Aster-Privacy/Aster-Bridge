@@ -569,8 +569,9 @@ pub async fn serve(
     broadcaster: broadcast::Sender<StateChange>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
+    let mut acceptor = crate::accept::ResilientAcceptor::new("IMAP");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("IMAP rejected non-loopback peer {}", peer);
             drop(stream);
@@ -620,8 +621,9 @@ pub async fn run_implicit_tls(
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
+    let mut conn_acceptor = crate::accept::ResilientAcceptor::new("IMAPS");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("IMAPS rejected non-loopback peer {}", peer);
             drop(stream);
@@ -3705,6 +3707,94 @@ mod tests {
         let _ = read_until_tag(&mut reader, "a2").await;
 
         (reader, writer)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_append_keeps_talking_so_the_client_does_not_time_out() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", backend.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match backend.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[11u8; 32]).unwrap());
+        let _ = db.seed_jmap_mailboxes();
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: b"pass".to_vec(),
+            identity_key: Some("identity-key-for-append".to_string()),
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (state_tx, _state_rx) = broadcast::channel(16);
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, session, db_clone, client, passwords, state_tx, None).await;
+        });
+        for _ in 0..80 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let literal = b"From: a@b.test\r\nSubject: import\r\n\r\nbody\r\n";
+        writer
+            .write_all(format!("z1 APPEND INBOX {{{}}}\r\n", literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected a continuation, got {:?}", cont);
+        writer.write_all(literal).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut heard = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < deadline && heard.len() < 2 {
+            let mut line = String::new();
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    if line.contains("still working") || line.contains("APPEND in progress") {
+                        heard.push(line);
+                    } else if line.starts_with("z1 ") {
+                        heard.push(format!("TAGGED {}", line));
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        drop(dir);
+        assert!(
+            heard.len() >= 2,
+            "a stalled APPEND told the client nothing for four seconds, so a mail client waiting on a sixty second timer would give up on the import: heard {:?}",
+            heard
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

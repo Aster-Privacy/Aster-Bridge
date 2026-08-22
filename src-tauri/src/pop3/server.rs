@@ -82,8 +82,9 @@ pub async fn serve_with_tls(
     passwords: Arc<AppPasswords>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
+    let mut acceptor = crate::accept::ResilientAcceptor::new("POP3");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("POP3 rejected non-loopback peer {}", peer);
             drop(stream);
@@ -125,8 +126,9 @@ pub async fn run_implicit_tls(
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
+    let mut conn_acceptor = crate::accept::ResilientAcceptor::new("POP3S");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("POP3S rejected non-loopback peer {}", peer);
             drop(stream);

@@ -20,6 +20,7 @@
 //
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accept;
 mod api_client;
 mod auth;
 mod config;
@@ -314,10 +315,22 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
         None
     };
     let imaps_port = if tls_cfg_opt.is_some() {
-        port_picker::pick_available_port(host, guard.config.imap_implicit_tls_port).unwrap_or(0)
+        match port_picker::pick_startup_port(host, guard.config.imap_implicit_tls_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("IMAPS listener disabled: {}", e);
+                0
+            }
+        }
     } else { 0 };
     let smtps_port = if tls_cfg_opt.is_some() {
-        port_picker::pick_available_port(host, guard.config.smtp_implicit_tls_port).unwrap_or(0)
+        match port_picker::pick_startup_port(host, guard.config.smtp_implicit_tls_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("SMTPS listener disabled: {}", e);
+                0
+            }
+        }
     } else { 0 };
     guard.bound_imaps_port = imaps_port;
     guard.bound_smtps_port = smtps_port;
@@ -2002,10 +2015,22 @@ fn main() {
                                 None
                             };
                             let imaps_port = if tls_cfg_opt.is_some() {
-                                port_picker::pick_available_port(host, guard.config.imap_implicit_tls_port).unwrap_or(0)
+                                match port_picker::pick_startup_port(host, guard.config.imap_implicit_tls_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("IMAPS listener disabled: {}", e);
+                0
+            }
+        }
                             } else { 0 };
                             let smtps_port = if tls_cfg_opt.is_some() {
-                                port_picker::pick_available_port(host, guard.config.smtp_implicit_tls_port).unwrap_or(0)
+                                match port_picker::pick_startup_port(host, guard.config.smtp_implicit_tls_port) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("SMTPS listener disabled: {}", e);
+                0
+            }
+        }
                             } else { 0 };
                             guard.bound_imaps_port = imaps_port;
                             guard.bound_smtps_port = smtps_port;

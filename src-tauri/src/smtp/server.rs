@@ -144,8 +144,9 @@ pub async fn run(
     let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("SMTP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
 
+    let mut acceptor = crate::accept::ResilientAcceptor::new("SMTP");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("SMTP rejected non-loopback peer {}", peer);
             drop(stream);
@@ -189,8 +190,9 @@ pub async fn run_implicit_tls(
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
+    let mut conn_acceptor = crate::accept::ResilientAcceptor::new("SMTPS");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
             tracing::warn!("SMTPS rejected non-loopback peer {}", peer);
             drop(stream);
