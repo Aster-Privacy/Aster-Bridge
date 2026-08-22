@@ -274,6 +274,20 @@ fn restrict_db_file_permissions(db_path: &Path) {
     }
 }
 
+pub fn without_starving_the_runtime<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -563,8 +577,10 @@ impl Database {
     where
         F: FnOnce(&Connection) -> Result<R, rusqlite::Error>,
     {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        f(&conn).map_err(|e| e.to_string())
+        without_starving_the_runtime(|| {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            f(&conn).map_err(|e| e.to_string())
+        })
     }
 
     pub fn upsert_cached_message(
