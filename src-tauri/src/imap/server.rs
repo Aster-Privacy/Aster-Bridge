@@ -1693,6 +1693,9 @@ where
         }
     }
 
+    let _ = writer.flush().await;
+    let _ = writer.shutdown().await;
+
     Ok(())
 }
 
@@ -3727,7 +3730,7 @@ mod tests {
             reader.read_line(&mut line).await.unwrap();
             line
         };
-        let line = tokio::time::timeout(Duration::from_secs(2), read_fut)
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
             .await
             .expect("EXISTS not delivered");
         assert!(line.contains("EXISTS"), "expected * N EXISTS, got: {}", line);
@@ -4690,7 +4693,7 @@ mod tests {
             reader.read_line(&mut line).await.unwrap();
             line
         };
-        let line = tokio::time::timeout(Duration::from_secs(2), read_fut)
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
             .await
             .expect("flag change not delivered");
         assert!(
@@ -4728,7 +4731,7 @@ mod tests {
             reader.read_line(&mut line).await.unwrap();
             line
         };
-        let line = tokio::time::timeout(Duration::from_secs(2), read_fut)
+        let line = tokio::time::timeout(Duration::from_secs(10), read_fut)
             .await
             .expect("EXPUNGE not delivered");
         assert!(

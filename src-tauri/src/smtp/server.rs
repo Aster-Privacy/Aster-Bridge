@@ -636,6 +636,9 @@ where
         }
     }
 
+    let _ = writer.flush().await;
+    let _ = writer.shutdown().await;
+
     Ok(())
 }
 

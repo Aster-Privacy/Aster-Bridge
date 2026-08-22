@@ -480,6 +480,9 @@ where
         }
     }
 
+    let _ = writer.flush().await;
+    let _ = writer.shutdown().await;
+
     Ok(())
 }
 
@@ -694,6 +697,62 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    #[tokio::test]
+    async fn a_quit_reply_reaches_a_client_whose_writes_are_buffered() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let buffered = tokio::io::join(server_read, tokio::io::BufWriter::new(server_write));
+        let handle = tokio::spawn(run_session(buffered, session, db, client, passwords, None));
+
+        let (client_read, mut client_write) = tokio::io::split(client_side);
+        let mut reader = BufReader::new(client_read);
+        let mut line = String::new();
+
+        client_write.write_all(b"QUIT
+").await.unwrap();
+        client_write.flush().await.unwrap();
+
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"), "greeting was {:?}", line);
+
+        line.clear();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("the server never answered QUIT")
+        .unwrap();
+        assert!(
+            read > 0 && line.starts_with("+OK"),
+            "a client behind a buffering transport got {:?} instead of a goodbye, so it sees an unexplained disconnect",
+            line
+        );
+
+        let _ = handle.await;
+        drop(dir);
     }
 
     #[tokio::test]
