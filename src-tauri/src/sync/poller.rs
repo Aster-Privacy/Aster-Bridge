@@ -34,6 +34,7 @@ use crate::jmap::state::StateChange;
 
 const POLL_INTERVAL_SECS: u64 = 30;
 const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
+const TRIGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct SyncTrigger {
     pub done: oneshot::Sender<Result<(), String>>,
@@ -1181,6 +1182,8 @@ pub async fn run_poll_loop(
     let mut last_tick = tokio::time::Instant::now();
     let mut sync_count: u32 = 0;
     let mut last_deep_at: Option<tokio::time::Instant> = None;
+    let mut last_triggered_at: Option<tokio::time::Instant> = None;
+    let mut last_triggered_result: Result<(), String> = Ok(());
     let deep_due = |last: &Option<tokio::time::Instant>| {
         last.map_or(true, |t| {
             t.elapsed() >= std::time::Duration::from_secs(DEEP_SYNC_INTERVAL_SECS)
@@ -1220,6 +1223,20 @@ pub async fn run_poll_loop(
             }
             maybe_trigger = trigger_rx.recv() => {
                 let Some(trigger) = maybe_trigger else { return; };
+                let mut waiting = vec![trigger.done];
+                while let Ok(queued) = trigger_rx.try_recv() {
+                    waiting.push(queued.done);
+                }
+                let cooling = last_triggered_at
+                    .map_or(false, |at| at.elapsed() < TRIGGER_COOLDOWN);
+                if cooling {
+                    let replay = last_triggered_result.clone();
+                    for done in waiting {
+                        let _ = done.send(replay.clone());
+                    }
+                    continue;
+                }
+                last_triggered_at = Some(tokio::time::Instant::now());
                 last_tick = tokio::time::Instant::now();
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
@@ -1230,12 +1247,17 @@ pub async fn run_poll_loop(
                     if e.contains("plan_upgrade_required") {
                         tracing::warn!("sync: plan_upgrade_required from server - stopping poll loop");
                         emit_bridge_access_revoked();
-                        let _ = trigger.done.send(Err(e.clone()));
+                        for done in waiting {
+                            let _ = done.send(Err(e.clone()));
+                        }
                         return;
                     }
                 }
+                last_triggered_result = result.clone();
                 interval.reset();
-                let _ = trigger.done.send(result);
+                for done in waiting {
+                    let _ = done.send(result.clone());
+                }
             }
         }
     }
@@ -2444,4 +2466,54 @@ mod tests {
             .unwrap();
         assert!(body.contains("1 attachment."));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_storm_of_sync_triggers_cannot_hammer_the_backend() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let (dir, db) = temp_db();
+        let session = mock_session();
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let (tx, rx) = sync_trigger_channel();
+        let loop_handle = tokio::spawn(run_poll_loop(
+            session,
+            client,
+            Arc::new(db),
+            None,
+            rx,
+            Some(3600),
+        ));
+
+        let storm_started = tokio::time::Instant::now();
+        while storm_started.elapsed() < std::time::Duration::from_secs(2) {
+            let (done, _rx) = oneshot::channel();
+            let _ = tx.try_send(SyncTrigger { done });
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let seen = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        loop_handle.abort();
+        drop(dir);
+
+        assert!(
+            seen < 40,
+            "a two second trigger storm produced {} backend connections, which is the runaway that pins the processor when the network is down",
+            seen
+        );
+    }
+
 }

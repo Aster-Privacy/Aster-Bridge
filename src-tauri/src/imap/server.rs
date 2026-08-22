@@ -685,7 +685,11 @@ async fn run_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (read_half, mut writer) = tokio::io::split(stream);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut writer = crate::imap::heartbeat::HeartbeatWriter::new(
+        write_half,
+        crate::imap::heartbeat::heartbeat_interval(),
+    );
     let mut reader = BufReader::new(read_half);
     let _ = client;
     let starttls_capable = tls_config.is_some();
@@ -708,6 +712,7 @@ where
     let mut failed_auth: u32 = 0;
 
     loop {
+        writer.disarm();
         writer.flush().await?;
         line.clear();
         let n = match read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH).await {
@@ -741,6 +746,7 @@ where
         } else {
             tracing::debug!("IMAP <- {}", trimmed);
         }
+        writer.arm();
         let args = if parts.len() > 2 {
             parts[2].to_string()
         } else {
@@ -776,7 +782,8 @@ where
                 let upgraded_client = client.clone();
                 let upgraded_passwords = passwords.clone();
                 let upgraded_broadcaster = broadcaster.clone();
-                let rejoined = tokio::io::join(reader.into_inner(), writer);
+                let reclaimed = writer.reclaim().await?;
+                let rejoined = tokio::io::join(reader.into_inner(), reclaimed);
                 let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
                 let tls_stream = acceptor
                     .accept(rejoined)
@@ -2286,7 +2293,13 @@ async fn handle_copy_move(
         return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
 
-    let messages = db.list_cached_messages(&source_folder).unwrap_or_default();
+    let messages = {
+        let db = Arc::clone(db);
+        let folder = source_folder.clone();
+        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
     let mut selected: Vec<(usize, CachedMessage)> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let seq = (i + 1) as u32;
@@ -2304,7 +2317,12 @@ async fn handle_copy_move(
     }
 
     let token = session.read().await.access_token.to_string();
-    let validity = uid_validity(db);
+    let validity = {
+        let db = Arc::clone(db);
+        tokio::task::spawn_blocking(move || uid_validity(&db))
+            .await
+            .unwrap_or(1)
+    };
     let mut src_uids: Vec<u32> = Vec::new();
     let mut tgt_uids: Vec<u32> = Vec::new();
     let mut moved_seqs: Vec<usize> = Vec::new();
@@ -2331,22 +2349,38 @@ async fn handle_copy_move(
             }
         }
     }
-    for (seq, m) in &selected {
-        let _ = db.upsert_cached_message(
-            &m.aster_id,
-            target_internal,
-            m.subject.as_deref(),
-            m.sender.as_deref(),
-            m.recipients.as_deref(),
-            m.date.as_deref(),
-            m.size,
-            m.body_text.as_deref(),
-            m.raw_headers.as_deref(),
-        );
-        let _ = db.remove_uid_mapping(m.imap_uid as i64, &source_folder);
-        src_uids.push(m.imap_uid);
-        tgt_uids.push(db.assign_uid_if_missing(target_internal, &m.aster_id).unwrap_or(0));
-        moved_seqs.push(*seq);
+    {
+        let db = Arc::clone(db);
+        let folder = source_folder.clone();
+        let entries = selected.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let mut src: Vec<u32> = Vec::new();
+            let mut tgt: Vec<u32> = Vec::new();
+            let mut seqs: Vec<usize> = Vec::new();
+            for (seq, m) in &entries {
+                let _ = db.upsert_cached_message(
+                    &m.aster_id,
+                    target_internal,
+                    m.subject.as_deref(),
+                    m.sender.as_deref(),
+                    m.recipients.as_deref(),
+                    m.date.as_deref(),
+                    m.size,
+                    m.body_text.as_deref(),
+                    m.raw_headers.as_deref(),
+                );
+                let _ = db.remove_uid_mapping(m.imap_uid as i64, &folder);
+                src.push(m.imap_uid);
+                tgt.push(db.assign_uid_if_missing(target_internal, &m.aster_id).unwrap_or(0));
+                seqs.push(*seq);
+            }
+            (src, tgt, seqs)
+        })
+        .await
+        .unwrap_or_default();
+        src_uids = recorded.0;
+        tgt_uids = recorded.1;
+        moved_seqs = recorded.2;
     }
     let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
     let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
@@ -3014,6 +3048,7 @@ mod tests {
         rate_limit_first_store: bool,
         bulk_metadata: bool,
         gateway_blip_job_create: bool,
+        slow_metadata_ms: u64,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -3023,6 +3058,7 @@ mod tests {
             rate_limit_first_store,
             bulk_metadata,
             gateway_blip_job_create,
+            slow_metadata_ms,
         } = opts;
         let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3064,6 +3100,9 @@ mod tests {
                 patch(move |Json(body): Json<serde_json::Value>| {
                     let calls = c7.clone();
                     async move {
+                        if slow_metadata_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
+                        }
                         let count = body
                             .get("items")
                             .and_then(|v| v.as_array())
@@ -3087,6 +3126,9 @@ mod tests {
                 patch(move |AxumPath(id): AxumPath<String>| {
                     let calls = c2.clone();
                     async move {
+                        if slow_metadata_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
+                        }
                         calls.lock().await.push(("PATCH".to_string(), id.clone()));
                         if id.starts_with("draft-") {
                             (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
@@ -3558,6 +3600,82 @@ mod tests {
         assert!(ok_line.starts_with("a1 OK"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_move_never_leaves_the_client_without_a_response() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                slow_metadata_ms: 900,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        seed(&db, "msg-move-1", "inbox", "moving");
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        writer
+            .write_all(b"a3 UID MOVE 1 Archive\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let mut heartbeats = 0usize;
+        let mut widest_gap = Duration::from_millis(0);
+        let mut last = tokio::time::Instant::now();
+        loop {
+            let mut line = String::new();
+            let read = tokio::time::timeout(Duration::from_secs(20), reader.read_line(&mut line))
+                .await
+                .expect("the connection went silent for 20 seconds during a slow MOVE")
+                .unwrap();
+            assert!(read > 0, "the server closed the connection during MOVE");
+            let now = tokio::time::Instant::now();
+            let gap = now.duration_since(last);
+            if gap > widest_gap {
+                widest_gap = gap;
+            }
+            last = now;
+            if line.starts_with("* OK still working") {
+                heartbeats += 1;
+                continue;
+            }
+            if line.starts_with("a3 ") {
+                assert!(line.contains("OK"), "MOVE failed: {}", line);
+                break;
+            }
+        }
+
+        assert!(
+            heartbeats > 0,
+            "a MOVE that took most of a second produced no keepalive at all"
+        );
+        assert!(
+            widest_gap < Duration::from_secs(5),
+            "the client waited {:?} with no bytes, which is how a mail client decides the server stopped answering",
+            widest_gap
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_connection_between_commands_is_not_flooded_with_keepalives() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut _writer) = login_and_select(addr).await;
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let idle = tokio::time::timeout(Duration::from_millis(300), async {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            line
+        })
+        .await;
+        assert!(
+            idle.is_err(),
+            "an idle connection sent unsolicited traffic: {:?}",
+            idle
+        );
+    }
+
     async fn login_and_select(
         addr: std::net::SocketAddr,
     ) -> (
@@ -3769,7 +3887,7 @@ mod tests {
         assert_eq!(result, Some("stored"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn keepalive_keeps_writing_while_the_append_blocks_its_thread() {
         let mut out: Vec<u8> = Vec::new();
         let result = run_with_keepalive_every(
