@@ -48,6 +48,7 @@ enum PumpMessage {
 pub struct HeartbeatWriter<W> {
     tx: Option<mpsc::UnboundedSender<PumpMessage>>,
     armed: Arc<AtomicBool>,
+    command_active: Arc<AtomicBool>,
     pending_flush: Option<oneshot::Receiver<std::io::Result<()>>>,
     pump: Option<tokio::task::JoinHandle<W>>,
 }
@@ -63,12 +64,14 @@ where
         Self {
             tx: Some(tx),
             armed,
+            command_active: Arc::new(AtomicBool::new(false)),
             pending_flush: None,
             pump: Some(pump),
         }
     }
 
     pub fn arm(&self) {
+        self.command_active.store(true, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
         if let Some(tx) = self.tx.as_ref() {
             let _ = tx.send(PumpMessage::Wake);
@@ -76,6 +79,7 @@ where
     }
 
     pub fn disarm(&self) {
+        self.command_active.store(false, Ordering::SeqCst);
         self.armed.store(false, Ordering::SeqCst);
     }
 
@@ -137,7 +141,12 @@ where
             Poll::Ready(result) => {
                 this.pending_flush = None;
                 match result {
-                    Ok(inner) => Poll::Ready(inner),
+                    Ok(inner) => {
+                        if inner.is_ok() && this.command_active.load(Ordering::SeqCst) {
+                            this.armed.store(true, Ordering::SeqCst);
+                        }
+                        Poll::Ready(inner)
+                    }
                     Err(_) => Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "the connection is closed",
@@ -369,6 +378,76 @@ mod tests {
         assert!(
             Duration::from_secs(PRODUCTION_INTERVAL_SECS) * 3 < Duration::from_secs(60),
             "a client that gives up after 60 seconds must see at least three keepalives first"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_append_keeps_the_client_informed_after_the_continuation_is_sent() {
+        let recorder = Recorder::default();
+        let mut writer = HeartbeatWriter::new(recorder.clone(), Duration::from_millis(50));
+        writer.arm();
+        writer
+            .write_all(b"+ Ready for literal data\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let seen = written(&recorder);
+        let beats = seen.matches("still working").count();
+        assert!(
+            beats >= 3,
+            "the connection went silent after the continuation, which is what makes a mail client abandon a mailbox import: {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_still_reaches_the_client_while_every_worker_is_blocked_on_the_database() {
+        let workers = 2;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        let recorder = Recorder::default();
+        let observed = recorder.clone();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+
+        rt.spawn({
+            let recorder = recorder.clone();
+            async move {
+                let mut writer = HeartbeatWriter::new(recorder, Duration::from_millis(50));
+                writer.arm();
+                writer
+                    .write_all(b"+ Ready for literal data\r\n")
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        std::thread::sleep(Duration::from_millis(120));
+
+        for _ in 0..workers {
+            let held = Arc::clone(&gate);
+            rt.spawn(async move {
+                crate::db::without_starving_the_runtime(|| {
+                    let _guard = held.lock().unwrap();
+                    std::thread::sleep(Duration::from_secs(3));
+                });
+            });
+        }
+
+        std::thread::sleep(Duration::from_millis(1500));
+        let seen = written(&observed);
+        let beats = seen.matches("still working").count();
+        drop(rt);
+        assert!(
+            beats >= 2,
+            "the connection went silent for over a second while the database held every worker, which is exactly what makes a mail client report that the server stopped responding: {:?}",
+            seen
         );
     }
 }
