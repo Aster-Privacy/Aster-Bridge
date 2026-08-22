@@ -9,12 +9,15 @@ const MAX_PROBE_STEPS: u16 = 20;
 
 const OCCUPANT_CONNECT_TIMEOUT_MS: u64 = 500;
 const OCCUPANT_READ_TIMEOUT_MS: u64 = 1000;
+const OCCUPANT_RECHECKS: u32 = 3;
+const OCCUPANT_RECHECK_DELAY_MS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Occupant {
     Free,
     AsterBridge,
-    Unknown,
+    Unidentified,
+    Unreachable,
 }
 
 pub fn probe_occupant(host: &str, port: u16) -> Occupant {
@@ -22,7 +25,7 @@ pub fn probe_occupant(host: &str, port: u16) -> Occupant {
 
     let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
         Ok(a) => a,
-        Err(_) => return Occupant::Unknown,
+        Err(_) => return Occupant::Unreachable,
     };
     if let Ok(listener) = std::net::TcpListener::bind(addr) {
         drop(listener);
@@ -33,7 +36,7 @@ pub fn probe_occupant(host: &str, port: u16) -> Occupant {
         std::time::Duration::from_millis(OCCUPANT_CONNECT_TIMEOUT_MS),
     ) {
         Ok(s) => s,
-        Err(_) => return Occupant::Unknown,
+        Err(_) => return Occupant::Unreachable,
     };
     if stream
         .set_read_timeout(Some(std::time::Duration::from_millis(
@@ -41,7 +44,7 @@ pub fn probe_occupant(host: &str, port: u16) -> Occupant {
         )))
         .is_err()
     {
-        return Occupant::Unknown;
+        return Occupant::Unidentified;
     }
     let mut buf = [0u8; 256];
     match stream.read(&mut buf) {
@@ -49,25 +52,54 @@ pub fn probe_occupant(host: &str, port: u16) -> Occupant {
             if String::from_utf8_lossy(&buf[..n]).contains("Aster Bridge") {
                 Occupant::AsterBridge
             } else {
-                Occupant::Unknown
+                Occupant::Unidentified
             }
         }
-        _ => Occupant::Unknown,
+        _ => Occupant::Unidentified,
+    }
+}
+
+fn pick_startup_port_for(preferred: u16, occupant: Occupant) -> Result<u16, String> {
+    match occupant {
+        Occupant::AsterBridge => {
+            tracing::error!(
+                "port {} is already served by another Aster Bridge; refusing to move to a different port",
+                preferred
+            );
+            Err(format!(
+                "Port {} is already in use by another copy of Aster Bridge. Quit the other copy, then start Aster Bridge again.",
+                preferred
+            ))
+        }
+        _ => {
+            tracing::error!(
+                "port {} is held by a program that did not identify itself; refusing to move to a different port",
+                preferred
+            );
+            Err(format!(
+                "Port {} is already in use by another program. Quit that program, or choose a different port in Settings, then start Aster Bridge again.",
+                preferred
+            ))
+        }
     }
 }
 
 pub fn pick_startup_port(host: &str, preferred: u16) -> Result<u16, String> {
-    if probe_occupant(host, preferred) == Occupant::AsterBridge {
-        tracing::error!(
-            "port {} is already served by another Aster Bridge; refusing to move to a different port",
-            preferred
-        );
-        return Err(format!(
-            "Port {} is already in use by another copy of Aster Bridge. Quit the other copy, then start Aster Bridge again.",
-            preferred
-        ));
+    match probe_occupant(host, preferred) {
+        Occupant::Free => pick_available_port(host, preferred),
+        Occupant::Unreachable => {
+            for _ in 0..OCCUPANT_RECHECKS {
+                std::thread::sleep(std::time::Duration::from_millis(OCCUPANT_RECHECK_DELAY_MS));
+                match probe_occupant(host, preferred) {
+                    Occupant::Free => return pick_available_port(host, preferred),
+                    Occupant::Unreachable => continue,
+                    other => return pick_startup_port_for(preferred, other),
+                }
+            }
+            pick_startup_port_for(preferred, Occupant::Unreachable)
+        }
+        other => pick_startup_port_for(preferred, other),
     }
-    pick_available_port(host, preferred)
 }
 
 pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
@@ -224,7 +256,7 @@ mod tests {
     #[test]
     fn a_foreign_listener_is_not_mistaken_for_aster_bridge() {
         let (port, handle) = serve_greeting("* OK Some Other Server ready\r\n");
-        assert_eq!(probe_occupant("127.0.0.1", port), Occupant::Unknown);
+        assert_eq!(probe_occupant("127.0.0.1", port), Occupant::Unidentified);
         handle.join().unwrap();
     }
 
@@ -243,14 +275,40 @@ mod tests {
     }
 
     #[test]
-    fn startup_still_moves_past_a_foreign_listener() {
+    fn startup_reports_a_foreign_listener_instead_of_stranding_configured_clients() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        if port >= u16::MAX - MAX_PROBE_STEPS {
-            return;
-        }
-        let picked = pick_startup_port("127.0.0.1", port).unwrap();
-        assert_ne!(picked, port);
+        let picked = pick_startup_port("127.0.0.1", port);
+        let message = picked.expect_err("moving to another port leaves every configured mail client refused");
+        assert!(
+            message.contains(&port.to_string()),
+            "the message must name the port the user has to free: {}",
+            message
+        );
         drop(listener);
+    }
+
+    #[test]
+    fn a_silent_program_holding_the_port_stops_startup_instead_of_moving_the_port() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert_eq!(probe_occupant("127.0.0.1", port), Occupant::Unidentified);
+        let picked = pick_startup_port("127.0.0.1", port);
+        assert!(
+            picked.is_err(),
+            "moving to {:?} would leave every configured mail client refused on port {}",
+            picked,
+            port
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_free_port_is_used_as_configured() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert_eq!(probe_occupant("127.0.0.1", port), Occupant::Free);
+        assert_eq!(pick_startup_port("127.0.0.1", port), Ok(port));
     }
 }
