@@ -37,6 +37,47 @@ CardDAV works with any client that speaks RFC 6352, including Contacts on macOS 
 
 TLS is on by default using a self-signed certificate generated on your machine. Your mail client or contacts app warns the first time you connect; accept the certificate to continue. The bridge shows the certificate path and SHA-256 fingerprint on the TLS screen so you can verify it.
 
+## Install on Linux
+
+Each release carries a `.deb`, an `.rpm`, and an AppImage. Install the package that matches your distribution, or make the AppImage executable with `chmod +x` and run it.
+
+Aster Bridge draws its window with WebKitGTK, which every package expects to find on the system. If the app starts but the window stays empty, install the WebKitGTK 4.1 runtime for your distribution:
+
+| Distribution | Package |
+|---|---|
+| Debian, Ubuntu | `libwebkit2gtk-4.1-0` |
+| Arch Linux | `webkit2gtk-4.1` |
+| Fedora | `webkit2gtk4.1` |
+| openSUSE | `libwebkit2gtk-4_1-0` |
+
+## Build from source
+
+Building the desktop app takes two steps, because the Rust binary embeds the web interface at compile time. Build the interface first, then the binary:
+
+```
+git clone https://github.com/Aster-Privacy/Aster-Bridge.git
+cd Aster-Bridge
+npm install
+npm run tauri:build
+```
+
+`npm run tauri:build` runs both steps and writes installers to `src-tauri/target/release/bundle/`. To produce only the binary, run `npm run build` first, then `cargo build --release` in `src-tauri/`. A bare `cargo build` or `cargo install` without a preceding `npm run build` stops with an error telling you which step is missing, so you never get a binary with nothing to display.
+
+To work on the app, run `npm run tauri:dev`. This build loads the interface from the Vite dev server on `http://localhost:5174` instead of from the binary, and it is the only build that expects a dev server to be running.
+
+Building on Linux also needs the WebKitGTK, GTK, and app indicator development packages. On Debian and Ubuntu:
+
+```
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
+```
+
+On Arch Linux:
+
+```
+sudo pacman -S webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg xdotool base-devel
+```
+
 ## Documentation
 
 Full setup guides, including per-client instructions, app passwords, ports and TLS, and troubleshooting, are at [astermail.org/bridge/docs](https://astermail.org/bridge/docs).

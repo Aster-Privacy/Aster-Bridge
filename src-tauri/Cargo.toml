@@ -24,6 +24,10 @@ edition = "2021"
 description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 license = "AGPL-3.0-or-later"
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
