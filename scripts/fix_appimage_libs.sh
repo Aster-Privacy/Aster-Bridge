@@ -30,6 +30,12 @@
 # never paints. The same applies to the other driver-adjacent libraries listed
 # below, all of which are on the AppImage project's excludelist.
 #
+# The bundler also leaves out a few libraries that the bundled ones still need.
+# WebKitGTK links the Flite speech engine, Flite links ALSA, and ALSA is on the same
+# excludelist, so the app fails to start on a system that has no ALSA runtime. Any
+# library named in BUNDLE_LIBS below is copied in from the build host when something
+# in the AppDir needs it and the bundler left it out.
+#
 # Usage: fix_appimage_libs.sh <path-to-appimage> [more...]
 
 set -euo pipefail
@@ -56,9 +62,33 @@ need() {
   }
 }
 
+BUNDLE_LIBS=(
+  "libasound.so.2"
+)
+
 need mksquashfs
 need unsquashfs
 need find
+need readelf
+
+# True when some binary or library inside the AppDir records $2 as a dependency.
+needed_by_appdir() {
+  local dir="$1" soname="$2" f
+  while IFS= read -r f; do
+    if readelf -d "$f" 2>/dev/null | grep -q "NEEDED.*\[$soname\]"; then
+      return 0
+    fi
+  done < <(find "$dir" -type f \( -name "*.so" -o -name "*.so.*" -o -perm -u+x \))
+  return 1
+}
+
+# Prints the path of $1 on the build host.
+host_library() {
+  local soname="$1" path
+  path="$(ldconfig -p 2>/dev/null | awk -v s="$soname" '$1 == s {print $NF; exit}')"
+  [[ -n "$path" && -e "$path" ]] || return 1
+  printf '%s\n' "$path"
+}
 
 fix_one() {
   local img
@@ -99,8 +129,24 @@ fix_one() {
     done < <(find "$appdir" -type f -name "$pattern")
   done
 
-  if [[ "$removed" -eq 0 ]]; then
-    echo "$(basename "$img"): no excluded libraries bundled, leaving it untouched"
+  local libdir added=0 soname source
+  libdir="$(dirname "$(find "$appdir" -type f -name "libwebkit2gtk-4.1.so.*" | head -n 1)")"
+  if [[ -d "$libdir" ]]; then
+    for soname in "${BUNDLE_LIBS[@]}"; do
+      [[ -e "$libdir/$soname" ]] && continue
+      needed_by_appdir "$appdir" "$soname" || continue
+      source="$(host_library "$soname")" || {
+        echo "ERROR: the AppDir needs $soname but the build host does not have it" >&2
+        exit 1
+      }
+      cp -L "$source" "$libdir/$soname"
+      echo "  bundling $soname from $source"
+      added=$((added + 1))
+    done
+  fi
+
+  if [[ "$removed" -eq 0 && "$added" -eq 0 ]]; then
+    echo "$(basename "$img"): nothing to change, leaving it untouched"
     return 0
   fi
 
@@ -137,9 +183,16 @@ fix_one() {
     echo "ERROR: the repacked $img has no runnable AppRun" >&2
     exit 1
   }
+  for soname in "${BUNDLE_LIBS[@]}"; do
+    if needed_by_appdir "$verify/squashfs-root" "$soname" &&
+      ! find "$verify/squashfs-root" -name "$soname" | grep -q .; then
+      echo "ERROR: $soname is needed but missing after repacking $img" >&2
+      exit 1
+    fi
+  done
 
   mv "$work/repacked.AppImage" "$img"
-  echo "$(basename "$img"): removed $removed bundled libraries and repacked"
+  echo "$(basename "$img"): removed $removed and added $added bundled libraries, then repacked"
 }
 
 [[ "$#" -ge 1 ]] || {
