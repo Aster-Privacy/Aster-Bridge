@@ -6,6 +6,7 @@ All notable changes to Aster Bridge are recorded here. Earlier history lives in 
 
 ### Fixed
 - The AppImage now opens on Arch Linux, Fedora, and other distributions that ship a recent version of Mesa. It stopped at a blank window and an `EGL_BAD_PARAMETER` error before, because it carried its own copy of a system graphics library that the graphics driver could no longer use.
+- The AppImage now starts on systems that do not have the ALSA sound library installed, instead of stopping with a missing library error.
 - Building Aster Bridge from source with `cargo build` or `cargo install` now produces an app that shows its own interface. It previously tried to load the interface from a development server and showed "Could not connect to localhost: Connection refused".
 - Building the app before you build the web interface now stops with a message telling you which step to run, instead of finishing and leaving you with an app that has nothing to display.
 
