@@ -45,7 +45,7 @@
         {
           "image-name": "mark.png",
           "name": "mark",
-          "glass": true,
+          "glass": false,
           "position": {
             "scale": 1.0,
             "translation-in-points": [
@@ -56,10 +56,15 @@
         }
       ],
       "shadow": {
-        "kind": "neutral",
-        "opacity": 0.5
+        "kind": "none",
+        "opacity": 0
       },
-      "specular": true
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "blur-material": null
     }
   ],
   "supported-platforms": {
