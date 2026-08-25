@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.27 - 2026-08-25
+
+### Changed
+- The app icon on Mac now sits on a white rounded tile, so it matches the other apps in the Dock.
+
 ## 0.4.26 - 2026-08-24
 
 ### Fixed
