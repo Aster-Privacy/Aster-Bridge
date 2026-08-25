@@ -131,7 +131,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: Aster Bridge __VERSION__
           releaseDraft: false
-          prerelease: false
+          prerelease: true
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
           tauriScript: npm run tauri
@@ -423,6 +423,8 @@ jobs:
           fi
 
           echo "All 6 bridge download assets present on $TAG."
+          gh release edit "$TAG" --repo "$REPO" --prerelease=false --latest
+          echo "Promoted $TAG to Latest."
 
   attest_provenance:
     needs: ensure_download_assets

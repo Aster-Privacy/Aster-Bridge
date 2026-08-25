@@ -48,6 +48,7 @@ import {
   type UpdateInfo,
 } from "./updater";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
+import { notify_native } from "@/notify";
 import {
   Button,
   UpgradeBtn,
@@ -459,7 +460,10 @@ function UpdateBanner() {
       try {
         const result = await check_for_update();
         if (cancelled || !result) return;
-        if (get_last_notified_version() !== result.version) set_info(result);
+        if (get_last_notified_version() !== result.version) {
+          set_info(result);
+          notify_native(i18next.t("notif_update_title"), i18next.t("update_available", { version: result.version }));
+        }
       } catch {
         // Offline or endpoint unreachable - retry on next interval.
       }
@@ -1948,6 +1952,14 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     if (!info) show_toast(t("toast_up_to_date"), "success");
   };
 
+  useEffect(() => {
+    const handler = (e: Event) => {
+      if ((e as CustomEvent<string>).detail === "check_updates") handle_check_updates();
+    };
+    window.addEventListener("aster_menu_action", handler);
+    return () => window.removeEventListener("aster_menu_action", handler);
+  });
+
   const handle_install_update = async () => {
     set_update_installing(true);
     try {
@@ -2397,8 +2409,17 @@ function DashboardView({
       else if (e.key === "2") { e.preventDefault(); set_active_tab("passwords"); }
       else if (e.key === "3") { e.preventDefault(); set_active_tab("settings"); }
     };
+    const menu_handler = (e: Event) => {
+      const action = (e as CustomEvent<string>).detail;
+      if (action === "status" || action === "passwords" || action === "settings") set_active_tab(action);
+      else if (action === "check_updates") set_active_tab("settings");
+    };
     window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    window.addEventListener("aster_menu_action", menu_handler);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      window.removeEventListener("aster_menu_action", menu_handler);
+    };
   }, []);
 
   return (
@@ -2647,6 +2668,27 @@ export function BridgeApp() {
       }
     }
   };
+
+  const toggle_ref = useRef(handle_toggle_bridge);
+  toggle_ref.current = handle_toggle_bridge;
+
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const unlisten = await listen<string>("menu_action", async (event) => {
+        const action = event.payload;
+        if (action === "toggle_bridge") { await toggle_ref.current(); return; }
+        if (action === "sync_now") {
+          try { await api.trigger_sync(); show_toast(i18next.t("toast_sync_started"), "success"); } catch { /* bridge not running */ }
+          return;
+        }
+        window.dispatchEvent(new CustomEvent("aster_menu_action", { detail: action }));
+      });
+      cleanup = () => { unlisten(); };
+    })();
+    return () => { if (cleanup) cleanup(); };
+  }, []);
 
   const handle_generate_password = async (label: string): Promise<string | null> => {
     try {

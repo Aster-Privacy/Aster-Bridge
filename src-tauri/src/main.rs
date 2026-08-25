@@ -31,6 +31,7 @@ mod db;
 mod diagnostics;
 #[cfg(target_os = "macos")]
 mod dock_icon;
+mod shell;
 mod error;
 mod imap;
 mod jmap;
@@ -45,11 +46,7 @@ mod tls;
 mod tls_pinning;
 
 use std::sync::Arc;
-use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, State, WindowEvent,
-};
+use tauri::{Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing_subscriber::EnvFilter;
@@ -241,7 +238,13 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
 }
 
 #[tauri::command]
-async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_bridge(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let result = start_bridge_inner(&state).await;
+    shell::refresh_tray(&app);
+    result
+}
+
+async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().await;
 
     if guard.running {
@@ -595,7 +598,13 @@ async fn start_bridge(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn stop_bridge(state: State<'_, AppState>) -> Result<(), String> {
+async fn stop_bridge(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let result = stop_bridge_inner(&state).await;
+    shell::refresh_tray(&app);
+    result
+}
+
+async fn stop_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().await;
 
     if let Some(handle) = guard.imap_handle.take() {
@@ -1753,12 +1762,10 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            shell::show_main_window(app);
         }))
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -1770,6 +1777,8 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState(bridge_state))
         .manage(TrayState(std::sync::Mutex::new(None)))
+        .manage(shell::TrayMenuState(std::sync::Mutex::new(None)))
+        .manage(shell::QuitState(std::sync::atomic::AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_bridge_status,
             start_bridge,
@@ -1814,15 +1823,9 @@ fn main() {
                     .unwrap_or(tauri::Theme::Light),
             );
 
-            let icon_bytes = include_bytes!("../icons/128x128.png");
-
-            let icon =
-                tauri::image::Image::from_bytes(icon_bytes).expect("failed to load tray icon");
-
             if service_mode {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
+                shell::hide_main_window(app.handle());
+                tracing::info!("running in service mode: tray disabled, window hidden");
             }
 
             #[cfg(windows)]
@@ -1849,75 +1852,16 @@ fn main() {
                 });
             }
 
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let handle = app.handle().clone();
-                app.deep_link().on_open_url(move |event| {
-                    for url in event.urls() {
-                        let url_str = url.to_string();
-                        if !url_str.starts_with("aster-mail://") {
-                            continue;
-                        }
-                        tracing::info!("deep-link received: {}", url_str);
-                        if let Some(window) = handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                        let _ = handle.emit("deep_link", url_str);
-                    }
-                });
-            }
-
-            if service_mode {
-                tracing::info!("running in service mode: tray disabled, window hidden");
-            } else {
-
-            let status = MenuItem::with_id(app, "status", "Aster Bridge", false, None::<&str>)?;
-            let sep1 = PredefinedMenuItem::separator(app)?;
-            let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
-            let sep2 = PredefinedMenuItem::separator(app)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit Aster Bridge", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&status, &sep1, &show, &sep2, &quit])?;
-
-            let tray = TrayIconBuilder::new()
-                .icon(icon)
-                .menu(&menu)
-                .tooltip("Aster Bridge")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                })
-                .build(app)?;
-
-            let tray_state: State<TrayState> = app.state();
-            if let Ok(mut tray_guard) = tray_state.0.lock() {
-                *tray_guard = Some(tray);
-            };
-
+            if !service_mode {
+                #[cfg(target_os = "macos")]
+                shell::install_app_menu(app)?;
+                app.on_menu_event(|app, event| shell::handle_menu_action(app, event.id.as_ref()));
+                let tray = shell::build_tray(app)?;
+                let tray_state: State<TrayState> = app.state();
+                if let Ok(mut tray_guard) = tray_state.0.lock() {
+                    *tray_guard = Some(tray);
+                }
+                shell::start_tray_refresh_loop(app.handle());
             }
 
             if has_device_id {
@@ -2342,7 +2286,7 @@ fn main() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                shell::hide_main_window(window.app_handle());
             }
             #[cfg(target_os = "macos")]
             if let WindowEvent::ThemeChanged(theme) = event {
@@ -2351,14 +2295,15 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("failed to start aster bridge desktop")
-        .run(|_app, _event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = _event {
-                if let Some(window) = _app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                if code.is_none() {
+                    api.prevent_exit();
+                    shell::request_quit(app);
                 }
             }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => shell::show_main_window(app),
+            _ => {}
         });
 }

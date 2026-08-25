@@ -166,12 +166,14 @@ async fn process_one(
             if !is_transient_send_error(&e) {
                 tracing::warn!("outbox id={} permanent failure: {}", row.id, err_msg);
                 let _ = db.outbox_mark_failed(row.id, &err_msg);
+                crate::sync::poller::notify_send_failed();
                 return;
             }
             let next_attempts = row.attempts + 1;
             if next_attempts >= MAX_ATTEMPTS {
                 tracing::warn!("outbox id={} exhausted retries: {}", row.id, err_msg);
                 let _ = db.outbox_mark_failed(row.id, &err_msg);
+                crate::sync::poller::notify_send_failed();
             } else {
                 let _ = db.outbox_bump_attempt(row.id, &err_msg);
             }

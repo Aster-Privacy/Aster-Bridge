@@ -2,6 +2,21 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.28 - 2026-08-25
+
+### Added
+- On Mac, Aster Bridge now has a full menu bar: **About Aster Bridge**, **Check for Updates**, **Settings** (Command-Comma), an **Edit** menu, a **View** menu with **Sync Now** (Command-R), a **Window** menu, and a **Help** menu.
+- The menu bar icon now shows the bridge status, and lets you start or stop the bridge, sync now, open settings, and check for updates without opening the window.
+- The app remembers the size and position of its window between launches.
+- You get a system notification when an update is available and when a message can't be sent.
+
+### Changed
+- On Mac, the menu bar icon is now a monochrome template image, so it matches the other status items in light and dark menu bars.
+- On Mac, closing the window removes Aster Bridge from the Dock and the app switcher while it keeps running in the menu bar. Click the menu bar icon to bring it back.
+- On Mac, background mode no longer leaves a Dock icon with no window behind it.
+- Quitting waits up to a few seconds for queued messages to finish sending before the app closes.
+- The About panel and Finder now show the copyright and app category.
+
 ## 0.4.27 - 2026-08-25
 
 ### Changed

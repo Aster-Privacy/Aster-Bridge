@@ -19,7 +19,7 @@
 
 [package]
 name = "aster-bridge-desktop"
-version = "0.4.27"
+version = "0.4.28"
 edition = "2021"
 description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 license = "AGPL-3.0-or-later"
@@ -40,6 +40,8 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-notification = "2"
 
 aster-crypto = { path = "../../Aster-Mail/aster-crypto", default-features = false, features = ["std"] }
 

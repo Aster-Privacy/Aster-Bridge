@@ -97,6 +97,19 @@ pub fn emit_import_progress(progress: &crate::imap::append::ImportProgress) {
     let _ = handle.emit("import_progress", progress.clone());
 }
 
+pub fn notify_send_failed() {
+    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
+    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
+    let Some(handle) = handle_opt else { return; };
+    use tauri_plugin_notification::NotificationExt;
+    let _ = handle
+        .notification()
+        .builder()
+        .title("Message not sent")
+        .body("Aster Bridge couldn't send a message. Open Aster Bridge to retry it.")
+        .show();
+}
+
 pub fn emit_session_expired() {
     let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
     let handle_opt = cell.lock().ok().and_then(|g| g.clone());
