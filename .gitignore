@@ -19,3 +19,8 @@ src-tauri/gen/
 updates/staging/
 updates/Dockerfile.linux_build
 updates/build_linux.sh
+
+# Arch packages built by packaging/arch/PKGBUILD
+*.pkg.tar.zst
+packaging/arch/src/
+packaging/arch/pkg/
