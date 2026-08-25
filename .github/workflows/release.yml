@@ -160,6 +160,32 @@ jobs:
             gh release upload "$TAG" "$img" "$img.sig" --clobber
           done
 
+      - name: Build and publish the Arch Linux package
+        # Arch has no .deb or .rpm, and the AppImage is not a package. Repack the
+        # release deb into a pacman package inside an Arch container so
+        # `pacman -U` installs Aster Bridge like any other Arch package.
+        if: matrix.leg == 'linux-x64'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          TAG="v${V}"
+          docker run --rm -e V="$V" -v "$PWD/packaging/arch:/pkg" archlinux:base-devel bash -c '
+            set -euo pipefail
+            pacman -Sy --noconfirm --needed pacman-contrib >/dev/null
+            useradd -m builder
+            cp /pkg/PKGBUILD /home/builder/PKGBUILD
+            chown -R builder:builder /home/builder
+            su builder -c "cd /home/builder && sed -i \"s/^pkgver=.*/pkgver=$V/\" PKGBUILD && updpkgsums && makepkg -f --noconfirm --nodeps"
+            cp /home/builder/*.pkg.tar.zst /pkg/
+          '
+          PKG="packaging/arch/aster-bridge-${V}-1-x86_64.pkg.tar.zst"
+          test -f "$PKG"
+          cp "$PKG" "packaging/arch/Aster-Bridge-x86_64.pkg.tar.zst"
+          gh release upload "$TAG" "$PKG" "packaging/arch/Aster-Bridge-x86_64.pkg.tar.zst" --clobber
+
       - name: Rename assets to canonical names
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -331,6 +357,7 @@ jobs:
             Aster-Bridge-aarch64.AppImage
             Aster-Bridge-arm64.deb
             Aster-Bridge-aarch64.rpm
+            Aster-Bridge-x86_64.pkg.tar.zst
           )
 
           declare -A SRC=(
@@ -343,6 +370,7 @@ jobs:
             [Aster-Bridge-arm64.deb]="Aster.Bridge_${V}_arm64.deb"
             [Aster-Bridge-aarch64.rpm]="Aster.Bridge-${V}-1.aarch64.rpm"
             [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
+            [Aster-Bridge-x86_64.pkg.tar.zst]="aster-bridge-${V}-1-x86_64.pkg.tar.zst"
           )
 
           assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
@@ -375,12 +403,12 @@ jobs:
             fi
           done
 
-          ABSENT_ARM=()
+          ABSENT_OPTIONAL=()
           for name in "${OPTIONAL[@]}"; do
-            has "$name" || ABSENT_ARM+=("$name")
+            has "$name" || ABSENT_OPTIONAL+=("$name")
           done
-          if [ ${#ABSENT_ARM[@]} -ne 0 ]; then
-            echo "::warning::$TAG has no Linux ARM assets: ${ABSENT_ARM[*]}. The ARM download links fall back to an older release."
+          if [ ${#ABSENT_OPTIONAL[@]} -ne 0 ]; then
+            echo "::warning::$TAG is missing optional assets: ${ABSENT_OPTIONAL[*]}. Those download links fall back to an older release."
           fi
 
           MISSING=()

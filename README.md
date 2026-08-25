@@ -39,7 +39,15 @@ TLS is on by default using a self-signed certificate generated on your machine. 
 
 ## Install on Linux
 
-Each release carries a `.deb`, an `.rpm`, and an AppImage. Install the package that matches your distribution, or make the AppImage executable with `chmod +x` and run it.
+Each release carries a `.deb`, an `.rpm`, a pacman package for Arch Linux, and an AppImage. Install the package that matches your distribution, or make the AppImage executable with `chmod +x` and run it.
+
+On Arch Linux, download `Aster-Bridge-x86_64.pkg.tar.zst` from the release and install it with pacman:
+
+```
+sudo pacman -U Aster-Bridge-x86_64.pkg.tar.zst
+```
+
+The package installs `aster-bridge` in `/usr/bin` and adds Aster Bridge to your app launcher. To build the same package yourself, run `makepkg` in `packaging/arch`.
 
 Aster Bridge draws its window with WebKitGTK, which every package expects to find on the system. If the app starts but the window stays empty, install the WebKitGTK 4.1 runtime for your distribution:
 

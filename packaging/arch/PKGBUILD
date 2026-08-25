@@ -1,0 +1,28 @@
+# Maintainer: Aster Communications Inc. <hello@astermail.org>
+
+pkgname=aster-bridge
+pkgver=0.4.26
+pkgrel=1
+pkgdesc="Local IMAP, SMTP, JMAP, POP3, and CardDAV bridge for Aster Mail"
+arch=('x86_64')
+url="https://github.com/Aster-Privacy/Aster-Bridge"
+license=('AGPL-3.0-or-later')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'libsoup3' 'dbus' 'glib2' 'gdk-pixbuf2' 'cairo')
+optdepends=('xdg-utils: open links in your browser')
+provides=('aster-bridge')
+conflicts=('aster-bridge-bin' 'aster-bridge-git')
+options=('!strip' '!debug')
+source=("aster-bridge-${pkgver}-amd64.deb::${url}/releases/download/v${pkgver}/Aster.Bridge_${pkgver}_amd64.deb")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir"
+  bsdtar -xf "aster-bridge-${pkgver}-amd64.deb" data.tar.gz
+  bsdtar -xf data.tar.gz -C "$pkgdir"
+  install -Dm644 "$pkgdir/usr/share/applications/Aster Bridge.desktop" \
+    "$pkgdir/usr/share/applications/aster-bridge.desktop"
+  rm -f "$pkgdir/usr/share/applications/Aster Bridge.desktop"
+  chmod 755 "$pkgdir/usr/bin/aster-bridge-desktop"
+  install -dm755 "$pkgdir/usr/bin"
+  ln -sf aster-bridge-desktop "$pkgdir/usr/bin/aster-bridge"
+}

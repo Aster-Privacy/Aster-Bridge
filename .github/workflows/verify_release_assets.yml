@@ -44,6 +44,7 @@ jobs:
             Aster-Bridge-aarch64.AppImage
             Aster-Bridge-arm64.deb
             Aster-Bridge-aarch64.rpm
+            Aster-Bridge-x86_64.pkg.tar.zst
           )
 
           declare -A SRC=(
@@ -56,6 +57,7 @@ jobs:
             [Aster-Bridge-arm64.deb]="Aster.Bridge_${V}_arm64.deb"
             [Aster-Bridge-aarch64.rpm]="Aster.Bridge-${V}-1.aarch64.rpm"
             [Aster-Bridge-universal.dmg]="Aster.Bridge_${V}_universal.dmg"
+            [Aster-Bridge-x86_64.pkg.tar.zst]="aster-bridge-${V}-1-x86_64.pkg.tar.zst"
           )
 
           assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
@@ -88,12 +90,12 @@ jobs:
             fi
           done
 
-          ABSENT_ARM=()
+          ABSENT_OPTIONAL=()
           for name in "${OPTIONAL[@]}"; do
-            has "$name" || ABSENT_ARM+=("$name")
+            has "$name" || ABSENT_OPTIONAL+=("$name")
           done
-          if [ ${#ABSENT_ARM[@]} -ne 0 ]; then
-            echo "::warning::$TAG has no Linux ARM assets: ${ABSENT_ARM[*]}. The ARM download links fall back to an older release."
+          if [ ${#ABSENT_OPTIONAL[@]} -ne 0 ]; then
+            echo "::warning::$TAG is missing optional assets: ${ABSENT_OPTIONAL[*]}. Those download links fall back to an older release."
           fi
 
           MISSING=()
