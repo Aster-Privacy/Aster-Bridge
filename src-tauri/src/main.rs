@@ -29,6 +29,8 @@ mod crypto;
 mod dav;
 mod db;
 mod diagnostics;
+#[cfg(target_os = "macos")]
+mod dock_icon;
 mod error;
 mod imap;
 mod jmap;
@@ -1805,6 +1807,13 @@ fn main() {
         .setup(move |app| {
             sync::poller::set_global_app_handle(Some(app.handle().clone()));
 
+            #[cfg(target_os = "macos")]
+            dock_icon::apply(
+                app.get_webview_window("main")
+                    .and_then(|w| w.theme().ok())
+                    .unwrap_or(tauri::Theme::Light),
+            );
+
             let icon_bytes = include_bytes!("../icons/128x128.png");
 
             let icon =
@@ -2334,6 +2343,10 @@ fn main() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            #[cfg(target_os = "macos")]
+            if let WindowEvent::ThemeChanged(theme) = event {
+                dock_icon::apply(*theme);
             }
         })
         .build(tauri::generate_context!())
