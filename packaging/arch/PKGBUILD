@@ -13,7 +13,7 @@ provides=('aster-bridge')
 conflicts=('aster-bridge-bin' 'aster-bridge-git')
 options=('!strip' '!debug')
 source=("aster-bridge-${pkgver}-amd64.deb::${url}/releases/download/v${pkgver}/Aster.Bridge_${pkgver}_amd64.deb")
-sha256sums=('SKIP')
+sha256sums=('2d4e32016a13ad23afdfba26d2ef678774d4ca5a8428b02c6921086becd722b3')
 
 package() {
   cd "$srcdir"
