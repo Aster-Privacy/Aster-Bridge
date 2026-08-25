@@ -31,7 +31,9 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["aster-mail"]
+        "schemes": [
+          "aster-mail"
+        ]
       }
     },
     "updater": {
@@ -54,7 +56,10 @@
     ],
     "macOS": {
       "minimumSystemVersion": "10.15",
-      "signingIdentity": null
+      "signingIdentity": null,
+      "files": {
+        "Resources/Assets.car": "icons/Assets.car"
+      }
     },
     "windows": {
       "certificateThumbprint": null,
