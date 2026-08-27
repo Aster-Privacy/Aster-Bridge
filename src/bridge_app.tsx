@@ -2760,23 +2760,28 @@ export function BridgeApp() {
 
   useEffect(() => {
     let unlisten_fn: (() => void) | null = null;
+    const apply_deep_link = (payload: string) => {
+      try {
+        const url = new URL(payload);
+        if (url.protocol !== "aster-mail:") return;
+        if (url.hostname !== "provision" && url.pathname !== "//provision" && url.pathname !== "/provision") return;
+        const raw_label = url.searchParams.get("label") || "Auto-provisioned";
+        // Deep links arrive from arbitrary local apps; the label is untrusted.
+        // Strip control chars and cap length before it is shown in the confirm modal.
+        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || "Auto-provisioned";
+        set_provision_label(label);
+      } catch {
+        /* ignore malformed deep link */
+      }
+    };
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
       const unlisten = await listen<string>("deep_link", (event) => {
-        try {
-          const url = new URL(event.payload);
-          if (url.protocol !== "aster-mail:") return;
-          if (url.hostname !== "provision" && url.pathname !== "//provision" && url.pathname !== "/provision") return;
-          const raw_label = url.searchParams.get("label") || "Auto-provisioned";
-          // Deep links arrive from arbitrary local apps; the label is untrusted.
-          // Strip control chars and cap length before it is shown in the confirm modal.
-          const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || "Auto-provisioned";
-          set_provision_label(label);
-        } catch {
-          /* ignore malformed deep link */
-        }
+        apply_deep_link(event.payload);
       });
       unlisten_fn = unlisten;
+      const pending = await api.take_pending_deep_link().catch(() => null);
+      if (pending) apply_deep_link(pending);
     })();
     return () => {
       if (unlisten_fn) unlisten_fn();

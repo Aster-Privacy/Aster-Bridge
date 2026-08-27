@@ -262,6 +262,10 @@ export async function provision_bundle(label: string): Promise<ProvisionBundle> 
   return tauri_invoke<ProvisionBundle>("provision_bundle", { label });
 }
 
+export async function take_pending_deep_link(): Promise<string | null> {
+  return tauri_invoke<string | null>("take_pending_deep_link");
+}
+
 const ALLOWED_OPEN_SCHEMES = ["https:", "http:", "mailto:"];
 
 export async function open_url(url: string): Promise<void> {

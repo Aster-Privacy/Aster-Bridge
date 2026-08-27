@@ -35,8 +35,8 @@ mod shell;
 mod error;
 mod imap;
 mod jmap;
-mod pop3;
 mod outbox;
+mod pop3;
 mod port_picker;
 #[cfg(test)]
 mod protocol_harness;
@@ -98,6 +98,8 @@ type SharedBridgeState = Arc<AsyncMutex<BridgeState>>;
 struct AppState(SharedBridgeState);
 
 struct TrayState(std::sync::Mutex<Option<tauri::tray::TrayIcon>>);
+
+struct PendingDeepLink(std::sync::Mutex<Option<String>>);
 
 #[cfg(windows)]
 fn read_text_scale_factor() -> f64 {
@@ -210,10 +212,22 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         connected = true;
     }
 
-    let imap_running = guard.imap_handle.as_ref().map_or(false, |h| !h.is_finished());
-    let smtp_running = guard.smtp_handle.as_ref().map_or(false, |h| !h.is_finished());
-    let jmap_running = guard.jmap_handle.as_ref().map_or(false, |h| !h.is_finished());
-    let pop3_running = guard.pop3_handle.as_ref().map_or(false, |h| !h.is_finished());
+    let imap_running = guard
+        .imap_handle
+        .as_ref()
+        .map_or(false, |h| !h.is_finished());
+    let smtp_running = guard
+        .smtp_handle
+        .as_ref()
+        .map_or(false, |h| !h.is_finished());
+    let jmap_running = guard
+        .jmap_handle
+        .as_ref()
+        .map_or(false, |h| !h.is_finished());
+    let pop3_running = guard
+        .pop3_handle
+        .as_ref()
+        .map_or(false, |h| !h.is_finished());
     let carddav_running = guard
         .carddav_handle
         .as_ref()
@@ -327,7 +341,9 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                 0
             }
         }
-    } else { 0 };
+    } else {
+        0
+    };
     let smtps_port = if tls_cfg_opt.is_some() {
         match port_picker::pick_startup_port(host, guard.config.smtp_implicit_tls_port) {
             Ok(p) => p,
@@ -336,7 +352,9 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                 0
             }
         }
-    } else { 0 };
+    } else {
+        0
+    };
     guard.bound_imaps_port = imaps_port;
     guard.bound_smtps_port = smtps_port;
 
@@ -377,8 +395,12 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                     tracing::error!("IMAPS server error: {}", e);
                 }
             }))
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let smtp_session = session.clone();
     let smtp_client = client.clone();
@@ -386,7 +408,15 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
     let smtp_db = db.clone();
     let smtp_tls = tls_cfg_opt.clone();
     let smtp_handle = tokio::spawn(async move {
-        if let Err(e) = smtp::server::run(&smtp_addr, smtp_session, smtp_client, smtp_passwords, smtp_db, smtp_tls).await
+        if let Err(e) = smtp::server::run(
+            &smtp_addr,
+            smtp_session,
+            smtp_client,
+            smtp_passwords,
+            smtp_db,
+            smtp_tls,
+        )
+        .await
         {
             tracing::error!("SMTP server error: {}", e);
         }
@@ -404,8 +434,12 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                     tracing::error!("SMTPS server error: {}", e);
                 }
             }))
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let jmap_handle = if jmap_enabled {
         let jmap_session = session.clone();
@@ -413,7 +447,11 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
         let jmap_client = client.clone();
         let jmap_passwords = passwords.clone();
         let jmap_tx = jmap_broadcaster.clone();
-        let jmap_tls = if jmap_https_enabled { tls_cfg_opt.clone() } else { None };
+        let jmap_tls = if jmap_https_enabled {
+            tls_cfg_opt.clone()
+        } else {
+            None
+        };
         Some(tokio::spawn(async move {
             if let Err(e) = jmap::server::run(
                 &jmap_addr,
@@ -443,9 +481,14 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
             None
         };
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                dav::server::run(&carddav_addr, dav_session, dav_client, dav_passwords, dav_tls)
-                    .await
+            if let Err(e) = dav::server::run(
+                &carddav_addr,
+                dav_session,
+                dav_client,
+                dav_passwords,
+                dav_tls,
+            )
+            .await
             {
                 tracing::error!("CardDAV server error: {}", e);
             }
@@ -457,7 +500,9 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
     let pop3_port = port_picker::pick_available_port(host, guard.config.pop3_port).unwrap_or(0);
     let pop3s_port = if tls_cfg_opt.is_some() {
         port_picker::pick_available_port(host, guard.config.pop3s_port).unwrap_or(0)
-    } else { 0 };
+    } else {
+        0
+    };
     guard.bound_pop3_port = pop3_port;
     guard.bound_pop3s_port = pop3s_port;
 
@@ -469,11 +514,16 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
         let p3_tls = tls_cfg_opt.clone();
         let p3_addr = format!("{}:{}", host, pop3_port);
         Some(tokio::spawn(async move {
-            if let Err(e) = pop3::server::run(&p3_addr, p3_session, p3_db, p3_client, p3_passwords, p3_tls).await {
+            if let Err(e) =
+                pop3::server::run(&p3_addr, p3_session, p3_db, p3_client, p3_passwords, p3_tls)
+                    .await
+            {
                 tracing::error!("POP3 server error: {}", e);
             }
         }))
-    } else { None };
+    } else {
+        None
+    };
 
     let pop3s_handle = if let Some(cfg) = tls_cfg_opt.clone() {
         if pop3s_port != 0 {
@@ -483,12 +533,25 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
             let p3s_passwords = passwords.clone();
             let p3s_addr = format!("{}:{}", host, pop3s_port);
             Some(tokio::spawn(async move {
-                if let Err(e) = pop3::server::run_implicit_tls(&p3s_addr, p3s_session, p3s_db, p3s_client, p3s_passwords, cfg).await {
+                if let Err(e) = pop3::server::run_implicit_tls(
+                    &p3s_addr,
+                    p3s_session,
+                    p3s_db,
+                    p3s_client,
+                    p3s_passwords,
+                    cfg,
+                )
+                .await
+                {
                     tracing::error!("POP3S server error: {}", e);
                 }
             }))
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let sync_session = session.clone();
     let sync_client = client.clone();
@@ -539,7 +602,11 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
     let token_refresh_handle = tokio::spawn(async move {
         let mut consecutive_failures: u32 = 0;
         loop {
-            let wait_secs = if consecutive_failures == 0 { 50 * 60 } else { 60 };
+            let wait_secs = if consecutive_failures == 0 {
+                50 * 60
+            } else {
+                60
+            };
             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
             let (device_id, signing_key) = {
                 let guard = refresh_state.lock().await;
@@ -553,7 +620,9 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                 device_id,
                 &signing_key,
                 &refresh_client,
-            ).await {
+            )
+            .await
+            {
                 Ok(()) => {
                     if consecutive_failures > 0 {
                         tracing::info!("access token refresh recovered");
@@ -562,7 +631,11 @@ async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
                 }
                 Err(e) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    tracing::warn!("proactive token refresh failed (attempt {}): {}", consecutive_failures, e);
+                    tracing::warn!(
+                        "proactive token refresh failed (attempt {}): {}",
+                        consecutive_failures,
+                        e
+                    );
                     if consecutive_failures == 5 {
                         sync::poller::emit_session_expired();
                     }
@@ -762,7 +835,9 @@ async fn refresh_plan_info(state: State<'_, AppState>) -> Result<(), String> {
 
     let mut plan_result = client.get_plan_info(&plan_token).await;
     for attempt in 0..2u8 {
-        if plan_result.is_ok() { break; }
+        if plan_result.is_ok() {
+            break;
+        }
         tracing::warn!("refresh_plan_info attempt {} failed, retrying", attempt + 1);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         plan_result = client.get_plan_info(&plan_token).await;
@@ -779,7 +854,9 @@ async fn refresh_plan_info(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_user_preferences(state: State<'_, AppState>) -> Result<UserPreferencesResponse, String> {
+async fn get_user_preferences(
+    state: State<'_, AppState>,
+) -> Result<UserPreferencesResponse, String> {
     let guard = state.0.lock().await;
     let session_arc = match &guard.session {
         Some(s) => s.clone(),
@@ -840,8 +917,7 @@ async fn get_user_preferences(state: State<'_, AppState>) -> Result<UserPreferen
 async fn get_setup_code(state: State<'_, AppState>) -> Result<String, String> {
     let mut guard = state.0.lock().await;
 
-    let (ed25519_pk, mlkem_pk, x25519_pk) =
-        auth::device_identity::get_pubkeys(&guard.identity);
+    let (ed25519_pk, mlkem_pk, x25519_pk) = auth::device_identity::get_pubkeys(&guard.identity);
     let machine_name = whoami::devicename();
 
     let code_resp = guard
@@ -919,9 +995,11 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let access_token = zeroize::Zeroizing::new(login_resp
-                .access_token
-                .ok_or_else(|| "no access token in login response".to_string())?);
+            let access_token = zeroize::Zeroizing::new(
+                login_resp
+                    .access_token
+                    .ok_or_else(|| "no access token in login response".to_string())?,
+            );
 
             let token_for_profile = access_token.clone();
             let token_for_plan = access_token.clone();
@@ -982,8 +1060,13 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
             drop(guard);
             let mut plan_result = plan_client.get_plan_info(&plan_token).await;
             for attempt in 0..2u8 {
-                if plan_result.is_ok() { break; }
-                tracing::warn!("plan check attempt {} failed during setup, retrying", attempt + 1);
+                if plan_result.is_ok() {
+                    break;
+                }
+                tracing::warn!(
+                    "plan check attempt {} failed during setup, retrying",
+                    attempt + 1
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 plan_result = plan_client.get_plan_info(&plan_token).await;
             }
@@ -1070,7 +1153,10 @@ async fn get_default_sender(state: State<'_, AppState>) -> Result<Option<String>
     drop(guard);
 
     let token = { (*session_arc.read().await.access_token).clone() };
-    client.get_default_sender(&token).await.map_err(|e| e.to_string())
+    client
+        .get_default_sender(&token)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1141,10 +1227,7 @@ async fn generate_app_password(
 }
 
 #[tauri::command]
-async fn delete_app_password(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+async fn delete_app_password(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let guard = state.0.lock().await;
 
     let passwords = guard
@@ -1156,29 +1239,49 @@ async fn delete_app_password(
 }
 
 #[tauri::command]
-async fn get_connection_info(
-    state: State<'_, AppState>,
-) -> Result<ConnectionInfoResponse, String> {
+async fn get_connection_info(state: State<'_, AppState>) -> Result<ConnectionInfoResponse, String> {
     let guard = state.0.lock().await;
 
-    let imap_port = if guard.running { guard.bound_imap_port } else { guard.config.imap_port };
-    let smtp_port = if guard.running { guard.bound_smtp_port } else { guard.config.smtp_port };
-    let jmap_port = if guard.running { guard.bound_jmap_port } else { guard.config.jmap_port };
+    let imap_port = if guard.running {
+        guard.bound_imap_port
+    } else {
+        guard.config.imap_port
+    };
+    let smtp_port = if guard.running {
+        guard.bound_smtp_port
+    } else {
+        guard.config.smtp_port
+    };
+    let jmap_port = if guard.running {
+        guard.bound_jmap_port
+    } else {
+        guard.config.jmap_port
+    };
     let carddav_port = if guard.running && guard.bound_carddav_port != 0 {
         guard.bound_carddav_port
-    } else { guard.config.carddav_port };
+    } else {
+        guard.config.carddav_port
+    };
 
     let tls_enabled = guard.config.tls_enabled && guard.tls_server_config.is_some();
     let jmap_https_enabled = guard.config.jmap_https_enabled && tls_enabled;
     let jmap_scheme = if jmap_https_enabled { "https" } else { "http" };
     let carddav_https_enabled = guard.config.carddav_https_enabled && tls_enabled;
-    let carddav_scheme = if carddav_https_enabled { "https" } else { "http" };
+    let carddav_scheme = if carddav_https_enabled {
+        "https"
+    } else {
+        "http"
+    };
     let pop3_port = if guard.running && guard.bound_pop3_port != 0 {
         guard.bound_pop3_port
-    } else { guard.config.pop3_port };
+    } else {
+        guard.config.pop3_port
+    };
     let pop3s_port = if guard.running && guard.bound_pop3s_port != 0 {
         guard.bound_pop3s_port
-    } else { guard.config.pop3s_port };
+    } else {
+        guard.config.pop3s_port
+    };
     Ok(ConnectionInfoResponse {
         imap_host: "127.0.0.1".to_string(),
         imap_port,
@@ -1191,10 +1294,14 @@ async fn get_connection_info(
         tls_enabled,
         imap_implicit_tls_port: if tls_enabled && guard.running && guard.bound_imaps_port != 0 {
             guard.bound_imaps_port
-        } else { guard.config.imap_implicit_tls_port },
+        } else {
+            guard.config.imap_implicit_tls_port
+        },
         smtp_implicit_tls_port: if tls_enabled && guard.running && guard.bound_smtps_port != 0 {
             guard.bound_smtps_port
-        } else { guard.config.smtp_implicit_tls_port },
+        } else {
+            guard.config.smtp_implicit_tls_port
+        },
         jmap_https_enabled,
         pop3_port,
         pop3s_port,
@@ -1215,17 +1322,23 @@ async fn get_tls_info(state: State<'_, AppState>) -> Result<TlsInfoResponse, Str
         .to_string();
     let fingerprint = if tls_enabled {
         tls::cert_fingerprint_sha256(&guard.config.data_dir)
-    } else { None };
+    } else {
+        None
+    };
     Ok(TlsInfoResponse {
         tls_enabled,
         fingerprint_sha256: fingerprint,
         cert_path,
         imap_implicit_tls_port: if tls_enabled && guard.running && guard.bound_imaps_port != 0 {
             guard.bound_imaps_port
-        } else { guard.config.imap_implicit_tls_port },
+        } else {
+            guard.config.imap_implicit_tls_port
+        },
         smtp_implicit_tls_port: if tls_enabled && guard.running && guard.bound_smtps_port != 0 {
             guard.bound_smtps_port
-        } else { guard.config.smtp_implicit_tls_port },
+        } else {
+            guard.config.smtp_implicit_tls_port
+        },
         jmap_https_enabled,
     })
 }
@@ -1235,7 +1348,8 @@ async fn open_tls_cert(state: State<'_, AppState>) -> Result<(), String> {
     let dir = {
         let guard = state.0.lock().await;
         let cert_path = tls::cert_pem_path(&guard.config.data_dir);
-        cert_path.parent()
+        cert_path
+            .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| guard.config.data_dir.clone())
     };
@@ -1260,17 +1374,13 @@ async fn set_tls_enabled(state: State<'_, AppState>, enabled: bool) -> Result<()
 }
 
 #[tauri::command]
-async fn get_data_directory(
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn get_data_directory(state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.0.lock().await;
     Ok(guard.config.data_dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-async fn open_data_directory(
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+async fn open_data_directory(state: State<'_, AppState>) -> Result<(), String> {
     let guard = state.0.lock().await;
     let dir = guard.config.data_dir.clone();
     drop(guard);
@@ -1318,6 +1428,11 @@ struct ProvisionBundle {
 }
 
 #[tauri::command]
+fn take_pending_deep_link(state: State<'_, PendingDeepLink>) -> Option<String> {
+    state.0.lock().ok().and_then(|mut pending| pending.take())
+}
+
+#[tauri::command]
 async fn provision_bundle(
     state: State<'_, AppState>,
     label: String,
@@ -1334,16 +1449,34 @@ async fn provision_bundle(
     let email = session.read().await.email.clone();
 
     let trimmed = label.trim();
-    let store_label = if trimmed.is_empty() { "Auto-provisioned" } else { trimmed };
+    let store_label = if trimmed.is_empty() {
+        "Auto-provisioned"
+    } else {
+        trimmed
+    };
     let password = auth::app_passwords::generate_app_password();
     passwords.store(store_label, &password)?;
 
-    let imap_port = if guard.running { guard.bound_imap_port } else { guard.config.imap_port };
-    let smtp_port = if guard.running { guard.bound_smtp_port } else { guard.config.smtp_port };
-    let jmap_port = if guard.running { guard.bound_jmap_port } else { guard.config.jmap_port };
+    let imap_port = if guard.running {
+        guard.bound_imap_port
+    } else {
+        guard.config.imap_port
+    };
+    let smtp_port = if guard.running {
+        guard.bound_smtp_port
+    } else {
+        guard.config.smtp_port
+    };
+    let jmap_port = if guard.running {
+        guard.bound_jmap_port
+    } else {
+        guard.config.jmap_port
+    };
     let carddav_port = if guard.running && guard.bound_carddav_port != 0 {
         guard.bound_carddav_port
-    } else { guard.config.carddav_port };
+    } else {
+        guard.config.carddav_port
+    };
 
     Ok(ProvisionBundle {
         email,
@@ -1357,7 +1490,10 @@ async fn provision_bundle(
         jmap_port,
         jmap_url: format!(
             "{}://127.0.0.1:{}/jmap/session",
-            if guard.config.jmap_https_enabled && guard.config.tls_enabled && guard.tls_server_config.is_some() {
+            if guard.config.jmap_https_enabled
+                && guard.config.tls_enabled
+                && guard.tls_server_config.is_some()
+            {
                 "https"
             } else {
                 "http"
@@ -1368,7 +1504,10 @@ async fn provision_bundle(
         carddav_port,
         carddav_url: format!(
             "{}://127.0.0.1:{}/",
-            if guard.config.carddav_https_enabled && guard.config.tls_enabled && guard.tls_server_config.is_some() {
+            if guard.config.carddav_https_enabled
+                && guard.config.tls_enabled
+                && guard.tls_server_config.is_some()
+            {
                 "https"
             } else {
                 "http"
@@ -1386,7 +1525,9 @@ struct ServiceSettingsResponse {
 }
 
 #[tauri::command]
-async fn get_service_settings(state: State<'_, AppState>) -> Result<ServiceSettingsResponse, String> {
+async fn get_service_settings(
+    state: State<'_, AppState>,
+) -> Result<ServiceSettingsResponse, String> {
     let guard = state.0.lock().await;
     Ok(ServiceSettingsResponse {
         service_mode: guard.config.service_mode,
@@ -1448,10 +1589,7 @@ async fn repair_cache(state: State<'_, AppState>) -> Result<(), String> {
         if guard.session.is_none() {
             return Err("not authenticated".to_string());
         }
-        (
-            guard.db.clone(),
-            guard.sync_trigger.as_ref().cloned(),
-        )
+        (guard.db.clone(), guard.sync_trigger.as_ref().cloned())
     };
     db.repair_cache()?;
     if let Some(trigger) = trigger {
@@ -1575,7 +1713,11 @@ async fn outbox_retry_now(state: State<'_, AppState>, id: i64) -> Result<(), Str
 async fn copy_diagnostic_bundle(state: State<'_, AppState>) -> Result<String, String> {
     let (cfg_clone, data_dir, db) = {
         let guard = state.0.lock().await;
-        (guard.config.clone(), guard.config.data_dir.clone(), guard.db.clone())
+        (
+            guard.config.clone(),
+            guard.config.data_dir.clone(),
+            guard.db.clone(),
+        )
     };
     let (messages, passwords, last_sync_ts) = db.db_stats().unwrap_or((0, 0, None));
     let bundle = DiagnosticBundle {
@@ -1592,7 +1734,11 @@ async fn copy_diagnostic_bundle(state: State<'_, AppState>) -> Result<String, St
             poll_interval_secs: cfg_clone.poll_interval_secs,
         },
         recent_log_lines: diagnostics::read_recent_lines(&data_dir),
-        db_stats: DbStats { messages, passwords, last_sync_ts },
+        db_stats: DbStats {
+            messages,
+            passwords,
+            last_sync_ts,
+        },
     };
     let serialized = serde_json::to_string_pretty(&bundle).map_err(|e| e.to_string())?;
     Ok(serialized)
@@ -1624,13 +1770,11 @@ fn main() {
         Ok(c) => {
             let _ = diagnostics::ensure_log_dir(&c.data_dir);
             diagnostics::prune_old_logs(&c.data_dir);
-            let file_appender = tracing_appender::rolling::daily(
-                diagnostics::log_dir(&c.data_dir),
-                "bridge.log",
-            );
+            let file_appender =
+                tracing_appender::rolling::daily(diagnostics::log_dir(&c.data_dir), "bridge.log");
             let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
-            let filter = EnvFilter::from_default_env()
-                .add_directive("aster_bridge=info".parse().unwrap());
+            let filter =
+                EnvFilter::from_default_env().add_directive("aster_bridge=info".parse().unwrap());
             use tracing_subscriber::layer::SubscriberExt;
             use tracing_subscriber::util::SubscriberInitExt;
             let stdout_layer = tracing_subscriber::fmt::layer();
@@ -1661,108 +1805,15 @@ fn main() {
         std::process::id()
     );
 
-    let mut cfg = match preliminary_cfg {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load config: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if std::env::args().any(|a| a == "--service") {
-        cfg.service_mode = true;
-    }
-    let service_mode = cfg.service_mode;
-
-    let db = match db::Database::open(&cfg.data_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("failed to open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let identity = match auth::device_identity::get_or_create_identity(&cfg.data_dir) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("failed to load device identity: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let client = Arc::new(api_client::ApiClient::new());
-    let shared_db = Arc::new(db);
-
-    tls::install_default_crypto_provider();
-    let tls_server_config: Option<Arc<rustls::ServerConfig>> = if cfg.tls_enabled {
-        match tls::ensure_cert(&cfg.data_dir) {
-            Ok((certs, key)) => match tls::server_config(certs, key) {
-                Ok(sc) => Some(sc),
-                Err(e) => {
-                    tracing::warn!("TLS server config build failed, disabling TLS: {}", e);
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("TLS cert generation failed, disabling TLS: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let has_device_id = identity.device_id.is_some();
-
-    let imap_port_initial = cfg.imap_port;
-    let smtp_port_initial = cfg.smtp_port;
-    let jmap_port_initial = cfg.jmap_port;
-    let carddav_port_initial = cfg.carddav_port;
-    let bridge_state = Arc::new(AsyncMutex::new(BridgeState {
-        config: cfg,
-        session: None,
-        db: shared_db,
-        client,
-        passwords: None,
-        running: false,
-        imap_handle: None,
-        imaps_handle: None,
-        smtp_handle: None,
-        smtps_handle: None,
-        jmap_handle: None,
-        carddav_handle: None,
-        pop3_handle: None,
-        pop3s_handle: None,
-        sync_handle: None,
-        gc_handle: None,
-        outbox_handle: None,
-        sync_trigger: None,
-        outbox_trigger: None,
-        bound_imap_port: imap_port_initial,
-        bound_smtp_port: smtp_port_initial,
-        bound_jmap_port: jmap_port_initial,
-        bound_carddav_port: carddav_port_initial,
-        bound_imaps_port: 0,
-        bound_smtps_port: 0,
-        bound_pop3_port: 0,
-        bound_pop3s_port: 0,
-        tls_server_config,
-        token_refresh_handle: None,
-        identity,
-        pending_code: None,
-        pending_code_normalized: None,
-        pending_expires_in: None,
-        display_name: None,
-        profile_picture: None,
-        profile_color: None,
-        plan_code: None,
-        has_bridge_access: false,
-        plan_info_loaded: false,
-    }));
-
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             shell::show_main_window(app);
+            for arg in argv.iter().skip(1) {
+                if arg.starts_with("aster-mail://") {
+                    tracing::info!("deep-link forwarded from second instance: {}", arg);
+                    let _ = app.emit("deep_link", arg.clone());
+                }
+            }
         }))
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -1775,10 +1826,10 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(AppState(bridge_state))
         .manage(TrayState(std::sync::Mutex::new(None)))
         .manage(shell::TrayMenuState(std::sync::Mutex::new(None)))
         .manage(shell::QuitState(std::sync::atomic::AtomicBool::new(false)))
+        .manage(PendingDeepLink(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_bridge_status,
             start_bridge,
@@ -1803,6 +1854,7 @@ fn main() {
             set_service_mode,
             set_autostart,
             provision_bundle,
+            take_pending_deep_link,
             trigger_sync,
             repair_cache,
             get_recent_logs,
@@ -1814,6 +1866,106 @@ fn main() {
             set_tls_enabled,
         ])
         .setup(move |app| {
+        let mut cfg = match preliminary_cfg {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to load config: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        if std::env::args().any(|a| a == "--service") {
+            cfg.service_mode = true;
+        }
+        let service_mode = cfg.service_mode;
+
+        let db = match db::Database::open(&cfg.data_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("failed to open database: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let identity = match auth::device_identity::get_or_create_identity(&cfg.data_dir) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("failed to load device identity: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let client = Arc::new(api_client::ApiClient::new());
+        let shared_db = Arc::new(db);
+
+        tls::install_default_crypto_provider();
+        let tls_server_config: Option<Arc<rustls::ServerConfig>> = if cfg.tls_enabled {
+            match tls::ensure_cert(&cfg.data_dir) {
+                Ok((certs, key)) => match tls::server_config(certs, key) {
+                    Ok(sc) => Some(sc),
+                    Err(e) => {
+                        tracing::warn!("TLS server config build failed, disabling TLS: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("TLS cert generation failed, disabling TLS: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let has_device_id = identity.device_id.is_some();
+
+        let imap_port_initial = cfg.imap_port;
+        let smtp_port_initial = cfg.smtp_port;
+        let jmap_port_initial = cfg.jmap_port;
+        let carddav_port_initial = cfg.carddav_port;
+        let bridge_state = Arc::new(AsyncMutex::new(BridgeState {
+            config: cfg,
+            session: None,
+            db: shared_db,
+            client,
+            passwords: None,
+            running: false,
+            imap_handle: None,
+            imaps_handle: None,
+            smtp_handle: None,
+            smtps_handle: None,
+            jmap_handle: None,
+            carddav_handle: None,
+            pop3_handle: None,
+            pop3s_handle: None,
+            sync_handle: None,
+            gc_handle: None,
+            outbox_handle: None,
+            sync_trigger: None,
+            outbox_trigger: None,
+            bound_imap_port: imap_port_initial,
+            bound_smtp_port: smtp_port_initial,
+            bound_jmap_port: jmap_port_initial,
+            bound_carddav_port: carddav_port_initial,
+            bound_imaps_port: 0,
+            bound_smtps_port: 0,
+            bound_pop3_port: 0,
+            bound_pop3s_port: 0,
+            tls_server_config,
+            token_refresh_handle: None,
+            identity,
+            pending_code: None,
+            pending_code_normalized: None,
+            pending_expires_in: None,
+            display_name: None,
+            profile_picture: None,
+            profile_color: None,
+            plan_code: None,
+            has_bridge_access: false,
+            plan_info_loaded: false,
+        }));
+            app.manage(AppState(bridge_state));
+
             sync::poller::set_global_app_handle(Some(app.handle().clone()));
 
             #[cfg(target_os = "macos")]
@@ -1851,6 +2003,40 @@ fn main() {
                     }
                 });
             }
+
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    if let Some(url) = urls
+                        .iter()
+                        .map(|url| url.to_string())
+                        .find(|url| url.starts_with("aster-mail://"))
+                    {
+                        tracing::info!("deep-link present at startup: {}", url);
+                        if let Ok(mut pending) = app.state::<PendingDeepLink>().0.lock() {
+                            *pending = Some(url);
+                        }
+                    }
+                }
+
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let url_str = url.to_string();
+                        if !url_str.starts_with("aster-mail://") {
+                            continue;
+                        }
+                        tracing::info!("deep-link received: {}", url_str);
+                        if let Some(window) = handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                        let _ = handle.emit("deep_link", url_str);
+                    }
+                });
+            }
+
 
             if !service_mode {
                 #[cfg(target_os = "macos")]
