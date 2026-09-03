@@ -950,6 +950,7 @@ pub fn cache_web_draft(
     };
     let cc = content.cc_recipients.join(", ");
     let bcc = content.bcc_recipients.join(", ");
+    let attachments = draft_cached_attachments(content);
     let meta = serde_json::json!({
         "is_html": true,
         "message_id": serde_json::Value::Null,
@@ -957,6 +958,7 @@ pub fn cache_web_draft(
         "draft_version": version,
         "cc": cc,
         "bcc": bcc,
+        "attachment_count": attachments.len(),
     })
     .to_string();
     let subject = if content.subject.is_empty() {
@@ -978,6 +980,19 @@ pub fn cache_web_draft(
             Some(&meta),
         )
         .unwrap_or(false);
+    match db.replace_message_attachments(draft_id, &attachments) {
+        Ok(()) => {
+            let state = if attachments.is_empty() {
+                ATTACHMENTS_NONE
+            } else {
+                ATTACHMENTS_STORED
+            };
+            if let Err(e) = db.set_attachments_state(draft_id, state) {
+                tracing::warn!("draft attachment state failed for {}: {}", draft_id, e);
+            }
+        }
+        Err(e) => tracing::warn!("draft attachment store failed for {}: {}", draft_id, e),
+    }
     if let Err(e) = db.assign_uid_if_missing("drafts", draft_id) {
         tracing::warn!("draft uid assign failed for {}: {}", draft_id, e);
     }
@@ -991,6 +1006,40 @@ pub fn cache_web_draft(
         _ => {}
     }
     was_new
+}
+
+fn draft_cached_attachments(content: &crate::crypto::draft::DraftContent) -> Vec<CachedAttachment> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    content
+        .attachments
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|a| {
+            let data = STANDARD.decode(a.data_base64.trim()).ok()?;
+            if data.is_empty() {
+                return None;
+            }
+            let content_id = a.content_id.clone().filter(|c| !c.is_empty());
+            Some((a, content_id, data))
+        })
+        .enumerate()
+        .map(|(seq, (a, content_id, data))| CachedAttachment {
+            seq: seq as i64,
+            name: if a.name.is_empty() {
+                format!("attachment-{}", seq + 1)
+            } else {
+                a.name.clone()
+            },
+            content_type: crate::crypto::attachment::normalize_content_type(Some(&a.mime_type)),
+            is_inline: content_id.is_some(),
+            content_id,
+            size: data.len() as i64,
+            data,
+        })
+        .collect()
 }
 
 fn cached_draft_versions(db: &Database) -> std::collections::HashMap<String, i64> {
@@ -2390,6 +2439,78 @@ mod tests {
             .unwrap();
         assert_eq!(db.count_cached_messages("drafts").unwrap(), 1);
         assert!(db.get_cached_message("web-draft-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn web_draft_attachments_are_cached_for_the_drafts_folder() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let (_dir, db) = temp_db();
+        let content = crate::crypto::draft::DraftContent {
+            to_recipients: vec!["bruno@example.com".to_string()],
+            subject: "with files".to_string(),
+            message: "<p>see attached</p>".to_string(),
+            attachments: Some(vec![
+                crate::crypto::draft::DraftAttachment {
+                    id: "a1".to_string(),
+                    name: "report.pdf".to_string(),
+                    size: "9 B".to_string(),
+                    size_bytes: 9,
+                    mime_type: "application/pdf".to_string(),
+                    data_base64: STANDARD.encode(b"hello pdf"),
+                    content_id: None,
+                },
+                crate::crypto::draft::DraftAttachment {
+                    id: "a2".to_string(),
+                    name: "".to_string(),
+                    size: "4 B".to_string(),
+                    size_bytes: 4,
+                    mime_type: "image/png".to_string(),
+                    data_base64: STANDARD.encode(b"\x89PNG"),
+                    content_id: Some("pic@aster".to_string()),
+                },
+                crate::crypto::draft::DraftAttachment {
+                    id: "a3".to_string(),
+                    name: "broken.bin".to_string(),
+                    size: "0 B".to_string(),
+                    size_bytes: 0,
+                    mime_type: "application/octet-stream".to_string(),
+                    data_base64: "not base64!!".to_string(),
+                    content_id: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-att", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 2);
+
+        let cached = db.get_cached_message("web-draft-att").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count"), Some(&serde_json::json!(2)));
+
+        let rows = db.get_message_attachments("web-draft-att").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 0);
+        assert_eq!(rows[0].name, "report.pdf");
+        assert_eq!(rows[0].content_type, "application/pdf");
+        assert_eq!(rows[0].data, b"hello pdf");
+        assert!(!rows[0].is_inline);
+        assert_eq!(rows[1].seq, 1);
+        assert_eq!(rows[1].name, "attachment-2");
+        assert_eq!(rows[1].content_id.as_deref(), Some("pic@aster"));
+        assert!(rows[1].is_inline);
+        assert_eq!(rows[1].size, 4);
+
+        let without = crate::crypto::draft::DraftContent {
+            subject: "with files".to_string(),
+            message: "<p>removed</p>".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-att", &without, "tester@aster.test", "2026-08-02T00:00:00Z", 3);
+        let cached = db.get_cached_message("web-draft-att").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
+        assert!(db.get_message_attachments("web-draft-att").unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.30 - 2026-09-03
+
+### Fixed
+- Messages that you send from your mail app through Aster Bridge now include their attachments. Earlier versions delivered the message without the files, and no error told you.
+- Inline images in HTML messages that you send arrive in place.
+- Messages that wait in the outbox and go out later keep their attachments.
+- Drafts that you saved on the web with attachments now show those attachments in your mail app, and sending a draft through JMAP includes the attachments, the Cc and Bcc recipients, and the HTML formatting.
+
 ## 0.4.29 - 2026-09-03
 
 ### Fixed

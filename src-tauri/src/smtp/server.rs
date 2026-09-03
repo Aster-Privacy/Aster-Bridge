@@ -650,6 +650,7 @@ pub fn build_send_payload(
     recipients: &[String],
     session_email: &str,
     sender_identity: Option<&crate::auth::session::SendIdentity>,
+    passphrase: &[u8],
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     use mail_parser::MessageParser;
 
@@ -766,7 +767,36 @@ pub fn build_send_payload(
         payload["body_html"] = serde_json::json!(html);
     }
 
+    let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_DATA_SIZE);
+    if !attachments.is_empty() {
+        let sealed = crate::crypto::attachment::seal_send_attachments(&attachments, passphrase)
+            .map_err(|e| crate::error::BridgeError::Smtp(format!("attachment sealing failed: {}", e)))?;
+        payload["attachments"] = serde_json::Value::Array(sealed);
+    }
+
     Ok(payload)
+}
+
+pub async fn build_send_payload_blocking(
+    raw_message: Vec<u8>,
+    from: Option<String>,
+    recipients: Vec<String>,
+    session_email: String,
+    sender_identity: Option<crate::auth::session::SendIdentity>,
+    passphrase: zeroize::Zeroizing<Vec<u8>>,
+) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
+    tokio::task::spawn_blocking(move || {
+        build_send_payload(
+            &raw_message,
+            from.as_deref(),
+            &recipients,
+            &session_email,
+            sender_identity.as_ref(),
+            &passphrase,
+        )
+    })
+    .await
+    .map_err(|e| crate::error::BridgeError::Smtp(format!("payload build did not finish: {}", e)))?
 }
 
 async fn send_via_api(
@@ -776,22 +806,29 @@ async fn send_via_api(
     recipients: &[String],
     raw_message: &[u8],
 ) -> std::result::Result<(), crate::error::BridgeError> {
-    let (session_email, sender_identity, access_token) = {
+    let (session_email, sender_identity, access_token, passphrase) = {
         let s = session.read().await;
         let lookup_addr = from
             .as_deref()
             .filter(|v| !v.is_empty())
             .unwrap_or(&s.email);
         let identity = s.find_send_identity(lookup_addr).cloned();
-        (s.email.clone(), identity, s.access_token.clone())
+        (
+            s.email.clone(),
+            identity,
+            s.access_token.clone(),
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+        )
     };
-    let payload = build_send_payload(
-        raw_message,
-        from.as_deref(),
-        recipients,
-        &session_email,
-        sender_identity.as_ref(),
-    )?;
+    let payload = build_send_payload_blocking(
+        raw_message.to_vec(),
+        from.clone(),
+        recipients.to_vec(),
+        session_email,
+        sender_identity,
+        passphrase,
+    )
+    .await?;
     client.send_mail(&access_token, &payload).await
 }
 
@@ -973,11 +1010,158 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    const ATTACHED_RAW: &[u8] = concat!(
+        "From: sender@aster.test\r\n",
+        "To: rcpt@example.com\r\n",
+        "Subject: with files\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n",
+        "\r\n",
+        "--OUTER\r\n",
+        "Content-Type: multipart/related; boundary=\"INNER\"\r\n",
+        "\r\n",
+        "--INNER\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "\r\n",
+        "<p>see <img src=\"cid:pic@aster\"></p>\r\n",
+        "--INNER\r\n",
+        "Content-Type: image/png; name=\"pic.png\"\r\n",
+        "Content-ID: <pic@aster>\r\n",
+        "Content-Disposition: inline; filename=\"pic.png\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "iVBORw0=\r\n",
+        "--INNER--\r\n",
+        "--OUTER\r\n",
+        "Content-Type: application/pdf; name=\"report.pdf\"\r\n",
+        "Content-Disposition: attachment; filename=\"report.pdf\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "aGVsbG8gcGRm\r\n",
+        "--OUTER--\r\n"
+    )
+    .as_bytes();
+
+    fn open_send_attachment(value: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let meta_bytes = STANDARD
+            .decode(value["recipient_encrypted_meta"].as_str().unwrap())
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        let key = STANDARD.decode(meta["session_key"].as_str().unwrap()).unwrap();
+        let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
+        let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        (cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap(), meta)
+    }
+
+    #[test]
+    fn build_send_payload_carries_sealed_attachments() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            ATTACHED_RAW,
+            Some("sender@aster.test"),
+            &recipients,
+            "sender@aster.test",
+            None,
+            b"vault-pass",
+        )
+        .unwrap();
+        assert_eq!(payload["is_html"], true);
+        assert!(payload["body"].as_str().unwrap().contains("cid:pic@aster"));
+        let list = payload["attachments"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        for entry in list {
+            for key in [
+                "encrypted_data",
+                "data_nonce",
+                "sender_encrypted_meta",
+                "sender_meta_nonce",
+                "recipient_encrypted_meta",
+            ] {
+                assert!(entry[key].is_string(), "missing {}", key);
+            }
+        }
+        let opened: Vec<(Vec<u8>, serde_json::Value)> =
+            list.iter().map(open_send_attachment).collect();
+        let pdf = opened
+            .iter()
+            .find(|(_, m)| m["filename"] == "report.pdf")
+            .unwrap();
+        assert_eq!(pdf.0, b"hello pdf");
+        assert_eq!(pdf.1["content_type"], "application/pdf");
+        assert_eq!(pdf.1["is_inline"], false);
+        let pic = opened
+            .iter()
+            .find(|(_, m)| m["filename"] == "pic.png")
+            .unwrap();
+        assert_eq!(pic.0, b"\x89PNG\r");
+        assert_eq!(pic.1["content_id"], "pic@aster");
+        assert_eq!(pic.1["is_inline"], true);
+    }
+
+    #[test]
+    fn build_send_payload_omits_attachments_key_without_parts() {
+        let raw = b"From: sender@aster.test\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn build_send_payload_sender_copy_meta_opens_with_the_vault_passphrase() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            ATTACHED_RAW,
+            Some("sender@aster.test"),
+            &recipients,
+            "sender@aster.test",
+            None,
+            b"vault-pass",
+        )
+        .unwrap();
+        let entry = &payload["attachments"][0];
+        let row = crate::api_client::AttachmentResponse {
+            id: "att-0".to_string(),
+            mail_item_id: "sent-1".to_string(),
+            encrypted_data: entry["encrypted_data"].as_str().unwrap().to_string(),
+            data_nonce: entry["data_nonce"].as_str().unwrap().to_string(),
+            encrypted_meta: entry["sender_encrypted_meta"].as_str().unwrap().to_string(),
+            meta_nonce: entry["sender_meta_nonce"].as_str().unwrap().to_string(),
+            size_bytes: 0,
+            seq_num: 0,
+            created_at: None,
+        };
+        let opened = crate::crypto::attachment::decrypt_attachment(&row, None, b"vault-pass", None).unwrap();
+        assert!(!opened.data.is_empty());
+        assert!(crate::crypto::attachment::decrypt_attachment(&row, None, b"wrong", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_matches_the_sync_builder() {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload_blocking(
+            ATTACHED_RAW.to_vec(),
+            Some("sender@aster.test".to_string()),
+            recipients,
+            "sender@aster.test".to_string(),
+            None,
+            zeroize::Zeroizing::new(b"pass".to_vec()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload["attachments"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["client_source"], "bridge");
+    }
+
     #[test]
     fn build_send_payload_uses_envelope_recipients_as_bcc_when_no_headers() {
         let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\nbody here\r\n";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["subject"], "hi");
         assert_eq!(payload["to"][0], "rcpt@example.com");
         assert_eq!(payload["client_source"], "bridge");
@@ -988,7 +1172,7 @@ mod tests {
     fn build_send_payload_prefers_header_to() {
         let raw = b"From: sender@aster.test\r\nTo: named@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["named@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["to"][0], "named@example.com");
         assert!(payload["bcc"].is_null());
     }
@@ -997,7 +1181,7 @@ mod tests {
     fn build_send_payload_envelope_only_recipient_added_as_bcc() {
         let raw = b"From: sender@aster.test\r\nTo: visible@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["bcc"][0], "hidden@example.com");
     }
 
@@ -1005,7 +1189,7 @@ mod tests {
     fn build_send_payload_body_is_never_empty() {
         let raw = b"From: sender@aster.test\r\nSubject: hi\r\n\r\n";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None).unwrap();
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         let body = payload["body"].as_str().unwrap();
         assert!(!body.is_empty());
     }
@@ -1014,7 +1198,7 @@ mod tests {
     fn build_send_payload_invalid_message_errors() {
         let raw: &[u8] = b"";
         let recipients = vec!["rcpt@example.com".to_string()];
-        let result = build_send_payload(raw, None, &recipients, "sender@aster.test", None);
+        let result = build_send_payload(raw, None, &recipients, "sender@aster.test", None, b"pass");
         assert!(result.is_err());
     }
 
@@ -1037,6 +1221,7 @@ mod tests {
             &recipients,
             "primary@aster.test",
             Some(&identity),
+            b"pass",
         )
         .unwrap();
         assert_eq!(payload["sender_email"], "alias@example.com");
@@ -1063,6 +1248,7 @@ mod tests {
             &recipients,
             "primary@aster.test",
             Some(&identity),
+            b"pass",
         )
         .unwrap();
         assert!(payload.get("sender_alias_hash").is_none());

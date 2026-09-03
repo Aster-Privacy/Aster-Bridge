@@ -26,7 +26,7 @@ use crate::api_client::ApiClient;
 use crate::auth::session::Session;
 use crate::db::{Database, OutboxRow};
 use crate::error::BridgeError;
-use crate::smtp::server::{build_send_payload, is_transient_send_error};
+use crate::smtp::server::{build_send_payload_blocking, is_transient_send_error};
 
 const TICK_SECS: u64 = 30;
 const MAX_ATTEMPTS: i64 = 7;
@@ -67,19 +67,26 @@ pub async fn try_send_row(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    let (session_email, sender_identity, access_token) = {
+    let (session_email, sender_identity, access_token, passphrase) = {
         let s = session.read().await;
         let lookup_addr = from_opt.filter(|v| !v.is_empty()).unwrap_or(&s.email);
         let identity = s.find_send_identity(lookup_addr).cloned();
-        (s.email.clone(), identity, s.access_token.clone())
+        (
+            s.email.clone(),
+            identity,
+            s.access_token.clone(),
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+        )
     };
-    let payload = build_send_payload(
-        &row.raw_mime,
-        from_opt,
-        &recipients,
-        &session_email,
-        sender_identity.as_ref(),
-    )?;
+    let payload = build_send_payload_blocking(
+        row.raw_mime.clone(),
+        from_opt.map(|s| s.to_string()),
+        recipients,
+        session_email,
+        sender_identity,
+        passphrase,
+    )
+    .await?;
     client.send_mail(&access_token, &payload).await
 }
 

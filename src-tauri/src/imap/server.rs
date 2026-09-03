@@ -1805,7 +1805,7 @@ fn format_attachment_size(bytes: usize) -> String {
 }
 
 fn draft_content_from_mime(raw_message: &[u8]) -> Option<crate::crypto::draft::DraftContent> {
-    use mail_parser::{MessageParser, MimeHeaders};
+    use mail_parser::MessageParser;
 
     fn addr_list(a: Option<&mail_parser::Address<'_>>) -> Vec<String> {
         a.map(|l| {
@@ -1827,37 +1827,19 @@ fn draft_content_from_mime(raw_message: &[u8]) -> Option<crate::crypto::draft::D
         .or_else(|| parsed.body_text(0).map(|s| s.to_string()))
         .unwrap_or_default();
 
-    let mut attachments: Vec<crate::crypto::draft::DraftAttachment> = Vec::new();
-    for part in parsed.attachments() {
-        let data = part.contents();
-        if data.is_empty() {
-            continue;
-        }
-        let name = part
-            .attachment_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("attachment-{}", attachments.len() + 1));
-        let mime_type = part
-            .content_type()
-            .map(|ct| match ct.subtype() {
-                Some(sub) => format!("{}/{}", ct.ctype(), sub),
-                None => ct.ctype().to_string(),
+    let attachments: Vec<crate::crypto::draft::DraftAttachment> =
+        crate::crypto::attachment::mime_attachments(&parsed, usize::MAX)
+            .into_iter()
+            .map(|part| crate::crypto::draft::DraftAttachment {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: part.name,
+                size: format_attachment_size(part.data.len()),
+                size_bytes: part.data.len() as i64,
+                mime_type: part.mime_type,
+                data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &part.data),
+                content_id: part.content_id,
             })
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        let content_id = part
-            .content_id()
-            .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
-            .filter(|s| !s.is_empty());
-        attachments.push(crate::crypto::draft::DraftAttachment {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            size: format_attachment_size(data.len()),
-            size_bytes: data.len() as i64,
-            mime_type,
-            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data),
-            content_id,
-        });
-    }
+            .collect();
 
     Some(crate::crypto::draft::DraftContent {
         to_recipients,

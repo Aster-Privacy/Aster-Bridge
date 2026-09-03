@@ -39,6 +39,100 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
     }))
 }
 
+async fn submission_body(
+    ctx: &Arc<JmapContext>,
+    msg: &crate::db::CachedMessage,
+    resolved_id: &str,
+    sender_email: String,
+    sender_alias_hash: Option<String>,
+    sender_display_name: Option<String>,
+) -> Result<Value, String> {
+    let recipients_str = msg.recipients.clone().unwrap_or_default();
+    let to_list: Vec<String> = recipients_str
+        .split(',')
+        .map(|s| strip_header_chars(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let body_content = msg.body_text.clone().unwrap_or_default();
+    let meta: Value = msg
+        .raw_headers
+        .as_deref()
+        .and_then(|r| serde_json::from_str(r).ok())
+        .unwrap_or(Value::Null);
+    let is_html = meta.get("is_html").and_then(|v| v.as_bool()).unwrap_or(false);
+    let cc_list = meta_address_list(&meta, "cc");
+    let bcc_list = meta_address_list(&meta, "bcc");
+    let final_body = if body_content.is_empty() {
+        " ".to_string()
+    } else {
+        body_content
+    };
+    let mut body = json!({
+        "to": to_list,
+        "subject": strip_header_chars(&msg.subject.clone().unwrap_or_default()),
+        "body": final_body,
+        "is_html": is_html,
+        "sender_email": sender_email,
+        "is_e2e_encrypted": false,
+        "client_source": "bridge",
+    });
+    if is_html {
+        body["body_html"] = body["body"].clone();
+    }
+    if !cc_list.is_empty() {
+        body["cc"] = json!(cc_list);
+    }
+    if !bcc_list.is_empty() {
+        body["bcc"] = json!(bcc_list);
+    }
+    if let Some(hash) = sender_alias_hash {
+        body["sender_alias_hash"] = json!(hash);
+    }
+    if let Some(dn) = sender_display_name {
+        body["sender_display_name"] = json!(dn);
+    }
+    if msg.attachments_state != crate::db::ATTACHMENTS_STORED {
+        return Ok(body);
+    }
+    let stored = ctx.db.get_message_attachments(resolved_id).unwrap_or_default();
+    if stored.is_empty() {
+        return Ok(body);
+    }
+    let outgoing: Vec<crate::crypto::attachment::OutgoingAttachment> = stored
+        .into_iter()
+        .map(|a| crate::crypto::attachment::OutgoingAttachment {
+            name: a.name,
+            mime_type: a.content_type,
+            content_id: a.content_id,
+            is_inline: a.is_inline,
+            data: a.data,
+        })
+        .collect();
+    let passphrase = zeroize::Zeroizing::new(ctx.session.read().await.vault_passphrase.clone());
+    let sealed = tokio::task::spawn_blocking(move || {
+        crate::crypto::attachment::seal_send_attachments(&outgoing, &passphrase)
+    })
+    .await;
+    match sealed {
+        Ok(Ok(list)) => {
+            body["attachments"] = Value::Array(list);
+            Ok(body)
+        }
+        Ok(Err(e)) => Err(format!("attachment sealing failed: {}", e)),
+        Err(e) => Err(format!("attachment sealing did not finish: {}", e)),
+    }
+}
+
+fn meta_address_list(meta: &Value, key: &str) -> Vec<String> {
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| strip_header_chars(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub async fn set(
     ctx: &Arc<JmapContext>,
     args: Value,
@@ -136,27 +230,25 @@ pub async fn set(
             }
         };
 
-        let recipients_str = msg.recipients.clone().unwrap_or_default();
-        let to_list: Vec<String> = recipients_str
-            .split(',')
-            .map(|s| strip_header_chars(s.trim()))
-            .filter(|s| !s.is_empty())
-            .collect();
-        let body_content = msg.body_text.clone().unwrap_or_default();
-        let mut body = json!({
-            "to": to_list,
-            "subject": strip_header_chars(&msg.subject.clone().unwrap_or_default()),
-            "body": if body_content.is_empty() { " ".to_string() } else { body_content },
-            "sender_email": sender_email,
-            "is_e2e_encrypted": false,
-            "client_source": "bridge",
-        });
-        if let Some(hash) = sender_alias_hash {
-            body["sender_alias_hash"] = json!(hash);
-        }
-        if let Some(dn) = sender_display_name {
-            body["sender_display_name"] = json!(dn);
-        }
+        let body = match submission_body(
+            ctx,
+            &msg,
+            &resolved_id,
+            sender_email,
+            sender_alias_hash,
+            sender_display_name,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(description) => {
+                not_created.insert(
+                    creation_id,
+                    json!({"type": "forbiddenToSend", "description": description}),
+                );
+                continue;
+            }
+        };
 
         match ctx.client.send_mail(&access_token, &body).await {
             Ok(_) => {
@@ -246,6 +338,109 @@ mod tests {
         ctx.db
             .upsert_cached_message(id, "drafts", Some("Subj"), Some("a@b.com"), Some("to@x.com, two@y.com"), Some("2026-01-01T00:00:00Z"), 10, Some("body"), Some("{}"))
             .unwrap();
+    }
+
+    fn open_sealed(value: &Value) -> (Vec<u8>, Value) {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let meta_bytes = STANDARD
+            .decode(value["recipient_encrypted_meta"].as_str().unwrap())
+            .unwrap();
+        let meta: Value = serde_json::from_slice(&meta_bytes).unwrap();
+        let key = STANDARD.decode(meta["session_key"].as_str().unwrap()).unwrap();
+        let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
+        let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        (cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap(), meta)
+    }
+
+    #[tokio::test]
+    async fn submission_body_carries_html_cc_bcc_and_attachments() {
+        let (ctx, _a, _d) = test_ctx();
+        let meta = json!({
+            "is_html": true,
+            "cc": "cc1@x.com, cc2@y.com",
+            "bcc": "hidden@z.com",
+            "attachment_count": 1
+        })
+        .to_string();
+        ctx.db
+            .upsert_cached_message(
+                "d1",
+                "drafts",
+                Some("Files"),
+                Some("tester@aster.test"),
+                Some("to@x.com"),
+                Some("2026-01-01T00:00:00Z"),
+                10,
+                Some("<p>hello</p>"),
+                Some(&meta),
+            )
+            .unwrap();
+        ctx.db
+            .replace_message_attachments(
+                "d1",
+                &[crate::db::CachedAttachment {
+                    seq: 0,
+                    name: "notes.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    content_id: None,
+                    is_inline: false,
+                    size: 5,
+                    data: b"notes".to_vec(),
+                }],
+            )
+            .unwrap();
+        ctx.db
+            .set_attachments_state("d1", crate::db::ATTACHMENTS_STORED)
+            .unwrap();
+        let msg = ctx.db.get_cached_message("d1").unwrap().unwrap();
+        let body = submission_body(&ctx, &msg, "d1", "tester@aster.test".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(body["to"], json!(["to@x.com"]));
+        assert_eq!(body["cc"], json!(["cc1@x.com", "cc2@y.com"]));
+        assert_eq!(body["bcc"], json!(["hidden@z.com"]));
+        assert_eq!(body["is_html"], json!(true));
+        assert_eq!(body["body_html"], json!("<p>hello</p>"));
+        let list = body["attachments"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        let (plain, meta) = open_sealed(&list[0]);
+        assert_eq!(plain, b"notes");
+        assert_eq!(meta["filename"], "notes.txt");
+        assert_eq!(meta["content_type"], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn submission_body_plain_message_has_no_extras() {
+        let (ctx, _a, _d) = test_ctx();
+        add_msg(&ctx, "p1");
+        let msg = ctx.db.get_cached_message("p1").unwrap().unwrap();
+        let body = submission_body(&ctx, &msg, "p1", "tester@aster.test".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(body["is_html"], json!(false));
+        assert!(body.get("body_html").is_none());
+        assert!(body.get("cc").is_none());
+        assert!(body.get("bcc").is_none());
+        assert!(body.get("attachments").is_none());
+        assert_eq!(body["to"], json!(["to@x.com", "two@y.com"]));
+    }
+
+    #[tokio::test]
+    async fn submission_body_skips_attachments_that_are_not_stored() {
+        let (ctx, _a, _d) = test_ctx();
+        add_msg(&ctx, "p2");
+        ctx.db
+            .set_attachments_state("p2", crate::db::ATTACHMENTS_PENDING)
+            .unwrap();
+        let msg = ctx.db.get_cached_message("p2").unwrap().unwrap();
+        let body = submission_body(&ctx, &msg, "p2", "tester@aster.test".to_string(), None, None)
+            .await
+            .unwrap();
+        assert!(body.get("attachments").is_none());
     }
 
     #[test]

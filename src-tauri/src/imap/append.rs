@@ -155,14 +155,7 @@ pub fn parse_imap_internal_date(value: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-#[derive(Debug, Clone)]
-pub struct ParsedAttachment {
-    pub name: String,
-    pub mime_type: String,
-    pub content_id: Option<String>,
-    pub is_inline: bool,
-    pub data: Vec<u8>,
-}
+pub type ParsedAttachment = crate::crypto::attachment::OutgoingAttachment;
 
 #[derive(Debug, Clone)]
 pub struct ImportedMessage {
@@ -272,7 +265,7 @@ pub fn build_imported_message(
     internal_date: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<ImportedMessage> {
-    use mail_parser::{MessageParser, MimeHeaders};
+    use mail_parser::MessageParser;
 
     fn addr_list(a: Option<&mail_parser::Address<'_>>) -> Vec<String> {
         a.map(|l| {
@@ -331,35 +324,7 @@ pub fn build_imported_message(
     let html_body = parsed.body_html(0).map(|s| s.to_string());
     let text_body = parsed.body_text(0).map(|s| s.to_string());
 
-    let mut attachments: Vec<ParsedAttachment> = Vec::new();
-    for part in parsed.attachments() {
-        let data = part.contents();
-        if data.is_empty() || data.len() > MAX_ATTACHMENT_BYTES {
-            continue;
-        }
-        let name = part
-            .attachment_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("attachment-{}", attachments.len() + 1));
-        let mime_type = part
-            .content_type()
-            .map(|ct| match ct.subtype() {
-                Some(sub) => format!("{}/{}", ct.ctype(), sub),
-                None => ct.ctype().to_string(),
-            })
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        let content_id = part
-            .content_id()
-            .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
-            .filter(|s| !s.is_empty());
-        attachments.push(ParsedAttachment {
-            is_inline: content_id.is_some(),
-            name,
-            mime_type,
-            content_id,
-            data: data.to_vec(),
-        });
-    }
+    let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_ATTACHMENT_BYTES);
 
     let message_id = parsed
         .message_id()
@@ -786,53 +751,20 @@ async fn upload_attachments(
     mail_id: &str,
     attachments: &[ParsedAttachment],
 ) {
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-    use rand_core::{OsRng, RngCore};
-
     for (seq, attachment) in attachments.iter().enumerate() {
         let sealed = {
             let attachment = attachment.clone();
             let passphrase = passphrase.to_vec();
             tokio::task::spawn_blocking(move || {
-                let mut session_key = [0u8; 32];
-                OsRng.fill_bytes(&mut session_key);
-                let cipher = match Aes256Gcm::new_from_slice(&session_key) {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("attachment cipher init failed: {}", e)),
-                };
-
-                let mut data_nonce = [0u8; 12];
-                OsRng.fill_bytes(&mut data_nonce);
-                let encrypted_data = cipher
-                    .encrypt(Nonce::from_slice(&data_nonce), attachment.data.as_ref())
-                    .map_err(|_| format!("attachment encrypt failed for {}", attachment.name))?;
-
-                let meta = serde_json::json!({
-                    "filename": attachment.name,
-                    "content_type": attachment.mime_type,
-                    "session_key": STANDARD.encode(session_key),
-                    "content_id": attachment.content_id,
-                    "is_inline": attachment.is_inline,
-                })
-                .to_string();
-
-                let encrypted_meta =
-                    crate::crypto::envelope::encrypt_pbkdf2_envelope(&meta, &passphrase)
-                        .map_err(|e| format!("attachment meta seal failed: {}", e))?;
-
-                let mut meta_nonce = [0u8; 12];
-                OsRng.fill_bytes(&mut meta_nonce);
-
-                Ok::<_, String>((encrypted_data, data_nonce, encrypted_meta, meta_nonce))
+                crate::crypto::attachment::seal_attachment(&attachment, &passphrase)
             })
             .await
         };
 
-        let (encrypted_data, data_nonce, encrypted_meta, meta_nonce) = match sealed {
+        let sealed = match sealed {
             Ok(Ok(parts)) => parts,
             Ok(Err(e)) => {
-                tracing::warn!("{}", e);
+                tracing::warn!("attachment sealing failed for {}: {}", attachment.name, e);
                 continue;
             }
             Err(e) => {
@@ -842,10 +774,10 @@ async fn upload_attachments(
         };
 
         let body = CreateAttachmentBody {
-            encrypted_data: &STANDARD.encode(&encrypted_data),
-            data_nonce: &STANDARD.encode(data_nonce),
-            encrypted_meta: &encrypted_meta,
-            meta_nonce: &STANDARD.encode(meta_nonce),
+            encrypted_data: &STANDARD.encode(&sealed.encrypted_data),
+            data_nonce: &STANDARD.encode(sealed.data_nonce),
+            encrypted_meta: &sealed.sender_meta,
+            meta_nonce: &STANDARD.encode(sealed.sender_meta_nonce),
             seq_num: seq as i16,
         };
 

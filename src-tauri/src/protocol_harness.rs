@@ -1541,6 +1541,7 @@ async fn alias_send_identities_real() {
             std::slice::from_ref(&to_self),
             &session.email,
             Some(id),
+            &session.vault_passphrase,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -1616,7 +1617,7 @@ async fn alias_roundtrip_real() {
     let mut markers: HashMap<String, (String, String)> = HashMap::new();
 
     async fn send_one(
-        client: &ApiClient, token: &str, our_email: &str,
+        client: &ApiClient, token: &str, our_email: &str, passphrase: &[u8],
         from_id: &SendIdentity, to_addr: &str, marker: &str,
     ) -> bool {
         let raw = format!(
@@ -1626,7 +1627,7 @@ async fn alias_roundtrip_real() {
         let to_vec = vec![to_addr.to_string()];
         let payload = match crate::smtp::server::build_send_payload(
             raw.as_bytes(), Some(&from_id.address),
-            &to_vec, our_email, Some(from_id),
+            &to_vec, our_email, Some(from_id), passphrase,
         ) {
             Ok(p) => p,
             Err(e) => { println!("  PAYLOAD FAIL from {} to {}: {}", from_id.address, to_addr, e); return false; }
@@ -1643,7 +1644,7 @@ async fn alias_roundtrip_real() {
     for id in &session.send_identities {
         let marker = format!("RTSND{}{}", markers.len(), run);
         send_total += 1;
-        let ok = send_one(&client, &token, &our_email, id, &our_email, &marker).await;
+        let ok = send_one(&client, &token, &our_email, &pass, id, &our_email, &marker).await;
         if ok { send_ok += 1; }
         println!("  SEND-AS {:<32} {} -> {}", id.address, id.kind.as_str(), if ok {"accepted"} else {"FAILED"});
         markers.insert(marker, (format!("send-as {}", id.kind.as_str()), id.address.clone()));
@@ -1654,7 +1655,7 @@ async fn alias_roundtrip_real() {
     for id in &aliases {
         let marker = format!("RTRCV{}{}", markers.len(), run);
         send_total += 1;
-        let ok = send_one(&client, &token, &our_email, primary_id, &id.address, &marker).await;
+        let ok = send_one(&client, &token, &our_email, &pass, primary_id, &id.address, &marker).await;
         if ok { send_ok += 1; }
         println!("  TO-ALIAS {:<32} -> {}", id.address, if ok {"accepted"} else {"FAILED"});
         markers.insert(marker, ("to-alias".into(), id.address.clone()));

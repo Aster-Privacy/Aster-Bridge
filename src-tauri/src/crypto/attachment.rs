@@ -25,7 +25,7 @@ use base64::Engine as _;
 use zeroize::Zeroizing;
 
 use crate::api_client::AttachmentResponse;
-use crate::crypto::envelope::decrypt_pbkdf2_envelope;
+use crate::crypto::envelope::{decrypt_pbkdf2_envelope, encrypt_pbkdf2_envelope};
 use crate::error::{BridgeError, Result};
 
 const SESSION_KEY_LEN: usize = 32;
@@ -293,11 +293,283 @@ pub fn decrypt_attachment(
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutgoingAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SealedAttachment {
+    pub encrypted_data: Vec<u8>,
+    pub data_nonce: [u8; DATA_NONCE_LEN],
+    pub sender_meta: String,
+    pub sender_meta_nonce: [u8; DATA_NONCE_LEN],
+    pub plain_meta: Zeroizing<String>,
+}
+
+pub fn mime_attachments(parsed: &mail_parser::Message<'_>, max_bytes: usize) -> Vec<OutgoingAttachment> {
+    use mail_parser::MimeHeaders;
+
+    let mut out = Vec::new();
+    for part in parsed.attachments() {
+        let data = part.contents();
+        if data.is_empty() || data.len() > max_bytes {
+            continue;
+        }
+        let name = part
+            .attachment_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("attachment-{}", out.len() + 1));
+        let mime_type = part
+            .content_type()
+            .map(|ct| match ct.subtype() {
+                Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                None => ct.ctype().to_string(),
+            })
+            .unwrap_or_else(|| DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string());
+        let content_id = part
+            .content_id()
+            .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
+            .filter(|s| !s.is_empty());
+        out.push(OutgoingAttachment {
+            is_inline: content_id.is_some(),
+            name,
+            mime_type,
+            content_id,
+            data: data.to_vec(),
+        });
+    }
+    out
+}
+
+pub fn seal_attachment(attachment: &OutgoingAttachment, passphrase: &[u8]) -> Result<SealedAttachment> {
+    use rand_core::{OsRng, RngCore};
+
+    let mut session_key = Zeroizing::new([0u8; SESSION_KEY_LEN]);
+    OsRng.fill_bytes(&mut *session_key);
+    let cipher = Aes256Gcm::new_from_slice(&*session_key)
+        .map_err(|e| BridgeError::Crypto(format!("attachment cipher init: {}", e)))?;
+    let mut data_nonce = [0u8; DATA_NONCE_LEN];
+    OsRng.fill_bytes(&mut data_nonce);
+    let encrypted_data = cipher
+        .encrypt(Nonce::from_slice(&data_nonce), attachment.data.as_ref())
+        .map_err(|_| {
+            BridgeError::Crypto(format!("attachment encrypt failed for {}", attachment.name))
+        })?;
+    let plain_meta = Zeroizing::new(
+        serde_json::json!({
+            "filename": attachment.name,
+            "content_type": attachment.mime_type,
+            "session_key": STANDARD.encode(*session_key),
+            "content_id": attachment.content_id,
+            "is_inline": attachment.is_inline,
+        })
+        .to_string(),
+    );
+    let sender_meta = encrypt_pbkdf2_envelope(&plain_meta, passphrase)?;
+    let mut sender_meta_nonce = [0u8; DATA_NONCE_LEN];
+    OsRng.fill_bytes(&mut sender_meta_nonce);
+    Ok(SealedAttachment {
+        encrypted_data,
+        data_nonce,
+        sender_meta,
+        sender_meta_nonce,
+        plain_meta,
+    })
+}
+
+pub fn send_attachment_value(sealed: &SealedAttachment) -> serde_json::Value {
+    serde_json::json!({
+        "encrypted_data": STANDARD.encode(&sealed.encrypted_data),
+        "data_nonce": STANDARD.encode(sealed.data_nonce),
+        "sender_encrypted_meta": sealed.sender_meta,
+        "sender_meta_nonce": STANDARD.encode(sealed.sender_meta_nonce),
+        "recipient_encrypted_meta": STANDARD.encode(sealed.plain_meta.as_bytes()),
+    })
+}
+
+pub fn seal_send_attachments(
+    attachments: &[OutgoingAttachment],
+    passphrase: &[u8],
+) -> Result<Vec<serde_json::Value>> {
+    attachments
+        .iter()
+        .map(|a| seal_attachment(a, passphrase).map(|s| send_attachment_value(&s)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::envelope::encrypt_pbkdf2_envelope;
     use rand_core::{OsRng, RngCore};
+
+    fn outgoing(name: &str, mime: &str, content_id: Option<&str>, data: &[u8]) -> OutgoingAttachment {
+        OutgoingAttachment {
+            name: name.to_string(),
+            mime_type: mime.to_string(),
+            content_id: content_id.map(|s| s.to_string()),
+            is_inline: content_id.is_some(),
+            data: data.to_vec(),
+        }
+    }
+
+    fn server_decrypt(value: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
+        let meta_bytes = STANDARD
+            .decode(value["recipient_encrypted_meta"].as_str().unwrap())
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        let key = STANDARD.decode(meta["session_key"].as_str().unwrap()).unwrap();
+        assert_eq!(key.len(), 32);
+        let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
+        assert_eq!(nonce.len(), 12);
+        let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let plain = cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap();
+        (plain, meta)
+    }
+
+    #[test]
+    fn sealed_send_attachment_is_readable_by_the_server_delivery_path() {
+        let att = outgoing("report.pdf", "application/pdf", None, b"hello pdf");
+        let value = send_attachment_value(&seal_attachment(&att, b"pass").unwrap());
+        let (plain, meta) = server_decrypt(&value);
+        assert_eq!(plain, b"hello pdf");
+        assert_eq!(meta["filename"], "report.pdf");
+        assert_eq!(meta["content_type"], "application/pdf");
+        assert_eq!(meta["is_inline"], false);
+        assert!(meta["content_id"].is_null());
+        let meta_nonce = STANDARD
+            .decode(value["sender_meta_nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(meta_nonce.len(), 12);
+    }
+
+    #[test]
+    fn sealed_send_attachment_sender_copy_opens_with_the_passphrase() {
+        let att = outgoing("logo.png", "image/png", Some("logo@aster"), b"\x89PNG");
+        let sealed = seal_attachment(&att, b"vault-pass").unwrap();
+        let (plain, meta) = server_decrypt(&send_attachment_value(&sealed));
+        assert_eq!(plain, b"\x89PNG");
+        assert_eq!(meta["content_id"], "logo@aster");
+        assert_eq!(meta["is_inline"], true);
+        let sender_row = AttachmentResponse {
+            encrypted_meta: sealed.sender_meta.clone(),
+            ..row(
+                0,
+                &sealed.encrypted_data,
+                &sealed.data_nonce,
+                b"",
+                &sealed.sender_meta_nonce,
+            )
+        };
+        let opened = decrypt_attachment(&sender_row, None, b"vault-pass", None).unwrap();
+        assert_eq!(opened.data, b"\x89PNG");
+        assert_eq!(opened.filename, "logo.png");
+        assert_eq!(opened.content_id.as_deref(), Some("logo@aster"));
+        assert!(opened.is_inline);
+    }
+
+    #[test]
+    fn sealed_send_attachment_received_copy_opens_from_plain_meta() {
+        let att = outgoing("notes.txt", "text/plain", None, b"plain notes");
+        let sealed = seal_attachment(&att, b"vault-pass").unwrap();
+        let received_row = row(
+            3,
+            &sealed.encrypted_data,
+            &sealed.data_nonce,
+            sealed.plain_meta.as_bytes(),
+            &[0u8; 12],
+        );
+        let opened = decrypt_attachment(&received_row, None, b"other-pass", None).unwrap();
+        assert_eq!(opened.data, b"plain notes");
+        assert_eq!(opened.filename, "notes.txt");
+    }
+
+    #[test]
+    fn every_seal_uses_a_fresh_key_and_nonce() {
+        let att = outgoing("a.bin", "application/octet-stream", None, b"same bytes");
+        let one = seal_attachment(&att, b"p").unwrap();
+        let two = seal_attachment(&att, b"p").unwrap();
+        assert_ne!(one.encrypted_data, two.encrypted_data);
+        assert_ne!(one.data_nonce, two.data_nonce);
+        assert_ne!(one.sender_meta_nonce, two.sender_meta_nonce);
+    }
+
+    #[test]
+    fn mime_attachments_extracts_regular_and_inline_parts() {
+        let raw = concat!(
+            "From: a@b.c\r\n",
+            "To: d@e.f\r\n",
+            "Subject: mixed\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n",
+            "\r\n",
+            "--OUTER\r\n",
+            "Content-Type: multipart/related; boundary=\"INNER\"\r\n",
+            "\r\n",
+            "--INNER\r\n",
+            "Content-Type: text/html\r\n",
+            "\r\n",
+            "<p><img src=\"cid:pic@aster\"></p>\r\n",
+            "--INNER\r\n",
+            "Content-Type: image/png; name=\"pic.png\"\r\n",
+            "Content-ID: <pic@aster>\r\n",
+            "Content-Disposition: inline; filename=\"pic.png\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "iVBORw0=\r\n",
+            "--INNER--\r\n",
+            "--OUTER\r\n",
+            "Content-Type: application/pdf; name=\"report.pdf\"\r\n",
+            "Content-Disposition: attachment; filename=\"report.pdf\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "aGVsbG8gcGRm\r\n",
+            "--OUTER--\r\n"
+        )
+        .as_bytes();
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let list = mime_attachments(&parsed, 1024 * 1024);
+        assert_eq!(list.len(), 2);
+        let pic = list.iter().find(|a| a.name == "pic.png").unwrap();
+        assert_eq!(pic.mime_type, "image/png");
+        assert_eq!(pic.content_id.as_deref(), Some("pic@aster"));
+        assert!(pic.is_inline);
+        assert_eq!(pic.data, b"\x89PNG\r");
+        let pdf = list.iter().find(|a| a.name == "report.pdf").unwrap();
+        assert_eq!(pdf.mime_type, "application/pdf");
+        assert!(!pdf.is_inline);
+        assert_eq!(pdf.data, b"hello pdf");
+    }
+
+    #[test]
+    fn mime_attachments_skips_oversized_parts() {
+        let raw = concat!(
+            "From: a@b.c\r\n",
+            "Subject: big\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"B\"\r\n",
+            "\r\n",
+            "--B\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "body\r\n",
+            "--B\r\n",
+            "Content-Type: application/octet-stream; name=\"big.bin\"\r\n",
+            "Content-Disposition: attachment; filename=\"big.bin\"\r\n",
+            "\r\n",
+            "0123456789\r\n",
+            "--B--\r\n"
+        )
+        .as_bytes();
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        assert!(mime_attachments(&parsed, 4).is_empty());
+        assert_eq!(mime_attachments(&parsed, 64).len(), 1);
+    }
 
     fn random_key() -> [u8; 32] {
         let mut k = [0u8; 32];
