@@ -35,6 +35,7 @@ mod shell;
 mod error;
 mod imap;
 mod jmap;
+mod message_render;
 mod outbox;
 mod pop3;
 mod port_picker;

@@ -5,7 +5,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-use crate::db::CachedMessage;
+use crate::db::{CachedAttachment, CachedMessage};
 
 fn looks_like_headers(s: &str) -> bool {
     let t = s.trim_start();
@@ -45,7 +45,7 @@ fn sanitize_header_block(raw: &str) -> String {
     out
 }
 
-pub fn build_rfc5322(m: &CachedMessage) -> Vec<u8> {
+pub fn build_rfc5322(m: &CachedMessage, attachments: &[CachedAttachment]) -> Vec<u8> {
     let mut out = String::new();
 
     if let Some(h) = &m.raw_headers {
@@ -57,6 +57,10 @@ pub fn build_rfc5322(m: &CachedMessage) -> Vec<u8> {
             }
             return out.into_bytes();
         }
+    }
+
+    if !attachments.is_empty() {
+        return crate::message_render::render_text(m, attachments).into_bytes();
     }
 
     let is_html = parse_is_html(&m.raw_headers);
@@ -125,6 +129,7 @@ mod tests {
             raw_headers: Some("{}".to_string()),
             imap_uid: 1,
             thread_id: None,
+            attachments_state: 0,
         }
     }
 
@@ -160,7 +165,7 @@ mod tests {
 
     #[test]
     fn build_rfc5322_synthesizes_headers_from_fields() {
-        let out = String::from_utf8(build_rfc5322(&base_msg())).unwrap();
+        let out = String::from_utf8(build_rfc5322(&base_msg(), &[])).unwrap();
         assert!(out.contains("From: Alice <a@b.com>\r\n"));
         assert!(out.contains("To: Bob <b@c.com>\r\n"));
         assert!(out.contains("Subject: Hello\r\n"));
@@ -173,7 +178,7 @@ mod tests {
     fn build_rfc5322_html_content_type() {
         let mut m = base_msg();
         m.raw_headers = Some("{\"is_html\": true}".to_string());
-        let out = String::from_utf8(build_rfc5322(&m)).unwrap();
+        let out = String::from_utf8(build_rfc5322(&m, &[])).unwrap();
         assert!(out.contains("Content-Type: text/html; charset=utf-8\r\n"));
     }
 
@@ -181,7 +186,7 @@ mod tests {
     fn build_rfc5322_includes_message_id() {
         let mut m = base_msg();
         m.raw_headers = Some("{\"message_id\": \"mid-9@host\"}".to_string());
-        let out = String::from_utf8(build_rfc5322(&m)).unwrap();
+        let out = String::from_utf8(build_rfc5322(&m, &[])).unwrap();
         assert!(out.contains("Message-ID: <mid-9@host>\r\n"));
     }
 
@@ -189,7 +194,7 @@ mod tests {
     fn build_rfc5322_uses_raw_header_block_when_present() {
         let mut m = base_msg();
         m.raw_headers = Some("From: raw@x.com\nSubject: Raw Subject\n".to_string());
-        let out = String::from_utf8(build_rfc5322(&m)).unwrap();
+        let out = String::from_utf8(build_rfc5322(&m, &[])).unwrap();
         assert!(out.starts_with("From: raw@x.com\r\nSubject: Raw Subject\r\n\r\n"));
         assert!(out.contains("body content"));
         assert!(!out.contains("MIME-Version"));
@@ -199,7 +204,7 @@ mod tests {
     fn build_rfc5322_strips_injection_in_synthesized_headers() {
         let mut m = base_msg();
         m.subject = Some("evil\r\nBcc: attacker@x.com".to_string());
-        let out = String::from_utf8(build_rfc5322(&m)).unwrap();
+        let out = String::from_utf8(build_rfc5322(&m, &[])).unwrap();
         assert!(out.contains("Subject: evilBcc: attacker@x.com\r\n"));
         assert!(!out.contains("\r\nBcc:"));
     }
@@ -211,7 +216,7 @@ mod tests {
         m.recipients = None;
         m.date = None;
         m.body_text = None;
-        let out = String::from_utf8(build_rfc5322(&m)).unwrap();
+        let out = String::from_utf8(build_rfc5322(&m, &[])).unwrap();
         assert!(out.contains("From: Alice <a@b.com>\r\n"));
         assert!(!out.contains("Subject:"));
         assert!(!out.contains("To:"));

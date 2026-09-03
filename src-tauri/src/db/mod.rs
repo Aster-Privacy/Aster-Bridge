@@ -20,6 +20,7 @@
 //
 use rand_core::{OsRng, RngCore};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroize;
@@ -425,6 +426,33 @@ impl Database {
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_attachment (
+                aster_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                content_id TEXT,
+                is_inline INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (aster_id, seq)
+             );",
+        ).map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN attachments_state INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE message_cache ADD COLUMN attachment_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_attachments_state ON message_cache(attachments_state);
+             UPDATE message_cache SET attachments_state = 1
+              WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 raw_mime BLOB NOT NULL,
@@ -673,7 +701,7 @@ impl Database {
     pub fn list_cached_messages(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
                  FROM message_cache m
                  LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
                  WHERE m.folder = ?1
@@ -693,6 +721,7 @@ impl Database {
                     raw_headers: row.get(9)?,
                     imap_uid: row.get::<_, i64>(10)? as u32,
                     thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -706,7 +735,7 @@ impl Database {
     pub fn list_cached_message_meta(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
                  FROM message_cache m
                  LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
                  WHERE m.folder = ?1
@@ -726,6 +755,7 @@ impl Database {
                     raw_headers: row.get(9)?,
                     imap_uid: row.get::<_, i64>(10)? as u32,
                     thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -769,6 +799,7 @@ impl Database {
                 .ok();
             if let Some(id) = &aster_id {
                 conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [id])?;
+                conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [id])?;
                 conn.execute(
                     "DELETE FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
                     rusqlite::params![id, folder],
@@ -807,6 +838,7 @@ impl Database {
     pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
             conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
             Ok(())
         })
@@ -1223,6 +1255,7 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
+                 DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM jmap_state;
                  DELETE FROM jmap_change_log;
@@ -1239,6 +1272,7 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
+                 DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
                  DELETE FROM app_passwords;
@@ -1275,7 +1309,7 @@ impl Database {
     pub fn get_cached_message(&self, aster_id: &str) -> Result<Option<CachedMessage>, String> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id
+                "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
                  FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
                  WHERE m.aster_id = ?1",
                 [aster_id],
@@ -1292,6 +1326,7 @@ impl Database {
                     raw_headers: row.get(9)?,
                     imap_uid: row.get::<_, i64>(10)? as u32,
                     thread_id: row.get(11)?,
+                    attachments_state: row.get(12)?,
                 }),
             )
             .map(Some)
@@ -1543,10 +1578,194 @@ impl Database {
         })
     }
 
+    pub fn replace_message_attachments(
+        &self,
+        aster_id: &str,
+        attachments: &[CachedAttachment],
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                for a in attachments {
+                    conn.execute(
+                        "INSERT INTO message_attachment (aster_id, seq, name, content_type, content_id, is_inline, size, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            aster_id,
+                            a.seq,
+                            a.name,
+                            a.content_type,
+                            a.content_id,
+                            a.is_inline as i32,
+                            a.size,
+                            a.data,
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_STORED],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn set_attachments_state(&self, aster_id: &str, state: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn attachments_state(&self, aster_id: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT attachments_state FROM message_cache WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+    }
+
+    pub fn bump_attachment_attempts(&self, aster_id: &str) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachment_attempts = attachment_attempts + 1 WHERE aster_id = ?1",
+                [aster_id],
+            )?;
+            conn.query_row(
+                "SELECT attachment_attempts FROM message_cache WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+    }
+
+    pub fn get_message_attachments(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline, size, data
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: row.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_message_attachment_meta(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline, size
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: Vec::new(),
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_attachment_meta_for_folder(
+        &self,
+        folder: &str,
+    ) -> Result<HashMap<String, Vec<CachedAttachment>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.aster_id, a.seq, a.name, a.content_type, a.content_id, a.is_inline, a.size
+                 FROM message_attachment a
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1 ORDER BY a.aster_id, a.seq ASC",
+            )?;
+            let rows = stmt.query_map([folder], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CachedAttachment {
+                        seq: row.get(1)?,
+                        name: row.get(2)?,
+                        content_type: row.get(3)?,
+                        content_id: row.get(4)?,
+                        is_inline: row.get::<_, i64>(5)? != 0,
+                        size: row.get(6)?,
+                        data: Vec::new(),
+                    },
+                ))
+            })?;
+            let mut out: HashMap<String, Vec<CachedAttachment>> = HashMap::new();
+            for r in rows {
+                let (id, att) = r?;
+                out.entry(id).or_default().push(att);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_attachment_backlog(&self, limit: i64) -> Result<Vec<(String, String)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, folder FROM message_cache
+                 WHERE attachments_state = ?1
+                 ORDER BY attachment_attempts ASC, created_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![ATTACHMENTS_PENDING, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn clear_all_user_data(&self) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
+                 DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
                  DELETE FROM app_passwords;
@@ -1573,6 +1792,22 @@ pub struct JmapMailboxRow {
     pub folder_label: String,
 }
 
+pub const ATTACHMENTS_NONE: i64 = 0;
+pub const ATTACHMENTS_PENDING: i64 = 1;
+pub const ATTACHMENTS_STORED: i64 = 2;
+pub const ATTACHMENTS_FAILED: i64 = 3;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedAttachment {
+    pub seq: i64,
+    pub name: String,
+    pub content_type: String,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+    pub size: i64,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedMessage {
     pub aster_id: String,
@@ -1587,6 +1822,7 @@ pub struct CachedMessage {
     pub raw_headers: Option<String>,
     pub imap_uid: u32,
     pub thread_id: Option<String>,
+    pub attachments_state: i64,
 }
 
 #[cfg(test)]

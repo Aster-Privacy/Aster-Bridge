@@ -2546,77 +2546,9 @@ pub fn date_header_rfc2822(s: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn build_rfc822(msg: &CachedMessage) -> String {
-    let mut out = String::new();
-    let date = sanitize_header(&date_header_rfc2822(msg.date.as_deref().unwrap_or("")));
-    let from = sanitize_header(msg.sender.as_deref().unwrap_or("unknown@astermail.org"));
-    let to = sanitize_header(msg.recipients.as_deref().unwrap_or(""));
-    let subject = sanitize_header(msg.subject.as_deref().unwrap_or(""));
-    let aster_id = sanitize_header(&msg.aster_id);
-    let meta: serde_json::Value = msg
-        .raw_headers
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let real_message_id = meta
-        .get("message_id")
-        .and_then(|v| v.as_str())
-        .map(|s| sanitize_header(s))
-        .filter(|s| !s.is_empty());
-    let is_html_flag = meta.get("is_html").and_then(|v| v.as_bool());
-    let cc = meta
-        .get("cc")
-        .and_then(|v| v.as_str())
-        .map(sanitize_header)
-        .filter(|s| !s.is_empty());
-    let bcc = meta
-        .get("bcc")
-        .and_then(|v| v.as_str())
-        .map(sanitize_header)
-        .filter(|s| !s.is_empty());
-    out.push_str(&format!("Date: {}\r\n", date));
-    out.push_str(&format!("From: {}\r\n", from));
-    if !to.is_empty() {
-        out.push_str(&format!("To: {}\r\n", to));
-    }
-    if let Some(cc) = cc {
-        out.push_str(&format!("Cc: {}\r\n", cc));
-    }
-    if let Some(bcc) = bcc {
-        out.push_str(&format!("Bcc: {}\r\n", bcc));
-    }
-    out.push_str(&format!("Subject: {}\r\n", subject));
-    match real_message_id {
-        Some(mid) => {
-            if mid.starts_with('<') {
-                out.push_str(&format!("Message-ID: {}\r\n", mid));
-            } else {
-                out.push_str(&format!("Message-ID: <{}>\r\n", mid));
-            }
-        }
-        None => {
-            out.push_str(&format!("Message-ID: <{}@aster-bridge>\r\n", aster_id));
-        }
-    }
-    let body = msg.body_text.as_deref().unwrap_or("");
-    let is_html = is_html_flag.unwrap_or_else(|| {
-        body.contains("</")
-            || body.contains("<html")
-            || body.contains("<body")
-            || body.contains("<div")
-            || body.contains("<p ")
-            || body.contains("<!DOCTYPE")
-    });
-    out.push_str("MIME-Version: 1.0\r\n");
-    if is_html {
-        out.push_str("Content-Type: text/html; charset=utf-8\r\n");
-    } else {
-        out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-    }
-    out.push_str("Content-Transfer-Encoding: 8bit\r\n");
-    out.push_str("\r\n");
-    out.push_str(body);
-    out
+    crate::message_render::render_text(msg, &[])
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {
@@ -2755,6 +2687,124 @@ fn parse_set(spec: &str, max: u32) -> Vec<u32> {
     out
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SectionRequest {
+    section: String,
+    mime: bool,
+    peek: bool,
+    partial: Option<(usize, Option<usize>)>,
+}
+
+fn parse_partial_spec(spec: &str) -> Option<(usize, Option<usize>)> {
+    let mut it = spec.split('.');
+    let off: usize = it.next()?.trim().parse().ok()?;
+    let len = it.next().and_then(|s| s.trim().parse::<usize>().ok());
+    Some((off, len))
+}
+
+fn is_numeric_section(s: &str) -> bool {
+    !s.is_empty() && s.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_section_requests(fetch_parts: &str) -> Vec<SectionRequest> {
+    let upper = fetch_parts.to_ascii_uppercase();
+    let mut out: Vec<SectionRequest> = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = upper[cursor..].find("BODY") {
+        let start = cursor + rel;
+        let after = &upper[start + 4..];
+        let (peek, open) = if let Some(rest) = after.strip_prefix(".PEEK[") {
+            (true, start + 4 + (after.len() - rest.len()))
+        } else if let Some(rest) = after.strip_prefix('[') {
+            (false, start + 4 + (after.len() - rest.len()))
+        } else {
+            cursor = start + 4;
+            continue;
+        };
+        let Some(close_rel) = upper[open..].find(']') else {
+            break;
+        };
+        let close = open + close_rel;
+        let inner = upper[open..close].trim().to_string();
+        cursor = close + 1;
+        let partial = if upper[cursor..].starts_with('<') {
+            match upper[cursor..].find('>') {
+                Some(end_rel) => {
+                    let spec = &upper[cursor + 1..cursor + end_rel];
+                    cursor += end_rel + 1;
+                    parse_partial_spec(spec)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (section, mime) = match inner.strip_suffix(".MIME") {
+            Some(base) => (base.to_string(), true),
+            None => (inner.clone(), false),
+        };
+        if !is_numeric_section(&section) {
+            continue;
+        }
+        if out.iter().any(|r| r.section == section && r.mime == mime && r.partial == partial) {
+            continue;
+        }
+        out.push(SectionRequest {
+            section,
+            mime,
+            peek,
+            partial,
+        });
+    }
+    out
+}
+
+fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String, String) {
+    match partial {
+        Some((off, len_opt)) => {
+            let bytes = data.as_bytes();
+            let start = off.min(bytes.len());
+            let end = match len_opt {
+                Some(l) => start.saturating_add(l).min(bytes.len()),
+                None => bytes.len(),
+            };
+            (
+                format!("<{}>", off),
+                String::from_utf8_lossy(&bytes[start..end]).into_owned(),
+            )
+        }
+        None => (String::new(), data.to_string()),
+    }
+}
+
+fn mark_fetched_seen(
+    db: &Arc<Database>,
+    folder: &str,
+    msg: &CachedMessage,
+    seq_num: usize,
+    out: &mut Vec<u8>,
+    pushes: &mut Vec<String>,
+    already: &mut bool,
+) {
+    if *already {
+        return;
+    }
+    *already = true;
+    let current_flags = msg.flags as u32;
+    if current_flags & 1 == 0 {
+        let new_flags = current_flags | 1;
+        let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
+        pushes.push(msg.aster_id.clone());
+        out.extend_from_slice(
+            format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes(),
+        );
+    }
+}
+
+fn literal(key: &str, data: &str) -> String {
+    format!("{} {{{}}}\r\n{}", key, data.len(), data)
+}
+
 async fn handle_fetch(
     writer: &mut (impl AsyncWrite + Unpin),
     db: &Arc<Database>,
@@ -2789,24 +2839,22 @@ async fn handle_fetch(
         || upper_parts.contains("BODY.PEEK[HEADER]")
         || upper_parts.contains("RFC822.HEADER");
     let wants_body_text = upper_parts.contains("BODY[TEXT]") || upper_parts.contains("BODY.PEEK[TEXT]");
+    let body_text_is_peek = upper_parts.contains("BODY.PEEK[TEXT]");
     let header_fields = parse_header_fields_request(fetch_parts);
     let wants_gm_labels = contains_word(&upper_parts, "X-GM-LABELS");
     let wants_gm_thrid = contains_word(&upper_parts, "X-GM-THRID");
     let wants_gm_msgid = contains_word(&upper_parts, "X-GM-MSGID");
     let wants_bodystructure = contains_word(&upper_parts, "BODYSTRUCTURE");
-    let wants_body_1 = (upper_parts.contains("BODY[1]") || upper_parts.contains("BODY.PEEK[1]"))
-        && !wants_body_text;
+    let section_requests = parse_section_requests(fetch_parts);
     let wants_internaldate = upper_parts.contains("INTERNALDATE")
         || is_all || is_fast || is_full;
     let body_is_peek = upper_parts.contains("BODY.PEEK[]")
-        || upper_parts.contains("BODY.PEEK[TEXT]")
-        || upper_parts.contains("BODY.PEEK[1]")
         || upper_parts.contains("RFC822.HEADER");
 
     let needs_body = wants_body
         || wants_body_header
         || wants_body_text
-        || wants_body_1
+        || !section_requests.is_empty()
         || wants_rfc822_text
         || wants_bodystructure
         || header_fields.is_some();
@@ -2816,6 +2864,11 @@ async fn handle_fetch(
         db.list_cached_message_meta(folder)
     }
     .unwrap_or_default();
+    let folder_attachment_meta = if !needs_body && wants_size {
+        db.list_attachment_meta_for_folder(folder).unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
     let total = messages.len() as u32;
     let max_uid_val = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
     let range_cap = if uid_command { max_uid_val } else { total };
@@ -2835,7 +2888,20 @@ async fn handle_fetch(
             }
         };
         let uid = msg.imap_uid;
-        let rfc = build_rfc822(msg);
+        let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
+            if msg.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&msg.aster_id).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            folder_attachment_meta
+                .get(&msg.aster_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let rendered = crate::message_render::render(msg, &attachments, needs_body);
+        let mut seen_marked = false;
         let mut items: Vec<String> = Vec::new();
 
         if wants_flags {
@@ -2853,8 +2919,7 @@ async fn handle_fetch(
         }
 
         if wants_size {
-            let sz = rfc.len() + if needs_body { 0 } else { msg.size.max(0) as usize };
-            items.push(format!("RFC822.SIZE {}", sz));
+            items.push(format!("RFC822.SIZE {}", rendered.size));
         }
 
         if wants_envelope {
@@ -2886,8 +2951,8 @@ async fn handle_fetch(
 
         if wants_gm_labels {
             let labels = gmail_labels_for_message(msg);
-            let rendered: Vec<String> = labels.iter().map(|l| quote_or_atom_label(l)).collect();
-            items.push(format!("X-GM-LABELS ({})", rendered.join(" ")));
+            let rendered_labels: Vec<String> = labels.iter().map(|l| quote_or_atom_label(l)).collect();
+            items.push(format!("X-GM-LABELS ({})", rendered_labels.join(" ")));
         }
 
         if wants_gm_thrid {
@@ -2906,107 +2971,68 @@ async fn handle_fetch(
         }
 
         if wants_bodystructure {
-            let bs_meta: serde_json::Value = msg.raw_headers.as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(serde_json::Value::Null);
-            let is_html_bs = bs_meta.get("is_html").and_then(|v| v.as_bool()).unwrap_or_else(|| {
-                let b = msg.body_text.as_deref().unwrap_or("");
-                b.trim_start().starts_with('<') || b.contains("</")
-            });
-            let body_start = rfc.find("\r\n\r\n").map(|p| p + 4).unwrap_or(rfc.len());
-            let body = &rfc[body_start..];
-            let body_size = body.len();
-            let line_count = body.chars().filter(|c| *c == '\n').count();
-            let subtype = if is_html_bs { "HTML" } else { "PLAIN" };
-            items.push(format!(
-                "BODYSTRUCTURE (\"TEXT\" \"{}\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} {})",
-                subtype, body_size, line_count
-            ));
+            items.push(format!("BODYSTRUCTURE {}", rendered.bodystructure));
         }
 
-        if wants_body_text || wants_body_1 {
-            let this_is_peek = (wants_body_text && upper_parts.contains("BODY.PEEK[TEXT]"))
-                || (wants_body_1 && upper_parts.contains("BODY.PEEK[1]"));
-            let body_start = rfc.find("\r\n\r\n").map(|p| p + 4).unwrap_or(rfc.len());
-            let body = &rfc[body_start..];
-            let key = if wants_body_text { "BODY[TEXT]" } else { "BODY[1]" };
-            if !this_is_peek {
-                let current_flags = msg.flags as u32;
-                if current_flags & 1 == 0 {
-                    let new_flags = current_flags | 1;
-                    let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
-                    fetch_seen_pushes.push(msg.aster_id.clone());
-                    out.extend_from_slice(
-                        format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
-                    );
-                }
+        if wants_body_text {
+            if !body_text_is_peek {
+                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
-            items.push(format!("{} {{{}}}\r\n{}", key, body.len(), body));
+            items.push(literal("BODY[TEXT]", rendered.body()));
+        }
+
+        for req in &section_requests {
+            if !req.peek {
+                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+            }
+            let key_base = if req.mime {
+                format!("BODY[{}.MIME]", req.section)
+            } else {
+                format!("BODY[{}]", req.section)
+            };
+            let content = if req.mime {
+                rendered.part_header(&req.section)
+            } else {
+                rendered.part_body(&req.section)
+            };
+            match content {
+                Some(data) => {
+                    let (suffix, slice) = apply_partial(data, req.partial);
+                    items.push(literal(&format!("{}{}", key_base, suffix), &slice));
+                }
+                None => items.push(format!("{} NIL", key_base)),
+            }
         }
 
         if let Some((field_list_token, fields)) = &header_fields {
-            let header_end = rfc.find("\r\n\r\n").map(|p| p + 4).unwrap_or(rfc.len());
-            let header = &rfc[..header_end];
-            let filtered = filter_header_fields(header, fields);
-            items.push(format!(
-                "BODY[HEADER.FIELDS ({})] {{{}}}\r\n{}",
-                field_list_token,
-                filtered.len(),
-                filtered
+            let filtered = filter_header_fields(rendered.header(), fields);
+            items.push(literal(
+                &format!("BODY[HEADER.FIELDS ({})]", field_list_token),
+                &filtered,
             ));
         }
 
         if wants_body_header {
-            let header_end = rfc.find("\r\n\r\n").map(|p| p + 4).unwrap_or(rfc.len());
-            let header = &rfc[..header_end];
-            items.push(format!(
-                "BODY[HEADER] {{{}}}\r\n{}",
-                header.len(),
-                header
-            ));
+            items.push(literal("BODY[HEADER]", rendered.header()));
         }
 
         if wants_body {
             if !body_is_peek {
-                let current_flags = msg.flags as u32;
-                if current_flags & 1 == 0 {
-                    let new_flags = current_flags | 1;
-                    let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
-                    fetch_seen_pushes.push(msg.aster_id.clone());
-                    out.extend_from_slice(
-                        format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
-                    );
-                }
+                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
-                let bytes = rfc.as_bytes();
-                let start = off.min(bytes.len());
-                let end = match len_opt {
-                    Some(l) => start.saturating_add(l).min(bytes.len()),
-                    None => bytes.len(),
-                };
-                let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-                items.push(format!("BODY[]<{}> {{{}}}\r\n{}", off, slice.len(), slice));
+                let (suffix, slice) = apply_partial(&rendered.text, Some((off, len_opt)));
+                items.push(literal(&format!("BODY[]{}", suffix), &slice));
             } else {
-                items.push(format!("BODY[] {{{}}}\r\n{}", rfc.len(), rfc));
+                items.push(literal("BODY[]", &rendered.text));
             }
         }
 
         if wants_rfc822_text {
-            let body_start = rfc.find("\r\n\r\n").map(|p| p + 4).unwrap_or(rfc.len());
-            let body = &rfc[body_start..];
             if !body_is_peek {
-                let current_flags = msg.flags as u32;
-                if current_flags & 1 == 0 {
-                    let new_flags = current_flags | 1;
-                    let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
-                    fetch_seen_pushes.push(msg.aster_id.clone());
-                    out.extend_from_slice(
-                        format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes()
-                    );
-                }
+                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
-            items.push(format!("RFC822.TEXT {{{}}}\r\n{}", body.len(), body));
+            items.push(literal("RFC822.TEXT", rendered.body()));
         }
 
         out.extend_from_slice(format!("* {} FETCH ({})\r\n", seq_num, items.join(" ")).as_bytes());

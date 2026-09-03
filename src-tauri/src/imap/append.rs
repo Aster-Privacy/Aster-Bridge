@@ -1004,7 +1004,24 @@ pub async fn append_imported_message(
         is_spam: Some(folder == "spam"),
         is_read: Some(flags.seen),
         is_starred: Some(flags.flagged),
+        has_attachments: Some(attachment_count > 0),
+        attachment_count: Some(attachment_count.min(i16::MAX as usize) as i16),
     };
+
+    let local_attachments: Vec<crate::db::CachedAttachment> = message
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(seq, a)| crate::db::CachedAttachment {
+            seq: seq as i64,
+            name: a.name.clone(),
+            content_type: a.mime_type.clone(),
+            content_id: a.content_id.clone(),
+            is_inline: a.is_inline,
+            size: a.data.len() as i64,
+            data: a.data.clone(),
+        })
+        .collect();
 
     let uid = {
         let cache_db = db.clone();
@@ -1020,6 +1037,12 @@ pub async fn append_imported_message(
                 Some(&identity_key),
                 &inbound_keys,
             );
+
+            if !local_attachments.is_empty() {
+                cache_db
+                    .replace_message_attachments(&cache_id, &local_attachments)
+                    .map_err(|e| format!("could not store attachments locally: {}", e))?;
+            }
 
             let uid = cache_db
                 .assign_uid_if_missing(&cache_folder, &cache_id)

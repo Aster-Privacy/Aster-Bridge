@@ -51,7 +51,7 @@ pub fn folder_counts(db: &Database, folder: &str) -> (u32, u32) {
 pub fn list_messages_all(db: &Database) -> Vec<CachedMessage> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id
+            "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.body_text, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
              FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
              ORDER BY m.created_at DESC",
         )?;
@@ -69,6 +69,7 @@ pub fn list_messages_all(db: &Database) -> Vec<CachedMessage> {
                 raw_headers: row.get(9)?,
                 imap_uid: row.get::<_, i64>(10)? as u32,
                 thread_id: row.get(11)?,
+                attachments_state: row.get(12)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

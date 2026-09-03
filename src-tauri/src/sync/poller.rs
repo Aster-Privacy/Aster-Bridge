@@ -18,7 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
@@ -28,7 +28,11 @@ use zeroize::Zeroizing;
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
 use crate::crypto::envelope::decrypt_envelope;
-use crate::db::Database;
+use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
+use crate::db::{
+    CachedAttachment, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
+    ATTACHMENTS_STORED,
+};
 use crate::error::BridgeError;
 use crate::jmap::state::StateChange;
 
@@ -244,6 +248,7 @@ struct EnvelopeAttachment {
     content_type: String,
     content_id: Option<String>,
     size: Option<i64>,
+    key: Option<String>,
 }
 
 fn json_trimmed_string(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -279,6 +284,7 @@ fn parse_envelope_attachments(v: &serde_json::Value) -> Vec<EnvelopeAttachment> 
             content_type: normalize_content_type(json_trimmed_string(entry, "content_type")),
             content_id: json_trimmed_string(entry, "content_id"),
             size: entry.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
+            key: json_trimmed_string(entry, "key"),
         };
         match seq {
             Some(s) => {
@@ -302,61 +308,291 @@ fn attachment_display_name(a: &EnvelopeAttachment) -> String {
         .unwrap_or_else(|| ATTACHMENT_PLACEHOLDER_NAME.to_string())
 }
 
-fn format_attachment_bytes(bytes: i64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.1} KB", b / KB)
-    } else {
-        format!("{} B", bytes)
+const ATTACHMENT_INLINE_DOWNLOADS_PER_PASS: usize = 25;
+const ATTACHMENT_BACKLOG_PER_PASS: i64 = 25;
+const ATTACHMENT_MAX_ATTEMPTS: i64 = 50;
+
+enum AttachmentFetchError {
+    Transport(String),
+    Content(String),
+}
+
+fn classify_api_error(e: BridgeError) -> AttachmentFetchError {
+    match e {
+        BridgeError::Network(_) | BridgeError::Auth(_) => {
+            AttachmentFetchError::Transport(e.to_string())
+        }
+        other => AttachmentFetchError::Content(other.to_string()),
     }
 }
 
-fn describe_attachment(a: &EnvelopeAttachment) -> String {
-    let mut details = vec![a.content_type.clone()];
-    if let Some(size) = a.size {
-        details.push(format_attachment_bytes(size));
+fn key_entry(a: &EnvelopeAttachment) -> AttachmentKeyEntry {
+    AttachmentKeyEntry {
+        key: a.key.clone(),
+        filename: a.filename.clone(),
+        content_type: Some(a.content_type.clone()),
+        content_id: a.content_id.clone(),
+        size: a.size,
     }
-    format!("{} ({})", attachment_display_name(a), details.join(", "))
 }
 
-fn attachment_unavailable_note(attachments: &[EnvelopeAttachment]) -> String {
-    let count = attachments.len();
-    let described: Vec<String> = attachments
-        .iter()
-        .filter(|a| a.filename.is_some() || a.size.is_some())
-        .map(describe_attachment)
-        .collect();
-    if described.len() != count || count == 0 {
-        return if count == 1 {
-            "[This message has 1 attachment. Aster Bridge cannot download attachments yet. \
-             Open the message in the Aster web or mobile app to get it.]"
-                .to_string()
+fn cached_attachment_entries(raw_headers: Option<&str>) -> Vec<EnvelopeAttachment> {
+    let Some(raw) = raw_headers else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(list) = parsed.get("attachments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter(|e| e.is_object())
+        .map(|e| EnvelopeAttachment {
+            seq: e.get("seq").and_then(|x| x.as_i64()),
+            filename: json_trimmed_string(e, "name").filter(|n| n != ATTACHMENT_PLACEHOLDER_NAME),
+            content_type: normalize_content_type(json_trimmed_string(e, "type")),
+            content_id: json_trimmed_string(e, "cid"),
+            size: e.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
+            key: json_trimmed_string(e, "key"),
+        })
+        .collect()
+}
+
+fn entry_for_row(
+    entries: &[EnvelopeAttachment],
+    seq: i64,
+    position: usize,
+) -> Option<&EnvelopeAttachment> {
+    entries.iter().find(|e| e.seq == Some(seq)).or_else(|| {
+        if entries.iter().all(|e| e.seq.is_none()) {
+            entries.get(position)
         } else {
-            format!(
-                "[This message has {} attachments. Aster Bridge cannot download attachments yet. \
-                 Open the message in the Aster web or mobile app to get them.]",
-                count
-            )
+            None
+        }
+    })
+}
+
+fn expected_attachment_count(item: &MailItem, entries: &[EnvelopeAttachment]) -> usize {
+    let declared = item.attachment_count.map(|n| n.max(0) as usize).unwrap_or(0);
+    let flagged = usize::from(item.has_attachments == Some(true));
+    entries.len().max(declared).max(flagged)
+}
+
+fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachment]) -> String {
+    let mut map = raw_headers
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    map.insert(
+        "attachment_count".to_string(),
+        serde_json::json!(entries.len()),
+    );
+    map.insert("attachments".to_string(), attachment_meta_json(entries));
+    serde_json::Value::Object(map).to_string()
+}
+
+fn carry_attachment_meta(
+    db: &Database,
+    aster_id: &str,
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Ok(Some(existing)) = db.get_cached_message(aster_id) else {
+        return;
+    };
+    let Some(raw) = existing.raw_headers.as_deref() else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    for key in ["attachment_count", "attachments"] {
+        if let Some(v) = parsed.get(key) {
+            meta.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
+async fn fetch_and_decrypt_attachments(
+    client: &ApiClient,
+    access_token: &str,
+    mail_id: &str,
+    entries: &[EnvelopeAttachment],
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
+    let resp = client
+        .list_attachments_for_mail(access_token, mail_id)
+        .await
+        .map_err(classify_api_error)?;
+    if resp.attachments.is_empty() {
+        return Err(AttachmentFetchError::Content(
+            "server returned no attachment rows".to_string(),
+        ));
+    }
+    let rows = resp.attachments;
+    let entries: Vec<EnvelopeAttachment> = entries.to_vec();
+    let passphrase = Zeroizing::new(passphrase.to_vec());
+    let identity_key = identity_key.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let mut out: Vec<CachedAttachment> = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let seq = row.seq_num as i64;
+            if out.iter().any(|a| a.seq == seq) {
+                continue;
+            }
+            let entry = entry_for_row(&entries, seq, position).map(key_entry);
+            let att = decrypt_attachment(row, entry.as_ref(), &passphrase, identity_key.as_deref())
+                .map_err(|e| e.to_string())?;
+            out.push(CachedAttachment {
+                seq: att.seq,
+                name: att.filename,
+                is_inline: att.is_inline || att.content_id.is_some(),
+                content_type: att.content_type,
+                content_id: att.content_id,
+                size: att.data.len() as i64,
+                data: att.data,
+            });
+        }
+        out.sort_by_key(|a| a.seq);
+        Ok::<Vec<CachedAttachment>, String>(out)
+    })
+    .await
+    .map_err(|e| AttachmentFetchError::Content(format!("attachment decrypt task: {}", e)))?
+    .map_err(AttachmentFetchError::Content)
+}
+
+async fn refresh_attachment_keys(
+    client: &ApiClient,
+    access_token: &str,
+    aster_id: &str,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> std::result::Result<Vec<EnvelopeAttachment>, AttachmentFetchError> {
+    let item = client
+        .fetch_mail_item(access_token, aster_id)
+        .await
+        .map_err(classify_api_error)?;
+    let plaintext = decrypt_envelope(
+        &item.encrypted_envelope,
+        Some(&item.envelope_nonce),
+        passphrase,
+        identity_key,
+        inbound_keys,
+    )
+    .map_err(|_| AttachmentFetchError::Content("envelope decrypt failed".to_string()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&plaintext)
+        .map_err(|e| AttachmentFetchError::Content(format!("envelope parse: {}", e)))?;
+    Ok(parse_envelope_attachments(&parsed))
+}
+
+async fn backfill_pending_attachments(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    skip: &HashSet<String>,
+) -> Vec<String> {
+    let mut updated: Vec<String> = Vec::new();
+    let backlog = match db.list_attachment_backlog(ATTACHMENT_BACKLOG_PER_PASS) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("attachment backlog query failed: {}", e);
+            return updated;
+        }
+    };
+    for (aster_id, folder) in backlog {
+        if skip.contains(&aster_id) {
+            continue;
+        }
+        let Ok(Some(msg)) = db.get_cached_message(&aster_id) else {
+            continue;
         };
-    }
-    if count == 1 {
-        format!(
-            "[This message has 1 attachment that Aster Bridge cannot download yet: {}. \
-             To get it, open the message in the Aster web or mobile app.]",
-            described[0]
+        let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
+        let mut meta_json = msg.raw_headers.clone();
+        if entries.iter().all(|e| e.key.is_none()) {
+            match refresh_attachment_keys(
+                client,
+                access_token,
+                &aster_id,
+                passphrase,
+                identity_key,
+                inbound_keys,
+            )
+            .await
+            {
+                Ok(fresh) if !fresh.is_empty() => {
+                    meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh));
+                    entries = fresh;
+                }
+                Ok(_) => {}
+                Err(AttachmentFetchError::Transport(e)) => {
+                    tracing::warn!("attachment key refresh for {} deferred: {}", aster_id, e);
+                    break;
+                }
+                Err(AttachmentFetchError::Content(e)) => {
+                    tracing::debug!("attachment key refresh for {} skipped: {}", aster_id, e);
+                }
+            }
+        }
+        match fetch_and_decrypt_attachments(
+            client,
+            access_token,
+            &aster_id,
+            &entries,
+            passphrase,
+            identity_key,
         )
-    } else {
-        format!(
-            "[This message has {} attachments that Aster Bridge cannot download yet: {}. \
-             To get them, open the message in the Aster web or mobile app.]",
-            count,
-            described.join(", ")
-        )
+        .await
+        {
+            Ok(list) => {
+                if let Err(e) = db.replace_message_attachments(&aster_id, &list) {
+                    tracing::warn!("attachment store for {} failed: {}", aster_id, e);
+                    continue;
+                }
+                let body = msg.body_text.clone().unwrap_or_default();
+                let cleaned = crate::message_render::strip_legacy_note(&body);
+                if cleaned.is_some() || meta_json != msg.raw_headers {
+                    let new_body = cleaned.unwrap_or(body);
+                    let _ = db.update_cached_body(&aster_id, &new_body, meta_json.as_deref());
+                }
+                if msg.imap_uid > 0 {
+                    let _ = db.remove_uid_mapping(msg.imap_uid as i64, &folder);
+                }
+                let _ = db.assign_uid_if_missing(&folder, &aster_id);
+                tracing::info!(
+                    "attachments for {} stored ({} part(s))",
+                    aster_id,
+                    list.len()
+                );
+                updated.push(aster_id);
+            }
+            Err(AttachmentFetchError::Transport(e)) => {
+                tracing::warn!("attachment download for {} deferred: {}", aster_id, e);
+                break;
+            }
+            Err(AttachmentFetchError::Content(e)) => {
+                let attempts = db.bump_attachment_attempts(&aster_id).unwrap_or(0);
+                tracing::warn!(
+                    "attachment download for {} failed (attempt {}): {}",
+                    aster_id,
+                    attempts,
+                    e
+                );
+                if attempts >= ATTACHMENT_MAX_ATTEMPTS {
+                    let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
+                    updated.push(aster_id);
+                }
+            }
+        }
     }
+    updated
 }
 
 fn attachment_meta_json(attachments: &[EnvelopeAttachment]) -> serde_json::Value {
@@ -376,17 +612,13 @@ fn attachment_meta_json(attachments: &[EnvelopeAttachment]) -> serde_json::Value
                 if let Some(cid) = &a.content_id {
                     map.insert("cid".to_string(), serde_json::json!(cid));
                 }
+                if let Some(key) = &a.key {
+                    map.insert("key".to_string(), serde_json::json!(key));
+                }
                 serde_json::Value::Object(map)
             })
             .collect(),
     )
-}
-
-fn escape_html_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn normalize_date_rfc3339(s: &str) -> String {
@@ -477,36 +709,50 @@ fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
     db.set_message_flags_by_id(&item.id, new_flags).is_ok()
 }
 
-pub(crate) fn cache_mail_item(
+struct PreparedMessage {
+    subject: Option<String>,
+    sender: Option<String>,
+    recipients: Option<String>,
+    date: Option<String>,
+    body_text: Option<String>,
+    is_html: bool,
+    message_id: Option<String>,
+    attachments: Vec<EnvelopeAttachment>,
+    expected_attachments: usize,
+}
+
+enum Prepared {
+    Done(CacheOutcome),
+    Ready(PreparedMessage),
+}
+
+fn prepare_mail_item(
     db: &Database,
     folder: &str,
     item: &MailItem,
     passphrase: &[u8],
     identity_key: Option<&str>,
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
-) -> CacheOutcome {
+) -> Prepared {
     if !is_valid_item_id(&item.id) {
         tracing::warn!("rejecting message with invalid id format");
-        return CacheOutcome::default();
+        return Prepared::Done(CacheOutcome::default());
     }
 
     if db.body_cached(&item.id) {
         let _ = db.set_folder_if_changed(&item.id, folder);
         let _ = db.assign_uid_if_missing(folder, &item.id);
-        return CacheOutcome {
+        return Prepared::Done(CacheOutcome {
             was_new: false,
             flags_changed: reconcile_server_flags(db, item),
             inbound_decrypt_failed: false,
-        };
+        });
     }
 
     if !item.envelope_nonce.is_empty() {
-        match db.replay_check_and_record(&item.id, &item.envelope_nonce) {
-            Ok(false) => {
-                tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
-                return CacheOutcome::default();
-            }
-            _ => {}
+        if let Ok(false) = db.replay_check_and_record(&item.id, &item.envelope_nonce) {
+            tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
+            return Prepared::Done(CacheOutcome::default());
         }
     }
 
@@ -536,10 +782,10 @@ pub(crate) fn cache_mail_item(
             } else {
                 tracing::debug!("envelope decrypt skipped");
             }
-            return CacheOutcome {
+            return Prepared::Done(CacheOutcome {
                 inbound_decrypt_failed: inbound,
                 ..CacheOutcome::default()
-            };
+            });
         }
     };
 
@@ -574,21 +820,7 @@ pub(crate) fn cache_mail_item(
         is_html = false;
     }
     let attachments = parse_envelope_attachments(&parsed);
-    let attachment_count = attachments.len();
-    if attachment_count > 0 {
-        let note = attachment_unavailable_note(&attachments);
-        match body_text.as_mut() {
-            Some(b) => {
-                if is_html {
-                    b.push_str(&format!("<p>{}</p>", escape_html_text(&note)));
-                } else {
-                    b.push_str("\n\n");
-                    b.push_str(&note);
-                }
-            }
-            None => body_text = Some(note),
-        }
-    }
+    let expected_attachments = expected_attachment_count(item, &attachments);
     const MAX_CACHED_BODY_BYTES: usize = 5 * 1024 * 1024;
     if let Some(b) = body_text.as_mut() {
         if b.len() > MAX_CACHED_BODY_BYTES {
@@ -600,19 +832,47 @@ pub(crate) fn cache_mail_item(
             b.push_str("\n[truncated]");
         }
     }
-    let size = body_text.as_ref().map(|b| b.len() as i64).unwrap_or(0);
     let message_id = json_str(&parsed, "message_id").or_else(|| json_str(&parsed, "messageId"));
+    Prepared::Ready(PreparedMessage {
+        subject,
+        sender,
+        recipients,
+        date,
+        body_text,
+        is_html,
+        message_id,
+        attachments,
+        expected_attachments,
+    })
+}
+
+fn commit_mail_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    prepared: PreparedMessage,
+    downloaded: Option<Vec<CachedAttachment>>,
+) -> CacheOutcome {
+    let attachment_count = prepared.expected_attachments;
+    let size = prepared
+        .body_text
+        .as_ref()
+        .map(|b| b.len() as i64)
+        .unwrap_or(0);
     let mut raw_headers_map = serde_json::Map::new();
-    raw_headers_map.insert("is_html".to_string(), serde_json::json!(is_html));
-    raw_headers_map.insert("message_id".to_string(), serde_json::json!(message_id));
+    raw_headers_map.insert("is_html".to_string(), serde_json::json!(prepared.is_html));
+    raw_headers_map.insert(
+        "message_id".to_string(),
+        serde_json::json!(prepared.message_id),
+    );
     raw_headers_map.insert(
         "attachment_count".to_string(),
         serde_json::json!(attachment_count),
     );
-    if attachment_count > 0 {
+    if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
             "attachments".to_string(),
-            attachment_meta_json(&attachments),
+            attachment_meta_json(&prepared.attachments),
         );
     }
     let raw_headers_meta = serde_json::Value::Object(raw_headers_map).to_string();
@@ -620,12 +880,12 @@ pub(crate) fn cache_mail_item(
     let was_new = match db.upsert_cached_message(
         &item.id,
         folder,
-        subject.as_deref(),
-        sender.as_deref(),
-        recipients.as_deref(),
-        date.as_deref(),
+        prepared.subject.as_deref(),
+        prepared.sender.as_deref(),
+        prepared.recipients.as_deref(),
+        prepared.date.as_deref(),
         size,
-        body_text.as_deref(),
+        prepared.body_text.as_deref(),
         Some(&raw_headers_meta),
     ) {
         Ok(n) => n,
@@ -634,6 +894,22 @@ pub(crate) fn cache_mail_item(
             return CacheOutcome::default();
         }
     };
+    let stored = match downloaded {
+        Some(list) if !list.is_empty() => match db.replace_message_attachments(&item.id, &list) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("attachment store for {} failed: {}", item.id, e);
+                false
+            }
+        },
+        _ => false,
+    };
+    if !stored
+        && attachment_count > 0
+        && db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE) != ATTACHMENTS_STORED
+    {
+        let _ = db.set_attachments_state(&item.id, ATTACHMENTS_PENDING);
+    }
     if let Err(e) = db.assign_uid_if_missing(folder, &item.id) {
         tracing::warn!("uid assign failed for {}: {}", item.id, e);
     }
@@ -642,6 +918,20 @@ pub(crate) fn cache_mail_item(
         was_new,
         flags_changed: flags_changed && !was_new,
         inbound_decrypt_failed: false,
+    }
+}
+
+pub(crate) fn cache_mail_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> CacheOutcome {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, inbound_keys) {
+        Prepared::Done(outcome) => outcome,
+        Prepared::Ready(prepared) => commit_mail_item(db, folder, item, prepared, None),
     }
 }
 
@@ -872,10 +1162,12 @@ async fn run_sync_pass(
 ) -> Result<(), String> {
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut updated_ids: Vec<String> = Vec::new();
     let mut all_folders_complete = true;
     let mut failed_inbound: Vec<(&'static str, MailItem)> = Vec::new();
+    let mut inline_downloads = 0usize;
+    let mut attachments_handled: HashSet<String> = HashSet::new();
 
     let (access_token, passphrase, identity_key, our_email, ratchet_keys, inbound_keys) = {
         let s = session.read().await;
@@ -913,14 +1205,64 @@ async fn run_sync_pass(
                     let mut new_ids: Vec<String> = Vec::new();
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
-                        let outcome = cache_mail_item(
+                        let outcome = match prepare_mail_item(
                             db,
                             folder_query.label,
                             item,
                             &passphrase,
                             identity_key.as_deref(),
                             &inbound_keys,
-                        );
+                        ) {
+                            Prepared::Done(outcome) => outcome,
+                            Prepared::Ready(prepared) => {
+                                let mut downloaded: Option<Vec<CachedAttachment>> = None;
+                                let mut content_failed = false;
+                                if prepared.expected_attachments > 0
+                                    && inline_downloads < ATTACHMENT_INLINE_DOWNLOADS_PER_PASS
+                                {
+                                    inline_downloads += 1;
+                                    attachments_handled.insert(item.id.clone());
+                                    match fetch_and_decrypt_attachments(
+                                        client,
+                                        &access_token,
+                                        &item.id,
+                                        &prepared.attachments,
+                                        &passphrase,
+                                        identity_key.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(list) => downloaded = Some(list),
+                                        Err(AttachmentFetchError::Transport(e)) => {
+                                            tracing::warn!(
+                                                "attachment download for {} deferred: {}",
+                                                item.id,
+                                                e
+                                            );
+                                        }
+                                        Err(AttachmentFetchError::Content(e)) => {
+                                            tracing::warn!(
+                                                "attachment download for {} failed: {}",
+                                                item.id,
+                                                e
+                                            );
+                                            content_failed = true;
+                                        }
+                                    }
+                                }
+                                let outcome = commit_mail_item(
+                                    db,
+                                    folder_query.label,
+                                    item,
+                                    prepared,
+                                    downloaded,
+                                );
+                                if content_failed {
+                                    let _ = db.bump_attachment_attempts(&item.id);
+                                }
+                                outcome
+                            }
+                        };
                         if outcome.flags_changed {
                             updated_ids.push(item.id.clone());
                         }
@@ -944,11 +1286,15 @@ async fn run_sync_pass(
                             )
                             .await
                             {
-                                let meta = serde_json::json!({
-                                    "is_html": looks_like_html(&plaintext),
-                                    "message_id": serde_json::Value::Null,
-                                })
-                                .to_string();
+                                let mut meta_map = serde_json::Map::new();
+                                meta_map.insert(
+                                    "is_html".to_string(),
+                                    serde_json::json!(looks_like_html(&plaintext)),
+                                );
+                                meta_map
+                                    .insert("message_id".to_string(), serde_json::Value::Null);
+                                carry_attachment_meta(db, &item.id, &mut meta_map);
+                                let meta = serde_json::Value::Object(meta_map).to_string();
                                 let _ = db.update_cached_body(&item.id, &plaintext, Some(&meta));
                             }
                         }
@@ -1019,6 +1365,18 @@ async fn run_sync_pass(
             updated_ids.extend(healed_updated);
         }
     }
+
+    let backfilled = backfill_pending_attachments(
+        db,
+        client,
+        &access_token,
+        &passphrase,
+        identity_key.as_deref(),
+        &inbound_keys,
+        &attachments_handled,
+    )
+    .await;
+    updated_ids.extend(backfilled);
 
     match identity_key.as_deref() {
         Some(ik) => {
@@ -1318,6 +1676,8 @@ mod tests {
             is_spam: None,
             is_read: None,
             is_starred: None,
+            has_attachments: None,
+            attachment_count: None,
         }
     }
 
@@ -2207,26 +2567,6 @@ mod tests {
         );
     }
 
-    fn legacy_entries(count: usize) -> Vec<EnvelopeAttachment> {
-        (0..count)
-            .map(|i| EnvelopeAttachment {
-                seq: Some(i as i64),
-                filename: None,
-                content_type: DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
-                content_id: None,
-                size: None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn the_attachment_note_agrees_in_number() {
-        assert!(attachment_unavailable_note(&legacy_entries(1)).contains("1 attachment."));
-        assert!(attachment_unavailable_note(&legacy_entries(1)).contains("to get it."));
-        assert!(attachment_unavailable_note(&legacy_entries(3)).contains("3 attachments."));
-        assert!(attachment_unavailable_note(&legacy_entries(3)).contains("to get them."));
-    }
-
     #[test]
     fn attachment_entries_are_matched_by_seq_not_by_position() {
         let v = serde_json::json!({"attachment_keys": [
@@ -2289,72 +2629,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_negative_size_is_dropped_from_the_description() {
-        let v = serde_json::json!({"attachment_keys": [
-            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf"},
-            {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": -4},
-            {"seq": 2, "key": "k2", "filename": "c.bin", "content_type": "text/plain", "size": 2048}
-        ]});
-        let parsed = parse_envelope_attachments(&v);
-        assert_eq!(parsed[0].size, None);
-        assert_eq!(parsed[1].size, None);
-        assert_eq!(describe_attachment(&parsed[0]), "a.pdf (application/pdf)");
-        assert_eq!(describe_attachment(&parsed[2]), "c.bin (text/plain, 2.0 KB)");
-    }
-
-    #[test]
-    fn the_note_names_attachments_when_the_envelope_describes_them() {
-        let v = serde_json::json!({"attachment_keys": [
-            {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": 2},
-            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11}
-        ]});
-        let note = attachment_unavailable_note(&parse_envelope_attachments(&v));
-        assert!(note.contains("2 attachments that Aster Bridge cannot download yet"));
-        assert!(note.contains("a.pdf (application/pdf, 11 B), b.png (image/png, 2 B)"));
-        assert!(note.contains("To get them, open the message"));
-    }
-
-    #[test]
-    fn a_partly_described_list_keeps_the_plain_count_note() {
-        let v = serde_json::json!({"attachment_keys": [
-            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11},
-            {"seq": 1, "key": "k1"}
-        ]});
-        let note = attachment_unavailable_note(&parse_envelope_attachments(&v));
-        assert!(note.contains("2 attachments."));
-        assert!(!note.contains("a.pdf"));
-    }
-
-    #[test]
-    fn an_attacker_named_file_cannot_inject_markup_into_an_html_body() {
-        let (_dir, db) = temp_db();
-        let item = item_with_envelope(
-            "html-injection",
-            &serde_json::json!({
-                "subject": "report",
-                "body_html": "<p>hello</p>",
-                "attachment_keys": [{
-                    "seq": 0,
-                    "key": "k0",
-                    "filename": "<img src=x onerror=alert(1)>.png",
-                    "content_type": "image/png",
-                    "size": 4
-                }]
-            }),
-        );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
-
-        let body = db
-            .get_cached_message("html-injection")
-            .unwrap()
-            .unwrap()
-            .body_text
-            .unwrap();
-        assert!(!body.contains("<img src=x"));
-        assert!(body.contains("&lt;img src=x onerror=alert(1)&gt;.png"));
-    }
-
-    #[test]
     fn cached_attachment_metadata_is_persisted_for_jmap() {
         let (_dir, db) = temp_db();
         let item = item_with_envelope(
@@ -2398,29 +2672,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_message_reports_attachments_instead_of_hiding_them() {
-        let (_dir, db) = temp_db();
-        let item = item_with_envelope(
-            "with-attachments",
-            &serde_json::json!({
-                "subject": "invoice",
-                "body_text": "see attached",
-                "attachment_keys": [{"seq": 0, "key": "k0"}, {"seq": 1, "key": "k1"}]
-            }),
-        );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
-
-        let cached = db.get_cached_message("with-attachments").unwrap().unwrap();
-        let body = cached.body_text.unwrap();
-        assert!(body.starts_with("see attached"));
-        assert!(body.contains("2 attachments."));
-
-        let meta: serde_json::Value =
-            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
-        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(2));
-    }
-
-    #[test]
     fn a_message_without_attachments_keeps_its_body_untouched() {
         let (_dir, db) = temp_db();
         let item = item_with_envelope(
@@ -2434,50 +2685,6 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(0));
-    }
-
-    #[test]
-    fn an_html_body_carries_the_note_as_markup() {
-        let (_dir, db) = temp_db();
-        let item = item_with_envelope(
-            "html-attachments",
-            &serde_json::json!({
-                "subject": "report",
-                "body_html": "<p>hello</p>",
-                "attachment_keys": [{"seq": 0, "key": "k0"}]
-            }),
-        );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
-
-        let body = db
-            .get_cached_message("html-attachments")
-            .unwrap()
-            .unwrap()
-            .body_text
-            .unwrap();
-        assert!(body.starts_with("<p>hello</p>"));
-        assert!(body.contains("<p>[This message has 1 attachment."));
-    }
-
-    #[test]
-    fn a_body_less_message_still_announces_its_attachments() {
-        let (_dir, db) = temp_db();
-        let item = item_with_envelope(
-            "only-attachments",
-            &serde_json::json!({
-                "subject": "scan",
-                "attachment_keys": [{"seq": 0, "key": "k0"}]
-            }),
-        );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
-
-        let body = db
-            .get_cached_message("only-attachments")
-            .unwrap()
-            .unwrap()
-            .body_text
-            .unwrap();
-        assert!(body.contains("1 attachment."));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2527,6 +2734,434 @@ mod tests {
             "a two second trigger storm produced {} backend connections, which is the runaway that pins the processor when the network is down",
             seen
         );
+    }
+
+
+    #[test]
+    fn a_missing_or_negative_size_is_dropped() {
+        let v = serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf"},
+            {"seq": 1, "key": "k1", "filename": "b.png", "content_type": "image/png", "size": -4},
+            {"seq": 2, "key": "k2", "filename": "c.bin", "content_type": "text/plain", "size": 2048}
+        ]});
+        let parsed = parse_envelope_attachments(&v);
+        assert_eq!(parsed[0].size, None);
+        assert_eq!(parsed[1].size, None);
+        assert_eq!(parsed[2].size, Some(2048));
+        assert_eq!(parsed[2].key.as_deref(), Some("k2"));
+    }
+
+    #[test]
+    fn a_message_with_attachments_is_marked_pending_and_keeps_its_body() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "with-attachments",
+            &serde_json::json!({
+                "subject": "invoice",
+                "body_text": "see attached",
+                "attachment_keys": [
+                    {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 11},
+                    {"seq": 1, "key": "k1"}
+                ]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+
+        let cached = db.get_cached_message("with-attachments").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("see attached"));
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(2));
+        let list = meta.get("attachments").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(list[0].get("key").and_then(|v| v.as_str()), Some("k0"));
+        assert_eq!(list[1].get("key").and_then(|v| v.as_str()), Some("k1"));
+        assert_eq!(list[1].get("name").and_then(|v| v.as_str()), Some("Attachment"));
+    }
+
+    #[test]
+    fn an_attacker_named_file_never_reaches_the_body() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "html-injection",
+            &serde_json::json!({
+                "subject": "report",
+                "body_html": "<p>hello</p>",
+                "attachment_keys": [{
+                    "seq": 0,
+                    "key": "k0",
+                    "filename": "<img src=x onerror=alert(1)>.png",
+                    "content_type": "image/png",
+                    "size": 4
+                }]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        let cached = db.get_cached_message("html-injection").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("<p>hello</p>"));
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+    }
+
+    #[test]
+    fn a_body_less_message_with_attachments_is_pending() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "only-attachments",
+            &serde_json::json!({
+                "subject": "scan",
+                "attachment_keys": [{"seq": 0, "key": "k0"}]
+            }),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        let cached = db.get_cached_message("only-attachments").unwrap().unwrap();
+        assert!(cached.body_text.as_deref().unwrap_or("").is_empty());
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        assert_eq!(db.list_attachment_backlog(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_message_without_attachments_is_never_pending() {
+        let (_dir, db) = temp_db();
+        let item = item_with_envelope(
+            "no-attachments-state",
+            &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
+        );
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        let cached = db.get_cached_message("no-attachments-state").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_server_count_marks_a_message_pending_even_without_keys() {
+        let (_dir, db) = temp_db();
+        let mut item = item_with_envelope(
+            "count-only",
+            &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
+        );
+        item.attachment_count = Some(1);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        let cached = db.get_cached_message("count-only").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn cached_meta_entries_round_trip_into_download_entries() {
+        let raw = serde_json::json!({
+            "is_html": false,
+            "attachment_count": 2,
+            "attachments": [
+                {"seq": 0, "name": "a.pdf", "type": "application/pdf", "size": 11, "key": "k0"},
+                {"seq": 1, "name": "Attachment", "type": "application/octet-stream"}
+            ]
+        })
+        .to_string();
+        let entries = cached_attachment_entries(Some(&raw));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].filename.as_deref(), Some("a.pdf"));
+        assert_eq!(entries[0].key.as_deref(), Some("k0"));
+        assert_eq!(entries[1].filename, None);
+        assert_eq!(entries[1].key, None);
+        assert!(cached_attachment_entries(None).is_empty());
+        assert!(cached_attachment_entries(Some("From: x\r\n")).is_empty());
+    }
+
+    #[test]
+    fn merged_meta_keeps_other_fields_and_adds_keys() {
+        let raw = serde_json::json!({"is_html": true, "message_id": "<m@x>", "attachment_count": 1, "attachments": [{"seq": 0, "name": "a.pdf", "type": "application/pdf"}]}).to_string();
+        let fresh = parse_envelope_attachments(&serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 3}
+        ]}));
+        let merged: serde_json::Value =
+            serde_json::from_str(&merge_attachment_meta(Some(&raw), &fresh)).unwrap();
+        assert_eq!(merged.get("is_html"), Some(&serde_json::json!(true)));
+        assert_eq!(merged.get("message_id"), Some(&serde_json::json!("<m@x>")));
+        let list = merged.get("attachments").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(list[0].get("key").and_then(|v| v.as_str()), Some("k0"));
+        assert_eq!(list[0].get("size").and_then(|v| v.as_i64()), Some(3));
+    }
+
+    fn sealed_attachment_row(
+        seq: i16,
+        key: &[u8; 32],
+        plain: &[u8],
+        filename: &str,
+        content_type: &str,
+    ) -> serde_json::Value {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+        let data_nonce = [7u8; 12];
+        let aad = crate::crypto::attachment::attachment_data_aad(seq as i64);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&data_nonce),
+                Payload {
+                    msg: plain,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let meta_nonce = [9u8; 12];
+        let meta = serde_json::json!({"filename": filename, "content_type": content_type})
+            .to_string();
+        let sealed_meta = cipher
+            .encrypt(Nonce::from_slice(&meta_nonce), meta.as_bytes())
+            .unwrap();
+        serde_json::json!({
+            "id": format!("att-{}", seq),
+            "mail_item_id": "mail-1",
+            "encrypted_data": STANDARD.encode(ct),
+            "data_nonce": STANDARD.encode(data_nonce),
+            "encrypted_meta": STANDARD.encode(sealed_meta),
+            "meta_nonce": STANDARD.encode(meta_nonce),
+            "size_bytes": plain.len(),
+            "seq_num": seq,
+            "created_at": null
+        })
+    }
+
+    fn server_item_with_envelope(id: &str, envelope: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "item_type": "received",
+            "encrypted_envelope": envelope_b64(envelope),
+            "envelope_nonce": "",
+            "folder_token": "tok",
+            "is_external": false,
+            "created_at": "2026-06-14T00:00:00Z",
+            "has_attachments": true,
+            "attachment_count": 1
+        })
+    }
+
+    async fn spawn_mock_attachment_server(
+        listed: Vec<serde_json::Value>,
+        single: serde_json::Value,
+        attachments: Vec<serde_json::Value>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{routing::get, Json, Router};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let total = listed.len();
+        let list_body = serde_json::json!({
+            "items": listed,
+            "total": total,
+            "has_more": false,
+            "next_cursor": serde_json::Value::Null
+        });
+        let att_total = attachments.len();
+        let att_body = serde_json::json!({"attachments": attachments, "total": att_total});
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move || {
+                    let body = list_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id",
+                get(move || {
+                    let body = single.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/mail/v1/attachments/by-mail/:id",
+                get(move || {
+                    let body = att_body.clone();
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Json(body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), hits)
+    }
+
+    #[tokio::test]
+    async fn a_new_message_downloads_and_stores_its_attachments_during_sync() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let key = [42u8; 32];
+        let plain = b"%PDF-1.7 attachment payload".to_vec();
+        let envelope = serde_json::json!({
+            "subject": "invoice",
+            "body_text": "see attached",
+            "attachment_keys": [{
+                "seq": 0,
+                "key": STANDARD.encode(key),
+                "filename": "report.pdf",
+                "content_type": "application/pdf",
+                "size": plain.len()
+            }]
+        });
+        let item = server_item_with_envelope("mail-1", &envelope);
+        let row = sealed_attachment_row(0, &key, &plain, "report.pdf", "application/pdf");
+        let (base, hits) =
+            spawn_mock_attachment_server(vec![item.clone()], item, vec![row]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+
+        let cached = db.get_cached_message("mail-1").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
+        assert_eq!(cached.body_text.as_deref(), Some("see attached"));
+        assert!(cached.imap_uid > 0);
+        let stored = db.get_message_attachments("mail-1").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "report.pdf");
+        assert_eq!(stored[0].content_type, "application/pdf");
+        assert_eq!(stored[0].data, plain);
+        assert_eq!(stored[0].size, plain.len() as i64);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+
+        let rendered = crate::message_render::render_text(&cached, &stored);
+        assert!(rendered.contains("Content-Type: multipart/mixed"));
+        assert!(rendered.contains("filename=\"report.pdf\""));
+        assert!(!rendered.contains("Aster Bridge cannot download"));
+        assert!(!rendered.contains("still downloading"));
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_cached_message_has_its_attachments_backfilled() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let key = [5u8; 32];
+        let plain = b"PNG payload".to_vec();
+        let legacy_body = "see attached\n\n[This message has 1 attachment that Aster Bridge cannot download yet: pic.png (image/png, 11 B). To get it, open the message in the Aster web or mobile app.]";
+        let legacy_meta = serde_json::json!({
+            "is_html": false,
+            "message_id": null,
+            "attachment_count": 1,
+            "attachments": [{"seq": 0, "name": "pic.png", "type": "image/png", "size": 11}]
+        })
+        .to_string();
+        db.upsert_cached_message(
+            "mail-legacy",
+            "inbox",
+            Some("old"),
+            Some("a@b.c"),
+            Some("d@e.f"),
+            Some("2026-06-14T00:00:00Z"),
+            legacy_body.len() as i64,
+            Some(legacy_body),
+            Some(&legacy_meta),
+        )
+        .unwrap();
+        db.set_attachments_state("mail-legacy", ATTACHMENTS_PENDING).unwrap();
+        let first_uid = db.assign_uid_if_missing("inbox", "mail-legacy").unwrap();
+
+        let envelope = serde_json::json!({
+            "subject": "old",
+            "body_text": "see attached",
+            "attachment_keys": [{
+                "seq": 0,
+                "key": STANDARD.encode(key),
+                "filename": "pic.png",
+                "content_type": "image/png",
+                "size": plain.len()
+            }]
+        });
+        let single = server_item_with_envelope("mail-legacy", &envelope);
+        let row = sealed_attachment_row(0, &key, &plain, "pic.png", "image/png");
+        let (base, hits) = spawn_mock_attachment_server(vec![], single, vec![row]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+        let (tx, mut rx) = broadcast::channel(4);
+
+        run_sync_pass(&session, &client, &db, Some(&tx), false)
+            .await
+            .unwrap();
+
+        let cached = db.get_cached_message("mail-legacy").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
+        assert_eq!(cached.body_text.as_deref(), Some("see attached"));
+        assert!(cached.imap_uid > first_uid, "clients must refetch the rebuilt message");
+        let meta: serde_json::Value =
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        let list = meta.get("attachments").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(list[0].get("key").and_then(|v| v.as_str()), Some(STANDARD.encode(key).as_str()));
+        let stored = db.get_message_attachments("mail-legacy").unwrap();
+        assert_eq!(stored[0].data, plain);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let change = rx.try_recv().expect("backfill must broadcast a state change");
+        assert!(change.changed.contains_key("Email"));
+    }
+
+    #[tokio::test]
+    async fn an_undecryptable_attachment_counts_an_attempt_and_stays_pending() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let envelope = serde_json::json!({
+            "subject": "broken",
+            "body_text": "see attached",
+            "attachment_keys": [{"seq": 0, "key": STANDARD.encode([1u8; 32]), "filename": "x.bin"}]
+        });
+        let item = server_item_with_envelope("mail-broken", &envelope);
+        let row = sealed_attachment_row(0, &[2u8; 32], b"payload", "x.bin", "application/octet-stream");
+        let (base, hits) =
+            spawn_mock_attachment_server(vec![item.clone()], item, vec![row]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+
+        let cached = db.get_cached_message("mail-broken").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        assert_eq!(cached.body_text.as_deref(), Some("see attached"));
+        assert!(cached.imap_uid > 0);
+        assert!(db.get_message_attachments("mail-broken").unwrap().is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(db.bump_attachment_attempts("mail-broken").unwrap(), 2);
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(db.attachments_state("mail-broken").unwrap(), ATTACHMENTS_PENDING);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_attachment_endpoint_leaves_the_message_pending_without_an_attempt() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let envelope = serde_json::json!({
+            "subject": "offline",
+            "body_text": "see attached",
+            "attachment_keys": [{"seq": 0, "key": STANDARD.encode([1u8; 32])}]
+        });
+        let item = server_item_with_envelope("mail-offline", &envelope);
+        let base = spawn_mock_list_server(vec![item]).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, false)
+            .await
+            .unwrap();
+
+        let cached = db.get_cached_message("mail-offline").unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        assert_eq!(cached.body_text.as_deref(), Some("see attached"));
+        assert_eq!(db.bump_attachment_attempts("mail-offline").unwrap(), 2);
     }
 
 }

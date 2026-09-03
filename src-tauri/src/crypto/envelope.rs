@@ -84,7 +84,7 @@ pub fn decrypt_envelope(
     decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
 }
 
-fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Result<String> {
+pub(crate) fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Result<String> {
     let data = STANDARD
         .decode(encrypted_data_b64)
         .map_err(|e| BridgeError::Crypto(format!("data decode: {}", e)))?;

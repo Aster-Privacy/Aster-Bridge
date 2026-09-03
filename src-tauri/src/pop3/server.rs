@@ -12,15 +12,31 @@ use tokio::sync::RwLock;
 use crate::api_client::ApiClient;
 use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
-use crate::db::Database;
+use crate::db::{CachedAttachment, Database, ATTACHMENTS_STORED};
 use crate::error::Result;
-use crate::imap::server::build_rfc822;
+use crate::message_render;
 
 const MAX_LINE_LENGTH: usize = 512;
 const MAX_FAILED_AUTH: u32 = 5;
 
-fn pop3_size(m: &crate::db::CachedMessage) -> usize {
-    build_rfc822(m).len()
+fn pop3_size(m: &crate::db::CachedMessage, attachments: &[CachedAttachment]) -> usize {
+    message_render::rendered_size(m, attachments)
+}
+
+fn attachments_of<'a>(
+    meta: &'a std::collections::HashMap<String, Vec<CachedAttachment>>,
+    m: &crate::db::CachedMessage,
+) -> &'a [CachedAttachment] {
+    meta.get(&m.aster_id).map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+fn full_message_text(db: &Database, m: &crate::db::CachedMessage) -> String {
+    let attachments = if m.attachments_state == ATTACHMENTS_STORED {
+        db.get_message_attachments(&m.aster_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    message_render::render_text(m, &attachments)
 }
 
 static POP3_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -194,6 +210,8 @@ where
     let mut authenticated = false;
     let mut user_received = false;
     let mut messages: Vec<crate::db::CachedMessage> = Vec::new();
+    let mut attachment_meta: std::collections::HashMap<String, Vec<CachedAttachment>> =
+        std::collections::HashMap::new();
     let mut deleted: Vec<bool> = Vec::new();
     let mut line = String::new();
     let mut failed_auth: u32 = 0;
@@ -266,6 +284,7 @@ where
                         _session_lock = Some(Pop3SessionLock);
                         passwords.record_use(&pw_id, Some("pop3"));
                         messages = db.list_cached_message_meta("inbox").unwrap_or_default();
+                        attachment_meta = db.list_attachment_meta_for_folder("inbox").unwrap_or_default();
                         deleted = vec![false; messages.len()];
                         authenticated = true;
                         writer.write_all(b"+OK maildrop ready\r\n").await?;
@@ -302,7 +321,7 @@ where
                 let count = deleted.iter().filter(|d| !**d).count();
                 let total_octets: usize = messages.iter().zip(deleted.iter())
                     .filter(|(_, d)| !*d)
-                    .map(|(m, _)| pop3_size(m))
+                    .map(|(m, _)| pop3_size(m, attachments_of(&attachment_meta, m)))
                     .sum();
                 writer.write_all(format!("+OK {} {}\r\n", count, total_octets).as_bytes()).await?;
             }
@@ -311,12 +330,12 @@ where
                     let count = deleted.iter().filter(|d| !**d).count();
                     let total: usize = messages.iter().zip(deleted.iter())
                         .filter(|(_, d)| !*d)
-                        .map(|(m, _)| pop3_size(m))
+                        .map(|(m, _)| pop3_size(m, attachments_of(&attachment_meta, m)))
                         .sum();
                     let mut resp = format!("+OK {} messages ({} octets)\r\n", count, total);
                     for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
                         if !del {
-                            resp.push_str(&format!("{} {}\r\n", i + 1, pop3_size(msg)));
+                            resp.push_str(&format!("{} {}\r\n", i + 1, pop3_size(msg, attachments_of(&attachment_meta, msg))));
                         }
                     }
                     resp.push_str(".\r\n");
@@ -325,7 +344,7 @@ where
                     if n == 0 || n > messages.len() || deleted[n - 1] {
                         writer.write_all(b"-ERR no such message\r\n").await?;
                     } else {
-                        writer.write_all(format!("+OK {} {}\r\n", n, pop3_size(&messages[n - 1])).as_bytes()).await?;
+                        writer.write_all(format!("+OK {} {}\r\n", n, pop3_size(&messages[n - 1], attachments_of(&attachment_meta, &messages[n - 1]))).as_bytes()).await?;
                     }
                 } else {
                     writer.write_all(b"-ERR syntax error\r\n").await?;
@@ -358,7 +377,7 @@ where
                     } else if let Some(full) =
                         db.get_cached_message(&messages[n - 1].aster_id).ok().flatten()
                     {
-                        let rfc = build_rfc822(&full);
+                        let rfc = full_message_text(&db, &full);
                         let mut dot_stuffed = String::with_capacity(rfc.len() + 64);
                         let lines: Vec<&str> = rfc.split("\r\n").collect();
                         let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
@@ -393,7 +412,7 @@ where
                     db.get_cached_message(&messages[msg_num - 1].aster_id).ok().flatten()
                 };
                 if let Some(full) = full_top {
-                    let rfc = build_rfc822(&full);
+                    let rfc = full_message_text(&db, &full);
                     let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
                     let header_str = &rfc[..sep];
                     let body = rfc.get(sep + 2..).unwrap_or("");
@@ -491,6 +510,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imap::server::build_rfc822;
     use crate::db::CachedMessage;
 
     fn sample_message(aster_id: &str) -> CachedMessage {
@@ -507,6 +527,7 @@ mod tests {
             raw_headers: None,
             imap_uid: 1,
             thread_id: None,
+            attachments_state: 0,
         }
     }
 
@@ -514,22 +535,22 @@ mod tests {
     fn pop3_size_equals_build_rfc822_len() {
         let m = sample_message("id-1");
         let expected = build_rfc822(&m).len();
-        assert_eq!(pop3_size(&m), expected);
+        assert_eq!(pop3_size(&m, &[]), expected);
     }
 
     #[test]
     fn pop3_size_ignores_stored_size_field() {
         let mut m = sample_message("id-2");
-        let baseline = pop3_size(&m);
+        let baseline = pop3_size(&m, &[]);
         m.size = 123456789;
-        assert_eq!(pop3_size(&m), baseline);
-        assert_ne!(pop3_size(&m), m.size as usize);
+        assert_eq!(pop3_size(&m, &[]), baseline);
+        assert_ne!(pop3_size(&m, &[]), m.size as usize);
     }
 
     #[test]
     fn pop3_size_is_nonzero_for_real_message() {
         let m = sample_message("id-3");
-        assert!(pop3_size(&m) > 0);
+        assert!(pop3_size(&m, &[]) > 0);
     }
 
     #[test]
@@ -649,16 +670,16 @@ mod tests {
         let count = deleted.iter().filter(|d| !**d).count();
         let total: usize = messages.iter().zip(deleted.iter())
             .filter(|(_, d)| !*d)
-            .map(|(m, _)| pop3_size(m))
+            .map(|(m, _)| pop3_size(m, &[]))
             .sum();
         let mut resp = format!("+OK {} messages ({} octets)\r\n", count, total);
         for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
             if !del {
-                resp.push_str(&format!("{} {}\r\n", i + 1, pop3_size(msg)));
+                resp.push_str(&format!("{} {}\r\n", i + 1, pop3_size(msg, &[])));
             }
         }
         resp.push_str(".\r\n");
-        let expected_size = pop3_size(&messages[0]);
+        let expected_size = pop3_size(&messages[0], &[]);
         assert!(resp.starts_with(&format!("+OK 1 messages ({} octets)\r\n", expected_size)));
         assert!(resp.contains(&format!("1 {}\r\n", expected_size)));
     }
@@ -670,10 +691,10 @@ mod tests {
         let count = deleted.iter().filter(|d| !**d).count();
         let total_octets: usize = messages.iter().zip(deleted.iter())
             .filter(|(_, d)| !*d)
-            .map(|(m, _)| pop3_size(m))
+            .map(|(m, _)| pop3_size(m, &[]))
             .sum();
         assert_eq!(count, 1);
-        assert_eq!(total_octets, pop3_size(&messages[0]));
+        assert_eq!(total_octets, pop3_size(&messages[0], &[]));
     }
 
     type BackendCalls = Arc<tokio::sync::Mutex<Vec<String>>>;

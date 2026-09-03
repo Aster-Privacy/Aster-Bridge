@@ -19,6 +19,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 pub mod alias;
+pub mod attachment;
 pub mod contacts;
 pub mod draft;
 pub mod envelope;

@@ -72,12 +72,43 @@ pub async fn download(
         return build_blob_response(data, ct, &name);
     }
 
+    if let Some((aster_id, seq)) = parse_attachment_blob_id(&blob_id) {
+        if let Ok(list) = state.ctx.db.get_message_attachments(aster_id) {
+            if let Some(att) = list.into_iter().find(|a| a.seq == seq) {
+                let ct = if att.content_type.contains('/') {
+                    att.content_type.clone()
+                } else {
+                    "application/octet-stream".to_string()
+                };
+                return build_blob_response(att.data, &ct, &name);
+            }
+        }
+        return (StatusCode::NOT_FOUND, "blob not found").into_response();
+    }
+
     if let Ok(Some(m)) = state.ctx.db.get_cached_message(&blob_id) {
-        let body = mime::build_rfc5322(&m);
+        let attachments = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+            state.ctx.db.get_message_attachments(&m.aster_id).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let body = mime::build_rfc5322(&m, &attachments);
         return build_blob_response(body, "message/rfc822", &name);
     }
 
     (StatusCode::NOT_FOUND, "blob not found").into_response()
+}
+
+pub fn attachment_blob_id(aster_id: &str, seq: i64) -> String {
+    format!("{}_att_{}", aster_id, seq)
+}
+
+pub fn parse_attachment_blob_id(blob_id: &str) -> Option<(&str, i64)> {
+    let (aster_id, seq) = blob_id.rsplit_once("_att_")?;
+    if aster_id.is_empty() {
+        return None;
+    }
+    Some((aster_id, seq.parse().ok()?))
 }
 
 fn build_blob_response(data: Vec<u8>, content_type: &str, name: &str) -> Response {

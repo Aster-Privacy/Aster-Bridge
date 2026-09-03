@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.29 - 2026-09-03
+
+### Fixed
+- Aster Bridge now downloads the attachments of your messages, so they open in your mail app the same way they do on the web. Messages that arrived earlier with the "Aster Bridge cannot download yet" note get their attachments during the next few syncs, and your mail app fetches the completed message on its own.
+- Inline images in HTML messages show in place.
+- If the attachments of a message are still downloading, or Aster Bridge could not decrypt them, a short note at the end of the message says so.
+- Attachment names that contain quotes, non-Latin characters, or line breaks are encoded safely in the message headers.
+
 ## 0.4.28 - 2026-08-25
 
 ### Added

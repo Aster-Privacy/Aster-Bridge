@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::db::CachedMessage;
+use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
 use crate::jmap::dispatcher::MethodError;
 use crate::jmap::state::JmapContext;
 use crate::jmap::store;
@@ -59,7 +59,14 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
 
     for id in &want {
         match ctx.db.get_cached_message(id) {
-            Ok(Some(m)) => list.push(serialize_email(&m, &label_to_id, &properties, fetch_text)),
+            Ok(Some(m)) => {
+                let attachments = if m.attachments_state == ATTACHMENTS_STORED {
+                    ctx.db.get_message_attachment_meta(&m.aster_id).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments))
+            }
             _ => not_found.push(id.clone()),
         }
     }
@@ -78,6 +85,7 @@ fn serialize_email(
     label_to_id: &HashMap<String, String>,
     properties: &Option<Vec<String>>,
     fetch_text: bool,
+    attachments: &[CachedAttachment],
 ) -> Value {
     let mailbox_id = label_to_id.get(&m.folder).cloned().unwrap_or_default();
     let mut mailbox_ids = serde_json::Map::new();
@@ -145,6 +153,38 @@ fn serialize_email(
 
     let html_body = if is_html { vec![body_part.clone()] } else { vec![] };
     let text_body = if !is_html { vec![body_part.clone()] } else { vec![] };
+    let attachment_parts: Vec<Value> = attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let inline = a.is_inline && a.content_id.is_some();
+            json!({
+                "partId": format!("{}", i + 2),
+                "blobId": crate::jmap::blob::attachment_blob_id(&m.aster_id, a.seq),
+                "size": a.size,
+                "name": a.name,
+                "type": a.content_type,
+                "charset": Value::Null,
+                "disposition": if inline { "inline" } else { "attachment" },
+                "cid": a.content_id.as_deref().map(|c| c.trim_start_matches('<').trim_end_matches('>')),
+            })
+        })
+        .collect();
+    let (message_size, body_structure) = if attachment_parts.is_empty() {
+        (json!(m.size), body_part.clone())
+    } else {
+        let mut sub_parts = vec![body_part.clone()];
+        sub_parts.extend(attachment_parts.iter().cloned());
+        (
+            json!(crate::message_render::rendered_size(m, attachments)),
+            json!({
+                "partId": Value::Null,
+                "blobId": Value::Null,
+                "type": "multipart/mixed",
+                "subParts": sub_parts,
+            }),
+        )
+    };
 
     let include_body_values = fetch_text
         || properties
@@ -158,7 +198,7 @@ fn serialize_email(
     full_map.insert("threadId".to_string(), json!(m.thread_id.as_deref().unwrap_or(&m.aster_id)));
     full_map.insert("mailboxIds".to_string(), Value::Object(mailbox_ids));
     full_map.insert("keywords".to_string(), Value::Object(keywords));
-    full_map.insert("size".to_string(), json!(m.size));
+    full_map.insert("size".to_string(), message_size);
     full_map.insert("receivedAt".to_string(), json!(received_at));
     full_map.insert("messageId".to_string(), json!(message_id.map(|m| vec![m])));
     full_map.insert("inReplyTo".to_string(), Value::Null);
@@ -171,15 +211,15 @@ fn serialize_email(
     full_map.insert("replyTo".to_string(), Value::Null);
     full_map.insert("subject".to_string(), json!(subject));
     full_map.insert("sentAt".to_string(), json!(received_at));
-    full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0));
+    full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0 || !attachments.is_empty()));
     full_map.insert("preview".to_string(), json!(preview_of(m.body_text.as_deref())));
     if include_body_values {
         full_map.insert("bodyValues".to_string(), Value::Object(body_values));
     }
     full_map.insert("textBody".to_string(), json!(text_body));
     full_map.insert("htmlBody".to_string(), json!(html_body));
-    full_map.insert("attachments".to_string(), Value::Array(vec![]));
-    full_map.insert("bodyStructure".to_string(), body_part);
+    full_map.insert("attachments".to_string(), Value::Array(attachment_parts));
+    full_map.insert("bodyStructure".to_string(), body_structure);
     let full = Value::Object(full_map);
 
     if let Some(props) = properties {
@@ -943,6 +983,7 @@ mod tests {
             raw_headers: Some(json!({"is_html": false, "message_id": "mid-1@test"}).to_string()),
             imap_uid: 1,
             thread_id: Some("thread-1".to_string()),
+            attachments_state: 0,
         }
     }
 
@@ -1062,7 +1103,7 @@ mod tests {
         let m = cached("e1", "inbox");
         let mut label_to_id = HashMap::new();
         label_to_id.insert("inbox".to_string(), "mbx_inbox".to_string());
-        let v = serialize_email(&m, &label_to_id, &None, false);
+        let v = serialize_email(&m, &label_to_id, &None, false, &[]);
         assert_eq!(v.get("id"), Some(&json!("e1")));
         assert_eq!(v.get("blobId"), Some(&json!("e1")));
         assert_eq!(v.get("threadId"), Some(&json!("thread-1")));
@@ -1078,7 +1119,7 @@ mod tests {
     fn serialize_email_threadid_falls_back_to_id() {
         let mut m = cached("e2", "inbox");
         m.thread_id = None;
-        let v = serialize_email(&m, &HashMap::new(), &None, false);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
         assert_eq!(v.get("threadId"), Some(&json!("e2")));
     }
 
@@ -1086,7 +1127,7 @@ mod tests {
     fn serialize_email_property_selection() {
         let m = cached("e3", "inbox");
         let props = Some(vec!["subject".to_string()]);
-        let v = serialize_email(&m, &HashMap::new(), &props, false);
+        let v = serialize_email(&m, &HashMap::new(), &props, false, &[]);
         let obj = v.as_object().unwrap();
         assert!(obj.contains_key("id"));
         assert!(obj.contains_key("subject"));
@@ -1098,7 +1139,7 @@ mod tests {
     fn serialize_email_keywords_from_flags() {
         let mut m = cached("e4", "inbox");
         m.flags = 1 | 4 | 16;
-        let v = serialize_email(&m, &HashMap::new(), &None, false);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
         assert_eq!(v.pointer("/keywords/$seen"), Some(&json!(true)));
         assert_eq!(v.pointer("/keywords/$flagged"), Some(&json!(true)));
         assert_eq!(v.pointer("/keywords/$draft"), Some(&json!(true)));
@@ -1109,7 +1150,7 @@ mod tests {
     fn serialize_email_html_body_when_html() {
         let mut m = cached("e5", "inbox");
         m.raw_headers = Some(json!({"is_html": true}).to_string());
-        let v = serialize_email(&m, &HashMap::new(), &None, false);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
         assert!(v.get("htmlBody").unwrap().as_array().unwrap().len() == 1);
         assert!(v.get("textBody").unwrap().as_array().unwrap().is_empty());
     }
@@ -1118,7 +1159,7 @@ mod tests {
     fn serialize_email_reports_attachments_when_the_envelope_had_them() {
         let mut m = cached("e5a", "inbox");
         m.raw_headers = Some(json!({"is_html": false, "attachment_count": 2}).to_string());
-        let v = serialize_email(&m, &HashMap::new(), &None, false);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
         assert_eq!(v.get("hasAttachment"), Some(&json!(true)));
     }
 
@@ -1127,12 +1168,12 @@ mod tests {
         let mut m = cached("e5b", "inbox");
         m.raw_headers = Some(json!({"is_html": false, "attachment_count": 0}).to_string());
         assert_eq!(
-            serialize_email(&m, &HashMap::new(), &None, false).get("hasAttachment"),
+            serialize_email(&m, &HashMap::new(), &None, false, &[]).get("hasAttachment"),
             Some(&json!(false))
         );
         let legacy = cached("e5c", "inbox");
         assert_eq!(
-            serialize_email(&legacy, &HashMap::new(), &None, false).get("hasAttachment"),
+            serialize_email(&legacy, &HashMap::new(), &None, false, &[]).get("hasAttachment"),
             Some(&json!(false))
         );
     }
@@ -1140,7 +1181,7 @@ mod tests {
     #[test]
     fn serialize_email_fetch_text_populates_body_values() {
         let m = cached("e6", "inbox");
-        let v = serialize_email(&m, &HashMap::new(), &None, true);
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[]);
         assert_eq!(
             v.pointer("/bodyValues/1/value"),
             Some(&json!("this is the body text here"))

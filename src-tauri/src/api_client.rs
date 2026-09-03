@@ -408,6 +408,34 @@ pub struct MailItem {
     pub is_spam: Option<bool>,
     pub is_read: Option<bool>,
     pub is_starred: Option<bool>,
+    #[serde(default)]
+    pub has_attachments: Option<bool>,
+    #[serde(default)]
+    pub attachment_count: Option<i16>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct AttachmentResponse {
+    pub id: String,
+    pub mail_item_id: String,
+    pub encrypted_data: String,
+    pub data_nonce: String,
+    pub encrypted_meta: String,
+    #[serde(default)]
+    pub meta_nonce: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    pub seq_num: i16,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AttachmentListResponse {
+    pub attachments: Vec<AttachmentResponse>,
+    #[serde(default)]
+    pub total: i64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -862,6 +890,28 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub async fn list_attachments_for_mail(
+        &self,
+        access_token: &str,
+        mail_id: &str,
+    ) -> Result<AttachmentListResponse> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/mail/v1/attachments/by-mail/{}",
+                self.base_url, mail_id
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
     }
 
     pub async fn list_drafts(
