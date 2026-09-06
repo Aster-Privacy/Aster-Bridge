@@ -49,7 +49,7 @@ pub fn is_transient_send_error(err: &BridgeError) -> bool {
 
 const MAX_LINE_LENGTH: usize = 998;
 const MAX_DATA_LINE_LENGTH: usize = 1_000_000;
-const MAX_DATA_SIZE: usize = 25 * 1024 * 1024;
+const MAX_DATA_SIZE: usize = 70 * 1024 * 1024;
 const MAX_RECIPIENTS: usize = 100;
 const MAX_FAILED_AUTH: u32 = 5;
 
@@ -343,12 +343,16 @@ where
                                 }
                             }
                         } else {
-                            let smtp_reply = match &e {
+                            let smtp_reply: String = match &e {
                                 BridgeError::PlanUpgradeRequired(_) => {
-                                    b"550 5.7.1 Plan upgrade required to send via Aster Bridge\r\n"
-                                        as &[u8]
+                                    "550 5.7.1 Plan upgrade required to send via Aster Bridge\r\n"
+                                        .to_string()
                                 }
-                                _ => b"550 Send rejected\r\n",
+                                BridgeError::MessageTooLarge(msg) => format!(
+                                    "552 5.3.4 {}\r\n",
+                                    msg.replace(['\r', '\n'], " ")
+                                ),
+                                _ => "550 Send rejected\r\n".to_string(),
                             };
                             tracing::error!("Failed to send mail via API: {}", e);
                             let log_line = format!(
@@ -374,7 +378,7 @@ where
                                     .open(&path)
                                     .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
                             }
-                            writer.write_all(smtp_reply).await?;
+                            writer.write_all(smtp_reply.as_bytes()).await?;
                         }
                     }
                 }
