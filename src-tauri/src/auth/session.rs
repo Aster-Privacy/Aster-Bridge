@@ -68,6 +68,7 @@ pub struct Session {
     pub username: String,
     pub email: String,
     pub access_token: Zeroizing<String>,
+    pub refresh_token: Option<Zeroizing<String>>,
     pub vault_passphrase: Vec<u8>,
     pub identity_key: Option<String>,
     pub data_kek: Option<Zeroizing<String>>,
@@ -327,6 +328,7 @@ pub async fn restore_or_login(
         username: login_resp.username,
         email: login_resp.email,
         access_token,
+        refresh_token: login_resp.refresh_token.map(Zeroizing::new),
         vault_passphrase: passphrase,
         identity_key,
         data_kek,
@@ -343,6 +345,37 @@ pub async fn refresh_access_token(
     signing_key: &ed25519_dalek::SigningKey,
     client: &ApiClient,
 ) -> Result<()> {
+    let (user_id, refresh_token) = {
+        let s = session.read().await;
+        (s.user_id, s.refresh_token.clone())
+    };
+
+    if let Some(refresh_token) = refresh_token {
+        match client
+            .refresh_session(&crate::api_client::RefreshSessionRequest {
+                refresh_token: refresh_token.to_string(),
+                expected_user_id: user_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                if let Some(access_token) = resp.access_token {
+                    let mut s = session.write().await;
+                    s.access_token = Zeroizing::new(access_token);
+                    if let Some(rotated) = resp.refresh_token {
+                        s.refresh_token = Some(Zeroizing::new(rotated));
+                    }
+                    return Ok(());
+                }
+                tracing::warn!("session refresh returned no access token; signing in with the device key");
+            }
+            Err(BridgeError::Network(e)) => return Err(BridgeError::Network(e)),
+            Err(e) => {
+                tracing::warn!("session refresh failed ({}); signing in with the device key", e);
+            }
+        }
+    }
+
     let challenge = client.device_challenge(device_id).await?;
     let signature = device_identity::sign_with_key(signing_key, &challenge.nonce)
         .map_err(|e| BridgeError::Crypto(e))?;
@@ -363,6 +396,7 @@ pub async fn refresh_access_token(
     );
     let mut s = session.write().await;
     s.access_token = access_token;
+    s.refresh_token = login_resp.refresh_token.map(Zeroizing::new);
     match material {
         Ok(m) => apply_vault_key_material(&mut s, m),
         Err(e) => tracing::warn!(
@@ -486,6 +520,7 @@ pub async fn first_time_setup(
                     username: login_resp.username,
                     email: login_resp.email,
                     access_token,
+                    refresh_token: login_resp.refresh_token.map(Zeroizing::new),
                     vault_passphrase: passphrase,
                     identity_key,
                     data_kek,
@@ -514,6 +549,7 @@ mod tests {
             username: "alice".to_string(),
             email: "alice@astermail.org".to_string(),
             access_token: Zeroizing::new("token-abc".to_string()),
+            refresh_token: None,
             vault_passphrase: b"passphrase-bytes".to_vec(),
             identity_key: Some("identity-key".to_string()),
             ratchet_identity_public: None,
@@ -547,6 +583,7 @@ mod tests {
             username: "bob".to_string(),
             email: "bob@astermail.org".to_string(),
             access_token: Zeroizing::new(String::new()),
+            refresh_token: None,
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_identity_public: None,

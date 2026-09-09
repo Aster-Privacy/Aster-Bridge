@@ -1038,6 +1038,7 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
                 username: login_resp.username,
                 email: login_resp.email,
                 access_token,
+                refresh_token: login_resp.refresh_token.map(zeroize::Zeroizing::new),
                 vault_passphrase: passphrase,
                 identity_key,
                 data_kek,

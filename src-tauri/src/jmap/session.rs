@@ -113,6 +113,7 @@ mod tests {
             username: "tester".to_string(),
             email: email.to_string(),
             access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
             vault_passphrase: Vec::new(),
             identity_key: None,
             ratchet_identity_public: None,
