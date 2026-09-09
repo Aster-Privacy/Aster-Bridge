@@ -24,7 +24,20 @@ use uuid::Uuid;
 
 use crate::error::{BridgeError, Result};
 
-const USER_AGENT: &str = "AsterBridge/0.2.2";
+const USER_AGENT_OS: &str = if cfg!(target_os = "windows") {
+    "Windows"
+} else if cfg!(target_os = "macos") {
+    "macOS"
+} else if cfg!(target_os = "linux") {
+    "Linux"
+} else {
+    std::env::consts::OS
+};
+const USER_AGENT: &str = concat!("AsterBridge/", env!("CARGO_PKG_VERSION"));
+
+fn user_agent() -> String {
+    format!("{} ({})", USER_AGENT, USER_AGENT_OS)
+}
 const API_BASE_URL: &str = "https://app.astermail.org/api";
 const ERR_BODY_MAX: usize = 256;
 
@@ -337,8 +350,21 @@ pub struct DeviceLoginResponse {
     pub username: String,
     pub email: String,
     pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
     pub encrypted_vault: String,
     pub vault_nonce: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshSessionRequest {
+    pub refresh_token: String,
+    pub expected_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshSessionResponse {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,7 +559,7 @@ impl ApiClient {
         default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
         let client = crate::tls_pinning::pinned_client_builder(
             default_headers,
-            USER_AGENT,
+            &user_agent(),
             std::time::Duration::from_secs(30),
         )
         .expect("failed to build pinned HTTP client");
@@ -547,7 +573,7 @@ impl ApiClient {
     #[cfg(test)]
     pub fn new_with_base_url(base_url: &str) -> Self {
         let client = Client::builder()
-            .user_agent(USER_AGENT)
+            .user_agent(user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -607,6 +633,20 @@ impl ApiClient {
     pub async fn device_login(&self, req: &DeviceLoginRequest) -> Result<DeviceLoginResponse> {
         let resp = self.client
             .post(format!("{}/core/v1/auth/device/login", self.base_url))
+            .json(req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn refresh_session(&self, req: &RefreshSessionRequest) -> Result<RefreshSessionResponse> {
+        let resp = self.client
+            .post(format!("{}/core/v1/auth/refresh", self.base_url))
             .json(req)
             .send()
             .await?;
