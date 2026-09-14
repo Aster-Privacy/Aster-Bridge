@@ -205,6 +205,180 @@ fn quarantine_unreadable_db(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+const OUTBOX_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_mime BLOB NOT NULL,
+    envelope_from TEXT NOT NULL,
+    envelope_to TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    last_error TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed'))
+);";
+
+const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+    ("uid_map", &["aster_id", "folder", "imap_uid"]),
+    (
+        "message_cache",
+        &[
+            "aster_id",
+            "folder",
+            "subject",
+            "sender",
+            "recipients",
+            "date",
+            "flags",
+            "size",
+            "body_cached",
+            "body_text",
+            "raw_headers",
+            "created_at",
+            "thread_id",
+            "message_id",
+            "attachments_state",
+            "attachment_attempts",
+        ],
+    ),
+    (
+        "app_passwords",
+        &["id", "label", "hash", "created_at", "last_used_at", "last_client", "use_count"],
+    ),
+    ("sync_state", &["key", "value"]),
+    (
+        "jmap_mailbox",
+        &["id", "name", "parent_id", "role", "sort_order", "folder_label"],
+    ),
+    ("jmap_state", &["type", "counter"]),
+    ("jmap_change_log", &["seq", "type", "state", "object_id", "op", "ts"]),
+    ("jmap_blob", &["blob_id", "data", "content_type", "size", "created_ts"]),
+    ("envelope_nonces", &["aster_id", "nonce", "first_seen"]),
+    (
+        "message_attachment",
+        &["aster_id", "seq", "name", "content_type", "content_id", "is_inline", "size", "data"],
+    ),
+    (
+        "outbox",
+        &[
+            "id",
+            "raw_mime",
+            "envelope_from",
+            "envelope_to",
+            "queued_at",
+            "attempts",
+            "last_attempt_at",
+            "last_error",
+            "status",
+        ],
+    ),
+];
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info(\"{}\")", table))
+        .map_err(|e| e.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string());
+    columns
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn repair_outbox_table(conn: &Connection) -> Result<(), String> {
+    let columns = table_columns(conn, "outbox")?;
+    let has = |name: &str| columns.iter().any(|c| c == name);
+
+    let core = ["id", "raw_mime", "envelope_from", "envelope_to", "queued_at"];
+    if !core.iter().all(|c| has(c)) {
+        let aside = format!("outbox_incompatible_{}", unix_millis());
+        tracing::warn!(
+            "outbox table has an unrecognized layout ({}); moving it to {} and recreating it",
+            columns.join(", "),
+            aside
+        );
+        conn.execute_batch(&format!("ALTER TABLE outbox RENAME TO \"{}\";", aside))
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let additions = [
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_attempt_at", "INTEGER"),
+        ("last_error", "TEXT"),
+        (
+            "status",
+            "TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed'))",
+        ),
+    ];
+    for (name, decl) in additions {
+        if !has(name) {
+            tracing::warn!("outbox table is missing column {}; adding it", name);
+            conn.execute_batch(&format!("ALTER TABLE outbox ADD COLUMN {} {};", name, decl))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_required_columns(conn: &Connection) -> Result<(), String> {
+    for (table, required) in REQUIRED_COLUMNS {
+        let columns = table_columns(conn, table)?;
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|name| !columns.iter().any(|c| c == name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "table {} is missing columns: {}",
+                table,
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_incompatible_db(db_path: &Path, reason: &str) -> Result<(), String> {
+    let dest = db_path.with_extension(format!("db.incompatible.{}", unix_millis()));
+    tracing::warn!(
+        "database schema could not be prepared ({}); moving it to {} and starting with a fresh database",
+        reason,
+        dest.display()
+    );
+    eprintln!(
+        "bridge.db has an incompatible schema ({}); moved to {} and created a fresh database",
+        reason,
+        dest.display()
+    );
+    std::fs::rename(db_path, &dest).map_err(|e| {
+        format!(
+            "database schema is incompatible ({}) and it could not be moved aside: {}",
+            reason, e
+        )
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let mut from = db_path.as_os_str().to_os_string();
+        from.push(suffix);
+        let from = PathBuf::from(from);
+        if from.exists() {
+            let mut to = dest.as_os_str().to_os_string();
+            to.push(suffix);
+            let _ = std::fs::rename(&from, PathBuf::from(to));
+        }
+    }
+    Ok(())
+}
+
 fn open_keyed(db_path: &Path, key: &[u8; 32]) -> Result<Connection, String> {
     if db_path.exists() {
         let probe = Connection::open(db_path).map_err(|e| e.to_string())?;
@@ -304,7 +478,25 @@ impl Database {
     pub fn open_with_key(data_dir: &Path, key: &[u8; 32]) -> Result<Self, String> {
         let db_path = data_dir.join("bridge.db");
         let conn = open_keyed(&db_path, key)?;
+        let conn = match Self::prepare_schema(&conn) {
+            Ok(()) => conn,
+            Err(e) => {
+                drop(conn);
+                quarantine_incompatible_db(&db_path, &e)?;
+                let fresh = open_keyed(&db_path, key)?;
+                Self::prepare_schema(&fresh)?;
+                fresh
+            }
+        };
 
+        restrict_db_file_permissions(&db_path);
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn prepare_schema(conn: &Connection) -> Result<(), String> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -452,19 +644,10 @@ impl Database {
               WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
         ).map_err(|e| e.to_string())?;
 
+        conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
+        repair_outbox_table(conn)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                raw_mime BLOB NOT NULL,
-                envelope_from TEXT NOT NULL,
-                envelope_to TEXT NOT NULL,
-                queued_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_attempt_at INTEGER,
-                last_error TEXT,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed'))
-             );
-             CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
+            "CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
@@ -510,11 +693,7 @@ impl Database {
             ).map_err(|e| format!("FTS backfill failed: {}", e))?;
         }
 
-        restrict_db_file_permissions(&db_path);
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        verify_required_columns(conn)
     }
 
     pub fn fts_search(&self, query: &str, limit: i64) -> Result<Vec<String>, String> {
@@ -1860,6 +2039,94 @@ pub struct CachedMessage {
 #[cfg(test)]
 mod encryption_tests {
     use super::*;
+
+    fn seed_foreign_schema(dir: &Path, key: &[u8; 32], sql: &str) {
+        let conn = Connection::open(dir.join("bridge.db")).unwrap();
+        apply_key(&conn, key).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    fn quarantined_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("bridge.db.incompatible."))
+            .collect()
+    }
+
+    #[test]
+    fn outbox_without_status_is_repaired_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [5u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_mime BLOB NOT NULL,
+                envelope_from TEXT NOT NULL,
+                envelope_to TEXT NOT NULL,
+                queued_at INTEGER NOT NULL
+             );
+             CREATE TABLE app_passwords (id TEXT PRIMARY KEY, label TEXT NOT NULL, hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+             INSERT INTO app_passwords (id, label, hash) VALUES ('p1', 'laptop', 'h');",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        assert_eq!(db.outbox_get(id).unwrap().unwrap().status, "pending");
+        assert_eq!(db.db_stats().unwrap().1, 1, "app passwords survive the repair");
+        assert!(quarantined_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_outbox_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [6u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE outbox (id INTEGER PRIMARY KEY, body TEXT, recipient TEXT);
+             INSERT INTO outbox (body, recipient) VALUES ('hello', 'a@b');",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let id = db.outbox_insert(b"raw", "from@x", "to@y").unwrap();
+        assert!(db.outbox_get(id).unwrap().is_some());
+        let aside: i64 = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'outbox_incompatible_%'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(aside, 1);
+    }
+
+    #[test]
+    fn incompatible_schema_is_quarantined_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        seed_foreign_schema(
+            dir.path(),
+            &key,
+            "CREATE TABLE message_cache (aster_id TEXT PRIMARY KEY, payload TEXT);",
+        );
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(quarantined_files(dir.path()).len(), 1);
+        db.upsert_cached_message("a1", "inbox", Some("s"), None, None, None, 1, None, None)
+            .unwrap();
+        assert!(db.get_cached_message("a1").unwrap().is_some());
+        drop(db);
+
+        let reopened = Database::open_with_key(dir.path(), &key).unwrap();
+        assert!(reopened.get_cached_message("a1").unwrap().is_some());
+        assert_eq!(quarantined_files(dir.path()).len(), 1, "a healthy database is not quarantined again");
+    }
 
     #[test]
     fn fresh_db_is_encrypted() {
