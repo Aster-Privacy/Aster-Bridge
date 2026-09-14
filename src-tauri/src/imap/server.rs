@@ -1855,6 +1855,17 @@ fn draft_content_from_mime(raw_message: &[u8]) -> Option<crate::crypto::draft::D
     })
 }
 
+fn draft_reply_parent(db: &Database, raw_message: &[u8]) -> Option<String> {
+    let headers = crate::smtp::reply_thread::ReplyHeaders::from_mime(raw_message);
+    if headers.is_empty() {
+        return None;
+    }
+    crate::smtp::reply_thread::resolve_reply(db, &headers)
+        .parent_aster_id
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .filter(|id| matches!(db.get_cached_message(id), Ok(Some(_))))
+}
+
 pub(crate) async fn append_draft(
     db: &Arc<Database>,
     client: &Arc<ApiClient>,
@@ -1884,8 +1895,10 @@ pub(crate) async fn append_draft(
         .as_ref()
         .map(|a| a.len() as i64)
         .unwrap_or(0);
+    let reply_to_id = draft_reply_parent(db, raw_message);
     let body = crate::api_client::CreateDraftBody {
-        draft_type: "new",
+        draft_type: if reply_to_id.is_some() { "reply" } else { "new" },
+        reply_to_id: reply_to_id.as_deref(),
         encrypted_content: &encrypted_content,
         content_nonce: &content_nonce,
         content_hash: &content_hash,
@@ -1899,7 +1912,7 @@ pub(crate) async fn append_draft(
         .map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now().to_rfc3339();
-    crate::sync::poller::cache_web_draft(db, &created.id, &content, &our_email, &now, created.version);
+    crate::sync::poller::cache_web_draft(db, &created.id, &content, &our_email, &now, created.version, reply_to_id.as_deref());
     let uid = db.assign_uid_if_missing("drafts", &created.id)?;
     Ok((uid, created.id))
 }

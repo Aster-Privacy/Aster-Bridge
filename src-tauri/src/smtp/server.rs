@@ -309,7 +309,7 @@ where
                 }
 
                 crate::imap::append::note_outgoing_message(&raw_message);
-                match send_via_api(&session, &client, &smtp.mail_from, &smtp.rcpt_to, &raw_message)
+                match send_via_api(&session, &client, &db, &smtp.mail_from, &smtp.rcpt_to, &raw_message)
                     .await
                 {
                     Ok(()) => {
@@ -784,29 +784,42 @@ pub async fn build_send_payload_blocking(
     session_email: String,
     sender_identity: Option<crate::auth::session::SendIdentity>,
     passphrase: zeroize::Zeroizing<Vec<u8>>,
+    identity_key: Option<zeroize::Zeroizing<String>>,
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     tokio::task::spawn_blocking(move || {
-        build_send_payload(
+        let mut payload = build_send_payload(
             &raw_message,
             from.as_deref(),
             &recipients,
             &session_email,
             sender_identity.as_ref(),
             &passphrase,
-        )
+        )?;
+        let plain_text = mail_parser::MessageParser::default()
+            .parse(&raw_message)
+            .and_then(|m| m.body_text(0).map(|s| s.to_string()));
+        crate::smtp::reply_thread::attach_sent_copy(
+            &mut payload,
+            &session_email,
+            plain_text.as_deref(),
+            identity_key.as_deref().map(|k| k.as_str()),
+            &passphrase,
+        );
+        Ok(payload)
     })
     .await
     .map_err(|e| crate::error::BridgeError::Smtp(format!("payload build did not finish: {}", e)))?
 }
 
-async fn send_via_api(
-    session: &Arc<RwLock<Session>>,
-    client: &Arc<ApiClient>,
-    from: &Option<String>,
-    recipients: &[String],
+pub async fn build_threaded_send_payload(
     raw_message: &[u8],
-) -> std::result::Result<(), crate::error::BridgeError> {
-    let (session_email, sender_identity, access_token, passphrase) = {
+    from: Option<String>,
+    recipients: Vec<String>,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    db: &Database,
+) -> std::result::Result<(serde_json::Value, zeroize::Zeroizing<String>), crate::error::BridgeError> {
+    let (session_email, sender_identity, access_token, passphrase, identity_key) = {
         let s = session.read().await;
         let lookup_addr = from
             .as_deref()
@@ -818,15 +831,40 @@ async fn send_via_api(
             identity,
             s.access_token.clone(),
             zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+            s.identity_key.clone().map(zeroize::Zeroizing::new),
         )
     };
-    let payload = build_send_payload_blocking(
+    let headers = crate::smtp::reply_thread::ReplyHeaders::from_mime(raw_message);
+    let reply = crate::smtp::reply_thread::resolve_reply(db, &headers);
+    let mut payload = build_send_payload_blocking(
         raw_message.to_vec(),
-        from.clone(),
-        recipients.to_vec(),
+        from,
+        recipients,
         session_email,
         sender_identity,
         passphrase,
+        identity_key,
+    )
+    .await?;
+    crate::smtp::reply_thread::apply_reply_thread(&mut payload, client, &access_token, &reply).await;
+    Ok((payload, access_token))
+}
+
+async fn send_via_api(
+    session: &Arc<RwLock<Session>>,
+    client: &Arc<ApiClient>,
+    db: &Database,
+    from: &Option<String>,
+    recipients: &[String],
+    raw_message: &[u8],
+) -> std::result::Result<(), crate::error::BridgeError> {
+    let (payload, access_token) = build_threaded_send_payload(
+        raw_message,
+        from.clone(),
+        recipients.to_vec(),
+        session,
+        client,
+        db,
     )
     .await?;
     client.send_mail(&access_token, &payload).await
@@ -1150,6 +1188,7 @@ mod tests {
             "sender@aster.test".to_string(),
             None,
             zeroize::Zeroizing::new(b"pass".to_vec()),
+            None,
         )
         .await
         .unwrap();

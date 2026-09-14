@@ -26,7 +26,7 @@ use crate::api_client::ApiClient;
 use crate::auth::session::Session;
 use crate::db::{Database, OutboxRow};
 use crate::error::BridgeError;
-use crate::smtp::server::{build_send_payload_blocking, is_transient_send_error};
+use crate::smtp::server::{build_threaded_send_payload, is_transient_send_error};
 
 const TICK_SECS: u64 = 30;
 const MAX_ATTEMPTS: i64 = 7;
@@ -55,6 +55,7 @@ pub async fn try_send_row(
     row: &OutboxRow,
     session: &Arc<RwLock<Session>>,
     client: &Arc<ApiClient>,
+    db: &Database,
 ) -> Result<(), BridgeError> {
     let from_opt = if row.envelope_from.is_empty() {
         None
@@ -67,24 +68,13 @@ pub async fn try_send_row(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    let (session_email, sender_identity, access_token, passphrase) = {
-        let s = session.read().await;
-        let lookup_addr = from_opt.filter(|v| !v.is_empty()).unwrap_or(&s.email);
-        let identity = s.find_send_identity(lookup_addr).cloned();
-        (
-            s.email.clone(),
-            identity,
-            s.access_token.clone(),
-            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
-        )
-    };
-    let payload = build_send_payload_blocking(
-        row.raw_mime.clone(),
+    let (payload, access_token) = build_threaded_send_payload(
+        &row.raw_mime,
         from_opt.map(|s| s.to_string()),
         recipients,
-        session_email,
-        sender_identity,
-        passphrase,
+        session,
+        client,
+        db,
     )
     .await?;
     client.send_mail(&access_token, &payload).await
@@ -160,7 +150,7 @@ async fn process_one(
         }
         return;
     }
-    match try_send_row(row, session, client).await {
+    match try_send_row(row, session, client, db).await {
         Ok(()) => {
             if let Err(e) = db.outbox_mark_sent(row.id) {
                 tracing::warn!("outbox mark_sent failed for {}: {}", row.id, e);

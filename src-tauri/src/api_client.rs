@@ -275,6 +275,8 @@ pub struct CreateDraftBody<'a> {
     pub size_bytes: i64,
     pub has_attachments: bool,
     pub attachment_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,6 +284,8 @@ pub struct CreateDraftBody<'a> {
 pub struct DraftListItem {
     pub id: String,
     pub draft_type: String,
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
     pub encrypted_content: String,
     pub content_nonce: String,
     pub version: i64,
@@ -1188,6 +1192,26 @@ impl ApiClient {
             .post(format!("{}/bridge/v1/send", self.base_url))
             .bearer_auth(access_token)
             .json(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
+    pub async fn link_thread(
+        &self,
+        access_token: &str,
+        item_id: &str,
+        thread_token: &str,
+    ) -> Result<()> {
+        let resp = self.client
+            .put(format!("{}/bridge/v1/messages/{}/thread", self.base_url, item_id))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "thread_token": thread_token }))
             .send()
             .await?;
 

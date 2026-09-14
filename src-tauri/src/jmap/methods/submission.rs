@@ -123,6 +123,49 @@ async fn submission_body(
     }
 }
 
+fn draft_reply(
+    ctx: &Arc<JmapContext>,
+    msg: &crate::db::CachedMessage,
+) -> crate::smtp::reply_thread::ResolvedReply {
+    let reply_to_id = msg
+        .raw_headers
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<Value>(r).ok())
+        .and_then(|m| m.get("reply_to_id").and_then(|v| v.as_str()).map(String::from))
+        .filter(|id| !id.is_empty());
+    match reply_to_id {
+        Some(id) => crate::smtp::reply_thread::resolve_draft_reply(&ctx.db, &id),
+        None => crate::smtp::reply_thread::ResolvedReply::default(),
+    }
+}
+
+async fn attach_sent_copy(ctx: &Arc<JmapContext>, body: &mut Value) {
+    let (from_email, identity_key, passphrase) = {
+        let s = ctx.session.read().await;
+        (
+            s.email.clone(),
+            s.identity_key.clone().map(zeroize::Zeroizing::new),
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+        )
+    };
+    let mut payload = std::mem::take(body);
+    let joined = tokio::task::spawn_blocking(move || {
+        crate::smtp::reply_thread::attach_sent_copy(
+            &mut payload,
+            &from_email,
+            None,
+            identity_key.as_deref().map(|k| k.as_str()),
+            &passphrase,
+        );
+        payload
+    })
+    .await;
+    match joined {
+        Ok(p) => *body = p,
+        Err(e) => tracing::warn!("sent copy task did not finish: {}", e),
+    }
+}
+
 fn meta_address_list(meta: &Value, key: &str) -> Vec<String> {
     meta.get(key)
         .and_then(|v| v.as_str())
@@ -240,7 +283,12 @@ pub async fn set(
         )
         .await
         {
-            Ok(b) => b,
+            Ok(mut b) => {
+                let reply = draft_reply(ctx, &msg);
+                crate::smtp::reply_thread::apply_reply_thread(&mut b, &ctx.client, &access_token, &reply).await;
+                attach_sent_copy(ctx, &mut b).await;
+                b
+            }
             Err(description) => {
                 not_created.insert(
                     creation_id,
@@ -442,6 +490,39 @@ mod tests {
             .await
             .unwrap();
         assert!(body.get("attachments").is_none());
+    }
+
+    #[test]
+    fn draft_reply_reads_reply_to_id_from_draft_meta() {
+        let (ctx, _a, _d) = test_ctx();
+        ctx.db
+            .upsert_cached_message("parent", "inbox", Some("S"), None, None, None, 1, None, Some(r#"{"message_id":"<root@x.test>"}"#))
+            .unwrap();
+        ctx.db
+            .upsert_cached_message("d1", "drafts", Some("Re: S"), None, Some("to@x.com"), None, 1, Some("hi"), Some(r#"{"reply_to_id":"parent"}"#))
+            .unwrap();
+        let msg = ctx.db.get_cached_message("d1").unwrap().unwrap();
+        let reply = draft_reply(&ctx, &msg);
+        assert_eq!(reply.parent_aster_id.as_deref(), Some("parent"));
+        assert_eq!(reply.in_reply_to.as_deref(), Some("<root@x.test>"));
+        add_msg(&ctx, "d2");
+        let plain = ctx.db.get_cached_message("d2").unwrap().unwrap();
+        assert_eq!(draft_reply(&ctx, &plain), crate::smtp::reply_thread::ResolvedReply::default());
+    }
+
+    #[tokio::test]
+    async fn attach_sent_copy_uses_session_keys() {
+        let (ctx, _a, _d) = test_ctx();
+        {
+            let mut s = ctx.session.write().await;
+            s.identity_key = Some("ik".to_string());
+            s.vault_passphrase = b"vault-pass".to_vec();
+        }
+        let mut body = json!({"to": ["to@x.com"], "subject": "S", "body": "hi", "is_html": false, "sender_email": "tester@aster.test"});
+        attach_sent_copy(&ctx, &mut body).await;
+        assert_eq!(body["folder_token"], json!(crate::smtp::reply_thread::sent_folder_token("ik")));
+        assert!(body["encrypted_envelope"].as_str().is_some());
+        assert_eq!(body["to"], json!(["to@x.com"]));
     }
 
     #[test]

@@ -1251,6 +1251,38 @@ impl Database {
         })
     }
 
+    pub fn find_aster_id_by_message_id(&self, message_id: &str) -> Option<String> {
+        let bare = message_id.trim().trim_matches(&['<', '>'][..]).trim().to_string();
+        if bare.is_empty() {
+            return None;
+        }
+        let angled = format!("<{}>", bare);
+        self.with_conn(|conn| {
+            let by_column = conn
+                .query_row(
+                    "SELECT aster_id FROM message_cache WHERE message_id IN (?1, ?2) ORDER BY folder = 'drafts' LIMIT 1",
+                    rusqlite::params![bare, angled],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if by_column.is_some() {
+                return Ok(by_column);
+            }
+            Ok(conn
+                .query_row(
+                    "SELECT aster_id FROM message_cache
+                     WHERE message_id IS NULL AND raw_headers IS NOT NULL
+                       AND CASE WHEN json_valid(raw_headers) THEN json_extract(raw_headers, '$.message_id') END IN (?1, ?2)
+                     ORDER BY folder = 'drafts' LIMIT 1",
+                    rusqlite::params![bare, angled],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn repair_cache(&self) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute_batch(
@@ -2331,6 +2363,19 @@ mod db_tests {
         db.update_message_thread_and_msgid("a1", None, Some("m2")).unwrap();
         let msg = db.get_cached_message("a1").unwrap().unwrap();
         assert_eq!(msg.thread_id.as_deref(), Some("t1"), "null thread keeps prior value");
+    }
+
+    #[test]
+    fn find_aster_id_by_message_id_uses_column_then_headers() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.update_message_thread_and_msgid("a1", None, Some("col@x.test")).unwrap();
+        db.upsert_cached_message("a2", "inbox", Some("s"), None, None, None, 1, None, Some(r#"{"message_id":"<json@x.test>"}"#))
+            .unwrap();
+        assert_eq!(db.find_aster_id_by_message_id("<col@x.test>").as_deref(), Some("a1"));
+        assert_eq!(db.find_aster_id_by_message_id("json@x.test").as_deref(), Some("a2"));
+        assert_eq!(db.find_aster_id_by_message_id("<json@x.test>").as_deref(), Some("a2"));
+        assert!(db.find_aster_id_by_message_id("missing@x.test").is_none());
     }
 
     #[test]

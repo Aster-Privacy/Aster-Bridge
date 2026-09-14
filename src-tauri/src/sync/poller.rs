@@ -876,6 +876,10 @@ fn commit_mail_item(
         );
     }
     let raw_headers_meta = serde_json::Value::Object(raw_headers_map).to_string();
+    let bare_message_id = prepared
+        .message_id
+        .as_deref()
+        .and_then(|m| crate::smtp::reply_thread::message_ids(m).into_iter().next());
 
     let was_new = match db.upsert_cached_message(
         &item.id,
@@ -894,6 +898,11 @@ fn commit_mail_item(
             return CacheOutcome::default();
         }
     };
+    if bare_message_id.is_some() {
+        if let Err(e) = db.update_message_thread_and_msgid(&item.id, None, bare_message_id.as_deref()) {
+            tracing::warn!("message id index failed for {}: {}", item.id, e);
+        }
+    }
     let stored = match downloaded {
         Some(list) if !list.is_empty() => match db.replace_message_attachments(&item.id, &list) {
             Ok(()) => true,
@@ -942,6 +951,7 @@ pub fn cache_web_draft(
     our_email: &str,
     date: &str,
     version: i64,
+    reply_to_id: Option<&str>,
 ) -> bool {
     let recipients = if content.to_recipients.is_empty() {
         None
@@ -959,6 +969,7 @@ pub fn cache_web_draft(
         "cc": cc,
         "bcc": bcc,
         "attachment_count": attachments.len(),
+        "reply_to_id": reply_to_id,
     })
     .to_string();
     let subject = if content.subject.is_empty() {
@@ -1457,7 +1468,7 @@ async fn run_sync_pass(
                             };
                             let date = normalize_date_rfc3339(&d.updated_at);
                             let was_new =
-                                cache_web_draft(db, &d.id, &content, &our_email, &date, d.version);
+                                cache_web_draft(db, &d.id, &content, &our_email, &date, d.version, d.reply_to_id.as_deref());
                             if was_new {
                                 new_ids.push(d.id.clone());
                             } else {
@@ -2483,7 +2494,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        cache_web_draft(&db, "web-draft-att", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 2);
+        cache_web_draft(&db, "web-draft-att", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 2, None);
 
         let cached = db.get_cached_message("web-draft-att").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
@@ -2509,7 +2520,7 @@ mod tests {
             message: "<p>removed</p>".to_string(),
             ..Default::default()
         };
-        cache_web_draft(&db, "web-draft-att", &without, "tester@aster.test", "2026-08-02T00:00:00Z", 3);
+        cache_web_draft(&db, "web-draft-att", &without, "tester@aster.test", "2026-08-02T00:00:00Z", 3, None);
         let cached = db.get_cached_message("web-draft-att").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
         assert!(db.get_message_attachments("web-draft-att").unwrap().is_empty());
@@ -2525,7 +2536,7 @@ mod tests {
             message: "x".to_string(),
             ..Default::default()
         };
-        cache_web_draft(&db, "web-draft-gone", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1);
+        cache_web_draft(&db, "web-draft-gone", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
         assert!(db.get_cached_message("web-draft-gone").unwrap().is_some());
 
         let base = spawn_mock_server_with_drafts(vec![], vec![]).await;
