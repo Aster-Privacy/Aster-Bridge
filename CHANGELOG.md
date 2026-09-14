@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.32 - 2026-09-14
+
+### Fixed
+- Aster Bridge now starts when its local database contains tables it didn't create, for example after another tool wrote to the same folder. It repairs the database, or moves it aside and starts with a fresh one, instead of quitting before the window opens.
+
 ## 0.4.31 - 2026-09-14
 
 ### Fixed
