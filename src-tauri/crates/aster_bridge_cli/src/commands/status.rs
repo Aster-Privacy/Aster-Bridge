@@ -309,7 +309,7 @@ async fn run_live(ctx: &Context) -> CliResult<i32> {
                 render(ctx, &snapshot);
                 if redraw {
                     out.blank();
-                    out.line(out.dim("Updates every 2 seconds. Press Ctrl+C to stop."));
+                    out.line(out.dim("Updates every 2 seconds. Press Control-C to stop."));
                 } else if !out.json {
                     out.blank();
                 }

@@ -181,7 +181,7 @@ async fn wait_for_confirmation(
             }
             _ = redraw.tick(), if live => {
                 let text = format!(
-                    "Waiting for you to enter the code. It expires in {}. Press Ctrl+C to cancel.",
+                    "Waiting for you to enter the code. It expires in {}. Press Control-C to cancel.",
                     format_remaining(pending.expires_at)
                 );
                 clear(&mut drawn);

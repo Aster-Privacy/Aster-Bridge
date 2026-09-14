@@ -93,10 +93,10 @@ pub fn plan_label(code: Option<&str>) -> String {
 pub fn access_denied(plan_code: Option<&str>) -> CliError {
     let message = match plan_code.map(str::trim).filter(|c| !c.is_empty()) {
         Some(code) => format!(
-            "Your {} plan doesn't include Aster Bridge.",
+            "Your {} plan doesn't include Aster Bridge, which needs a Star plan or higher.",
             plan_label(Some(code))
         ),
-        None => "Your plan doesn't include Aster Bridge.".to_string(),
+        None => "Your plan doesn't include Aster Bridge, which needs a Star plan or higher.".to_string(),
     };
     CliError::access_required(message)
 }
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(plan_label(None), "Unknown");
         assert_eq!(
             access_denied(Some("free")).message,
-            "Your Free plan doesn't include Aster Bridge."
+            "Your Free plan doesn't include Aster Bridge, which needs a Star plan or higher."
         );
     }
 

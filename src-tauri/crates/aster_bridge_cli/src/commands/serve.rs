@@ -396,7 +396,7 @@ fn print_banner(ctx: &Context, email: &str, plan_code: &str, services: &[Value])
         "To connect an email app, use {} as the username and an app password. To create one, run: aster-bridge app-password create",
         email
     ));
-    out.line(out.dim("Press Ctrl+C to stop."));
+    out.line(out.dim("Press Control-C to stop."));
 }
 
 pub fn service_rows(services: &[Value]) -> Vec<Vec<String>> {
