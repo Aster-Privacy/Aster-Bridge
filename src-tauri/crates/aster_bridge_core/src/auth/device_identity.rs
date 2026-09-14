@@ -146,10 +146,8 @@ fn aead_open(wrap_key: &[u8; 32], magic: &[u8; 8], data: &[u8]) -> Result<Vec<u8
 }
 
 fn wrap_key_load() -> Result<Option<[u8; 32]>, String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_WRAP_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    match entry.get_password() {
-        Ok(encoded) => {
+    match crate::secrets::get(KEYRING_WRAP_USER)? {
+        Some(encoded) => {
             let bytes = b64url_decode(&encoded)?;
             let key: [u8; 32] = bytes
                 .as_slice()
@@ -157,8 +155,7 @@ fn wrap_key_load() -> Result<Option<[u8; 32]>, String> {
                 .map_err(|_| "wrap key wrong size".to_string())?;
             Ok(Some(key))
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keyring get: {}", e)),
+        None => Ok(None),
     }
 }
 
@@ -168,22 +165,12 @@ fn wrap_key_load_or_create() -> Result<[u8; 32], String> {
     }
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_WRAP_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    entry
-        .set_password(&b64url(&key))
-        .map_err(|e| format!("keyring set wrap: {}", e))?;
+    crate::secrets::set(KEYRING_WRAP_USER, &b64url(&key))?;
     Ok(key)
 }
 
 fn wrap_key_delete() -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_WRAP_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keyring delete wrap: {}", e)),
-    }
+    crate::secrets::delete(KEYRING_WRAP_USER)
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -373,39 +360,79 @@ pub fn unseal_vault_envelope(
     Ok(plaintext)
 }
 
-const KEYRING_SERVICE: &str = "com.astermail.bridge";
+#[cfg(any(test, feature = "test-support"))]
+pub fn seal_vault_envelope(
+    mlkem_pk_b64: &str,
+    x25519_pk_b64: &str,
+    plaintext: &[u8],
+) -> Result<String, String> {
+    use ml_kem::kem::Encapsulate;
+
+    let mlkem_pk = b64url_decode(mlkem_pk_b64)?;
+    let encoded = ml_kem::Encoded::<MlKemEncapKey>::try_from(mlkem_pk.as_slice())
+        .map_err(|e| format!("mlkem public size: {:?}", e))?;
+    let ek = MlKemEncapKey::from_bytes(&encoded);
+    let (ct, mut ss_pq) = ek
+        .encapsulate(&mut OsRng)
+        .map_err(|e| format!("encapsulate: {:?}", e))?;
+
+    let x25519_pk: [u8; 32] = b64url_decode(x25519_pk_b64)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "x25519 public size".to_string())?;
+    let eph_secret = StaticSecret::random_from_rng(OsRng);
+    let eph_public = XPublicKey::from(&eph_secret);
+    let ss_cl = eph_secret.diffie_hellman(&XPublicKey::from(x25519_pk));
+
+    let mut nonce_bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(ss_pq.as_slice());
+    ikm[32..].copy_from_slice(ss_cl.as_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(&nonce_bytes), &ikm);
+    let mut shared_key = [0u8; 32];
+    hk.expand(b"astermail-device-enroll-v1", &mut shared_key)
+        .map_err(|e| e.to_string())?;
+    ikm.zeroize();
+    ss_pq.zeroize();
+
+    let cipher = XChaCha20Poly1305::new((&shared_key).into());
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|e| format!("encrypt: {:?}", e))?;
+    shared_key.zeroize();
+
+    let mut envelope = Vec::with_capacity(32 + ct.len() + 24 + ciphertext.len());
+    envelope.extend_from_slice(eph_public.as_bytes());
+    envelope.extend_from_slice(ct.as_slice());
+    envelope.extend_from_slice(&nonce_bytes);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(b64url(&envelope))
+}
+
 const KEYRING_USER: &str = "vault-passphrase";
 
 fn keyring_store(passphrase: &[u8]) -> std::result::Result<(), String> {
-    let encoded = b64url(passphrase);
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    entry
-        .set_password(&encoded)
-        .map_err(|e| format!("keyring set: {}", e))
+    let mut encoded = b64url(passphrase);
+    let result = crate::secrets::set(KEYRING_USER, &encoded);
+    encoded.zeroize();
+    result
 }
 
 fn keyring_load() -> std::result::Result<Option<Vec<u8>>, String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    match entry.get_password() {
-        Ok(encoded) => {
-            let bytes = b64url_decode(&encoded)?;
-            Ok(Some(bytes))
+    match crate::secrets::get(KEYRING_USER)? {
+        Some(mut encoded) => {
+            let bytes = b64url_decode(&encoded);
+            encoded.zeroize();
+            bytes.map(Some)
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keyring get: {}", e)),
+        None => Ok(None),
     }
 }
 
 fn keyring_delete() -> std::result::Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keyring delete: {}", e)),
-    }
+    crate::secrets::delete(KEYRING_USER)
 }
 
 pub fn store_passphrase(data_dir: &Path, passphrase: &[u8]) -> Result<(), String> {
@@ -547,6 +574,16 @@ mod tests {
             x25519_static_secret,
             x25519_public_bytes,
         }
+    }
+
+    #[test]
+    fn sealed_envelope_opens_with_the_device_keys() {
+        let identity = test_identity();
+        let (_, mlkem_pk, x25519_pk) = get_pubkeys(&identity);
+        let envelope = seal_vault_envelope(&mlkem_pk, &x25519_pk, b"vault-passphrase").unwrap();
+        assert_eq!(unseal_vault_envelope(&identity, &envelope).unwrap(), b"vault-passphrase");
+        let other = test_identity();
+        assert!(unseal_vault_envelope(&other, &envelope).is_err());
     }
 
     #[test]

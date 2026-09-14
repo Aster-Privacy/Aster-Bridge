@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroize;
 
-const KEYRING_SERVICE: &str = "com.astermail.bridge";
 const KEYRING_DB_USER: &str = "db-encryption-key-v1";
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -55,27 +54,26 @@ fn from_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-fn get_or_create_db_key() -> Result<[u8; 32], String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_DB_USER)
-        .map_err(|e| format!("keyring init: {}", e))?;
+pub fn forget_db_key() -> Result<(), String> {
+    crate::secrets::delete(KEYRING_DB_USER)
+}
 
-    match entry.get_password() {
-        Ok(mut hex) => {
+fn get_or_create_db_key() -> Result<[u8; 32], String> {
+    match crate::secrets::get(KEYRING_DB_USER).map_err(|e| format!("db key: {}", e))? {
+        Some(mut hex) => {
             let result = from_hex(hex.trim());
             hex.zeroize();
             result
         }
-        Err(keyring::Error::NoEntry) => {
+        None => {
             let mut key = [0u8; 32];
             OsRng.fill_bytes(&mut key);
             let mut hex = to_hex(&key);
-            entry
-                .set_password(&hex)
-                .map_err(|e| format!("keyring set db key: {}", e))?;
+            let stored = crate::secrets::set(KEYRING_DB_USER, &hex);
             hex.zeroize();
+            stored.map_err(|e| format!("db key: {}", e))?;
             Ok(key)
         }
-        Err(e) => Err(format!("keyring get db key: {}", e)),
     }
 }
 

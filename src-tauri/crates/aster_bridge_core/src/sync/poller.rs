@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tauri::Emitter;
 use zeroize::Zeroizing;
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
@@ -52,14 +51,6 @@ pub fn sync_trigger_channel() -> (SyncTriggerTx, SyncTriggerRx) {
 }
 
 static GLOBAL_SYNC_TRIGGER: OnceLock<StdMutex<Option<SyncTriggerTx>>> = OnceLock::new();
-static GLOBAL_APP_HANDLE: OnceLock<StdMutex<Option<tauri::AppHandle>>> = OnceLock::new();
-
-pub fn set_global_app_handle(handle: Option<tauri::AppHandle>) {
-    let cell = GLOBAL_APP_HANDLE.get_or_init(|| StdMutex::new(None));
-    if let Ok(mut guard) = cell.lock() {
-        *guard = handle;
-    }
-}
 
 fn emit_sync_progress(
     folder: &str,
@@ -68,57 +59,34 @@ fn emit_sync_progress(
     folder_done: usize,
     folder_total: usize,
 ) {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    let _ = handle.emit("sync_progress", serde_json::json!({
-        "folder": folder,
-        "done": done,
-        "total": total,
-        "folder_done": folder_done,
-        "folder_total": folder_total,
-    }));
+    let progress = crate::events::SyncProgress {
+        folder: folder.to_string(),
+        done,
+        total,
+        folder_done,
+        folder_total,
+    };
+    crate::events::emit(|sink| sink.sync_progress(&progress));
 }
 
 fn emit_sync_done(failed: bool) {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    let _ = handle.emit("sync_done", serde_json::json!({ "failed": failed }));
+    crate::events::emit(|sink| sink.sync_done(failed));
 }
 
 fn emit_bridge_access_revoked() {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    let _ = handle.emit("bridge_access_revoked", serde_json::Value::Null);
+    crate::events::emit(|sink| sink.access_revoked());
 }
 
 pub fn emit_import_progress(progress: &crate::imap::append::ImportProgress) {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    let _ = handle.emit("import_progress", progress.clone());
+    crate::events::emit(|sink| sink.import_progress(progress));
 }
 
 pub fn notify_send_failed() {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    use tauri_plugin_notification::NotificationExt;
-    let _ = handle
-        .notification()
-        .builder()
-        .title("Message not sent")
-        .body("Aster Bridge couldn't send a message. Open Aster Bridge to retry it.")
-        .show();
+    crate::events::emit(|sink| sink.send_failed());
 }
 
 pub fn emit_session_expired() {
-    let Some(cell) = GLOBAL_APP_HANDLE.get() else { return; };
-    let handle_opt = cell.lock().ok().and_then(|g| g.clone());
-    let Some(handle) = handle_opt else { return; };
-    let _ = handle.emit("session_expired", serde_json::Value::Null);
+    crate::events::emit(|sink| sink.session_expired());
 }
 
 async fn check_plan_access(session: &Arc<RwLock<Session>>, client: &Arc<ApiClient>) -> bool {
@@ -137,6 +105,15 @@ pub fn set_global_sync_trigger(tx: Option<SyncTriggerTx>) {
     let cell = GLOBAL_SYNC_TRIGGER.get_or_init(|| StdMutex::new(None));
     if let Ok(mut guard) = cell.lock() {
         *guard = tx;
+    }
+}
+
+pub fn clear_global_sync_trigger_if(tx: &SyncTriggerTx) {
+    let Some(cell) = GLOBAL_SYNC_TRIGGER.get() else { return; };
+    if let Ok(mut guard) = cell.lock() {
+        if guard.as_ref().map_or(false, |current| current.same_channel(tx)) {
+            *guard = None;
+        }
     }
 }
 
@@ -1597,18 +1574,59 @@ async fn report_envelope_capability(session: &Arc<RwLock<Session>>, client: &Arc
     .await;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollExit {
+    AccessRevoked,
+    TriggerClosed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PollTuning {
+    pub interval: std::time::Duration,
+    pub plan_check_every: u32,
+}
+
+impl PollTuning {
+    pub fn from_interval_secs(poll_interval_secs: Option<u64>) -> Self {
+        let secs = poll_interval_secs.filter(|&v| v >= 5).unwrap_or(POLL_INTERVAL_SECS);
+        Self {
+            interval: std::time::Duration::from_secs(secs),
+            plan_check_every: PLAN_CHECK_INTERVAL,
+        }
+    }
+}
+
 pub async fn run_poll_loop(
     session: Arc<RwLock<Session>>,
     client: Arc<ApiClient>,
     db: Arc<Database>,
     jmap_broadcaster: Option<broadcast::Sender<StateChange>>,
-    mut trigger_rx: SyncTriggerRx,
+    trigger_rx: SyncTriggerRx,
     poll_interval_secs: Option<u64>,
-) {
+) -> PollExit {
+    run_poll_loop_tuned(
+        session,
+        client,
+        db,
+        jmap_broadcaster,
+        trigger_rx,
+        PollTuning::from_interval_secs(poll_interval_secs),
+    )
+    .await
+}
+
+pub async fn run_poll_loop_tuned(
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    db: Arc<Database>,
+    jmap_broadcaster: Option<broadcast::Sender<StateChange>>,
+    mut trigger_rx: SyncTriggerRx,
+    tuning: PollTuning,
+) -> PollExit {
     migrate_legacy_dates(&db);
     report_envelope_capability(&session, &client).await;
-    let interval_secs = poll_interval_secs.filter(|&v| v >= 5).unwrap_or(POLL_INTERVAL_SECS);
-    let interval_dur = std::time::Duration::from_secs(interval_secs);
+    let interval_dur = tuning.interval;
+    let plan_check_every = tuning.plan_check_every.max(1);
     let mut interval = tokio::time::interval(interval_dur);
     let mut last_tick = tokio::time::Instant::now();
     let mut sync_count: u32 = 0;
@@ -1631,15 +1649,16 @@ pub async fn run_poll_loop(
                     tracing::info!("sync: detected sleep/wake gap ({:.0}s); running immediate sync pass", elapsed.as_secs_f64());
                 }
                 sync_count += 1;
-                if sync_count % PLAN_CHECK_INTERVAL == 0 {
+                if sync_count % plan_check_every == 0 {
                     if !check_plan_access(&session, &client).await {
                         tracing::warn!("sync: bridge access revoked - stopping poll loop");
                         emit_bridge_access_revoked();
-                        return;
+                        return PollExit::AccessRevoked;
                     }
                 }
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
+                crate::account_state::observe(&result);
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                     report_envelope_capability(&session, &client).await;
@@ -1648,12 +1667,12 @@ pub async fn run_poll_loop(
                     if e.contains("plan_upgrade_required") {
                         tracing::warn!("sync: plan_upgrade_required from server - stopping poll loop");
                         emit_bridge_access_revoked();
-                        return;
+                        return PollExit::AccessRevoked;
                     }
                 }
             }
             maybe_trigger = trigger_rx.recv() => {
-                let Some(trigger) = maybe_trigger else { return; };
+                let Some(trigger) = maybe_trigger else { return PollExit::TriggerClosed; };
                 let mut waiting = vec![trigger.done];
                 while let Ok(queued) = trigger_rx.try_recv() {
                     waiting.push(queued.done);
@@ -1671,6 +1690,7 @@ pub async fn run_poll_loop(
                 last_tick = tokio::time::Instant::now();
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
+                crate::account_state::observe(&result);
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                 }
@@ -1681,7 +1701,7 @@ pub async fn run_poll_loop(
                         for done in waiting {
                             let _ = done.send(Err(e.clone()));
                         }
-                        return;
+                        return PollExit::AccessRevoked;
                     }
                 }
                 last_triggered_result = result.clone();

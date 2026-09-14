@@ -17,12 +17,35 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-[package]
-name = "aster-bridge-desktop"
+[workspace]
+members = [".", "crates/aster_bridge_core", "crates/aster_bridge_cli"]
+resolver = "2"
+
+[workspace.package]
 version = "0.4.32"
 edition = "2021"
-description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+aster-bridge-core = { path = "crates/aster_bridge_core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+zeroize = { version = "1", features = ["derive"] }
+mail-parser = "0.9"
+whoami = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tempfile = "3"
+
+[package]
+name = "aster-bridge-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aster Bridge - IMAP/SMTP bridge for Aster Mail"
 
 [features]
 default = ["custom-protocol"]
@@ -32,6 +55,8 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+aster-bridge-core = { workspace = true }
+
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
@@ -43,63 +68,18 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-notification = "2"
 
-aster-crypto = { path = "../../Aster-Mail/aster-crypto", default-features = false, features = ["std"] }
-
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
-mail-parser = "0.9"
-quick-xml = "0.38"
-
-axum = { version = "0.7", features = ["macros", "ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
-rcgen = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-webpki-roots = "1"
-x509-parser = "0.16"
-subtle = "2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-time = "0.3"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-futures-util = "0.3"
-async-stream = "0.3"
-percent-encoding = "2"
-
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-p256 = { version = "0.13", features = ["ecdh"] }
-ml-kem = { version = "0.2", features = ["deterministic"] }
-miniz_oxide = "0.8"
-chacha20poly1305 = "0.10"
-aes-gcm = "0.10"
-hkdf = "0.12"
-pbkdf2 = "0.12"
-sha2 = "0.10"
-hmac = "0.12"
-argon2 = "0.5"
-rand = "0.8"
-rand_core = "0.6"
-
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
-zeroize = { version = "1", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"
-whoami = "1"
-
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustls = { workspace = true }
+zeroize = { workspace = true }
+mail-parser = { workspace = true }
+whoami = { workspace = true }
 open = "5"
 
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-thiserror = "2"
-anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -108,11 +88,6 @@ objc2-foundation = { version = "0.3", features = ["NSData"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-
-[dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
-tokio-tungstenite = "0.23"
 
 [profile.release]
 panic = "abort"

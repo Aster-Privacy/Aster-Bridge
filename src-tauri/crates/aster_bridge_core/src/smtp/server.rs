@@ -356,15 +356,13 @@ where
                                 chrono::Utc::now().to_rfc3339(),
                                 crate::diagnostics::redact_line(&format!("SMTP send failed: {}", e))
                             );
-                            if let Some(dir) = dirs::data_local_dir() {
-                                let path = dir.join("com.astermail.bridge").join("smtp_errors.log");
+                            if let Ok(dir) = crate::config::data_dir() {
+                                let path = dir.join("smtp_errors.log");
                                 let _ = std::fs::create_dir_all(path.parent().unwrap());
                                 const MAX_LOG_BYTES: u64 = 1_048_576;
                                 if let Ok(meta) = std::fs::metadata(&path) {
                                     if meta.len() > MAX_LOG_BYTES {
-                                        let rotated = dir
-                                            .join("com.astermail.bridge")
-                                            .join("smtp_errors.log.1");
+                                        let rotated = dir.join("smtp_errors.log.1");
                                         let _ = std::fs::rename(&path, &rotated);
                                     }
                                 }

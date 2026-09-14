@@ -252,7 +252,7 @@ pub fn refresh_tray(app: &AppHandle) {
         let (signed_in, running, port, pending) = {
             let guard = state.0.lock().await;
             let pending = guard.db.outbox_list_pending().map(|r| r.len()).unwrap_or(0);
-            (guard.session.is_some(), guard.running, guard.bound_imap_port, pending)
+            (guard.session.is_some(), guard.running(), guard.bound_ports().imap, pending)
         };
         let status_text = if !signed_in {
             "Bridge: Not signed in".to_string()
@@ -290,7 +290,7 @@ pub fn start_tray_refresh_loop(app: &AppHandle) {
 
 async fn outbox_pending(state: &SharedBridgeState) -> usize {
     let guard = state.lock().await;
-    if !guard.running {
+    if !guard.running() {
         return 0;
     }
     guard.db.outbox_list_pending().map(|r| r.len()).unwrap_or(0)

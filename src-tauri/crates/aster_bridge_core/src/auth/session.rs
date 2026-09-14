@@ -276,6 +276,15 @@ pub async fn restore_or_login(
         .map_err(|e| BridgeError::Auth(e))?
         .ok_or_else(|| BridgeError::Auth("no stored passphrase - first-time setup required".to_string()))?;
 
+    login_with_passphrase(identity, device_id, passphrase, client).await
+}
+
+pub async fn login_with_passphrase(
+    identity: &DeviceIdentity,
+    device_id: Uuid,
+    passphrase: Vec<u8>,
+    client: &ApiClient,
+) -> Result<Session> {
     let challenge = client.device_challenge(device_id).await?;
 
     let signature = device_identity::sign_challenge(identity, &challenge.nonce)
@@ -307,7 +316,7 @@ pub async fn restore_or_login(
             ),
             Err(e) => {
                 tracing::error!(
-                    "vault decrypt failed during restore: {}; encrypted mail cannot be decrypted until you sign in again",
+                    "vault decrypt failed during sign-in: {}; encrypted mail cannot be decrypted until you sign in again",
                     e
                 );
                 (None, None, None, Vec::new(), Vec::new())

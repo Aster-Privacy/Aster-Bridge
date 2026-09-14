@@ -574,9 +574,12 @@ impl ApiClient {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_base_url(base_url: &str) -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
         let client = Client::builder()
+            .default_headers(default_headers)
             .user_agent(user_agent())
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())

@@ -125,9 +125,12 @@ impl Default for BridgeConfig {
 }
 
 pub fn data_dir() -> Result<PathBuf, String> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| "cannot resolve local data directory".to_string())?;
-    let dir = base.join("com.astermail.bridge");
+    let dir = match crate::secrets::data_dir_override() {
+        Some(dir) => dir,
+        None => dirs::data_local_dir()
+            .ok_or_else(|| "cannot resolve local data directory".to_string())?
+            .join("com.astermail.bridge"),
+    };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }
@@ -175,7 +178,7 @@ pub fn load_config() -> Result<BridgeConfig, String> {
     Ok(config)
 }
 
-pub(crate) fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
+pub fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
     for (name, port) in [
         ("imap_port", c.imap_port),
         ("imap_implicit_tls_port", c.imap_implicit_tls_port),
