@@ -83,7 +83,7 @@ fn host_requires_pin(server_name: &ServerName<'_>) -> bool {
         ServerName::DnsName(dns) => {
             let host = dns.as_ref().to_ascii_lowercase();
             let host = host.trim_end_matches('.');
-            PINNED_EXACT.iter().any(|e| host == *e)
+            PINNED_EXACT.contains(&host)
                 || PINNED_SUFFIXES.iter().any(|s| host.ends_with(*s))
         }
         _ => false,

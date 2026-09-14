@@ -273,7 +273,7 @@ pub async fn restore_or_login(
         .ok_or_else(|| BridgeError::Auth("no device_id stored - first-time setup required".to_string()))?;
 
     let passphrase = device_identity::load_passphrase(&config.data_dir)
-        .map_err(|e| BridgeError::Auth(e))?
+        .map_err(BridgeError::Auth)?
         .ok_or_else(|| BridgeError::Auth("no stored passphrase - first-time setup required".to_string()))?;
 
     login_with_passphrase(identity, device_id, passphrase, client).await
@@ -288,7 +288,7 @@ pub async fn login_with_passphrase(
     let challenge = client.device_challenge(device_id).await?;
 
     let signature = device_identity::sign_challenge(identity, &challenge.nonce)
-        .map_err(|e| BridgeError::Crypto(e))?;
+        .map_err(BridgeError::Crypto)?;
 
     let login_resp = client
         .device_login(&crate::api_client::DeviceLoginRequest {
@@ -387,7 +387,7 @@ pub async fn refresh_access_token(
 
     let challenge = client.device_challenge(device_id).await?;
     let signature = device_identity::sign_with_key(signing_key, &challenge.nonce)
-        .map_err(|e| BridgeError::Crypto(e))?;
+        .map_err(BridgeError::Crypto)?;
     let login_resp = client
         .device_login(&crate::api_client::DeviceLoginRequest {
             challenge_id: challenge.challenge_id,
@@ -468,19 +468,19 @@ pub async fn first_time_setup(
                     .ok_or_else(|| BridgeError::Auth("no sealed envelope".to_string()))?;
 
                 let passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
-                    .map_err(|e| BridgeError::Crypto(e))?;
+                    .map_err(BridgeError::Crypto)?;
 
                 device_identity::set_device_id(&config.data_dir, device_id)
-                    .map_err(|e| BridgeError::Auth(e))?;
+                    .map_err(BridgeError::Auth)?;
 
                 device_identity::store_passphrase(&config.data_dir, &passphrase)
-                    .map_err(|e| BridgeError::Auth(e))?;
+                    .map_err(BridgeError::Auth)?;
 
                 tracing::info!("Device enrolled successfully!");
 
                 let challenge = client.device_challenge(device_id).await?;
                 let signature = device_identity::sign_challenge(identity, &challenge.nonce)
-                    .map_err(|e| BridgeError::Crypto(e))?;
+                    .map_err(BridgeError::Crypto)?;
 
                 let login_resp = client
                     .device_login(&crate::api_client::DeviceLoginRequest {

@@ -460,7 +460,6 @@ mod tests {
     use rand_core::OsRng;
     use serde_json::json;
 
-    type MlKemEncapKey = <MlKem768 as KemCore>::EncapsulationKey;
 
     fn pub_sec1(sk: &SecretKey) -> Vec<u8> {
         sk.public_key().to_encoded_point(false).as_bytes().to_vec()

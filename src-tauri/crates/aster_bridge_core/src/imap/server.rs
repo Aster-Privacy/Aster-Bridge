@@ -790,7 +790,7 @@ where
                 let tls_stream = acceptor
                     .accept(rejoined)
                     .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(std::io::Error::other)?;
                 let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                 return Box::pin(run_session_erased(
                     erased,
@@ -846,9 +846,7 @@ where
                 let upper_args = args.to_ascii_uppercase();
                 let is_plain = upper_args == "PLAIN" || upper_args.starts_with("PLAIN ");
                 if is_plain {
-                    let inline_creds = args
-                        .splitn(2, ' ')
-                        .nth(1)
+                    let inline_creds = args.split_once(' ').map(|x| x.1)
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
                     let creds = match inline_creds {
@@ -1278,7 +1276,7 @@ where
                                         break;
                                     }
                                     let s = String::from_utf8_lossy(&buf);
-                                    let t = s.trim_end_matches(|c| c == '\r' || c == '\n');
+                                    let t = s.trim_end_matches(['\r', '\n']);
                                     if t.eq_ignore_ascii_case("DONE") {
                                         terminated = true;
                                         buf.clear();
@@ -1930,7 +1928,7 @@ fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
         if let Some(m) = messages.iter().rev().find(|m| {
             m.raw_headers
                 .as_deref()
-                .map_or(false, |rh| rh.contains(mid.as_str()))
+                .is_some_and(|rh| rh.contains(mid.as_str()))
         }) {
             return Some(m.imap_uid);
         }
@@ -2080,8 +2078,7 @@ async fn handle_login(
 
 pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
     let s = s.trim_start();
-    if s.starts_with('"') {
-        let rest = &s[1..];
+    if let Some(rest) = s.strip_prefix('"') {
         let mut val = String::new();
         let mut chars = rest.char_indices();
         let mut end = rest.len();
@@ -2097,10 +2094,10 @@ pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
                 val.push(c);
             }
         }
-        let remainder = if end + 1 <= rest.len() { &rest[end + 1..] } else { "" };
+        let remainder = if end < rest.len() { &rest[end + 1..] } else { "" };
         (val, remainder)
     } else {
-        let end = s.find(|c: char| c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        let end = s.find([' ', '\t', '\r', '\n'])
             .unwrap_or(s.len());
         (s[..end].to_string(), &s[end..])
     }
@@ -2115,7 +2112,7 @@ fn imap_glob_match(pattern: &str, name: &str) -> bool {
         let mut pos = 0usize;
         for part in &parts {
             if part.is_empty() { continue; }
-            if let Some(idx) = n[pos..].find(part.as_ref() as &str) {
+            if let Some(idx) = n[pos..].find(part as &str) {
                 pos += idx + part.len();
             } else {
                 return false;
@@ -2128,7 +2125,7 @@ fn imap_glob_match(pattern: &str, name: &str) -> bool {
         let mut pos = 0usize;
         for part in &parts {
             if part.is_empty() { continue; }
-            if let Some(idx) = n[pos..].find(part.as_ref() as &str) {
+            if let Some(idx) = n[pos..].find(part as &str) {
                 if n[pos..pos + idx].contains('/') { return false; }
                 pos += idx + part.len();
             } else {
@@ -2323,9 +2320,6 @@ async fn handle_copy_move(
             .await
             .unwrap_or(1)
     };
-    let mut src_uids: Vec<u32> = Vec::new();
-    let mut tgt_uids: Vec<u32> = Vec::new();
-    let mut moved_seqs: Vec<usize> = Vec::new();
     for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
         let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
         if bulk_move_chunk(client, &token, &ids, &flags).await {
@@ -2349,11 +2343,11 @@ async fn handle_copy_move(
             }
         }
     }
-    {
+    let (src_uids, tgt_uids, mut moved_seqs) = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
         let entries = selected.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut src: Vec<u32> = Vec::new();
             let mut tgt: Vec<u32> = Vec::new();
             let mut seqs: Vec<usize> = Vec::new();
@@ -2377,11 +2371,8 @@ async fn handle_copy_move(
             (src, tgt, seqs)
         })
         .await
-        .unwrap_or_default();
-        src_uids = recorded.0;
-        tgt_uids = recorded.1;
-        moved_seqs = recorded.2;
-    }
+        .unwrap_or_default()
+    };
     let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
     let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
 
@@ -2572,10 +2563,9 @@ fn parse_header_fields_request(fetch_parts: &str) -> Option<(String, Vec<String>
     let alt = "BODY[HEADER.FIELDS (";
     let (start, _) = if let Some(p) = upper.find(key) {
         (p + key.len(), key.len())
-    } else if let Some(p) = upper.find(alt) {
-        (p + alt.len(), alt.len())
     } else {
-        return None;
+        let p = upper.find(alt)?;
+        (p + alt.len(), alt.len())
     };
     let rest = &fetch_parts[start..];
     let end = rest.find(')')?;
@@ -2926,7 +2916,7 @@ async fn handle_fetch(
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::Value::Null);
             let msg_id_raw = env_meta.get("message_id").and_then(|v| v.as_str())
-                .map(|s| sanitize_header(s))
+                .map(sanitize_header)
                 .filter(|s| !s.is_empty());
             let msg_id = match msg_id_raw {
                 Some(ref mid) if mid.starts_with('<') => mid.clone(),
@@ -3517,7 +3507,7 @@ mod tests {
             if n == 0 {
                 break;
             }
-            let t = line.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+            let t = line.trim_end_matches(['\r', '\n']).to_string();
             let is_tag_line = t.starts_with(&format!("{} ", tag));
             out.push(t);
             if is_tag_line {

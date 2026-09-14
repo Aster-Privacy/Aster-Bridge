@@ -236,6 +236,46 @@ fn fingerprint_hex_colon(der: &[u8]) -> String {
         .join(":")
 }
 
+pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
+pub async fn accept_with_timeout<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limit = std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS);
+    accept_within(acceptor, stream, protocol, limit).await
+}
+
+pub async fn accept_within<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    protocol: &str,
+    limit: std::time::Duration,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limit, acceptor.accept(stream)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            tracing::warn!("{} TLS handshake failed: {}", protocol, e);
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{} TLS handshake timed out after {}s and the connection was closed; a client configured without encryption on an encrypted-only port looks exactly like this",
+                protocol,
+                limit.as_secs()
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,46 +346,6 @@ mod tests {
         for p in parts {
             assert_eq!(p.len(), 2);
             assert!(p.chars().all(|c| c.is_ascii_hexdigit() && (!c.is_alphabetic() || c.is_uppercase())));
-        }
-    }
-}
-
-pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
-
-pub async fn accept_with_timeout<S>(
-    acceptor: &tokio_rustls::TlsAcceptor,
-    stream: S,
-    protocol: &str,
-) -> Option<tokio_rustls::server::TlsStream<S>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let limit = std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS);
-    accept_within(acceptor, stream, protocol, limit).await
-}
-
-pub async fn accept_within<S>(
-    acceptor: &tokio_rustls::TlsAcceptor,
-    stream: S,
-    protocol: &str,
-    limit: std::time::Duration,
-) -> Option<tokio_rustls::server::TlsStream<S>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    match tokio::time::timeout(limit, acceptor.accept(stream)).await {
-        Ok(Ok(stream)) => Some(stream),
-        Ok(Err(e)) => {
-            tracing::warn!("{} TLS handshake failed: {}", protocol, e);
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                "{} TLS handshake timed out after {}s and the connection was closed; a client configured without encryption on an encrypted-only port looks exactly like this",
-                protocol,
-                limit.as_secs()
-            );
-            None
         }
     }
 }

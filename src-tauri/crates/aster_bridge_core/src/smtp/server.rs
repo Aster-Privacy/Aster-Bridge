@@ -322,7 +322,7 @@ where
                             let envelope_from = smtp
                                 .mail_from
                                 .clone()
-                                .unwrap_or_else(|| String::new());
+                                .unwrap_or_default();
                             let envelope_to = smtp.rcpt_to.join(",");
                             match db.outbox_insert(&raw_message, &envelope_from, &envelope_to) {
                                 Ok(id) => {
@@ -458,7 +458,7 @@ where
                 let tls_stream = acceptor
                     .accept(rejoined)
                     .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(std::io::Error::other)?;
                 let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                 return Box::pin(handle_session_erased(
                     erased,
@@ -561,7 +561,7 @@ where
                         };
                         let ok = resolved.eq_ignore_ascii_case(&s.email)
                             || s.find_send_identity(&resolved)
-                                .map_or(false, |i| i.enabled);
+                                .is_some_and(|i| i.enabled);
                         (resolved, ok)
                     };
                     if !identity_ok {

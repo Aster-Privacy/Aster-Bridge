@@ -100,7 +100,7 @@ pub fn encrypt_metadata(
         .map_err(|_| BridgeError::Crypto("metadata encrypt failed".to_string()))?;
 
     let encrypted_b64 = STANDARD.encode(&ciphertext);
-    let nonce_b64 = STANDARD.encode(&nonce_bytes);
+    let nonce_b64 = STANDARD.encode(nonce_bytes);
 
     Ok((encrypted_b64, nonce_b64))
 }

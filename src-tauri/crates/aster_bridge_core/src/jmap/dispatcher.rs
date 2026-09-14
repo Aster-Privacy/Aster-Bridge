@@ -214,6 +214,7 @@ async fn dispatch_one(
     }
 }
 
+#[cfg(test)]
 fn resolve_back_refs(
     args: &mut Value,
     by_call_id: &HashMap<String, Value>,

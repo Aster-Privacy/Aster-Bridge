@@ -305,7 +305,7 @@ mod tests {
         let nonce_bytes = [4u8; NONCE_LEN];
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
-        (STANDARD.encode(&ciphertext), STANDARD.encode(&nonce_bytes))
+        (STANDARD.encode(&ciphertext), STANDARD.encode(nonce_bytes))
     }
 
     #[test]

@@ -39,7 +39,7 @@ fn restrict_dir_permissions(dir: &Path) {
             if !user.is_empty() {
                 let _ = std::process::Command::new("icacls")
                     .args([
-                        &dir.to_string_lossy().to_string(),
+                        dir.to_string_lossy().as_ref(),
                         "/inheritance:r",
                         "/grant:r",
                         &format!("{}:(OI)(CI)F", user),

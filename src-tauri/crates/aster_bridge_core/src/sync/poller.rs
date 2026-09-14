@@ -111,7 +111,7 @@ pub fn set_global_sync_trigger(tx: Option<SyncTriggerTx>) {
 pub fn clear_global_sync_trigger_if(tx: &SyncTriggerTx) {
     let Some(cell) = GLOBAL_SYNC_TRIGGER.get() else { return; };
     if let Ok(mut guard) = cell.lock() {
-        if guard.as_ref().map_or(false, |current| current.same_channel(tx)) {
+        if guard.as_ref().is_some_and(|current| current.same_channel(tx)) {
             *guard = None;
         }
     }
@@ -1119,7 +1119,7 @@ fn take_heal_permit(
     let Ok(mut guard) = state.lock() else {
         return false;
     };
-    let allowed = guard.map_or(true, |t| {
+    let allowed = guard.is_none_or(|t| {
         now.duration_since(t) >= std::time::Duration::from_secs(INBOUND_HEAL_COOLDOWN_SECS)
     });
     if allowed {
@@ -1488,12 +1488,11 @@ async fn run_sync_pass(
     if deep && all_folders_complete && last_err.is_none() {
         if let Ok(local) = db.list_all_cached_id_folders() {
             for (id, folder) in local {
-                if !seen_ids.contains(&id) {
-                    if db.delete_message_by_aster_id(&id).is_ok() {
+                if !seen_ids.contains(&id)
+                    && db.delete_message_by_aster_id(&id).is_ok() {
                         tracing::info!("sync: pruned {} from {} (gone on server)", id, folder);
                         destroyed_ids.push(id);
                     }
-                }
             }
         }
     }
@@ -1634,7 +1633,7 @@ pub async fn run_poll_loop_tuned(
     let mut last_triggered_at: Option<tokio::time::Instant> = None;
     let mut last_triggered_result: Result<(), String> = Ok(());
     let deep_due = |last: &Option<tokio::time::Instant>| {
-        last.map_or(true, |t| {
+        last.is_none_or(|t| {
             t.elapsed() >= std::time::Duration::from_secs(DEEP_SYNC_INTERVAL_SECS)
         })
     };
@@ -1649,13 +1648,12 @@ pub async fn run_poll_loop_tuned(
                     tracing::info!("sync: detected sleep/wake gap ({:.0}s); running immediate sync pass", elapsed.as_secs_f64());
                 }
                 sync_count += 1;
-                if sync_count % plan_check_every == 0 {
-                    if !check_plan_access(&session, &client).await {
+                if sync_count.is_multiple_of(plan_check_every)
+                    && !check_plan_access(&session, &client).await {
                         tracing::warn!("sync: bridge access revoked - stopping poll loop");
                         emit_bridge_access_revoked();
                         return PollExit::AccessRevoked;
                     }
-                }
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
@@ -1678,7 +1676,7 @@ pub async fn run_poll_loop_tuned(
                     waiting.push(queued.done);
                 }
                 let cooling = last_triggered_at
-                    .map_or(false, |at| at.elapsed() < TRIGGER_COOLDOWN);
+                    .is_some_and(|at| at.elapsed() < TRIGGER_COOLDOWN);
                 if cooling {
                     let replay = last_triggered_result.clone();
                     for done in waiting {
@@ -1989,14 +1987,12 @@ mod tests {
         let mut first = item_with_envelope("msg-replay", &json);
         first.envelope_nonce = nonce_pbkdf2.clone();
         let _ = cache_mail_item(&db, "inbox", &first, b"pass", None, &[]);
-        assert_eq!(
+        assert!(
             db.replay_check_and_record("msg-replay", &nonce_pbkdf2).unwrap(),
-            true,
             "same nonce must be accepted"
         );
-        assert_eq!(
+        assert!(
             db.replay_check_and_record("msg-replay", &STANDARD.encode([0x02u8])).unwrap(),
-            true,
             "a server-side re-encryption rotates the nonce and must not lock the item out"
         );
     }

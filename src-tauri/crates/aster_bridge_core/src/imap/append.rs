@@ -512,7 +512,7 @@ pub fn current_import_progress() -> Option<ImportProgress> {
 }
 
 fn apply_import_outcome(slot: &mut Option<ImportProgress>, stored: bool, now: u64) -> ImportProgress {
-    if !slot.as_ref().map_or(false, |p| p.active) {
+    if !slot.as_ref().is_some_and(|p| p.active) {
         *slot = Some(ImportProgress {
             active: true,
             started_at_ms: now,

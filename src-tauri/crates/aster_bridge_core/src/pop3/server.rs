@@ -263,7 +263,7 @@ where
                     let tls_stream = acceptor
                         .accept(rejoined)
                         .await
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                     return Box::pin(run_session_erased(erased, session, db, client, passwords)).await;
                 }
@@ -637,8 +637,8 @@ mod tests {
 
     #[test]
     fn uidl_line_format() {
-        let messages = vec![sample_message("uid-a"), sample_message("uid-b")];
-        let deleted = vec![false, false];
+        let messages = [sample_message("uid-a"), sample_message("uid-b")];
+        let deleted = [false, false];
         let mut resp = String::from("+OK\r\n");
         for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
             if !del {
@@ -651,8 +651,8 @@ mod tests {
 
     #[test]
     fn uidl_skips_deleted() {
-        let messages = vec![sample_message("uid-a"), sample_message("uid-b")];
-        let deleted = vec![true, false];
+        let messages = [sample_message("uid-a"), sample_message("uid-b")];
+        let deleted = [true, false];
         let mut resp = String::from("+OK\r\n");
         for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
             if !del {
@@ -665,8 +665,8 @@ mod tests {
 
     #[test]
     fn list_line_format() {
-        let messages = vec![sample_message("l-a")];
-        let deleted = vec![false];
+        let messages = [sample_message("l-a")];
+        let deleted = [false];
         let count = deleted.iter().filter(|d| !**d).count();
         let total: usize = messages.iter().zip(deleted.iter())
             .filter(|(_, d)| !*d)
@@ -686,8 +686,8 @@ mod tests {
 
     #[test]
     fn stat_totals_exclude_deleted() {
-        let messages = vec![sample_message("s-a"), sample_message("s-b")];
-        let deleted = vec![false, true];
+        let messages = [sample_message("s-a"), sample_message("s-b")];
+        let deleted = [false, true];
         let count = deleted.iter().filter(|d| !**d).count();
         let total_octets: usize = messages.iter().zip(deleted.iter())
             .filter(|(_, d)| !*d)

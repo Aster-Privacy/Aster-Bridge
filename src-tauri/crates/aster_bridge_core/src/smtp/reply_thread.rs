@@ -103,7 +103,7 @@ pub fn message_ids(value: &str) -> Vec<String> {
             rest = &after[end + 1..];
         }
     } else {
-        value.split_whitespace().for_each(|t| push(t));
+        value.split_whitespace().for_each(push);
     }
     out
 }

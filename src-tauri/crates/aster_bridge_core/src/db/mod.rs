@@ -42,7 +42,7 @@ fn from_hex(s: &str) -> Result<[u8; 32], String> {
         return Err("db key must be 64 hex chars".to_string());
     }
     let mut out = [0u8; 32];
-    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = (chunk[0] as char)
             .to_digit(16)
             .ok_or_else(|| "invalid hex".to_string())?;
@@ -431,7 +431,7 @@ fn restrict_db_file_permissions(db_path: &Path) {
             if !user.is_empty() {
                 let _ = std::process::Command::new("icacls")
                     .args([
-                        &p.to_string_lossy().to_string(),
+                        p.to_string_lossy().as_ref(),
                         "/inheritance:r",
                         "/grant:r",
                         &format!("{}:(F)", user),
@@ -2094,11 +2094,11 @@ mod encryption_tests {
         assert!(db.outbox_get(id).unwrap().is_some());
         let aside: i64 = db
             .with_conn(|conn| {
-                Ok(conn.query_row(
+                conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'outbox_incompatible_%'",
                     [],
                     |r| r.get(0),
-                )?)
+                )
             })
             .unwrap();
         assert_eq!(aside, 1);

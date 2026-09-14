@@ -392,7 +392,7 @@ mod e2e_tests {
         let v: serde_json::Value = r.json().await.unwrap();
         let second = &v["methodResponses"][1];
         assert_eq!(second[0], "Mailbox/get");
-        assert!(second[1]["list"].as_array().unwrap().len() > 0);
+        assert!(!second[1]["list"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -835,7 +835,7 @@ mod e2e_tests {
             .unwrap();
         let v: serde_json::Value = r.json().await.unwrap();
         assert!(
-            v["methodResponses"][0][1]["list"].as_array().unwrap().len() > 0,
+            !v["methodResponses"][0][1]["list"].as_array().unwrap().is_empty(),
             "mailbox table must still exist after evil queries"
         );
     }

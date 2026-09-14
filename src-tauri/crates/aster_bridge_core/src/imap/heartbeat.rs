@@ -88,9 +88,8 @@ where
         match self.pump.take() {
             Some(handle) => handle
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| std::io::Error::other(e.to_string())),
+            None => Err(std::io::Error::other(
                 "the connection writer was already reclaimed",
             )),
         }

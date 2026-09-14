@@ -90,7 +90,7 @@ fn set_file_permissions_restrictive(path: &Path) -> Result<(), String> {
         if !user.is_empty() {
             match std::process::Command::new("icacls")
                 .args([
-                    &path.to_string_lossy().to_string(),
+                    path.to_string_lossy().as_ref(),
                     "/inheritance:r",
                     "/grant:r",
                     &format!("{}:(F)", user),

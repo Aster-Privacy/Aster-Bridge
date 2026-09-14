@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn the_fingerprint_matches_the_shared_cross_client_vector() {
         let mut point = vec![UNCOMPRESSED_POINT_TAG];
-        point.extend(std::iter::repeat(0x11).take(64));
+        point.extend(std::iter::repeat_n(0x11, 64));
         assert_eq!(
             identity_fingerprint(Some(&STANDARD.encode(point))).as_deref(),
             Some("8LkxWgRZ2rerX6aQPnM8kXdhFUIWzZDl2XnabIUsYCo=")

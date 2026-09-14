@@ -557,6 +557,12 @@ pub struct MailListQuery {
 }
 
 #[allow(dead_code)]
+impl Default for ApiClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ApiClient {
     pub fn new() -> Self {
         let mut default_headers = reqwest::header::HeaderMap::new();

@@ -54,7 +54,7 @@ struct BridgeState {
 
 impl BridgeState {
     fn running(&self) -> bool {
-        self.runtime.as_ref().map_or(false, |r| r.is_running())
+        self.runtime.as_ref().is_some_and(|r| r.is_running())
     }
 
     fn bound_ports(&self) -> runtime::BoundPorts {
@@ -68,7 +68,7 @@ impl BridgeState {
     fn service_running(&self, service: runtime::Service) -> bool {
         self.runtime
             .as_ref()
-            .map_or(false, |r| r.service_running(service))
+            .is_some_and(|r| r.service_running(service))
     }
 
     fn stop_runtime(&mut self, reason: runtime::StopReason) {
@@ -273,7 +273,7 @@ async fn start_runtime(shared: &SharedBridgeState) -> Result<(), runtime::StartE
     if !guard
         .session
         .as_ref()
-        .map_or(false, |current| Arc::ptr_eq(current, &session))
+        .is_some_and(|current| Arc::ptr_eq(current, &session))
     {
         return Err(runtime::StartError::NotSignedIn);
     }
@@ -1592,12 +1592,11 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to start aster bridge desktop")
         .run(|app, event| match event {
-            tauri::RunEvent::ExitRequested { api, code, .. } => {
-                if code.is_none() {
+            tauri::RunEvent::ExitRequested { api, code, .. }
+                if code.is_none() => {
                     api.prevent_exit();
                     shell::request_quit(app);
                 }
-            }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => shell::show_main_window(app),
             _ => {}

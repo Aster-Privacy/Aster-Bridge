@@ -1273,7 +1273,7 @@ async fn report_internal_decrypt(client: &ApiClient, session: &crate::auth::sess
                 }
             };
             if let Some(kid) = msg.pq_key_id {
-                match resolve_pq_secret(&client, &token, sync_key.as_ref(), &session.inbound_keys, kid).await {
+                match resolve_pq_secret(client, &token, sync_key.as_ref(), &session.inbound_keys, kid).await {
                     Some(s) => msg.pq_secret = Some(s),
                     None => {
                         failed += 1;
