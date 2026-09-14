@@ -2,6 +2,13 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.31 - 2026-09-14
+
+### Fixed
+- When you reply to a message from your mail app through Aster Bridge, the reply now stays in the same conversation for you and for the recipient. Earlier versions sent every reply as a new conversation, including replies between Aster addresses.
+- Messages that you send through Aster Bridge now appear in your Sent folder on the web, in the Aster apps, and in your mail app.
+- Aster Bridge now refreshes your session in the background, so it no longer signs in again every 50 minutes.
+
 ## 0.4.30 - 2026-09-03
 
 ### Fixed
