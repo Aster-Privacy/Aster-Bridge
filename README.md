@@ -58,6 +58,104 @@ Aster Bridge draws its window with WebKitGTK, which every package expects to fin
 | Fedora | `webkit2gtk4.1` |
 | openSUSE | `libwebkit2gtk-4_1-0` |
 
+## Run Aster Bridge from the command line
+
+The `aster-bridge` command-line tool runs the same IMAP, SMTP, POP3, JMAP, and CardDAV servers as the desktop app, without a window. Use it on servers, headless machines, and terminals over SSH. It needs the same Star plan or higher, and it checks your plan the same way the desktop app does.
+
+### Install the command-line tool
+
+Each release carries an archive for your platform, with a matching `.sha256` checksum file:
+
+| Platform | Archive |
+|---|---|
+| Linux (x86-64) | `aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux (ARM64) | `aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS (Apple silicon and Intel) | `aster-bridge-cli-universal-apple-darwin.tar.gz` |
+| Windows (x64) | `aster-bridge-cli-x86_64-pc-windows-msvc.zip` |
+
+To install on Linux, download the archive and its checksum, verify it, and put the binary on your `PATH`:
+
+```
+sha256sum -c aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 aster-bridge-cli-x86_64-unknown-linux-gnu/aster-bridge ~/.local/bin/
+```
+
+The Linux binary doesn't need WebKitGTK, GTK, or D-Bus libraries. On macOS, use `shasum -a 256 -c` to verify the archive. If you download it with `curl` instead of a browser, macOS doesn't ask you to confirm the first launch. On Windows, extract the zip file and run `aster-bridge.exe` from PowerShell or Command Prompt.
+
+### Sign in
+
+To link the tool to your account, run:
+
+```
+aster-bridge login
+```
+
+The tool shows a code. Enter it at [app.astermail.org/link-device](https://app.astermail.org/link-device) in a browser where you're signed in to Aster Mail, and the tool finishes signing in. If you can't keep the terminal open, run `aster-bridge login --no-wait`, enter the code, and then run `aster-bridge login` again within 10 minutes.
+
+### Start the servers
+
+To run the servers in the foreground, run `aster-bridge serve`. Press Control-C to stop them. In another terminal, `aster-bridge status` shows your account, plan, ports, and sync state.
+
+If your plan no longer includes Aster Bridge, `serve` stops with exit code 4 and tells you how to upgrade. The tool also stops when you sign this device out from another app or when the session expires.
+
+To create a password for your email app, run `aster-bridge app-password create --label "Laptop"`. The password appears once, so copy it before you close the terminal. Use `aster-bridge app-password list` and `aster-bridge app-password revoke ID` to manage passwords, and `aster-bridge tls fingerprint` to verify the certificate that your email app shows.
+
+The command-line tool keeps its own account, cache, and settings, so it can run alongside the desktop app. If both run on the same computer, give the command-line tool different ports:
+
+```
+aster-bridge config set imap_port 2143
+aster-bridge config set smtp_port 2025
+```
+
+### Run in the background
+
+To start Aster Bridge automatically, sign in and then run `aster-bridge service install`. The tool registers itself with your platform's service manager:
+
+| Platform | Service manager |
+|---|---|
+| Linux | A systemd user service |
+| macOS | A launchd agent |
+| Windows | A startup entry that runs when you sign in |
+
+Use `aster-bridge service status` to check the service and `aster-bridge service uninstall` to remove it. On Linux, a user service stops when you sign out. To keep it running without an active session, run `sudo loginctl enable-linger $USER`.
+
+### Store keys without a system keychain
+
+The tool stores its keys in the system keychain: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux. Servers often don't run a Secret Service. To store keys in an encrypted file instead, create a key and point the tool at it:
+
+```
+openssl rand -hex 32 > ~/.config/aster-bridge.key
+chmod 600 ~/.config/aster-bridge.key
+export ASTER_BRIDGE_SECRET_KEY_FILE=~/.config/aster-bridge.key
+aster-bridge --secret-backend file login
+```
+
+Set `ASTER_BRIDGE_SECRET_BACKEND=file` so every command uses the file. Under systemd, you can supply the key as a credential named `secret-key` instead. Keep the key somewhere safe, because the tool can't read your account without it.
+
+### Data folders and scripting
+
+The tool keeps its data in the following folder. To use another folder, pass `--data-dir` or set `ASTER_BRIDGE_DATA_DIR`.
+
+| Platform | Folder |
+|---|---|
+| Linux | `~/.local/share/com.astermail.bridge.cli` |
+| macOS | `~/Library/Application Support/com.astermail.bridge.cli` |
+| Windows | `%LOCALAPPDATA%\com.astermail.bridge.cli` |
+
+Add `--json` to any command for machine-readable output. Every command exits with one of these codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | The command succeeded. |
+| 1 | An error occurred. |
+| 2 | The command or its options aren't valid. |
+| 3 | You aren't signed in, or the servers aren't running. |
+| 4 | Your plan doesn't include Aster Bridge, or the plan check failed. |
+| 5 | The session expired or this device was signed out. |
+| 6 | The keychain or key file isn't available. |
+| 7 | Another Aster Bridge process is using the data folder. |
+
 ## Build from source
 
 Building the desktop app takes two steps, because the Rust binary embeds the web interface at compile time. Build the interface first, then the binary:

@@ -45,6 +45,14 @@ jobs:
             Aster-Bridge-arm64.deb
             Aster-Bridge-aarch64.rpm
             Aster-Bridge-x86_64.pkg.tar.zst
+            aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz
+            aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz.sha256
+            aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz
+            aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz.sha256
+            aster-bridge-cli-universal-apple-darwin.tar.gz
+            aster-bridge-cli-universal-apple-darwin.tar.gz.sha256
+            aster-bridge-cli-x86_64-pc-windows-msvc.zip
+            aster-bridge-cli-x86_64-pc-windows-msvc.zip.sha256
           )
 
           declare -A SRC=(
