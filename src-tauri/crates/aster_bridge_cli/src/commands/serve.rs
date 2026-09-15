@@ -583,6 +583,7 @@ impl Shared {
     fn status(&self) -> Value {
         let outbox = self.db.outbox_stats().unwrap_or_default();
         let (messages, app_passwords, last_sync) = self.db.db_stats().unwrap_or((0, 0, None));
+        let last_sync = last_sync.and_then(|value| value.trim().parse::<i64>().ok());
         json!({
             "running": self.running.is_running(),
             "pid": std::process::id(),
