@@ -113,6 +113,8 @@ impl ContactsStore {
 
         let mut entries = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut skipped_integrity = 0usize;
+        let mut skipped_decrypt = 0usize;
 
         for _ in 0..MAX_PAGES {
             let page = self
@@ -130,7 +132,8 @@ impl ContactsStore {
                         version,
                         hash,
                     ) {
-                        tracing::warn!(
+                        skipped_integrity += 1;
+                        tracing::debug!(
                             "contact {} failed its integrity check and was skipped",
                             record.id
                         );
@@ -141,7 +144,8 @@ impl ContactsStore {
                 let payload = match keys.decrypt_data(&record.encrypted_data, &record.data_nonce) {
                     Ok(payload) => payload,
                     Err(e) => {
-                        tracing::warn!("contact {} could not be decrypted: {}", record.id, e);
+                        skipped_decrypt += 1;
+                        tracing::debug!("contact {} could not be decrypted: {}", record.id, e);
                         continue;
                     }
                 };
@@ -168,6 +172,15 @@ impl ContactsStore {
                 Some(next) if page.has_more => cursor = Some(next),
                 _ => break,
             }
+        }
+
+        if skipped_integrity > 0 || skipped_decrypt > 0 {
+            tracing::warn!(
+                "skipped {} contacts this sync, {} failed an integrity check and {} could not be decrypted",
+                skipped_integrity + skipped_decrypt,
+                skipped_integrity,
+                skipped_decrypt
+            );
         }
 
         let mut seen = HashMap::new();
