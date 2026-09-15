@@ -31,8 +31,10 @@ use crate::control;
 use crate::exit::{
     CliError, CliResult, CODE_PROGRAM_PATH, CODE_SERVICE_COMMAND, EXIT_NOT_READY, EXIT_OK,
 };
-#[cfg(not(windows))]
-use crate::exit::{CODE_SERVICE_FILE, CODE_SERVICE_UNSUPPORTED};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::exit::CODE_SERVICE_FILE;
+#[cfg(not(any(target_os = "macos", windows)))]
+use crate::exit::CODE_SERVICE_UNSUPPORTED;
 use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend;

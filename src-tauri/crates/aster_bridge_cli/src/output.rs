@@ -49,6 +49,25 @@ impl Tone {
     }
 }
 
+const SWEEP_TAIL: usize = 6;
+
+fn sweep_period(width: usize) -> usize {
+    width.saturating_sub(1).max(1) * 2
+}
+
+fn sweep_levels(width: usize, frame: usize) -> Vec<usize> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let travel = width - 1;
+    let period = sweep_period(width);
+    let step = frame % period;
+    let head = if step <= travel { step } else { period - step };
+    (0..width)
+        .map(|index| SWEEP_TAIL - index.abs_diff(head).min(SWEEP_TAIL))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Output {
     pub json: bool,
@@ -199,6 +218,37 @@ impl Output {
         painted
     }
 
+    pub fn sweep(&self, text: &str, frame: usize) -> String {
+        if !self.ansi() {
+            return text.to_string();
+        }
+        if self.palette.depth == ColorDepth::Ansi16 {
+            return self.accent(text);
+        }
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return String::new();
+        }
+        let levels = sweep_levels(chars.len(), frame);
+        let mut painted = String::with_capacity(text.len() * 4);
+        let mut previous = usize::MAX;
+        for (character, level) in chars.iter().zip(levels) {
+            if level != previous {
+                let color =
+                    self.palette
+                        .gradient(Role::AccentDeep, Role::AccentSoft, SWEEP_TAIL, level);
+                painted.push_str(&format!(
+                    "\x1b[{}m",
+                    self.palette.rgb_sequence(color, Role::Accent)
+                ));
+                previous = level;
+            }
+            painted.push(*character);
+        }
+        painted.push_str("\x1b[0m");
+        painted
+    }
+
     pub fn heading(&self, text: &str) -> String {
         if !self.ansi() {
             return text.to_string();
@@ -232,12 +282,18 @@ impl Output {
     }
 
     pub fn banner(&self, tone: Tone, title: &str) {
-        let title = if tone == Tone::Good || tone == Tone::Accent {
+        let lively = tone == Tone::Good || tone == Tone::Accent;
+        let glyph = if lively {
+            self.dot(tone)
+        } else {
+            self.mark(tone)
+        };
+        let title = if lively {
             self.heading(title)
         } else {
             self.bold(title)
         };
-        println!("{} {}", self.mark(tone), title);
+        println!("{} {}", glyph, title);
     }
 
     pub fn fields(&self, rows: &[(&str, String)]) {
@@ -350,13 +406,99 @@ pub fn error_details(err: &CliError) -> Vec<(&'static str, String)> {
     rows
 }
 
-fn unicode_ready() -> bool {
-    if !cfg!(windows) {
-        return true;
+pub fn terminal_width() -> Option<usize> {
+    if let Some(columns) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        if columns > 0 {
+            return Some(columns);
+        }
     }
-    std::env::var_os("WT_SESSION").is_some()
+    console_width()
+}
+
+#[cfg(windows)]
+fn console_width() -> Option<usize> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+            return None;
+        }
+        let width = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+        usize::try_from(width).ok().filter(|width| *width > 0)
+    }
+}
+
+#[cfg(not(windows))]
+fn console_width() -> Option<usize> {
+    None
+}
+
+pub fn truncate_visible(text: &str, width: usize) -> String {
+    if visible_len(text) <= width {
+        return text.to_string();
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut visible = 0usize;
+    let mut inside = false;
+    let mut colored = false;
+    for character in text.chars() {
+        if character == '\x1b' {
+            inside = true;
+            colored = true;
+            kept.push(character);
+            continue;
+        }
+        if inside {
+            kept.push(character);
+            if character == 'm' {
+                inside = false;
+            }
+            continue;
+        }
+        if visible + 1 >= width {
+            kept.push('\u{2026}');
+            break;
+        }
+        kept.push(character);
+        visible += 1;
+    }
+    if colored {
+        kept.push_str("\x1b[0m");
+    }
+    kept
+}
+
+#[cfg(windows)]
+fn unicode_ready() -> bool {
+    use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+    if std::env::var_os("WT_SESSION").is_some()
         || std::env::var_os("TERM").is_some()
         || std::env::var_os("TERM_PROGRAM").is_some()
+    {
+        return true;
+    }
+    unsafe {
+        const CP_UTF8: u32 = 65001;
+        if GetConsoleOutputCP() == CP_UTF8 {
+            return true;
+        }
+        SetConsoleOutputCP(CP_UTF8) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn unicode_ready() -> bool {
+    true
 }
 
 fn vt_ready(stderr: bool, is_terminal: bool) -> bool {
@@ -567,6 +709,154 @@ mod tests {
         assert!(dark.contains('\x1b'));
         assert!(light.contains('\x1b'));
         assert_ne!(dark, light);
+    }
+
+    fn band_center(levels: &[usize]) -> Option<usize> {
+        let peak = *levels.iter().max()?;
+        if peak == 0 {
+            return None;
+        }
+        let mut hits = levels
+            .iter()
+            .enumerate()
+            .filter(|(_, level)| **level == peak);
+        let first = hits.next()?.0;
+        if hits.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    #[test]
+    fn sweep_moves_one_column_per_frame_and_turns_around() {
+        let width = 28usize;
+        let period = sweep_period(width);
+        let centers: Vec<Option<usize>> = (0..period)
+            .map(|frame| band_center(&sweep_levels(width, frame)))
+            .collect();
+        let mut previous: Option<usize> = None;
+        for center in &centers {
+            let center = center.expect("the band is always on screen");
+            if let Some(last) = previous {
+                assert!(
+                    center.abs_diff(last) <= 1,
+                    "band jumped from {} to {}",
+                    last,
+                    center
+                );
+            }
+            previous = Some(center);
+        }
+        assert!(centers.iter().flatten().any(|center| *center == 0));
+        assert!(centers.iter().flatten().any(|center| *center == width - 1));
+        assert_eq!(sweep_levels(width, 0), sweep_levels(width, period));
+        assert_ne!(sweep_levels(width, 0), sweep_levels(width, 1));
+    }
+
+    #[test]
+    fn a_short_line_is_left_alone_and_a_long_one_is_cut_with_an_ellipsis() {
+        assert_eq!(truncate_visible("hello", 10), "hello");
+        assert_eq!(truncate_visible("hello", 5), "hello");
+        assert_eq!(truncate_visible("hello", 4), "hel\u{2026}");
+        assert_eq!(visible_len(&truncate_visible("hello world", 6)), 6);
+        assert_eq!(truncate_visible("hello", 0), "\u{2026}");
+    }
+
+    #[test]
+    fn truncating_keeps_color_codes_and_always_resets() {
+        let out = Output::assemble(
+            false,
+            ColorChoice::Always,
+            ThemeChoice::Dark,
+            true,
+            true,
+            true,
+            true,
+        );
+        let painted = out.sweep("Listening for your email app", 4);
+        let cut = truncate_visible(&painted, 10);
+        assert_eq!(visible_len(&cut), 10);
+        assert!(cut.ends_with("\x1b[0m"));
+        assert!(!truncate_visible("plain text here", 6).contains('\x1b'));
+    }
+
+    #[test]
+    fn sweep_levels_stay_within_the_tail() {
+        for frame in 0..200 {
+            let levels = sweep_levels(28, frame);
+            assert_eq!(levels.len(), 28);
+            assert!(levels.iter().all(|level| *level <= SWEEP_TAIL));
+            for pair in levels.windows(2) {
+                assert!(pair[1].abs_diff(pair[0]) <= 1);
+            }
+        }
+        assert!(sweep_levels(0, 5).is_empty());
+    }
+
+    #[test]
+    fn sweep_frames_differ_so_the_line_animates() {
+        let out = Output::assemble(
+            false,
+            ColorChoice::Always,
+            ThemeChoice::Dark,
+            true,
+            true,
+            true,
+            true,
+        );
+        let text = "Listening for your email app";
+        let first = out.sweep(text, 10);
+        assert_ne!(first, out.sweep(text, 11));
+        assert_eq!(
+            first,
+            out.sweep(text, 10 + sweep_period(text.chars().count()))
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_every_character_and_resets_color() {
+        let out = Output::assemble(
+            false,
+            ColorChoice::Always,
+            ThemeChoice::Dark,
+            true,
+            true,
+            true,
+            true,
+        );
+        let text = "Listening for your email app";
+        for frame in 0..40 {
+            let painted = out.sweep(text, frame);
+            let stripped: String = strip_ansi(&painted);
+            assert_eq!(stripped, text);
+            assert!(painted.ends_with("\x1b[0m"));
+        }
+    }
+
+    #[test]
+    fn sweep_without_color_returns_the_plain_text() {
+        let out = Output::build(false, ColorChoice::Never, ThemeChoice::Dark, false, false);
+        assert_eq!(out.sweep("Working", 3), "Working");
+        assert_eq!(out.sweep("", 0), "");
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut plain = String::new();
+        let mut inside = false;
+        for character in text.chars() {
+            if character == '\x1b' {
+                inside = true;
+                continue;
+            }
+            if inside {
+                if character == 'm' {
+                    inside = false;
+                }
+                continue;
+            }
+            plain.push(character);
+        }
+        plain
     }
 
     #[test]

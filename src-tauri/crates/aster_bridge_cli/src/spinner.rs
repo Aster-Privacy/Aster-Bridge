@@ -22,9 +22,9 @@ use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
 
-use crate::output::{visible_len, Output, Tone};
+use crate::output::{terminal_width, truncate_visible, visible_len, Output, Tone};
 
-pub const FRAME_INTERVAL: Duration = Duration::from_millis(90);
+pub const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 const UNICODE_FRAMES: [&str; 10] = [
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -38,6 +38,8 @@ pub struct Spinner {
     detail: String,
     frame: usize,
     drawn: usize,
+    painted: String,
+    cursor_hidden: bool,
 }
 
 impl Spinner {
@@ -48,6 +50,8 @@ impl Spinner {
             detail: String::new(),
             frame: 0,
             drawn: 0,
+            painted: String::new(),
+            cursor_hidden: false,
         };
         if spinner.out.animates() {
             spinner.draw();
@@ -70,16 +74,44 @@ impl Spinner {
     }
 
     pub fn clear(&mut self) {
+        self.painted.clear();
         if self.drawn == 0 {
+            self.show_cursor();
             return;
         }
+        let mut frame = String::with_capacity(self.drawn + 8);
         if self.out.ansi() {
-            print!("\r\x1b[2K");
+            frame.push_str("\r\x1b[2K");
         } else {
-            print!("\r{}\r", " ".repeat(self.drawn));
+            frame.push('\r');
+            frame.push_str(&" ".repeat(self.drawn));
+            frame.push('\r');
         }
-        let _ = std::io::stdout().flush();
         self.drawn = 0;
+        self.write(&frame);
+        self.show_cursor();
+    }
+
+    fn write(&self, frame: &str) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(frame.as_bytes());
+        let _ = stdout.flush();
+    }
+
+    fn hide_cursor(&mut self) {
+        if self.cursor_hidden || !self.out.ansi() {
+            return;
+        }
+        self.cursor_hidden = true;
+        self.write("\x1b[?25l");
+    }
+
+    fn show_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        self.cursor_hidden = false;
+        self.write("\x1b[?25h");
     }
 
     pub fn finish(&mut self, tone: Tone, text: impl AsRef<str>) {
@@ -92,18 +124,53 @@ impl Spinner {
     }
 
     fn draw(&mut self) {
+        if !viewport_follows_cursor() {
+            return;
+        }
+        if let Some(frame) = self.compose(terminal_width()) {
+            self.hide_cursor();
+            self.write(&frame);
+        }
+    }
+
+    fn compose(&mut self, width: Option<usize>) -> Option<String> {
         let frames = self.frames();
         let glyph = frames[self.frame % frames.len()];
-        let painted_glyph = self.out.tone(glyph, Tone::Accent);
-        let painted_label = self.out.gradient_from(&self.label, self.frame / 2);
-        let mut rendered = format!("{} {}", painted_glyph, painted_label);
+        let mut rendered = format!(
+            "{} {}",
+            self.out.tone(glyph, Tone::Accent),
+            self.out.sweep(&self.label, self.frame)
+        );
         if !self.detail.is_empty() {
             rendered.push_str(&format!("  {}", self.out.dim(&self.detail)));
         }
-        self.clear();
-        print!("{}", rendered);
-        let _ = std::io::stdout().flush();
-        self.drawn = visible_len(&rendered);
+        if let Some(width) = width {
+            let room = width.saturating_sub(1);
+            if room == 0 {
+                return None;
+            }
+            rendered = truncate_visible(&rendered, room);
+        }
+        if rendered == self.painted {
+            return None;
+        }
+        let visible = visible_len(&rendered);
+        let mut frame = String::with_capacity(rendered.len() + 16);
+        frame.push('\r');
+        if self.out.ansi() {
+            frame.push_str("\x1b[2K");
+            frame.push_str(&rendered);
+        } else {
+            frame.push_str(&rendered);
+            if self.drawn > visible {
+                frame.push_str(&" ".repeat(self.drawn - visible));
+                frame.push('\r');
+                frame.push_str(&rendered);
+            }
+        }
+        self.drawn = visible;
+        self.painted = rendered;
+        Some(frame)
     }
 
     fn frames(&self) -> &'static [&'static str] {
@@ -113,6 +180,31 @@ impl Spinner {
             &ASCII_FRAMES
         }
     }
+}
+
+#[cfg(windows)]
+fn viewport_follows_cursor() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return true;
+        }
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+            return true;
+        }
+        info.dwCursorPosition.Y >= info.srWindow.Top
+            && info.dwCursorPosition.Y <= info.srWindow.Bottom
+    }
+}
+
+#[cfg(not(windows))]
+fn viewport_follows_cursor() -> bool {
+    true
 }
 
 pub async fn while_working<F, T>(out: &Output, quiet: bool, label: &str, work: F) -> T
@@ -150,6 +242,88 @@ mod tests {
 
     fn plain() -> Output {
         Output::build(false, ColorChoice::Never, ThemeChoice::Dark, false, false)
+    }
+
+    fn animating() -> Output {
+        Output::assemble(
+            false,
+            ColorChoice::Always,
+            ThemeChoice::Dark,
+            true,
+            true,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_frame_is_one_write_that_starts_by_clearing_the_line() {
+        let out = animating();
+        let mut spinner = Spinner::start(&out, "Listening for your email app");
+        spinner.painted.clear();
+        let frame = spinner.compose(Some(120)).expect("first frame");
+        assert!(frame.starts_with("\r\x1b[2K"));
+        assert_eq!(frame.matches('\r').count(), 1);
+        assert_eq!(frame.matches("\x1b[2K").count(), 1);
+        assert!(frame.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn an_unchanged_frame_is_not_written_again() {
+        let out = animating();
+        let mut spinner = Spinner::start(&out, "Working");
+        spinner.painted.clear();
+        assert!(spinner.compose(Some(120)).is_some());
+        assert!(spinner.compose(Some(120)).is_none());
+        spinner.frame += 1;
+        assert!(spinner.compose(Some(120)).is_some());
+    }
+
+    #[test]
+    fn a_frame_never_outgrows_the_terminal() {
+        let out = animating();
+        let mut spinner = Spinner::start(&out, "Listening for your email app");
+        spinner.set_detail("up 3m 20s  \u{b7}  Press Control-C to stop.");
+        for width in [8usize, 20, 40, 64] {
+            spinner.painted.clear();
+            spinner.frame += 1;
+            let frame = spinner.compose(Some(width)).expect("frame");
+            let body = frame.trim_start_matches('\r').trim_start_matches("\x1b[2K");
+            assert!(
+                visible_len(body) < width,
+                "width {} produced {} columns",
+                width,
+                visible_len(body)
+            );
+        }
+        spinner.painted.clear();
+        assert!(spinner.compose(Some(1)).is_none());
+    }
+
+    #[test]
+    fn the_label_animates_across_frames() {
+        let out = animating();
+        let mut spinner = Spinner::start(&out, "Listening for your email app");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..12 {
+            spinner.frame += 1;
+            spinner.painted.clear();
+            seen.insert(spinner.compose(Some(120)).expect("frame"));
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn clearing_restores_the_cursor_and_forgets_the_frame() {
+        let out = animating();
+        let mut spinner = Spinner::start(&out, "Working");
+        spinner.painted.clear();
+        let _ = spinner.compose(Some(120));
+        assert!(!spinner.painted.is_empty());
+        spinner.clear();
+        assert_eq!(spinner.drawn, 0);
+        assert!(spinner.painted.is_empty());
+        assert!(!spinner.cursor_hidden);
     }
 
     #[test]
