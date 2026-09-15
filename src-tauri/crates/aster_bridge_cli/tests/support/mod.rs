@@ -27,7 +27,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aster_bridge_core::config::{save_config, BridgeConfig};
@@ -267,14 +267,31 @@ fn collect<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<S
     })
 }
 
+fn claimed_ports() -> &'static Mutex<std::collections::HashSet<u16>> {
+    static CLAIMED: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    CLAIMED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn reserve_ports(count: usize) -> Vec<u16> {
+    let mut claimed = claimed_ports().lock().unwrap();
+    let mut held: Vec<TcpListener> = Vec::new();
+    let mut ports: Vec<u16> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ports.len() < count {
+        assert!(Instant::now() < deadline, "no free ports for the test harness");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if claimed.insert(port) {
+            ports.push(port);
+        }
+        held.push(listener);
+    }
+    drop(held);
+    ports
+}
+
 fn write_config(data: &Path) {
-    let listeners: Vec<TcpListener> = (0..8)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: Vec<u16> = listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect();
+    let ports = reserve_ports(8);
     let config = BridgeConfig {
         imap_port: ports[0],
         smtp_port: ports[1],
@@ -287,7 +304,6 @@ fn write_config(data: &Path) {
         data_dir: data.to_path_buf(),
         ..BridgeConfig::default()
     };
-    drop(listeners);
     save_config(&config).unwrap();
 }
 
