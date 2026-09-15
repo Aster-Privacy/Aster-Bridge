@@ -54,6 +54,7 @@ pub const CODE_SERVICE_FILE: &str = "service_file_failed";
 pub const CODE_PROGRAM_PATH: &str = "program_path_unknown";
 pub const CODE_DATA_DIR: &str = "data_dir_failed";
 pub const CODE_CONTROL_UNREACHABLE: &str = "control_unreachable";
+pub const CODE_CONTROL_TIMEOUT: &str = "control_timeout";
 pub const CODE_PLAN_CHECK: &str = "plan_check_failed";
 pub const CODE_USAGE: &str = "usage";
 pub const CODE_NOT_SIGNED_IN: &str = "not_signed_in";
@@ -67,6 +68,7 @@ pub const CODE_SECRET_KEY_FILE_INVALID: &str = "secret_key_file_invalid";
 pub const CODE_PORT_UNAVAILABLE: &str = "port_unavailable";
 pub const CODE_OUTBOX_ALREADY_SENT: &str = "outbox_already_sent";
 pub const CODE_LOCKED: &str = "locked";
+pub const CODE_NOT_FOUND: &str = "not_found";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorDoc {
@@ -111,7 +113,7 @@ pub const CATALOG: &[ErrorDoc] = &[
         code: CODE_CACHE_REBUILD,
         exit_code: EXIT_ERROR,
         summary: "Aster Bridge can't rebuild the local mail cache.",
-        resolution: "Check the free space on the disk that holds the data folder, then run: aster-bridge cache rebuild",
+        resolution: "Check the free space on the disk that holds the data folder, then run: aster-bridge repair-cache",
     },
     ErrorDoc {
         reference: "ASTER-1005",
@@ -254,11 +256,25 @@ pub const CATALOG: &[ErrorDoc] = &[
         resolution: "To see the messages that are waiting, run: aster-bridge outbox list",
     },
     ErrorDoc {
+        reference: "ASTER-1025",
+        code: CODE_NOT_FOUND,
+        exit_code: EXIT_ERROR,
+        summary: "Aster Bridge couldn't find the item you asked for.",
+        resolution: "Check the ID, then run the command again. To list app passwords, run: aster-bridge app-password list",
+    },
+    ErrorDoc {
+        reference: "ASTER-1026",
+        code: CODE_CONTROL_TIMEOUT,
+        exit_code: EXIT_ERROR,
+        summary: "Aster Bridge is taking longer than expected to finish the request.",
+        resolution: "The work keeps going in the background. To check on it, run: aster-bridge status",
+    },
+    ErrorDoc {
         reference: "ASTER-2000",
         code: CODE_USAGE,
         exit_code: EXIT_USAGE,
         summary: "The command or its options aren't valid.",
-        resolution: "To see the commands and their options, run: aster-bridge help",
+        resolution: "To see the commands and their options, run: aster-bridge --help",
     },
     ErrorDoc {
         reference: "ASTER-3001",
@@ -450,7 +466,8 @@ impl CliError {
             exit_code: value
                 .get("exit_code")
                 .and_then(Value::as_i64)
-                .map(|c| c as i32)
+                .and_then(|c| i32::try_from(c).ok())
+                .filter(|c| (EXIT_OK..=EXIT_LOCKED).contains(c))
                 .unwrap_or(EXIT_ERROR),
             code: text("code").unwrap_or_else(|| "error".to_string()),
             message: text("message").unwrap_or_else(|| "Aster Bridge returned an error.".to_string()),

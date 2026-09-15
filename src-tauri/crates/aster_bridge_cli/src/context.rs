@@ -49,15 +49,44 @@ pub fn default_data_dir() -> Option<PathBuf> {
 }
 
 pub fn folder_tag(data_dir: &std::path::Path) -> Option<String> {
-    if default_data_dir().as_deref() == Some(data_dir) {
+    let folded = fold_path(data_dir);
+    if default_data_dir().map(|dir| fold_path(&dir)).as_deref() == Some(folded.as_str()) {
         return None;
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in data_dir.to_string_lossy().as_bytes() {
+    for byte in folded.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     Some(format!("{:016x}", hash))
+}
+
+fn fold_path(data_dir: &std::path::Path) -> String {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for part in data_dir.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let droppable = parts.len() > 1
+                    && parts
+                        .last()
+                        .is_some_and(|last| last != std::ffi::OsStr::new(".."));
+                if droppable {
+                    parts.pop();
+                } else {
+                    parts.push(part.as_os_str().to_os_string());
+                }
+            }
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    let joined: std::path::PathBuf = parts.iter().collect();
+    let text = joined.to_string_lossy().to_string();
+    if cfg!(any(windows, target_os = "macos")) {
+        text.to_lowercase()
+    } else {
+        text
+    }
 }
 
 pub fn service_retry_delay() -> Duration {
@@ -84,16 +113,13 @@ impl Context {
         let dir = std::path::absolute(&dir).map_err(|e| {
             CliError::usage(format!("The data folder {} isn't valid: {}", dir.display(), e))
         })?;
-        let existed = dir.is_dir();
         std::fs::create_dir_all(&dir).map_err(|e| {
             CliError::coded(
                 CODE_DATA_DIR,
                 format!("Couldn't create the data folder {}: {}", dir.display(), e),
             )
         })?;
-        if !existed {
-            aster_bridge_core::secrets::restrict_permissions(&dir, true);
-        }
+        aster_bridge_core::secrets::restrict_permissions(&dir, true);
         aster_bridge_core::secrets::set_data_dir_override(Some(dir.clone()));
         Ok(Self {
             data_dir: dir,
@@ -169,6 +195,9 @@ pub fn drain_timeout() -> Duration {
     #[cfg(feature = "test-support")]
     if let Some(ms) = env_u64("ASTER_BRIDGE_TEST_DRAIN_MS") {
         return Duration::from_millis(ms);
+    }
+    if cfg!(windows) {
+        return Duration::from_secs(4);
     }
     Duration::from_secs(8)
 }

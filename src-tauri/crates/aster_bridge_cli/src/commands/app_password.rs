@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use super::common;
 use crate::cli::AppPasswordCommand;
 use crate::context::Context;
-use crate::exit::{CliResult, EXIT_OK};
+use crate::exit::{CliError, CliResult, CODE_APP_PASSWORD_REVOKE, EXIT_OK};
 use crate::output::{format_timestamp, Tone};
 use crate::spinner;
 
@@ -39,7 +39,8 @@ pub async fn run(ctx: &Context, command: AppPasswordCommand) -> CliResult<i32> {
 }
 
 async fn create(ctx: &Context, label: Option<String>, email: &str) -> CliResult<i32> {
-    common::clean_label(label.as_deref())?;
+    let label = Some(common::clean_label(label.as_deref())?);
+    let owned_label = label.clone();
     let out = &ctx.out;
     let result = spinner::while_working(
         out,
@@ -49,9 +50,9 @@ async fn create(ctx: &Context, label: Option<String>, email: &str) -> CliResult<
             ctx,
             "app_password_create",
             json!({ "label": label }),
-            |offline| {
+            move |offline| {
                 let passwords = AppPasswords::new(offline.db.clone());
-                common::app_password_create(&passwords, &offline.state, label.as_deref())
+                common::app_password_create(&passwords, &offline.state, owned_label.as_deref())
             },
         ),
     )
@@ -129,21 +130,35 @@ async fn list(ctx: &Context) -> CliResult<i32> {
 }
 
 async fn revoke(ctx: &Context, id: &str) -> CliResult<i32> {
+    let owned_id = id.to_string();
     let result = common::call_or_offline(
         ctx,
         "app_password_revoke",
         json!({ "id": id }),
-        |offline| common::app_password_revoke(&AppPasswords::new(offline.db.clone()), id),
+        move |offline| {
+            common::app_password_revoke(&AppPasswords::new(offline.db.clone()), &owned_id)
+        },
     )
     .await?;
     let out = &ctx.out;
+    let revoked = result
+        .get("revoked")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(revoked) = revoked else {
+        return Err(CliError::coded(
+            CODE_APP_PASSWORD_REVOKE,
+            format!("Aster Bridge didn't confirm that it revoked app password {}.", id.trim()),
+        )
+        .with_hint("To check which app passwords are active, run: aster-bridge app-password list"));
+    };
     if out.json {
         out.json(result);
     } else {
         out.line(format!(
             "{} Revoked app password {}. Email apps that use it can't sign in anymore.",
             out.mark(Tone::Good),
-            id.trim()
+            revoked
         ));
     }
     Ok(EXIT_OK)

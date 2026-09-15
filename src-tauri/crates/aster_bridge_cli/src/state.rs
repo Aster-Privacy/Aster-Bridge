@@ -164,30 +164,56 @@ pub fn clear_pending(data_dir: &Path) {
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
+    let mut last = String::new();
+    for attempt in 0..8u32 {
+        let tmp = scratch_path(path, attempt);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = match options.open(&tmp) {
+            Ok(file) => file,
+            Err(e) => {
+                last = e.to_string();
+                continue;
+            }
+        };
+        let result = (|mut file: std::fs::File| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })(file);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("couldn't write {}: {}", path.display(), e));
+            }
+        }
+    }
+    Err(format!("couldn't write {}: {}", path.display(), last))
+}
+
+fn scratch_path(path: &Path, attempt: u32) -> std::path::PathBuf {
     let file_name = path
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("couldn't write {}: {}", path.display(), e));
-    }
-    Ok(())
+    let spin = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        spin,
+        attempt
+    ))
 }
 
 #[cfg(test)]

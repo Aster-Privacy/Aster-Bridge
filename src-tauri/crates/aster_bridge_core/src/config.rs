@@ -209,8 +209,16 @@ pub fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
 pub fn save_config(config: &BridgeConfig) -> Result<(), String> {
     let config_path = config.data_dir.join("config.toml");
     let contents = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(&config_path, contents).map_err(|e| e.to_string())?;
-    Ok(())
+    let scratch = config_path.with_extension("toml.new");
+    let _ = std::fs::remove_file(&scratch);
+    std::fs::write(&scratch, contents).map_err(|e| e.to_string())?;
+    match std::fs::rename(&scratch, &config_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&scratch);
+            Err(e.to_string())
+        }
+    }
 }
 
 #[cfg(test)]

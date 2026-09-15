@@ -27,6 +27,7 @@ pub mod outbox;
 pub mod serve;
 pub mod service;
 pub mod status;
+pub mod stop;
 
 use crate::cli::{Cli, Command, SyncCommand, TlsCommand};
 use crate::context::{self, Context};
@@ -54,6 +55,7 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
             service,
         } => serve::run(&ctx, json_events, service).await,
         Command::Status { refresh, live } => status::run(&ctx, refresh, live).await,
+        Command::Stop => stop::run(&ctx).await,
         Command::AppPassword(command) => app_password::run(&ctx, command).await,
         Command::Outbox(command) => outbox::run(&ctx, command).await,
         Command::Sync(SyncCommand::Now) => misc::sync_now(&ctx).await,

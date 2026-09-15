@@ -194,7 +194,14 @@ async fn wait_for_confirmation(
                 spinner.tick();
             }
             _ = poll.tick() => {
-                match ops::poll_device_sign_in(client, identity, dir, &pending.normalized).await {
+                let polled = tokio::select! {
+                    _ = &mut cancel => {
+                        break Err(CliError::new(EXIT_ERROR, CODE_SIGN_IN_CANCELED, "Sign-in canceled.")
+                            .with_hint("The code stays valid until it expires. To continue, run: aster-bridge login"));
+                    }
+                    polled = ops::poll_device_sign_in(client, identity, dir, &pending.normalized) => polled,
+                };
+                match polled {
                     Ok(SignInPoll::Pending(_)) => {}
                     Ok(SignInPoll::Expired) => break Err(expired(dir)),
                     Ok(SignInPoll::Confirmed(session)) => break Ok(*session),

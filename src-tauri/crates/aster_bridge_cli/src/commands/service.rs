@@ -50,6 +50,23 @@ pub struct Spec {
 }
 
 impl Spec {
+    fn validate(&self) -> CliResult<()> {
+        let mut paths = vec![self.exe.as_path(), self.data_dir.as_path()];
+        if let Some(key_file) = &self.key_file {
+            paths.push(key_file.as_path());
+        }
+        for path in paths {
+            if path.to_str().is_none() {
+                return Err(CliError::coded(
+                    CODE_PROGRAM_PATH,
+                    format!("The background service needs paths this computer can write as text, and {} isn't one.", path.display()),
+                )
+                .with_hint("Move Aster Bridge and its data folder to a path without unusual characters, then run the command again."));
+            }
+        }
+        Ok(())
+    }
+
     fn args(&self) -> Vec<String> {
         vec![
             self.exe.display().to_string(),
@@ -136,21 +153,24 @@ async fn install(ctx: &Context) -> CliResult<i32> {
     let key_file = key_file_for_service(dir)?;
 
     let installed = platform::exists(dir);
-    if control::running(dir).await.is_some() {
+    let guard = if control::running(dir).await.is_some() {
         if !installed {
             return Err(CliError::locked("Aster Bridge is already running in this data folder.")
                 .with_hint("To install the background service, stop that copy first, then run the command again."));
         }
         stop_running(ctx).await?;
+        None
     } else {
-        drop(InstanceLock::acquire(dir)?);
-    }
+        Some(InstanceLock::acquire(dir)?)
+    };
 
     let spec = Spec {
         exe: current_exe()?,
         data_dir: dir.clone(),
         key_file,
     };
+    spec.validate()?;
+    drop(guard);
     platform::install(&spec)?;
     let pid = wait_for_start(dir).await;
 
@@ -397,9 +417,13 @@ mod platform {
         std::fs::write(&path, unit(spec)?)
             .map_err(|e| CliError::coded(CODE_SERVICE_FILE, format!("Couldn't write {}: {}", path.display(), e)))?;
         let name = unit_name(&spec.data_dir);
-        run_tool("systemctl", &["--user", "daemon-reload"])?;
-        run_tool("systemctl", &["--user", "enable", &name])?;
-        run_tool("systemctl", &["--user", "restart", &name])?;
+        let registered = run_tool("systemctl", &["--user", "daemon-reload"])
+            .and_then(|_| run_tool("systemctl", &["--user", "enable", &name]))
+            .and_then(|_| run_tool("systemctl", &["--user", "restart", &name]));
+        if let Err(e) = registered {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -417,6 +441,12 @@ mod platform {
         Ok(())
     }
 
+    fn current_user_name() -> Option<String> {
+        let (_, stdout) = probe_tool("id", &["-un"])?;
+        let name = stdout.trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
     pub fn state(data_dir: &Path) -> Option<String> {
         let (_, stdout) = probe_tool("systemctl", &["--user", "is-active", &unit_name(data_dir)])?;
         let state = stdout.trim();
@@ -424,7 +454,11 @@ mod platform {
     }
 
     pub fn extra_hint() -> Option<String> {
-        let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or_else(|| std::env::var("LOGNAME").ok().filter(|u| !u.is_empty()))
+            .or_else(current_user_name)?;
         if Path::new("/var/lib/systemd/linger").join(&user).exists() {
             return None;
         }

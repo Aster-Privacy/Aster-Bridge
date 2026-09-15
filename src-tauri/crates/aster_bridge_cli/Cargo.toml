@@ -46,6 +46,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = "0.4"
 dirs = "5"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["vendored"] }
 

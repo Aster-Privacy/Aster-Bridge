@@ -26,6 +26,28 @@ use crate::cli::{ColorChoice, GlobalArgs, ThemeChoice};
 use crate::exit::CliError;
 use crate::theme::{self, ColorDepth, Palette, Role};
 
+pub fn write_stdout(text: &str) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    if handle.write_all(text.as_bytes()).is_err() || handle.flush().is_err() {
+        restore_console();
+        std::process::exit(crate::exit::EXIT_OK);
+    }
+}
+
+macro_rules! out_line {
+    () => { $crate::output::write_stdout("\n") };
+    ($($arg:tt)*) => {
+        $crate::output::write_stdout(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+macro_rules! out_text {
+    ($($arg:tt)*) => { $crate::output::write_stdout(&format!($($arg)*)) };
+}
+
+pub(crate) use out_text;
+
 pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +97,7 @@ pub struct Output {
     err_palette: Palette,
     animate: bool,
     unicode: bool,
+    rich_unicode: bool,
 }
 
 impl Output {
@@ -125,6 +148,7 @@ impl Output {
             err_palette: Palette::new(appearance, err_depth),
             animate: !json && stdout_tty && depth != ColorDepth::None,
             unicode: unicode_ready(),
+            rich_unicode: unicode_ready() && rich_glyphs_ready(),
         }
     }
 
@@ -140,21 +164,30 @@ impl Output {
         self.unicode
     }
 
+    pub fn rich_unicode(&self) -> bool {
+        self.rich_unicode
+    }
+
     pub fn stdout_is_terminal(&self) -> bool {
         !self.json && std::io::stdout().is_terminal()
     }
 
     pub fn json(&self, value: Value) {
-        println!("{}", envelope(value));
+        out_line!("{}", envelope(value));
         let _ = std::io::stdout().flush();
     }
 
     pub fn line(&self, text: impl AsRef<str>) {
-        println!("{}", text.as_ref());
+        let text = text.as_ref();
+        if text.is_empty() {
+            out_line!();
+        } else {
+            out_line!("  {}", text);
+        }
     }
 
     pub fn blank(&self) {
-        println!();
+        out_line!();
     }
 
     pub fn bold(&self, text: &str) -> String {
@@ -257,7 +290,14 @@ impl Output {
     }
 
     pub fn dot(&self, tone: Tone) -> String {
-        self.tone(if self.unicode { "\u{25CF}" } else { "*" }, tone)
+        let glyph = if self.rich_unicode {
+            "\u{2726}"
+        } else if self.unicode {
+            "\u{25CF}"
+        } else {
+            "*"
+        };
+        self.tone(glyph, tone)
     }
 
     pub fn mark(&self, tone: Tone) -> String {
@@ -293,7 +333,7 @@ impl Output {
         } else {
             self.bold(title)
         };
-        println!("{} {}", glyph, title);
+        out_line!("  {} {}", glyph, title);
     }
 
     pub fn fields(&self, rows: &[(&str, String)]) {
@@ -303,7 +343,7 @@ impl Output {
             .max()
             .unwrap_or(0);
         for (label, value) in rows {
-            println!("  {}  {}", self.dim(&pad(label, width)), value);
+            out_line!("  {}  {}", self.dim(&pad(label, width)), value);
         }
     }
 
@@ -314,7 +354,7 @@ impl Output {
             .max()
             .unwrap_or(0);
         for (index, (text, command)) in rows.iter().enumerate() {
-            println!(
+            out_line!(
                 "  {} {}  {}",
                 self.accent(&format!("{}.", index + 1)),
                 pad(text, width),
@@ -332,26 +372,31 @@ impl Output {
                 }
             }
         }
+        fit_columns(&mut widths, terminal_width());
         let header = headers
             .iter()
             .enumerate()
-            .map(|(i, h)| pad(h, widths[i]))
+            .map(|(i, h)| pad(&truncate_visible(h, widths[i]), widths[i]))
             .collect::<Vec<_>>()
             .join("  ");
-        println!("  {}", self.dim(header.trim_end()));
+        out_line!("  {}", self.dim(header.trim_end()));
         for row in rows {
             let line = row
                 .iter()
                 .enumerate()
-                .map(|(i, cell)| pad(cell, widths.get(i).copied().unwrap_or(0)))
+                .map(|(i, cell)| {
+                    let width = widths.get(i).copied().unwrap_or(0);
+                    pad(&truncate_visible(cell, width), width)
+                })
                 .collect::<Vec<_>>()
                 .join("  ");
-            println!("  {}", line.trim_end());
+            out_line!("  {}", line.trim_end());
         }
     }
 
     pub fn warn(&self, text: impl AsRef<str>) {
         if self.json {
+            eprintln!("{}", serde_json::json!({ "warning": text.as_ref() }));
             return;
         }
         let sequence = self.err_palette.sequence(Role::Warn);
@@ -378,7 +423,11 @@ impl Output {
         };
         eprintln!("{} {}", label, err.message);
         for (name, value) in error_details(err) {
-            eprintln!("  {}  {}", self.err_dim(&pad(name, 9)), value);
+            eprintln!(
+                "  {}  {}",
+                self.err_dim(&pad(name, DETAIL_LABEL_WIDTH)),
+                indent_continuation(&value)
+            );
         }
     }
 
@@ -389,6 +438,16 @@ impl Output {
         }
         format!("\x1b[{}m{}\x1b[0m", sequence, text)
     }
+}
+
+const DETAIL_LABEL_WIDTH: usize = 9;
+
+fn indent_continuation(value: &str) -> String {
+    if !value.contains('\n') {
+        return value.to_string();
+    }
+    let padding = " ".repeat(DETAIL_LABEL_WIDTH + 4);
+    value.replace('\n', &format!("\n{}", padding))
 }
 
 pub fn error_details(err: &CliError) -> Vec<(&'static str, String)> {
@@ -438,9 +497,50 @@ fn console_width() -> Option<usize> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn console_width() -> Option<usize> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    for descriptor in [libc::STDOUT_FILENO, libc::STDERR_FILENO, libc::STDIN_FILENO] {
+        let ok = unsafe { libc::ioctl(descriptor, libc::TIOCGWINSZ, &mut size) } == 0;
+        if ok && size.ws_col > 0 {
+            return Some(usize::from(size.ws_col));
+        }
+    }
+    None
+}
+
+#[cfg(not(any(windows, unix)))]
 fn console_width() -> Option<usize> {
     None
+}
+
+const NARROWEST_COLUMN: usize = 4;
+
+fn fit_columns(widths: &mut [usize], terminal: Option<usize>) {
+    let Some(terminal) = terminal else {
+        return;
+    };
+    if widths.is_empty() {
+        return;
+    }
+    let room = terminal.saturating_sub(3 + 2 * (widths.len() - 1));
+    if room == 0 {
+        return;
+    }
+    for index in (0..widths.len()).rev() {
+        let total: usize = widths.iter().sum();
+        if total <= room {
+            return;
+        }
+        let surplus = total - room;
+        let spare = widths[index].saturating_sub(NARROWEST_COLUMN);
+        widths[index] -= surplus.min(spare);
+    }
 }
 
 pub fn truncate_visible(text: &str, width: usize) -> String {
@@ -465,17 +565,27 @@ pub fn truncate_visible(text: &str, width: usize) -> String {
             }
             continue;
         }
-        if visible + 1 >= width {
+        let columns = char_columns(character);
+        if visible + columns + 1 > width {
             kept.push('\u{2026}');
             break;
         }
         kept.push(character);
-        visible += 1;
+        visible += columns;
     }
     if colored {
         kept.push_str("\x1b[0m");
     }
     kept
+}
+
+fn rich_glyphs_ready() -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("TERM").is_some()
+        || std::env::var_os("TERM_PROGRAM").is_some()
 }
 
 #[cfg(windows)]
@@ -489,12 +599,34 @@ fn unicode_ready() -> bool {
     }
     unsafe {
         const CP_UTF8: u32 = 65001;
-        if GetConsoleOutputCP() == CP_UTF8 {
+        let previous = GetConsoleOutputCP();
+        if previous == CP_UTF8 {
             return true;
         }
-        SetConsoleOutputCP(CP_UTF8) != 0
+        if SetConsoleOutputCP(CP_UTF8) == 0 {
+            return false;
+        }
+        PREVIOUS_CODE_PAGE.store(previous, std::sync::atomic::Ordering::SeqCst);
+        true
     }
 }
+
+#[cfg(windows)]
+static PREVIOUS_CODE_PAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(windows)]
+pub fn restore_console() {
+    use windows_sys::Win32::System::Console::SetConsoleOutputCP;
+    let previous = PREVIOUS_CODE_PAGE.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if previous != 0 {
+        unsafe {
+            SetConsoleOutputCP(previous);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restore_console() {}
 
 #[cfg(not(windows))]
 fn unicode_ready() -> bool {
@@ -566,10 +698,39 @@ pub fn visible_len(text: &str) -> usize {
         } else if c == '\x1b' {
             in_escape = true;
         } else {
-            count += 1;
+            count += char_columns(c);
         }
     }
     count
+}
+
+pub fn char_columns(character: char) -> usize {
+    let point = u32::from(character);
+    if character == '\u{200d}' || (0x0300..=0x036f).contains(&point) {
+        return 0;
+    }
+    let wide = matches!(
+        point,
+        0x1100..=0x115f
+            | 0x2e80..=0x303e
+            | 0x3041..=0x33ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xa000..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1f64f
+            | 0x1f680..=0x1f9ff
+            | 0x20000..=0x3fffd
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
 }
 
 fn pad(text: &str, width: usize) -> String {
@@ -606,6 +767,9 @@ pub fn format_elapsed(seconds: i64) -> String {
 }
 
 pub fn format_relative(unix: i64, now: i64) -> String {
+    if unix <= 0 {
+        return "an unknown time".to_string();
+    }
     let difference = now - unix;
     if difference < 0 {
         return format_timestamp(unix);
@@ -781,6 +945,40 @@ mod tests {
     }
 
     #[test]
+    fn a_hint_that_wraps_lines_up_under_its_label() {
+        let indented = indent_continuation("first line\nsecond line");
+        assert_eq!(indented, "first line\n             second line");
+        assert_eq!(indent_continuation("only one line"), "only one line");
+    }
+
+    #[test]
+    fn a_wide_table_fits_a_narrow_terminal() {
+        let mut widths = vec![10, 4, 26, 46];
+        fit_columns(&mut widths, Some(40));
+        assert!(widths.iter().sum::<usize>() + 3 + 2 * 3 <= 40);
+        assert_eq!(widths[0], 10);
+        assert_eq!(widths[1], 4);
+    }
+
+    #[test]
+    fn a_table_that_already_fits_keeps_its_columns() {
+        let mut widths = vec![10, 4, 26, 46];
+        let original = widths.clone();
+        fit_columns(&mut widths, Some(200));
+        assert_eq!(widths, original);
+        let mut unknown = original.clone();
+        fit_columns(&mut unknown, None);
+        assert_eq!(unknown, original);
+    }
+
+    #[test]
+    fn columns_never_shrink_past_the_narrowest_width() {
+        let mut widths = vec![30, 30, 30];
+        fit_columns(&mut widths, Some(8));
+        assert!(widths.iter().all(|width| *width >= NARROWEST_COLUMN));
+    }
+
+    #[test]
     fn sweep_levels_stay_within_the_tail() {
         for frame in 0..200 {
             let levels = sweep_levels(28, frame);
@@ -881,6 +1079,7 @@ mod tests {
         assert_eq!(format_elapsed(7200), "2 hours");
         assert_eq!(format_elapsed(172_800), "2 days");
         assert_eq!(format_relative(100, 110), "just now");
-        assert_eq!(format_relative(0, 120), "2 minutes ago");
+        assert_eq!(format_relative(1, 121), "2 minutes ago");
+        assert_eq!(format_relative(0, 120), "an unknown time");
     }
 }

@@ -164,11 +164,8 @@ fn render(ctx: &Context, s: &Snapshot) {
         out.json(to_json(ctx, s));
         return;
     }
-    let data_dir = ctx.data_dir.display().to_string();
     if !s.signed_in {
         out.banner(Tone::Muted, "Signed out");
-        out.blank();
-        out.fields(&[("Data folder", data_dir)]);
         out.blank();
         out.line(format!(
             "To link this device to your account, run: {}",
@@ -246,7 +243,11 @@ fn render(ctx: &Context, s: &Snapshot) {
         let pending = outbox["pending"].as_u64().unwrap_or_default();
         let failed = outbox["failed"].as_u64().unwrap_or_default();
         let sent = outbox["sent_24h"].as_u64().unwrap_or_default();
-        let mut text = format!("{} waiting, {} sent in the last 24 hours", pending, sent);
+        let mut text = if pending == 0 && failed == 0 && sent == 0 {
+            "Empty".to_string()
+        } else {
+            format!("{} waiting, {} sent after retrying in the last 24 hours", pending, sent)
+        };
         if failed > 0 {
             text.push_str(&format!(", {}", out.tone(&format!("{} failed", failed), Tone::Bad)));
         }
@@ -260,7 +261,6 @@ fn render(ctx: &Context, s: &Snapshot) {
             ));
         }
     }
-    rows.push(("Data folder", data_dir));
     out.fields(&rows);
 
     if let Some(v) = live {
@@ -313,28 +313,55 @@ async fn run_live(ctx: &Context) -> CliResult<i32> {
     let cancel = signals::ctrl_c();
     tokio::pin!(cancel);
     let mut tick = tokio::time::interval(LIVE_INTERVAL);
+    if redraw {
+        crate::output::out_text!("\x1b[?25l\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+    let stop = |redraw: bool| {
+        if redraw {
+            crate::output::out_text!("\x1b[?25h");
+            let _ = std::io::stdout().flush();
+        }
+    };
     loop {
         tokio::select! {
             _ = &mut cancel => {
+                stop(redraw);
                 if redraw {
                     out.blank();
                 }
                 return Ok(EXIT_OK);
             }
-            _ = tick.tick() => {
-                let snapshot = snapshot(ctx, false).await?;
-                if redraw {
-                    print!("\x1b[2J\x1b[H");
-                }
-                render(ctx, &snapshot);
-                if redraw {
-                    out.blank();
-                    out.line(out.dim("Updates every 2 seconds. Press Control-C to stop."));
-                } else if !out.json {
-                    out.blank();
-                }
-                let _ = std::io::stdout().flush();
-            }
+            _ = tick.tick() => {}
         }
+        let taken = tokio::select! {
+            _ = &mut cancel => {
+                stop(redraw);
+                if redraw {
+                    out.blank();
+                }
+                return Ok(EXIT_OK);
+            }
+            taken = snapshot(ctx, false) => taken,
+        };
+        let taken = match taken {
+            Ok(taken) => taken,
+            Err(e) => {
+                stop(redraw);
+                return Err(e);
+            }
+        };
+        if redraw {
+            crate::output::out_text!("\x1b[?2026h\x1b[H");
+        }
+        render(ctx, &taken);
+        if redraw {
+            out.blank();
+            out.line(out.dim("Updates every 2 seconds. Press Control-C to stop."));
+            crate::output::out_text!("\x1b[0J\x1b[?2026l");
+        } else if !out.json {
+            out.blank();
+        }
+        let _ = std::io::stdout().flush();
     }
 }

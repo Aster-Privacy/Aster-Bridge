@@ -31,13 +31,24 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
-use crate::exit::{CliError, CODE_CONTROL_UNREACHABLE, EXIT_ERROR};
+use crate::exit::{CliError, CODE_CONTROL_TIMEOUT, CODE_CONTROL_UNREACHABLE, EXIT_ERROR};
 
 const CONTROL_FILE: &str = "control.json";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(45);
+const LONG_RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+const LONG_RUNNING_OPS: [&str; 3] = ["sync_now", "repair_cache", "outbox_retry"];
+
+fn response_read_timeout(op: &str) -> Duration {
+    if LONG_RUNNING_OPS.contains(&op) {
+        LONG_RESPONSE_READ_TIMEOUT
+    } else {
+        RESPONSE_READ_TIMEOUT
+    }
+}
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, CliError>> + Send>>;
 pub type Handler = Arc<dyn Fn(String, Value) -> HandlerFuture + Send + Sync>;
@@ -64,10 +75,12 @@ pub fn control_path(data_dir: &Path) -> PathBuf {
 pub struct ControlServer {
     path: PathBuf,
     pid: u32,
+    accept_loop: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
+        self.accept_loop.abort();
         let owned = std::fs::read(&self.path)
             .ok()
             .and_then(|b| serde_json::from_slice::<ControlFile>(&b).ok())
@@ -100,7 +113,7 @@ pub async fn start(data_dir: &Path, handler: Handler) -> std::io::Result<Control
     aster_bridge_core::secrets::restrict_permissions(&path, false);
 
     let token = Arc::new(token);
-    tokio::spawn(async move {
+    let accept_loop = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -116,7 +129,11 @@ pub async fn start(data_dir: &Path, handler: Handler) -> std::io::Result<Control
             }
         }
     });
-    Ok(ControlServer { path, pid })
+    Ok(ControlServer {
+        path,
+        pid,
+        accept_loop,
+    })
 }
 
 async fn serve_connection(stream: TcpStream, token: &str, handler: Handler) -> std::io::Result<()> {
@@ -156,6 +173,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub enum CallError {
     Unreachable,
+    TimedOut,
     Remote(CliError),
 }
 
@@ -199,8 +217,9 @@ impl ControlClient {
         }
         let mut reader = BufReader::new(read.take(MAX_RESPONSE_BYTES));
         let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(n) if n > 0 => {}
+        match tokio::time::timeout(response_read_timeout(op), reader.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => {}
+            Err(_) => return Err(CallError::TimedOut),
             _ => return Err(CallError::Unreachable),
         }
         let response: Value = serde_json::from_str(line.trim()).map_err(|_| CallError::Unreachable)?;
@@ -230,6 +249,10 @@ pub async fn call_running(data_dir: &Path, op: &str, args: Value) -> Result<Opti
     match client.call(op, args).await {
         Ok(value) => Ok(Some(value)),
         Err(CallError::Remote(err)) => Err(err),
+        Err(CallError::TimedOut) => Err(CliError::coded(
+            CODE_CONTROL_TIMEOUT,
+            "Aster Bridge is taking longer than expected to finish the request.",
+        )),
         Err(CallError::Unreachable) => Err(CliError::coded(
             CODE_CONTROL_UNREACHABLE,
             "Aster Bridge stopped responding while handling the request.",
@@ -266,6 +289,15 @@ mod tests {
             Err(CallError::Remote(e)) => assert_eq!(e.exit_code, crate::exit::EXIT_USAGE),
             _ => panic!("expected a remote error"),
         }
+    }
+
+    #[tokio::test]
+    async fn slow_operations_get_a_longer_deadline() {
+        assert_eq!(response_read_timeout("status"), RESPONSE_READ_TIMEOUT);
+        assert!(LONG_RESPONSE_READ_TIMEOUT > RESPONSE_READ_TIMEOUT);
+        assert_eq!(response_read_timeout("sync_now"), LONG_RESPONSE_READ_TIMEOUT);
+        assert_eq!(response_read_timeout("repair_cache"), LONG_RESPONSE_READ_TIMEOUT);
+        assert_eq!(response_read_timeout("outbox_retry"), LONG_RESPONSE_READ_TIMEOUT);
     }
 
     #[tokio::test]

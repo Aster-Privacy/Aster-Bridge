@@ -26,11 +26,11 @@ use crate::output::{terminal_width, truncate_visible, visible_len, Output, Tone}
 
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
-const UNICODE_FRAMES: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-    "\u{2807}", "\u{280f}",
-];
-const ASCII_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+const GUTTER: &str = "  ";
+const GLYPH_HOLD: usize = 5;
+const UNICODE_FRAMES: [&str; 4] = ["\u{2726}", "\u{2727}", "\u{00b7}", "\u{2727}"];
+const SIMPLE_FRAMES: [&str; 4] = ["\u{25cf}", "\u{2022}", "\u{b7}", "\u{2022}"];
+const ASCII_FRAMES: [&str; 4] = ["O", "o", ".", "o"];
 
 pub struct Spinner {
     out: Output,
@@ -135,7 +135,7 @@ impl Spinner {
 
     fn compose(&mut self, width: Option<usize>) -> Option<String> {
         let frames = self.frames();
-        let glyph = frames[self.frame % frames.len()];
+        let glyph = frames[(self.frame / GLYPH_HOLD) % frames.len()];
         let mut rendered = format!(
             "{} {}",
             self.out.tone(glyph, Tone::Accent),
@@ -145,7 +145,7 @@ impl Spinner {
             rendered.push_str(&format!("  {}", self.out.dim(&self.detail)));
         }
         if let Some(width) = width {
-            let room = width.saturating_sub(1);
+            let room = width.saturating_sub(GUTTER.len() + 1);
             if room == 0 {
                 return None;
             }
@@ -154,19 +154,15 @@ impl Spinner {
         if rendered == self.painted {
             return None;
         }
-        let visible = visible_len(&rendered);
+        let visible = GUTTER.len() + visible_len(&rendered);
         let mut frame = String::with_capacity(rendered.len() + 16);
         frame.push('\r');
-        if self.out.ansi() {
-            frame.push_str("\x1b[2K");
-            frame.push_str(&rendered);
-        } else {
-            frame.push_str(&rendered);
-            if self.drawn > visible {
-                frame.push_str(&" ".repeat(self.drawn - visible));
-                frame.push('\r');
-                frame.push_str(&rendered);
-            }
+        frame.push_str(GUTTER);
+        frame.push_str(&rendered);
+        let room = width.map_or(usize::MAX, |width| width.saturating_sub(1));
+        let padding = (self.drawn.saturating_sub(visible)).min(room.saturating_sub(visible));
+        if padding > 0 {
+            frame.push_str(&" ".repeat(padding));
         }
         self.drawn = visible;
         self.painted = rendered;
@@ -174,8 +170,10 @@ impl Spinner {
     }
 
     fn frames(&self) -> &'static [&'static str] {
-        if self.out.unicode() {
+        if self.out.rich_unicode() {
             &UNICODE_FRAMES
+        } else if self.out.unicode() {
+            &SIMPLE_FRAMES
         } else {
             &ASCII_FRAMES
         }
@@ -257,14 +255,14 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_is_one_write_that_starts_by_clearing_the_line() {
+    fn a_frame_is_one_write_that_repaints_in_place() {
         let out = animating();
         let mut spinner = Spinner::start(&out, "Listening for your email app");
         spinner.painted.clear();
         let frame = spinner.compose(Some(120)).expect("first frame");
-        assert!(frame.starts_with("\r\x1b[2K"));
+        assert!(frame.starts_with("\r  "));
         assert_eq!(frame.matches('\r').count(), 1);
-        assert_eq!(frame.matches("\x1b[2K").count(), 1);
+        assert_eq!(frame.matches("\x1b[2K").count(), 0);
         assert!(frame.ends_with("\x1b[0m"));
     }
 
@@ -288,7 +286,7 @@ mod tests {
             spinner.painted.clear();
             spinner.frame += 1;
             let frame = spinner.compose(Some(width)).expect("frame");
-            let body = frame.trim_start_matches('\r').trim_start_matches("\x1b[2K");
+            let body = frame.trim_start_matches('\r');
             assert!(
                 visible_len(body) < width,
                 "width {} produced {} columns",
@@ -297,7 +295,7 @@ mod tests {
             );
         }
         spinner.painted.clear();
-        assert!(spinner.compose(Some(1)).is_none());
+        assert!(spinner.compose(Some(3)).is_none());
     }
 
     #[test]

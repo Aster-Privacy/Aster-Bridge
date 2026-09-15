@@ -33,9 +33,23 @@ pub async fn shutdown() {
         ctrl_c().await;
         return;
     };
+    let mut hangup = signal(SignalKind::hangup()).ok();
+    let mut quit = signal(SignalKind::quit()).ok();
     tokio::select! {
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
+        _ = async {
+            match hangup.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        } => {}
+        _ = async {
+            match quit.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        } => {}
     }
 }
 

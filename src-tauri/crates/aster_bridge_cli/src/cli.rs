@@ -111,6 +111,8 @@ pub enum Command {
         #[arg(long, conflicts_with = "refresh", help = "Keep the status on screen and update it")]
         live: bool,
     },
+    #[command(about = "Stop the mail servers running on this computer")]
+    Stop,
     #[command(subcommand, about = "Manage passwords for email apps")]
     AppPassword(AppPasswordCommand),
     #[command(subcommand, about = "Inspect and retry outgoing mail")]

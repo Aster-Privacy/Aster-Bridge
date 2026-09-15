@@ -43,9 +43,10 @@ use crate::context::{self, Context};
 use crate::control;
 use crate::events::{self, CliEvents, SinkGuard};
 use crate::exit::{
-    CliError, CliResult, CODE_CACHE_REBUILD, CODE_OUTBOX_ALREADY_SENT, CODE_OUTBOX_NOT_FOUND,
-    CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
-    CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, EXIT_ERROR, EXIT_NOT_READY, EXIT_OK,
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CONTROL_UNREACHABLE, CODE_OUTBOX_ALREADY_SENT,
+    CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
+    CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, CODE_TLS_CERTIFICATE, EXIT_ERROR,
+    EXIT_NOT_READY, EXIT_OK,
 };
 use crate::lock::InstanceLock;
 use crate::output::Tone;
@@ -54,9 +55,21 @@ use crate::signals;
 use crate::spinner;
 use crate::state::{self, AccountInfo, PlanInfo, StopInfo};
 
+#[cfg(windows)]
+fn owns_its_console() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut pids = [0u32; 4];
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    count == 1
+}
+
+fn supervisor_restarts_every_failure() -> bool {
+    cfg!(target_os = "macos")
+}
+
 pub async fn run(ctx: &Context, json_events: bool, service: bool) -> CliResult<i32> {
     #[cfg(windows)]
-    if service {
+    if service && owns_its_console() {
         unsafe {
             windows_sys::Win32::System::Console::FreeConsole();
         }
@@ -74,6 +87,9 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool) -> CliResult<i
                 tokio::select! {
                     _ = tokio::time::sleep(context::service_failure_delay()) => {}
                     _ = signals::shutdown() => {}
+                }
+                if supervisor_restarts_every_failure() {
+                    return Ok(EXIT_OK);
                 }
                 return Ok(error.exit_code);
             }
@@ -185,7 +201,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
         return Err(CliError::not_signed_in());
     }
     tls::install_default_crypto_provider();
-    let mut config = common::load_config()?;
+    let config = common::load_config()?;
     let identity = device_identity::get_or_create_identity(&dir)
         .map_err(|e| map_store_error("Couldn't load the device identity", e))?;
     let Some(device_id) = identity.device_id else {
@@ -252,18 +268,19 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     });
 
     let tls_config = if config.tls_enabled {
-        match tls::ensure_cert(&dir).and_then(|(certs, key)| tls::server_config(certs, key)) {
-            Ok(server_config) => Some(server_config),
-            Err(e) => {
-                ctx.out.warn(format!(
-                    "TLS is off because the certificate couldn't be loaded: {}",
-                    e
-                ));
-                tracing::warn!("TLS disabled: {}", e);
-                config.tls_enabled = false;
-                None
-            }
-        }
+        let server_config = tls::ensure_cert(&dir)
+            .and_then(|(certs, key)| tls::server_config(certs, key))
+            .map_err(|e| {
+                tracing::warn!("TLS certificate unavailable: {}", e);
+                CliError::coded(
+                    CODE_TLS_CERTIFICATE,
+                    format!("Aster Bridge can't load its TLS certificate: {}", e),
+                )
+                .with_hint(
+                    "To serve without encryption on this device, run: aster-bridge config set tls_enabled false",
+                )
+            })?;
+        Some(server_config)
     } else {
         None
     };
@@ -319,16 +336,18 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
         config,
         refresh_lock: Mutex::new(()),
     });
-    let control_server = match control::start(&dir, handler(shared.clone())).await {
-        Ok(server) => Some(server),
-        Err(e) => {
-            ctx.out.warn(format!(
-                "Other aster-bridge commands can't reach this process: {}",
-                e
-            ));
-            None
-        }
-    };
+    let control_server = control::start(&dir, handler(shared.clone()))
+        .await
+        .map(Some)
+        .map_err(|e| {
+            CliError::coded(
+                CODE_CONTROL_UNREACHABLE,
+                format!("Aster Bridge can't open its control channel: {}", e),
+            )
+            .with_hint(
+                "Another copy might be using this data folder. Stop it, then run: aster-bridge serve",
+            )
+        })?;
 
     let services = shared.services();
     if ndjson {
@@ -397,12 +416,11 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
 
 fn print_banner(ctx: &Context, email: &str, plan_code: &str, services: &[Value]) {
     let out = &ctx.out;
-    out.banner(Tone::Good, "Aster Bridge is running");
+    out.banner(Tone::Accent, "Aster Bridge is running");
     out.blank();
     out.fields(&[
         ("Account", email.to_string()),
         ("Plan", common::plan_label(Some(plan_code))),
-        ("Data folder", ctx.data_dir.display().to_string()),
     ]);
     out.blank();
     out.table(&["SERVICE", "ADDRESS", "SECURITY"], &service_rows(services));
@@ -421,9 +439,12 @@ const RUNNING_LABEL: &str = "Listening for your email app";
 
 fn uptime_label(started: std::time::Instant) -> String {
     let seconds = started.elapsed().as_secs();
-    let hours = seconds / 3600;
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3600;
     let minutes = (seconds % 3600) / 60;
-    if hours > 0 {
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
         format!("{}h {}m", hours, minutes)
     } else if minutes > 0 {
         format!("{}m {}s", minutes, seconds % 60)

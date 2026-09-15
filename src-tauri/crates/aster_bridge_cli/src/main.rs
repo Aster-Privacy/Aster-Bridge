@@ -38,7 +38,9 @@ use clap::error::ErrorKind;
 use clap::Parser;
 
 fn main() {
-    std::process::exit(run());
+    let code = run();
+    output::restore_console();
+    std::process::exit(code);
 }
 
 fn run() -> i32 {

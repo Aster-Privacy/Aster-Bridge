@@ -35,9 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::context::{self, Context};
 use crate::exit::{
-    CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_NETWORK,
-    CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_SETTINGS_READ, CODE_SIGN_IN, EXIT_ACCESS, EXIT_ERROR,
-    UPGRADE_URL,
+    CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
+    CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_SETTINGS_READ, CODE_SIGN_IN,
+    EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::title_case;
@@ -192,13 +192,15 @@ pub fn open_offline(ctx: &Context) -> CliResult<Offline> {
 
 pub async fn call_or_offline<F>(ctx: &Context, op: &str, args: Value, offline: F) -> CliResult<Value>
 where
-    F: FnOnce(&Offline) -> CliResult<Value>,
+    F: FnOnce(&Offline) -> CliResult<Value> + Send + 'static,
 {
     if let Some(value) = crate::control::call_running(&ctx.data_dir, op, args).await? {
         return Ok(value);
     }
     let handle = open_offline(ctx)?;
-    offline(&handle)
+    tokio::task::spawn_blocking(move || offline(&handle))
+        .await
+        .map_err(|e| CliError::coded(CODE_INTERNAL, e.to_string()))?
 }
 
 pub async fn sign_in_offline(ctx: &Context) -> CliResult<(ApiClient, Session)> {
@@ -309,7 +311,7 @@ pub fn app_password_revoke(passwords: &AppPasswords, id: &str) -> CliResult<Valu
     if !passwords.list().iter().any(|entry| entry.id == id) {
         return Err(CliError::new(
             EXIT_ERROR,
-            "not_found",
+            crate::exit::CODE_NOT_FOUND,
             format!("No app password has the ID {}.", id),
         )
         .with_hint("To see your app passwords and their IDs, run: aster-bridge app-password list"));

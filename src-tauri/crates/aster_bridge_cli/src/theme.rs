@@ -166,7 +166,10 @@ pub fn to_ansi256(color: Rgb) -> u8 {
 }
 
 pub fn detect_depth(choice: ColorChoice, is_terminal: bool, vt_ready: bool) -> ColorDepth {
-    if choice == ColorChoice::Never || no_color_set() {
+    if choice == ColorChoice::Never {
+        return ColorDepth::None;
+    }
+    if no_color_set() && choice != ColorChoice::Always {
         return ColorDepth::None;
     }
     if !vt_ready {
@@ -175,13 +178,17 @@ pub fn detect_depth(choice: ColorChoice, is_terminal: bool, vt_ready: bool) -> C
     if choice == ColorChoice::Auto && !is_terminal {
         return ColorDepth::None;
     }
-    depth_from_env(|name| std::env::var(name).ok())
+    let depth = depth_from_env(|name| std::env::var(name).ok());
+    if depth == ColorDepth::None && choice == ColorChoice::Always {
+        return ColorDepth::Ansi16;
+    }
+    depth
 }
 
 pub fn depth_from_env(read: impl Fn(&str) -> Option<String>) -> ColorDepth {
     let term = read("TERM").unwrap_or_default().to_ascii_lowercase();
     if term == "dumb" {
-        return ColorDepth::Ansi16;
+        return ColorDepth::None;
     }
     let color_term = read("COLORTERM").unwrap_or_default().to_ascii_lowercase();
     if color_term.contains("truecolor") || color_term.contains("24bit") {
@@ -311,7 +318,7 @@ mod tests {
             ColorDepth::Ansi256
         );
         assert_eq!(depth_from_env(env(&[("TERM", "xterm")])), ColorDepth::Ansi16);
-        assert_eq!(depth_from_env(env(&[("TERM", "dumb")])), ColorDepth::Ansi16);
+        assert_eq!(depth_from_env(env(&[("TERM", "dumb")])), ColorDepth::None);
     }
 
     #[test]
