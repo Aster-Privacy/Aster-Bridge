@@ -133,6 +133,24 @@ aster-bridge --secret-backend file login
 
 Set `ASTER_BRIDGE_SECRET_BACKEND=file` so every command uses the file. Under systemd, you can supply the key as a credential named `secret-key` instead. Keep the key somewhere safe, because the tool can't read your account without it.
 
+### Colors
+
+Aster Bridge colors its output when your terminal supports color, and it matches those colors to your terminal background. To choose the background yourself, use `--theme`:
+
+```
+aster-bridge --theme dark status
+aster-bridge --theme light status
+```
+
+To turn color off, or to keep it on when you redirect output to a file, use `--color`:
+
+```
+aster-bridge --color never status
+aster-bridge --color always status > status.txt
+```
+
+To set either one for every command, use the `ASTER_BRIDGE_THEME` and `ASTER_BRIDGE_COLOR` environment variables. Aster Bridge also honors `NO_COLOR`, and it never colors `--json` output.
+
 ### Data folders and scripting
 
 The tool keeps its data in the following folder. To use another folder, pass `--data-dir` or set `ASTER_BRIDGE_DATA_DIR`.

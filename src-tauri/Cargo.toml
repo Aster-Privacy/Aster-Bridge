@@ -22,7 +22,7 @@ members = [".", "crates/aster_bridge_core", "crates/aster_bridge_cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.32"
+version = "0.4.33"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 

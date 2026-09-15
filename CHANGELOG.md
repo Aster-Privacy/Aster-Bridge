@@ -2,6 +2,17 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.33 - 2026-09-15
+
+### What's new
+- Aster Bridge now has a command-line tool. Run the same IMAP, SMTP, POP3, JMAP, and CardDAV servers on a server, a headless machine, or over SSH, with no window and no desktop libraries. Sign in with `aster-bridge login`, start the servers with `aster-bridge serve`, and run `aster-bridge service install` to start them at login. It keeps its own account, cache, and settings, so it runs alongside the desktop app. The README explains how to install it, store keys without a system keychain, and read its exit codes.
+- The command-line tool colors its output to match your terminal background. Use `--theme` and `--color` to choose, and it honors `NO_COLOR`.
+
+### Fixed
+- Your contacts now reach your mail app over CardDAV. Earlier versions asked the server for the wrong address and returned no cards at all.
+- App passwords now show their creation time in your own time zone, so it no longer looks later than the time they were last used.
+- Aster Bridge writes far fewer log messages while it syncs. Replies that keep their conversation and contacts it can't read no longer each write a warning.
+
 ## 0.4.32 - 2026-09-14
 
 ### Fixed
