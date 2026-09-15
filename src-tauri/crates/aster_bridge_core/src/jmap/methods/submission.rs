@@ -287,6 +287,20 @@ pub async fn set(
                 let reply = draft_reply(ctx, &msg);
                 crate::smtp::reply_thread::apply_reply_thread(&mut b, &ctx.client, &access_token, &reply).await;
                 attach_sent_copy(ctx, &mut b).await;
+                if let Err(e) = crate::crypto::internal_send::seal_internal_body(
+                    &mut b,
+                    &ctx.session,
+                    &ctx.client,
+                    &access_token,
+                )
+                .await
+                {
+                    not_created.insert(
+                        creation_id,
+                        json!({"type": "forbiddenToSend", "description": e.to_string()}),
+                    );
+                    continue;
+                }
                 b
             }
             Err(description) => {

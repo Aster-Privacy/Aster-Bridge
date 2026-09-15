@@ -25,6 +25,7 @@ pub mod draft;
 pub mod envelope;
 pub mod envelope_capability;
 pub mod inbound;
+pub mod internal_send;
 #[allow(dead_code)]
 pub mod metadata;
 pub mod preferences;
