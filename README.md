@@ -64,7 +64,7 @@ The `aster-bridge` command-line tool runs the same IMAP, SMTP, POP3, JMAP, and C
 
 ### Install the command-line tool
 
-Each release carries an archive for your platform, with a matching `.sha256` checksum file:
+To get the tool, open **Settings** > **Bridge** in Aster Mail and choose your platform under **Command line**, or download it from the [latest release](https://github.com/Aster-Privacy/Aster-Bridge/releases/latest). Each release carries an archive for your platform, with a matching `.sha256` checksum file:
 
 | Platform | Archive |
 |---|---|

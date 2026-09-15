@@ -505,19 +505,20 @@ jobs:
               continue
             fi
 
-            if [ "$name" = "Aster-Bridge-universal.dmg" ]; then
-              echo "::warning::no macOS build on $TAG; carrying over the dmg from the most recent release that has one"
-              for prev in $(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName'); do
-                [ "$prev" = "$TAG" ] && continue
-                if gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name' | grep -qxF "Aster-Bridge-universal.dmg"; then
-                  gh release download "$prev" --repo "$REPO" --pattern "Aster-Bridge-universal.dmg" --dir "$TMP" --clobber
-                  gh release upload "$TAG" "$TMP/Aster-Bridge-universal.dmg" --repo "$REPO" --clobber
-                  echo "::warning::carried over Aster-Bridge-universal.dmg from $prev - cut a fresh macOS build to replace it"
-                  break
-                fi
-              done
-              continue
-            fi
+            case "$name" in
+              Aster-Bridge-universal.dmg|aster-bridge-cli-*)
+                echo "::warning::$name is missing on $TAG; carrying it over from the most recent release that has it"
+                for prev in $(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName'); do
+                  [ "$prev" = "$TAG" ] && continue
+                  if gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name' | grep -qxF "$name"; then
+                    gh release download "$prev" --repo "$REPO" --pattern "$name" --dir "$TMP" --clobber
+                    gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
+                    echo "::warning::carried over $name from $prev - cut a fresh build to replace it"
+                    break
+                  fi
+                done
+                ;;
+            esac
           done
 
           ABSENT_OPTIONAL=()
