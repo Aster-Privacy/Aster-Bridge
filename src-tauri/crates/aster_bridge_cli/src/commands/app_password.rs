@@ -82,6 +82,11 @@ fn short_date(text: &str) -> String {
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
         return format_timestamp(parsed.timestamp());
     }
+    for pattern in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, pattern) {
+            return format_timestamp(naive.and_utc().timestamp());
+        }
+    }
     trimmed.replace('T', " ").chars().take(16).collect()
 }
 
@@ -156,6 +161,11 @@ mod tests {
     #[test]
     fn unix_created_at_still_renders() {
         assert_eq!(short_date("1789483860"), format_timestamp(1789483860));
+    }
+
+    #[test]
+    fn space_separated_created_at_is_read_as_utc() {
+        assert_eq!(short_date("2026-09-15 14:51:00"), format_timestamp(1789483860));
     }
 
     #[test]
