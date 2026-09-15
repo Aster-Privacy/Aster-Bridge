@@ -119,11 +119,23 @@ pub fn bridge_local_aster_id(message_id: &str) -> Option<&str> {
     valid.then_some(local)
 }
 
-fn cached_message_id(db: &Database, aster_id: &str) -> Option<String> {
+fn cached_metadata(db: &Database, aster_id: &str) -> Option<Value> {
     let msg = db.get_cached_message(aster_id).ok().flatten()?;
-    let meta: Value = serde_json::from_str(msg.raw_headers.as_deref()?).ok()?;
-    let raw = meta.get("message_id")?.as_str()?;
-    message_ids(raw).into_iter().next()
+    serde_json::from_str(msg.raw_headers.as_deref()?).ok()
+}
+
+fn cached_chain(db: &Database, aster_id: &str) -> Vec<String> {
+    let Some(meta) = cached_metadata(db, aster_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(refs) = meta.get("references").and_then(|v| v.as_str()) {
+        out.extend(message_ids(refs));
+    }
+    if let Some(mid) = meta.get("message_id").and_then(|v| v.as_str()) {
+        out.extend(message_ids(mid).into_iter().take(1));
+    }
+    out
 }
 
 fn aster_id_for(db: &Database, message_id: &str) -> Option<String> {
@@ -138,19 +150,23 @@ pub fn resolve_reply(db: &Database, headers: &ReplyHeaders) -> ResolvedReply {
     let chain: Vec<String> = headers
         .chain()
         .into_iter()
-        .filter_map(|id| match bridge_local_aster_id(&id) {
-            Some(local) => cached_message_id(db, local),
-            None => Some(id),
+        .flat_map(|id| match bridge_local_aster_id(&id) {
+            Some(local) => cached_chain(db, local),
+            None => vec![id],
         })
         .collect();
+    let in_reply_to = in_reply_to_value(&chain);
+    if in_reply_to.is_none() && parent_aster_id.is_some() {
+        tracing::warn!("reply has no usable parent message id, recipients see a new thread");
+    }
     ResolvedReply {
         parent_aster_id,
-        in_reply_to: in_reply_to_value(&chain),
+        in_reply_to,
     }
 }
 
 pub fn resolve_draft_reply(db: &Database, reply_to_id: &str) -> ResolvedReply {
-    let in_reply_to = cached_message_id(db, reply_to_id).and_then(|id| in_reply_to_value(&[id]));
+    let in_reply_to = in_reply_to_value(&cached_chain(db, reply_to_id));
     ResolvedReply {
         parent_aster_id: Some(reply_to_id.to_string()),
         in_reply_to,
@@ -496,6 +512,34 @@ mod tests {
         let r = resolve_reply(&db, &h);
         assert_eq!(r.parent_aster_id.as_deref(), Some("parent-2"));
         assert_eq!(r.in_reply_to.as_deref(), Some("<real-root@x.test>"));
+    }
+
+    #[test]
+    fn resolve_reply_carries_the_parents_own_references() {
+        let (_d, db) = test_db();
+        let meta = json!({
+            "is_html": false,
+            "message_id": "<parent@x.test>",
+            "references": "<root@x.test> <middle@x.test>"
+        })
+        .to_string();
+        db.upsert_cached_message(
+            "parent-3",
+            "inbox",
+            Some("s"),
+            Some("a@b.test"),
+            Some("me@aster.test"),
+            Some("2026-09-01T00:00:00Z"),
+            1,
+            Some("b"),
+            Some(&meta),
+        )
+        .unwrap();
+        let h = ReplyHeaders { in_reply_to: vec!["parent-3@aster-bridge".into()], references: vec![] };
+        let r = resolve_reply(&db, &h);
+        let chain = r.in_reply_to.unwrap();
+        assert!(chain.starts_with("<root@x.test> <middle@x.test>"));
+        assert!(chain.ends_with("<parent@x.test>"));
     }
 
     #[test]

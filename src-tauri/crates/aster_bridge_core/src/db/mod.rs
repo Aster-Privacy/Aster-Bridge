@@ -1413,6 +1413,21 @@ impl Database {
         })
     }
 
+    pub fn recache_messages_without_message_id(&self) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE message_cache SET body_cached = 0
+                 WHERE body_cached = 1
+                   AND (message_id IS NULL OR message_id = '')
+                   AND (raw_headers IS NULL
+                        OR NOT json_valid(raw_headers)
+                        OR json_extract(raw_headers, '$.message_id') IS NULL)",
+                [],
+            )?;
+            Ok(changed)
+        })
+    }
+
     pub fn update_message_thread_and_msgid(
         &self,
         aster_id: &str,
@@ -2254,6 +2269,64 @@ mod encryption_tests {
             )
             .unwrap();
         assert_eq!(count, 0, "fresh db must not expose old-key data");
+    }
+
+    #[test]
+    fn repairs_a_legacy_outbox_table_without_a_status_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [11u8; 32];
+        {
+            let db = Database::open_with_key(dir.path(), &key).unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_outbox_status_queued;
+                     DROP TABLE outbox;
+                     CREATE TABLE outbox (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         raw_mime BLOB NOT NULL,
+                         envelope_from TEXT NOT NULL,
+                         envelope_to TEXT NOT NULL,
+                         queued_at INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+        }
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let status_columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('outbox') WHERE name = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_columns, 1, "outbox must regain its status column");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_status_queued'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the queued index must exist after repair");
+    }
+
+    #[test]
+    fn recaches_only_messages_without_a_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[12u8; 32]).unwrap();
+        let with_id = serde_json::json!({"is_html": false, "message_id": "<a@x.test>"}).to_string();
+        let without_id = serde_json::json!({"is_html": false}).to_string();
+        db.upsert_cached_message("keep", "inbox", Some("s"), Some("a@x.test"), Some("b@x.test"), Some("2026-09-01T00:00:00Z"), 1, Some("body"), Some(&with_id)).unwrap();
+        db.upsert_cached_message("redo", "inbox", Some("s"), Some("a@x.test"), Some("b@x.test"), Some("2026-09-01T00:00:00Z"), 1, Some("body"), Some(&without_id)).unwrap();
+
+        assert_eq!(db.recache_messages_without_message_id().unwrap(), 1);
+        assert!(db.body_cached("keep"));
+        assert!(!db.body_cached("redo"));
+        assert_eq!(db.recache_messages_without_message_id().unwrap(), 0);
     }
 
     #[test]

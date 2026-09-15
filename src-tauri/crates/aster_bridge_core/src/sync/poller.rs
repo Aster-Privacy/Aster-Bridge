@@ -215,6 +215,20 @@ fn json_str(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+pub fn envelope_header(v: &serde_json::Value, name: &str) -> Option<String> {
+    let headers = v.get("raw_headers")?.as_array()?;
+    headers
+        .iter()
+        .find(|h| {
+            h.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+        })
+        .and_then(|h| h.get("value").and_then(|x| x.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 const DEFAULT_ATTACHMENT_CONTENT_TYPE: &str = "application/octet-stream";
 const ATTACHMENT_PLACEHOLDER_NAME: &str = "Attachment";
 
@@ -694,6 +708,8 @@ struct PreparedMessage {
     body_text: Option<String>,
     is_html: bool,
     message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
     attachments: Vec<EnvelopeAttachment>,
     expected_attachments: usize,
 }
@@ -809,7 +825,13 @@ fn prepare_mail_item(
             b.push_str("\n[truncated]");
         }
     }
-    let message_id = json_str(&parsed, "message_id").or_else(|| json_str(&parsed, "messageId"));
+    let message_id = json_str(&parsed, "message_id")
+        .or_else(|| json_str(&parsed, "messageId"))
+        .or_else(|| envelope_header(&parsed, "message-id"));
+    let in_reply_to = json_str(&parsed, "in_reply_to")
+        .or_else(|| envelope_header(&parsed, "in-reply-to"));
+    let references = json_str(&parsed, "references")
+        .or_else(|| envelope_header(&parsed, "references"));
     Prepared::Ready(PreparedMessage {
         subject,
         sender,
@@ -818,6 +840,8 @@ fn prepare_mail_item(
         body_text,
         is_html,
         message_id,
+        in_reply_to,
+        references,
         attachments,
         expected_attachments,
     })
@@ -846,6 +870,12 @@ fn commit_mail_item(
         "attachment_count".to_string(),
         serde_json::json!(attachment_count),
     );
+    if let Some(ref value) = prepared.in_reply_to {
+        raw_headers_map.insert("in_reply_to".to_string(), serde_json::json!(value));
+    }
+    if let Some(ref value) = prepared.references {
+        raw_headers_map.insert("references".to_string(), serde_json::json!(value));
+    }
     if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
             "attachments".to_string(),
@@ -1190,6 +1220,23 @@ fn retry_failed_inbound_items(
     (new_ids, updated_ids)
 }
 
+const MESSAGE_ID_BACKFILL_KEY: &str = "message_id_backfill_v1";
+
+fn backfill_missing_message_ids(db: &Database) {
+    if matches!(db.get_sync_state(MESSAGE_ID_BACKFILL_KEY), Ok(Some(_))) {
+        return;
+    }
+    match db.recache_messages_without_message_id() {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("sync: re-caching {} messages to recover message ids", count);
+            }
+            let _ = db.set_sync_state(MESSAGE_ID_BACKFILL_KEY, "done");
+        }
+        Err(e) => tracing::warn!("message id backfill failed: {}", e),
+    }
+}
+
 async fn run_sync_pass(
     session: &Arc<RwLock<Session>>,
     client: &Arc<ApiClient>,
@@ -1218,6 +1265,8 @@ async fn run_sync_pass(
         )
     };
     let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
+
+    backfill_missing_message_ids(db);
 
     let queries = build_folder_queries();
     let total_folders = queries.len();
@@ -2996,6 +3045,31 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(meta.get("attachment_count").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn envelope_header_reads_raw_headers_case_insensitively() {
+        let envelope = serde_json::json!({
+            "raw_headers": [
+                {"name": "Message-ID", "value": "<abc@example.com>"},
+                {"name": "in-reply-to", "value": "<parent@example.com>"},
+                {"name": "References", "value": " <root@example.com> <parent@example.com> "}
+            ]
+        });
+        assert_eq!(
+            envelope_header(&envelope, "message-id").as_deref(),
+            Some("<abc@example.com>")
+        );
+        assert_eq!(
+            envelope_header(&envelope, "IN-REPLY-TO").as_deref(),
+            Some("<parent@example.com>")
+        );
+        assert_eq!(
+            envelope_header(&envelope, "references").as_deref(),
+            Some("<root@example.com> <parent@example.com>")
+        );
+        assert_eq!(envelope_header(&envelope, "subject"), None);
+        assert_eq!(envelope_header(&serde_json::json!({}), "message-id"), None);
     }
 
     #[test]

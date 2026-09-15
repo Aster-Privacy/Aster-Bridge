@@ -294,6 +294,8 @@ fn cached_header_value(msg: &CachedMessage, field: &str) -> Option<String> {
         "cc" => meta_string("cc"),
         "bcc" => meta_string("bcc"),
         "message-id" => meta_string("message_id"),
+        "in-reply-to" => meta_string("in_reply_to"),
+        "references" => meta_string("references"),
         _ => None,
     }
 }
@@ -2923,13 +2925,31 @@ async fn handle_fetch(
                 Some(ref mid) => format!("<{}>", mid),
                 None => format!("<{}@aster-bridge>", msg.aster_id),
             };
+            let cc_list = imap_address_list(
+                env_meta.get("cc").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            );
+            let bcc_list = imap_address_list(
+                env_meta.get("bcc").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            );
+            let in_reply_to = match env_meta
+                .get("in_reply_to")
+                .and_then(|v| v.as_str())
+                .map(sanitize_header)
+                .filter(|s| !s.is_empty())
+            {
+                Some(value) => imap_quote(&value),
+                None => "NIL".to_string(),
+            };
             items.push(format!(
-                "ENVELOPE ({} {} {} {} NIL {} NIL NIL NIL {})",
+                "ENVELOPE ({} {} {} {} NIL {} {} {} {} {})",
                 imap_quote(&date),
                 imap_quote(&subject),
                 from_list,
                 from_list,
                 to_list,
+                cc_list,
+                bcc_list,
+                in_reply_to,
                 imap_quote(&msg_id)
             ));
         }

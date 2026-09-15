@@ -368,6 +368,18 @@ fn message_id_header(meta: &serde_json::Value, aster_id: &str) -> String {
     }
 }
 
+fn reference_header(meta: &serde_json::Value, key: &str, label: &str) -> String {
+    match meta
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(sanitize_header)
+        .filter(|s| !s.is_empty())
+    {
+        Some(value) => format!("{}: {}\r\n", label, value),
+        None => String::new(),
+    }
+}
+
 fn top_headers(msg: &CachedMessage, meta: &serde_json::Value) -> String {
     let mut out = String::new();
     let date = sanitize_header(&date_header_rfc2822(msg.date.as_deref().unwrap_or("")));
@@ -397,6 +409,8 @@ fn top_headers(msg: &CachedMessage, meta: &serde_json::Value) -> String {
     }
     out.push_str(&format!("Subject: {}\r\n", subject));
     out.push_str(&message_id_header(meta, &msg.aster_id));
+    out.push_str(&reference_header(meta, "in_reply_to", "In-Reply-To"));
+    out.push_str(&reference_header(meta, "references", "References"));
     out.push_str("MIME-Version: 1.0\r\n");
     out
 }
@@ -750,6 +764,24 @@ mod tests {
             size: data.len() as i64,
             data: data.to_vec(),
         }
+    }
+
+    #[test]
+    fn threading_headers_come_from_the_cached_metadata() {
+        let raw = "{\"is_html\":false,\"message_id\":\"<abc@example.com>\",\"in_reply_to\":\"<parent@example.com>\",\"references\":\"<root@example.com> <parent@example.com>\"}";
+        let m = msg(Some("body"), Some(raw), 0);
+        let r = render(&m, &[], true);
+        assert!(r.text.contains("Message-ID: <abc@example.com>"));
+        assert!(r.text.contains("In-Reply-To: <parent@example.com>"));
+        assert!(r.text.contains("References: <root@example.com> <parent@example.com>"));
+    }
+
+    #[test]
+    fn threading_headers_are_omitted_when_the_metadata_has_none() {
+        let m = msg(Some("body"), Some("{\"is_html\":false}"), 0);
+        let r = render(&m, &[], true);
+        assert!(!r.text.contains("In-Reply-To:"));
+        assert!(!r.text.contains("References:"));
     }
 
     #[test]
