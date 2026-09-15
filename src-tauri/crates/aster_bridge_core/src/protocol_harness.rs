@@ -86,7 +86,7 @@ fn mock_contacts_routes() -> axum::Router {
 
     Router::new()
         .route(
-            "/contacts/v1/",
+            "/contacts/v1",
             axum::routing::get(move || {
                 let rows = list.clone();
                 async move {

@@ -986,7 +986,7 @@ mod e2e_tests {
 
         let app = Router::new()
             .route(
-                "/contacts/v1/",
+                "/contacts/v1",
                 axum::routing::get(move || {
                     let rows = list_rows.clone();
                     async move {

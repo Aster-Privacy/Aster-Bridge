@@ -1325,7 +1325,7 @@ impl ApiClient {
     ) -> Result<ContactListResponse> {
         let mut request = self
             .client
-            .get(format!("{}/contacts/v1/", self.base_url))
+            .get(format!("{}/contacts/v1", self.base_url))
             .bearer_auth(access_token)
             .query(&[("limit", limit.to_string())]);
 
@@ -1368,7 +1368,7 @@ impl ApiClient {
     ) -> Result<CreateContactResponse> {
         let resp = self
             .client
-            .post(format!("{}/contacts/v1/", self.base_url))
+            .post(format!("{}/contacts/v1", self.base_url))
             .bearer_auth(access_token)
             .json(body)
             .send()
