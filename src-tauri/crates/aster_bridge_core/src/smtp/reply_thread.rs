@@ -157,7 +157,7 @@ pub fn resolve_reply(db: &Database, headers: &ReplyHeaders) -> ResolvedReply {
         .collect();
     let in_reply_to = in_reply_to_value(&chain);
     if in_reply_to.is_none() && parent_aster_id.is_some() {
-        tracing::warn!("reply has no usable parent message id, recipients see a new thread");
+        tracing::debug!("reply parent has no rfc message id, sending without in-reply-to");
     }
     ResolvedReply {
         parent_aster_id,
