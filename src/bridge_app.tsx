@@ -806,6 +806,8 @@ function UserAvatar({
   );
 }
 
+const DEFAULT_CODE_LIFETIME = 600;
+
 function SetupView({
   on_enrolled,
   can_go_back,
@@ -844,9 +846,11 @@ function SetupView({
 
     try {
       const result = await api.get_setup_code();
-      set_code(result);
-      const expiry = Date.now() + 300 * 1000;
-      set_time_left(300);
+      set_code(result.code);
+      const lifetime =
+        result.expires_in > 0 ? result.expires_in : DEFAULT_CODE_LIFETIME;
+      const expiry = Date.now() + lifetime * 1000;
+      set_time_left(lifetime);
       set_state("showing_code");
 
       countdown_ref.current = setInterval(() => {
@@ -863,7 +867,7 @@ function SetupView({
 
       const schedule_poll = () => {
         poll_count_ref.current += 1;
-        if (poll_count_ref.current > 60) { stop_polling(); set_state("expired"); return; }
+        if (Date.now() >= expiry) { stop_polling(); set_state("expired"); return; }
         poll_ref.current = setTimeout(async () => {
           if (!active_ref.current) return;
           try {

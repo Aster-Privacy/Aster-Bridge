@@ -124,8 +124,13 @@ export async function get_user_preferences(): Promise<UserPreferences> {
   return tauri_invoke<UserPreferences>("get_user_preferences");
 }
 
-export async function get_setup_code(): Promise<string> {
-  return tauri_invoke<string>("get_setup_code");
+export interface SetupCode {
+  code: string;
+  expires_in: number;
+}
+
+export async function get_setup_code(): Promise<SetupCode> {
+  return tauri_invoke<SetupCode>("get_setup_code");
 }
 
 export async function check_setup_confirmation(): Promise<"confirmed" | "expired" | "pending"> {

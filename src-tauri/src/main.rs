@@ -137,6 +137,12 @@ struct UserPreferencesResponse {
 }
 
 #[derive(serde::Serialize)]
+struct SetupCodeResponse {
+    code: String,
+    expires_in: u64,
+}
+
+#[derive(serde::Serialize)]
 struct SetupStatusResponse {
     status: String,
     done: bool,
@@ -467,7 +473,7 @@ async fn get_user_preferences(
 }
 
 #[tauri::command]
-async fn get_setup_code(state: State<'_, AppState>) -> Result<String, String> {
+async fn get_setup_code(state: State<'_, AppState>) -> Result<SetupCodeResponse, String> {
     let mut guard = state.0.lock().await;
     let code = ops::request_device_code(
         &guard.client,
@@ -479,7 +485,10 @@ async fn get_setup_code(state: State<'_, AppState>) -> Result<String, String> {
     guard.pending_code = Some(code.code.clone());
     guard.pending_code_normalized = Some(code.normalized);
     guard.pending_expires_in = Some(code.expires_in);
-    Ok(code.code)
+    Ok(SetupCodeResponse {
+        code: code.code,
+        expires_in: code.expires_in,
+    })
 }
 
 #[tauri::command]
