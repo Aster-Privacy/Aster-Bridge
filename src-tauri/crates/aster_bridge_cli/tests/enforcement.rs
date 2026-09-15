@@ -25,7 +25,7 @@ mod support;
 use std::time::Duration;
 
 use support::mock_backend::{CodeStatus, Plan, SyncMode, TEST_EMAIL};
-use support::{port_open, wait_until, Env, READY_TIMEOUT};
+use support::{port_open, wait_until, Env, MailClient, READY_TIMEOUT};
 
 #[test]
 fn login_links_the_device_and_records_the_plan() {
@@ -200,6 +200,53 @@ fn only_one_bridge_runs_per_data_folder_and_logout_stops_it() {
     let status = env.json(&["status"]);
     status.expect(3);
     assert_eq!(status.json()["signed_in"], false);
+}
+
+#[test]
+fn a_mail_client_signs_in_over_imap_and_opens_the_inbox() {
+    let env = Env::new();
+    env.login();
+    let created = env.json(&["app-password", "create", "--label", "Mail app"]);
+    created.expect(0);
+    let password = created.json()["password"].as_str().unwrap().to_string();
+
+    env.disable_tls();
+    let mut serve = env.serve(&[]);
+    serve.wait_event("ready", READY_TIMEOUT);
+
+    let mut imap = MailClient::connect(env.config_port("imap_port"));
+    let greeting = imap.read_line();
+    assert!(greeting.starts_with("* OK"), "unexpected greeting: {}", greeting);
+    assert!(imap
+        .tagged("a1", &format!("LOGIN {} wrong-password", TEST_EMAIL))
+        .starts_with("a1 NO"));
+    assert!(imap
+        .tagged("a2", &format!("LOGIN {} {}", TEST_EMAIL, password))
+        .starts_with("a2 OK"));
+    let folders = imap.command("a3", "LIST \"\" \"*\"");
+    assert!(folders.iter().any(|line| line.contains("INBOX")), "no INBOX in {:?}", folders);
+    let selected = imap.command("a4", "SELECT INBOX");
+    assert!(selected.last().unwrap().starts_with("a4 OK"), "select failed: {:?}", selected);
+    assert!(selected.iter().any(|line| line.contains("EXISTS")));
+    assert!(imap.tagged("a5", "LOGOUT").starts_with("a5 OK"));
+
+    let mut smtp = MailClient::connect(env.config_port("smtp_port"));
+    assert!(smtp.read_line().starts_with("220"));
+    smtp.send("EHLO test");
+    let mut capabilities = Vec::new();
+    loop {
+        let line = smtp.read_line();
+        let done = line.starts_with("250 ");
+        capabilities.push(line);
+        if done {
+            break;
+        }
+    }
+    assert!(capabilities.iter().any(|line| line.contains("AUTH")), "no AUTH in {:?}", capabilities);
+    smtp.send("QUIT");
+
+    env.json(&["logout", "--keep-cache"]).expect(0);
+    serve.expect_exit(0, None);
 }
 
 #[test]

@@ -226,6 +226,25 @@ impl Env {
             .unwrap_or_else(|| panic!("{} missing from config.toml", key))
     }
 
+    pub fn disable_tls(&self) {
+        let path = self.data.join("config.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let updated: String = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("tls_enabled") {
+                    "tls_enabled = false".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(updated.contains("tls_enabled = false"), "tls_enabled missing from config.toml");
+        std::fs::write(&path, updated).unwrap();
+    }
+
     pub fn log_text(&self) -> String {
         let mut text = String::new();
         let Ok(entries) = std::fs::read_dir(self.data.join("logs")) else {
@@ -270,6 +289,52 @@ fn write_config(data: &Path) {
     };
     drop(listeners);
     save_config(&config).unwrap();
+}
+
+pub struct MailClient {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+impl MailClient {
+    pub fn connect(port: u16) -> Self {
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        Self { stream, reader }
+    }
+
+    pub fn read_line(&mut self) -> String {
+        let mut line = String::new();
+        let read = self.reader.read_line(&mut line).unwrap();
+        assert!(read > 0, "the server closed the connection");
+        line.trim_end().to_string()
+    }
+
+    pub fn send(&mut self, line: &str) {
+        use std::io::Write;
+        self.stream.write_all(format!("{}
+", line).as_bytes()).unwrap();
+        self.stream.flush().unwrap();
+    }
+
+    pub fn command(&mut self, tag: &str, line: &str) -> Vec<String> {
+        self.send(&format!("{} {}", tag, line));
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line();
+            let done = line.starts_with(&format!("{} ", tag));
+            lines.push(line);
+            if done {
+                return lines;
+            }
+        }
+    }
+
+    pub fn tagged(&mut self, tag: &str, line: &str) -> String {
+        self.command(tag, line).last().unwrap().clone()
+    }
 }
 
 pub fn port_open(port: u16) -> bool {
