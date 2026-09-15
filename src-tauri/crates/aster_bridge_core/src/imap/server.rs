@@ -256,6 +256,13 @@ fn tokenize_search_criteria(raw: &str) -> Vec<String> {
                     cur.push(n);
                 }
             }
+            '(' | ')' if !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(cur.clone());
+                    cur.clear();
+                }
+                out.push(c.to_string());
+            }
             c if c.is_whitespace() && !in_quotes => {
                 if !cur.is_empty() {
                     out.push(cur.clone());
@@ -324,6 +331,20 @@ fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
 fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
     if *idx >= parts.len() { return true; }
     match parts[*idx].as_str() {
+        "(" => {
+            *idx += 1;
+            let mut result = true;
+            while *idx < parts.len() && parts[*idx] != ")" {
+                if !search_eval(msg, parts, idx) {
+                    result = false;
+                }
+            }
+            if *idx < parts.len() {
+                *idx += 1;
+            }
+            result
+        }
+        ")" => { *idx += 1; true }
         "ALL" => { *idx += 1; true }
         "UNSEEN" => { *idx += 1; (msg.flags & 1) == 0 }
         "SEEN" => { *idx += 1; (msg.flags & 1) != 0 }
@@ -4645,6 +4666,33 @@ mod tests {
         assert!(!search_matches(one, "HEADER X-CUSTOM-THING \"ANYTHING\""));
         assert!(!search_matches(one, "CC \"SOMEONE@EXAMPLE.COM\""));
         assert!(search_matches(one, "HEADER SUBJECT \"FIRST\""));
+    }
+
+    #[test]
+    fn tokenize_search_splits_parentheses() {
+        assert_eq!(
+            tokenize_search_criteria("(SUBJECT \"hello\")"),
+            vec!["(", "SUBJECT", "hello", ")"]
+        );
+        assert_eq!(
+            tokenize_search_criteria("SUBJECT \"a (b) c\""),
+            vec!["SUBJECT", "a (b) c"]
+        );
+    }
+
+    #[test]
+    fn search_matches_parenthesized_criteria() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "par-1", "inbox", "project alpha status");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        assert!(search_matches(m, "(SUBJECT \"ALPHA STATUS\")"));
+        assert!(!search_matches(m, "(SUBJECT \"ALPHA OMEGA\")"));
+        assert!(search_matches(m, "(FROM \"ALICE@EXAMPLE.COM\" SUBJECT \"PROJECT ALPHA\")"));
+        assert!(search_matches(m, "(OR SUBJECT \"ALPHA STATUS\" SUBJECT \"NOPE\")"));
+        assert!(!search_matches(m, "(SUBJECT \"NOPE\") (SUBJECT \"ALPHA STATUS\")"));
+        assert!(search_matches(m, "(UNSEEN)"));
     }
 
     #[test]
