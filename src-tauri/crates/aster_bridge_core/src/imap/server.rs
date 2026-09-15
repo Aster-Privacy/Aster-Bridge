@@ -3733,11 +3733,13 @@ mod tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
-        let _ = read_until_tag(&mut reader, "a1").await;
+        let login = read_until_tag(&mut reader, "a1").await.join("|");
+        assert!(login.contains("a1 OK"), "login failed: {}", login);
 
         writer.write_all(b"a2 SELECT INBOX\r\n").await.unwrap();
         writer.flush().await.unwrap();
-        let _ = read_until_tag(&mut reader, "a2").await;
+        let select = read_until_tag(&mut reader, "a2").await.join("|");
+        assert!(select.contains("a2 OK"), "select failed: {}", select);
 
         (reader, writer)
     }
