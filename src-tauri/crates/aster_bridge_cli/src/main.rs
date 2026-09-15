@@ -28,7 +28,9 @@ mod lock;
 mod output;
 mod secret_backend;
 mod signals;
+mod spinner;
 mod state;
+mod theme;
 
 use std::time::Duration;
 
@@ -51,7 +53,7 @@ fn run() -> i32 {
             return code;
         }
     };
-    let out = output::Output::new(cli.global.json);
+    let out = output::Output::new(&cli.global);
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {

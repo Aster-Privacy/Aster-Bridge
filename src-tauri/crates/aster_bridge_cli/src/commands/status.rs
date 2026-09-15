@@ -30,7 +30,7 @@ use crate::context::Context;
 use crate::control;
 use crate::exit::{CliResult, EXIT_ACCESS, EXIT_NOT_READY, EXIT_OK};
 use crate::lock::InstanceLock;
-use crate::output::{format_timestamp, Tone};
+use crate::output::{format_relative, format_timestamp, Tone};
 use crate::secret_backend;
 use crate::signals;
 use crate::state::{self, CliState};
@@ -166,30 +166,39 @@ fn render(ctx: &Context, s: &Snapshot) {
     }
     let data_dir = ctx.data_dir.display().to_string();
     if !s.signed_in {
-        out.line(format!("{} {}", out.dot(Tone::Muted), out.bold("Signed out")));
+        out.banner(Tone::Muted, "Signed out");
+        out.blank();
         out.fields(&[("Data folder", data_dir)]);
         out.blank();
-        out.line("To link this device to your account, run: aster-bridge login");
+        out.line(format!(
+            "To link this device to your account, run: {}",
+            out.strong_accent("aster-bridge login")
+        ));
         return;
     }
 
     let running = s.running();
     let denied = s.denied();
     let live = s.live.as_ref().filter(|_| running);
+    let now = state::now();
     match live {
-        Some(v) => out.line(format!(
-            "{} {}  {}",
-            out.dot(Tone::Good),
-            out.bold("Running"),
-            out.dim(&format!(
-                "process {}, started {}",
-                v["pid"].as_u64().unwrap_or_default(),
-                format_timestamp(v["started_at"].as_i64().unwrap_or_default())
-            ))
-        )),
-        None if denied => out.line(format!("{} {}", out.dot(Tone::Bad), out.bold("Stopped"))),
-        None => out.line(format!("{} {}", out.dot(Tone::Warn), out.bold("Stopped"))),
+        Some(v) => {
+            let started_at = v["started_at"].as_i64().unwrap_or_default();
+            out.line(format!(
+                "{} {}  {}",
+                out.mark(Tone::Good),
+                out.heading("Connected and running"),
+                out.dim(&format!(
+                    "since {}, process {}",
+                    format_relative(started_at, now),
+                    v["pid"].as_u64().unwrap_or_default()
+                ))
+            ));
+        }
+        None if denied => out.banner(Tone::Bad, "Stopped"),
+        None => out.banner(Tone::Warn, "Stopped"),
     }
+    out.blank();
 
     let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(account) = &s.state.account {
@@ -219,8 +228,16 @@ fn render(ctx: &Context, s: &Snapshot) {
     rows.push((
         "Last sync",
         match s.state.last_sync {
-            Some(sync) if sync.failed => format!("{} {}", format_timestamp(sync.at), out.tone("(failed)", Tone::Warn)),
-            Some(sync) => format_timestamp(sync.at),
+            Some(sync) if sync.failed => format!(
+                "{} {}",
+                format_relative(sync.at, now),
+                out.tone("(failed)", Tone::Warn)
+            ),
+            Some(sync) => format!(
+                "{}  {}",
+                format_relative(sync.at, now),
+                out.dim(&format_timestamp(sync.at))
+            ),
             None => "Never".to_string(),
         },
     ));
@@ -277,7 +294,10 @@ fn render(ctx: &Context, s: &Snapshot) {
             hints.push(hint);
         }
     } else if !running {
-        hints.push("To start Aster Bridge, run: aster-bridge serve".to_string());
+        hints.push(format!(
+            "To start Aster Bridge, run: {}",
+            out.strong_accent("aster-bridge serve")
+        ));
     }
     if !hints.is_empty() {
         out.blank();

@@ -47,6 +47,7 @@ use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend::{self, map_store_error};
 use crate::signals;
+use crate::spinner;
 use crate::state::{self, AccountInfo, PlanInfo, StopInfo};
 
 pub async fn run(ctx: &Context, json_events: bool, service: bool) -> CliResult<i32> {
@@ -192,9 +193,14 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     let client = Arc::new(context::api_client());
 
     tracing::info!("aster-bridge {} starting", VERSION);
-    let session = session::restore_or_login(&config, &identity, &client)
-        .await
-        .map_err(|e| common::map_login_error(&dir, e))?;
+    let session = spinner::while_working(
+        &ctx.out,
+        ndjson,
+        "Signing in to Aster Mail",
+        session::restore_or_login(&config, &identity, &client),
+    )
+    .await
+    .map_err(|e| common::map_login_error(&dir, e))?;
     let email = session.email.clone();
     let account = AccountInfo {
         user_id: session.user_id.to_string(),
@@ -209,7 +215,14 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
 
     let session = Arc::new(RwLock::new(session));
     let tuning = context::tuning(&config);
-    let grant = match runtime::check_bridge_access(&client, &session, tuning.plan_retry_delay).await {
+    let access = spinner::while_working(
+        &ctx.out,
+        ndjson,
+        "Checking your plan",
+        runtime::check_bridge_access(&client, &session, tuning.plan_retry_delay),
+    )
+    .await;
+    let grant = match access {
         Ok(grant) => grant,
         Err(StartError::BridgeAccessRequired { plan_code }) => {
             let code = plan_code.or_else(|| cached.plan.as_ref().and_then(|p| p.code.clone()));
@@ -253,22 +266,27 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
 
     let passwords = Arc::new(AppPasswords::new(db.clone()));
     let _sink = SinkGuard::install(CliEvents::new(dir.clone(), ndjson));
-    let running = BridgeRuntime::start(
-        grant,
-        RuntimeDeps {
-            session: session.clone(),
-            db: db.clone(),
-            client: client.clone(),
-            passwords: passwords.clone(),
-        },
-        StartOptions {
-            config: config.clone(),
-            tls: tls_config,
-            device_id,
-            signing_key: identity.ed25519_signing_key.clone(),
-            profile: ClientProfile::Cli,
-            tuning,
-        },
+    let running = spinner::while_working(
+        &ctx.out,
+        ndjson,
+        "Starting the mail servers",
+        BridgeRuntime::start(
+            grant,
+            RuntimeDeps {
+                session: session.clone(),
+                db: db.clone(),
+                client: client.clone(),
+                passwords: passwords.clone(),
+            },
+            StartOptions {
+                config: config.clone(),
+                tls: tls_config,
+                device_id,
+                signing_key: identity.ed25519_signing_key.clone(),
+                profile: ClientProfile::Cli,
+                tuning,
+            },
+        ),
     )
     .await
     .map_err(start_error)?;
@@ -379,11 +397,8 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
 
 fn print_banner(ctx: &Context, email: &str, plan_code: &str, services: &[Value]) {
     let out = &ctx.out;
-    out.line(format!(
-        "{} {}",
-        out.dot(Tone::Good),
-        out.bold("Aster Bridge is running")
-    ));
+    out.banner(Tone::Good, "Aster Bridge is running");
+    out.blank();
     out.fields(&[
         ("Account", email.to_string()),
         ("Plan", common::plan_label(Some(plan_code))),
@@ -393,9 +408,14 @@ fn print_banner(ctx: &Context, email: &str, plan_code: &str, services: &[Value])
     out.table(&["SERVICE", "ADDRESS", "SECURITY"], &service_rows(services));
     out.blank();
     out.line(format!(
-        "To connect an email app, use {} as the username and an app password. To create one, run: aster-bridge app-password create",
-        email
+        "To connect an email app, use {} as the username and an app password.",
+        out.bold(email)
     ));
+    out.line(format!(
+        "To create one, run: {}",
+        out.strong_accent("aster-bridge app-password create")
+    ));
+    out.blank();
     out.line(out.dim("Press Control-C to stop."));
 }
 

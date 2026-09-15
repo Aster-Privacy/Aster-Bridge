@@ -33,6 +33,7 @@ use crate::exit::{CliResult, EXIT_OK};
 use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend;
+use crate::spinner;
 use crate::state::{self, CliState};
 
 const STOP_WAIT: Duration = Duration::from_secs(30);
@@ -43,10 +44,10 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
     let out = &ctx.out;
     let _lock = match control::running(dir).await {
         Some(client) => {
-            if !out.json {
-                out.line("Stopping Aster Bridge...");
-            }
-            let _ = client.call("stop", Value::Null).await;
+            spinner::while_working(out, out.json, "Stopping Aster Bridge", async {
+                let _ = client.call("stop", Value::Null).await;
+            })
+            .await;
             InstanceLock::acquire_within(dir, STOP_WAIT).await?
         }
         None => InstanceLock::acquire(dir)?,
@@ -107,20 +108,27 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
         return Ok(EXIT_OK);
     }
     if !was_signed_in {
-        out.line("You're already signed out.");
-    } else if keep_cache {
         out.line(format!(
-            "{} Signed out. The mail cache stays on this computer.",
-            out.dot(Tone::Muted)
+            "{} You're already signed out.",
+            out.mark(Tone::Muted)
         ));
     } else {
+        out.banner(Tone::Good, "Signed out");
+        if keep_cache {
+            out.line("The mail cache stays on this computer.");
+        } else {
+            out.line("Aster Bridge removed this device's keys and the mail cache.");
+        }
         out.line(format!(
-            "{} Signed out. Aster Bridge removed this device's keys and the mail cache.",
-            out.dot(Tone::Muted)
+            "To sign in again, run: {}",
+            out.strong_accent("aster-bridge login")
         ));
     }
     if service_installed {
-        out.line("The background service is still installed. To remove it, run: aster-bridge service uninstall");
+        out.line(format!(
+            "The background service is still installed. To remove it, run: {}",
+            out.strong_accent("aster-bridge service uninstall")
+        ));
     }
     Ok(EXIT_OK)
 }

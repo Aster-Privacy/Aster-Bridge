@@ -48,6 +48,25 @@ pub struct GlobalArgs {
     pub log_level: Option<LogLevel>,
     #[arg(long, global = true, value_enum, env = "ASTER_BRIDGE_SECRET_BACKEND", default_value_t = SecretBackendChoice::Auto, help = "Where to keep encryption keys")]
     pub secret_backend: SecretBackendChoice,
+    #[arg(long, global = true, value_enum, env = "ASTER_BRIDGE_COLOR", default_value_t = ColorChoice::Auto, help = "When to color the output")]
+    pub color: ColorChoice,
+    #[arg(long, global = true, value_enum, env = "ASTER_BRIDGE_THEME", default_value_t = ThemeChoice::Auto, help = "Terminal background the colors are tuned for")]
+    pub theme: ThemeChoice,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    #[default]
+    Auto,
+    Dark,
+    Light,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +193,18 @@ mod tests {
     #[test]
     fn live_and_refresh_conflict() {
         assert!(Cli::try_parse_from(["aster-bridge", "status", "--live", "--refresh"]).is_err());
+    }
+
+    #[test]
+    fn color_and_theme_default_to_auto() {
+        let cli = Cli::try_parse_from(["aster-bridge", "status"]).unwrap();
+        assert_eq!(cli.global.color, ColorChoice::Auto);
+        assert_eq!(cli.global.theme, ThemeChoice::Auto);
+        let cli =
+            Cli::try_parse_from(["aster-bridge", "status", "--color", "never", "--theme", "light"])
+                .unwrap();
+        assert_eq!(cli.global.color, ColorChoice::Never);
+        assert_eq!(cli.global.theme, ThemeChoice::Light);
     }
 
     #[test]

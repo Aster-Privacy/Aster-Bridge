@@ -18,10 +18,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use aster_bridge_core::account_state::AccountState;
 use aster_bridge_core::api_client::ApiClient;
@@ -41,6 +39,7 @@ use crate::exit::{CliError, CliResult, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, LINK_DE
 use crate::lock::InstanceLock;
 use crate::output::{Output, Tone};
 use crate::secret_backend::{self, map_store_error};
+use crate::spinner::{Spinner, FRAME_INTERVAL};
 use crate::signals;
 use crate::state::{self, AccountInfo, PendingLogin, PlanInfo};
 
@@ -60,8 +59,13 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
                 "account": { "email": account.email, "username": account.username, "user_id": account.user_id },
             }));
         } else {
-            out.line(format!("You're already signed in as {}.", account.email));
-            out.line("To use a different account, run aster-bridge logout first.");
+            out.banner(Tone::Good, "Connected to Aster Mail");
+            out.blank();
+            out.fields(&[("Account", account.email.clone())]);
+            out.blank();
+            out.line(out.dim(
+                "To use a different account, run aster-bridge logout first.",
+            ));
         }
         return Ok(EXIT_OK);
     }
@@ -120,21 +124,20 @@ fn show_code(out: &Output, pending: &PendingLogin, no_wait: bool) {
         }));
         return;
     }
-    out.line(format!(
-        "To link this device, open {} in a browser where you're signed in to Aster Mail, and enter this code:",
-        LINK_DEVICE_URL
-    ));
+    out.banner(Tone::Accent, "Link this device");
     out.blank();
-    out.line(format!("    {}", out.bold(&pending.code)));
+    out.line(format!(
+        "  {} Open {} in a browser where you're signed in to Aster Mail.",
+        out.accent("1."),
+        out.bold(LINK_DEVICE_URL)
+    ));
+    out.line(format!("  {} Enter this code:", out.accent("2.")));
+    out.blank();
+    out.line(format!("      {}", out.heading(&pending.code)));
     out.blank();
     if no_wait {
         out.line(format!(
             "The code expires in {}. After you enter it, run aster-bridge login again to finish signing in.",
-            format_remaining(pending.expires_at)
-        ));
-    } else if !out.stdout_is_terminal() {
-        out.line(format!(
-            "The code expires in {}. Waiting for you to enter it.",
             format_remaining(pending.expires_at)
         ));
     }
@@ -153,22 +156,25 @@ async fn wait_for_confirmation(
     dir: &Path,
     pending: &PendingLogin,
 ) -> CliResult<Session> {
-    let live = out.stdout_is_terminal();
+    let animated = out.animates();
     let mut poll = tokio::time::interval(context::login_poll_interval());
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut redraw = tokio::time::interval(Duration::from_secs(1));
+    let mut redraw = tokio::time::interval(FRAME_INTERVAL);
+    redraw.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let cancel = signals::ctrl_c();
     tokio::pin!(cancel);
-    let mut drawn = 0usize;
     let mut warned = false;
 
-    let clear = |drawn: &mut usize| {
-        if *drawn > 0 {
-            print!("\r{}\r", " ".repeat(*drawn));
-            let _ = std::io::stdout().flush();
-            *drawn = 0;
-        }
+    let waiting = if animated {
+        "Waiting for you to enter the code".to_string()
+    } else {
+        format!(
+            "Waiting for you to enter the code. It expires in {}.",
+            format_remaining(pending.expires_at)
+        )
     };
+    let mut spinner = Spinner::start(out, waiting);
+    spinner.set_detail(waiting_detail(pending.expires_at));
 
     let result = loop {
         if state::now() >= pending.expires_at {
@@ -179,15 +185,9 @@ async fn wait_for_confirmation(
                 break Err(CliError::new(EXIT_ERROR, "canceled", "Sign-in canceled.")
                     .with_hint("The code stays valid until it expires. To continue, run: aster-bridge login"));
             }
-            _ = redraw.tick(), if live => {
-                let text = format!(
-                    "Waiting for you to enter the code. It expires in {}. Press Control-C to cancel.",
-                    format_remaining(pending.expires_at)
-                );
-                clear(&mut drawn);
-                print!("{}", out.dim(&text));
-                let _ = std::io::stdout().flush();
-                drawn = text.chars().count();
+            _ = redraw.tick(), if animated => {
+                spinner.set_detail(waiting_detail(pending.expires_at));
+                spinner.tick();
             }
             _ = poll.tick() => {
                 match ops::poll_device_sign_in(client, identity, dir, &pending.normalized).await {
@@ -196,7 +196,7 @@ async fn wait_for_confirmation(
                     Ok(SignInPoll::Confirmed(session)) => break Ok(*session),
                     Err(BridgeError::Network(e)) => {
                         if !warned {
-                            clear(&mut drawn);
+                            spinner.clear();
                             out.warn(format!("Couldn't reach Aster Mail, so Aster Bridge keeps trying. Details: {}", e));
                             warned = true;
                         }
@@ -209,8 +209,19 @@ async fn wait_for_confirmation(
             }
         }
     };
-    clear(&mut drawn);
+    if result.is_ok() {
+        spinner.finish(Tone::Good, "Code accepted.");
+    } else {
+        spinner.clear();
+    }
     result
+}
+
+fn waiting_detail(expires_at: i64) -> String {
+    format!(
+        "expires in {}. Press Control-C to cancel.",
+        format_remaining(expires_at)
+    )
 }
 
 async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResult<i32> {
@@ -276,14 +287,6 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
     })
     .map_err(|e| CliError::general(format!("Couldn't save the sign-in: {}", e)))?;
 
-    if !out.json {
-        out.line(format!(
-            "{} Signed in as {}",
-            out.dot(Tone::Good),
-            out.bold(&account.email)
-        ));
-    }
-
     match access {
         Ok(grant) => {
             if out.json {
@@ -293,10 +296,11 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
                     "plan": plan,
                 }));
             } else {
-                out.fields(&[("Plan", common::plan_label(Some(grant.plan_code())))]);
-                out.blank();
-                out.line("To start Aster Bridge, run: aster-bridge serve");
-                out.line("To run it in the background whenever you sign in to this computer, run: aster-bridge service install");
+                connected_panel(
+                    out,
+                    &account.email,
+                    Some(common::plan_label(Some(grant.plan_code()))),
+                );
             }
             Ok(EXIT_OK)
         }
@@ -316,10 +320,38 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
                     "Couldn't check your plan: {}. Aster Bridge checks it again when it starts.",
                     error
                 ));
-                out.blank();
-                out.line("To start Aster Bridge, run: aster-bridge serve");
+                connected_panel(out, &account.email, None);
             }
             Ok(EXIT_OK)
         }
     }
+}
+
+fn connected_panel(out: &Output, email: &str, plan: Option<String>) {
+    out.blank();
+    out.banner(Tone::Good, "Connected to Aster Mail");
+    out.blank();
+    let mut rows = vec![("Account", email.to_string())];
+    if let Some(plan) = plan {
+        rows.push(("Plan", plan));
+    }
+    out.fields(&rows);
+    out.blank();
+    out.line(out.bold("Next steps"));
+    out.steps(&[
+        (
+            "Start the mail servers".to_string(),
+            "aster-bridge serve".to_string(),
+        ),
+        (
+            "Create a password for an email app".to_string(),
+            "aster-bridge app-password create".to_string(),
+        ),
+        (
+            "Keep it running whenever you sign in".to_string(),
+            "aster-bridge service install".to_string(),
+        ),
+    ]);
+    out.blank();
+    out.line(out.dim("To check the connection later, run: aster-bridge status"));
 }

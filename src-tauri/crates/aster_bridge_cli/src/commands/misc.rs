@@ -29,6 +29,7 @@ use crate::context::Context;
 use crate::control;
 use crate::exit::{CliError, CliResult, EXIT_OK};
 use crate::output::{Output, Tone};
+use crate::spinner;
 
 const HIDDEN_KEYS: [&str; 2] = ["service_mode", "autostart"];
 const MIN_POLL_SECS: u64 = 5;
@@ -47,16 +48,18 @@ pub fn version(out: &Output) -> CliResult<i32> {
 pub async fn sync_now(ctx: &Context) -> CliResult<i32> {
     common::require_account(&ctx.data_dir)?;
     let out = &ctx.out;
-    if !out.json {
-        out.line("Syncing...");
-    }
-    let result = control::call_running(&ctx.data_dir, "sync_now", Value::Null)
-        .await?
-        .ok_or_else(CliError::not_running)?;
+    let result = spinner::while_working(
+        out,
+        out.json,
+        "Syncing your mail",
+        control::call_running(&ctx.data_dir, "sync_now", Value::Null),
+    )
+    .await?
+    .ok_or_else(CliError::not_running)?;
     if out.json {
         out.json(result);
     } else {
-        out.line(format!("{} Sync finished.", out.dot(Tone::Good)));
+        out.banner(Tone::Good, "Sync finished");
     }
     Ok(EXIT_OK)
 }
@@ -242,28 +245,27 @@ async fn config_set(ctx: &Context, key: &str, raw: &str) -> CliResult<i32> {
 pub async fn repair_cache(ctx: &Context) -> CliResult<i32> {
     common::require_account(&ctx.data_dir)?;
     let out = &ctx.out;
-    if !out.json {
-        out.line("Rebuilding the mail cache...");
-    }
-    let result = common::call_or_offline(ctx, "repair_cache", Value::Null, |offline| {
-        offline
-            .db
-            .repair_cache()
-            .map_err(|e| CliError::general(format!("Couldn't rebuild the cache: {}", e)))?;
-        Ok(json!({ "repaired": true, "synced": false }))
-    })
+    let result = spinner::while_working(
+        out,
+        out.json,
+        "Rebuilding the mail cache",
+        common::call_or_offline(ctx, "repair_cache", Value::Null, |offline| {
+            offline
+                .db
+                .repair_cache()
+                .map_err(|e| CliError::general(format!("Couldn't rebuild the cache: {}", e)))?;
+            Ok(json!({ "repaired": true, "synced": false }))
+        }),
+    )
     .await?;
     if out.json {
         out.json(result);
     } else if result["synced"].as_bool() == Some(true) {
-        out.line(format!(
-            "{} Rebuilt the mail cache and synced your mail.",
-            out.dot(Tone::Good)
-        ));
+        out.banner(Tone::Good, "Rebuilt the mail cache and synced your mail");
     } else {
-        out.line(format!(
-            "{} Rebuilt the mail cache. Aster Bridge downloads your mail again the next time it starts.",
-            out.dot(Tone::Good)
+        out.banner(Tone::Good, "Rebuilt the mail cache");
+        out.line(out.dim(
+            "Aster Bridge downloads your mail again the next time it starts.",
         ));
     }
     Ok(EXIT_OK)

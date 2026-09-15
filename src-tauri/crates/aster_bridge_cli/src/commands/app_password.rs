@@ -26,6 +26,7 @@ use crate::cli::AppPasswordCommand;
 use crate::context::Context;
 use crate::exit::{CliResult, EXIT_OK};
 use crate::output::{format_timestamp, Tone};
+use crate::spinner;
 
 pub async fn run(ctx: &Context, command: AppPasswordCommand) -> CliResult<i32> {
     let state = common::require_account(&ctx.data_dir)?;
@@ -39,45 +40,49 @@ pub async fn run(ctx: &Context, command: AppPasswordCommand) -> CliResult<i32> {
 
 async fn create(ctx: &Context, label: Option<String>, email: &str) -> CliResult<i32> {
     common::clean_label(label.as_deref())?;
-    let result = common::call_or_offline(
-        ctx,
-        "app_password_create",
-        json!({ "label": label }),
-        |offline| {
-            let passwords = AppPasswords::new(offline.db.clone());
-            common::app_password_create(&passwords, &offline.state, label.as_deref())
-        },
+    let out = &ctx.out;
+    let result = spinner::while_working(
+        out,
+        out.json,
+        "Creating an app password",
+        common::call_or_offline(
+            ctx,
+            "app_password_create",
+            json!({ "label": label }),
+            |offline| {
+                let passwords = AppPasswords::new(offline.db.clone());
+                common::app_password_create(&passwords, &offline.state, label.as_deref())
+            },
+        ),
     )
     .await?;
-    let out = &ctx.out;
     if out.json {
         out.json(result);
         return Ok(EXIT_OK);
     }
     let text = |key: &str| result[key].as_str().unwrap_or_default().to_string();
-    out.line(format!(
-        "{} Created an app password named {}.",
-        out.dot(Tone::Good),
-        text("label")
-    ));
+    out.banner(Tone::Good, "App password created");
+    out.fields(&[("Label", text("label")), ("ID", text("id"))]);
     out.blank();
-    out.line(format!("    {}", out.bold(&text("password"))));
+    out.line(format!("    {}", out.heading(&text("password"))));
     out.blank();
     out.line("Copy this password now. Aster Bridge doesn't show it again.");
     out.line(format!(
         "In your email app, use {} as the username and this password as the password.",
-        email
+        out.bold(email)
     ));
-    out.fields(&[("ID", text("id"))]);
     Ok(EXIT_OK)
 }
 
 fn short_date(text: &str) -> String {
     let trimmed = text.trim();
-    match trimmed.parse::<i64>() {
-        Ok(unix) => format_timestamp(unix),
-        Err(_) => trimmed.replace('T', " ").chars().take(16).collect(),
+    if let Ok(unix) = trimmed.parse::<i64>() {
+        return format_timestamp(unix);
     }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return format_timestamp(parsed.timestamp());
+    }
+    trimmed.replace('T', " ").chars().take(16).collect()
 }
 
 async fn list(ctx: &Context) -> CliResult<i32> {
@@ -92,8 +97,11 @@ async fn list(ctx: &Context) -> CliResult<i32> {
     }
     let items = result["app_passwords"].as_array().cloned().unwrap_or_default();
     if items.is_empty() {
-        out.line("You don't have any app passwords.");
-        out.line("To create one for an email app, run: aster-bridge app-password create --label <name>");
+        out.banner(Tone::Muted, "No app passwords");
+        out.line(format!(
+            "To create one for an email app, run: {}",
+            out.strong_accent("aster-bridge app-password create --label <name>")
+        ));
         return Ok(EXIT_OK);
     }
     let rows: Vec<Vec<String>> = items
@@ -128,9 +136,30 @@ async fn revoke(ctx: &Context, id: &str) -> CliResult<i32> {
         out.json(result);
     } else {
         out.line(format!(
-            "Revoked app password {}. Email apps that use it can't sign in anymore.",
+            "{} Revoked app password {}. Email apps that use it can't sign in anymore.",
+            out.mark(Tone::Good),
             id.trim()
         ));
     }
     Ok(EXIT_OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_created_at_matches_unix_rendering() {
+        assert_eq!(short_date("2026-09-15T14:51:00Z"), format_timestamp(1789483860));
+    }
+
+    #[test]
+    fn unix_created_at_still_renders() {
+        assert_eq!(short_date("1789483860"), format_timestamp(1789483860));
+    }
+
+    #[test]
+    fn unparsable_created_at_falls_back_to_text() {
+        assert_eq!(short_date("2026-09-15 14:51 something"), "2026-09-15 14:51");
+    }
 }

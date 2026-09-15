@@ -22,7 +22,9 @@ use std::io::{IsTerminal, Write};
 
 use serde_json::{Map, Value};
 
+use crate::cli::{ColorChoice, GlobalArgs, ThemeChoice};
 use crate::exit::CliError;
+use crate::theme::{self, ColorDepth, Palette, Role};
 
 pub const SCHEMA_VERSION: u64 = 1;
 
@@ -32,27 +34,91 @@ pub enum Tone {
     Warn,
     Bad,
     Muted,
+    Accent,
+}
+
+impl Tone {
+    fn role(self) -> Role {
+        match self {
+            Tone::Good => Role::Good,
+            Tone::Warn => Role::Warn,
+            Tone::Bad => Role::Bad,
+            Tone::Muted => Role::Muted,
+            Tone::Accent => Role::Accent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Output {
     pub json: bool,
-    color: bool,
-    err_color: bool,
+    palette: Palette,
+    err_palette: Palette,
+    animate: bool,
+    unicode: bool,
 }
 
 impl Output {
-    pub fn new(json: bool) -> Self {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    pub fn new(global: &GlobalArgs) -> Self {
+        Self::build(
+            global.json,
+            global.color,
+            global.theme,
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        )
+    }
+
+    pub fn build(
+        json: bool,
+        color: ColorChoice,
+        theme_choice: ThemeChoice,
+        stdout_tty: bool,
+        stderr_tty: bool,
+    ) -> Self {
+        Self::assemble(
+            json,
+            color,
+            theme_choice,
+            stdout_tty,
+            stderr_tty,
+            vt_ready(false, stdout_tty),
+            vt_ready(true, stderr_tty),
+        )
+    }
+
+    pub fn assemble(
+        json: bool,
+        color: ColorChoice,
+        theme_choice: ThemeChoice,
+        stdout_tty: bool,
+        stderr_tty: bool,
+        stdout_vt: bool,
+        stderr_vt: bool,
+    ) -> Self {
+        let appearance = theme::detect_appearance(theme_choice);
+        let choice = if json { ColorChoice::Never } else { color };
+        let depth = theme::detect_depth(choice, stdout_tty, stdout_vt);
+        let err_depth = theme::detect_depth(choice, stderr_tty, stderr_vt);
         Self {
             json,
-            color: !no_color && std::io::stdout().is_terminal() && enable_ansi(false),
-            err_color: !no_color && std::io::stderr().is_terminal() && enable_ansi(true),
+            palette: Palette::new(appearance, depth),
+            err_palette: Palette::new(appearance, err_depth),
+            animate: !json && stdout_tty && depth != ColorDepth::None,
+            unicode: unicode_ready(),
         }
     }
 
     pub fn ansi(&self) -> bool {
-        self.color
+        self.palette.depth != ColorDepth::None
+    }
+
+    pub fn animates(&self) -> bool {
+        self.animate
+    }
+
+    pub fn unicode(&self) -> bool {
+        self.unicode
     }
 
     pub fn stdout_is_terminal(&self) -> bool {
@@ -73,38 +139,128 @@ impl Output {
     }
 
     pub fn bold(&self, text: &str) -> String {
-        self.paint(text, "1")
+        self.wrap(text, "1".to_string())
     }
 
     pub fn dim(&self, text: &str) -> String {
-        self.paint(text, "2")
+        self.wrap(text, self.palette.sequence(Role::Muted))
     }
 
     pub fn tone(&self, text: &str, tone: Tone) -> String {
-        match tone {
-            Tone::Good => self.paint(text, "32"),
-            Tone::Warn => self.paint(text, "33"),
-            Tone::Bad => self.paint(text, "31"),
-            Tone::Muted => self.paint(text, "2"),
+        self.wrap(text, self.palette.sequence(tone.role()))
+    }
+
+    pub fn accent(&self, text: &str) -> String {
+        self.wrap(text, self.palette.sequence(Role::Accent))
+    }
+
+    pub fn strong_accent(&self, text: &str) -> String {
+        let sequence = self.palette.sequence(Role::Accent);
+        if sequence.is_empty() {
+            return text.to_string();
         }
+        self.wrap(text, format!("1;{}", sequence))
+    }
+
+    pub fn gradient(&self, text: &str) -> String {
+        self.gradient_from(text, 0)
+    }
+
+    pub fn gradient_from(&self, text: &str, offset: usize) -> String {
+        if !self.ansi() {
+            return text.to_string();
+        }
+        if self.palette.depth == ColorDepth::Ansi16 {
+            return self.accent(text);
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let span = chars.len().max(2);
+        let mut painted = String::with_capacity(text.len() * 12);
+        for (index, character) in chars.iter().enumerate() {
+            let position = (index + offset) % span;
+            let wave = if position * 2 <= span {
+                position * 2
+            } else {
+                span * 2 - position * 2
+            };
+            let color = self
+                .palette
+                .gradient(Role::AccentDeep, Role::AccentSoft, span, wave.min(span));
+            painted.push_str(&format!(
+                "\x1b[{}m{}",
+                self.palette.rgb_sequence(color, Role::Accent),
+                character
+            ));
+        }
+        painted.push_str("\x1b[0m");
+        painted
+    }
+
+    pub fn heading(&self, text: &str) -> String {
+        if !self.ansi() {
+            return text.to_string();
+        }
+        format!("\x1b[1m{}", self.gradient(text))
     }
 
     pub fn dot(&self, tone: Tone) -> String {
-        self.tone("\u{25CF}", tone)
+        self.tone(if self.unicode { "\u{25CF}" } else { "*" }, tone)
     }
 
-    fn paint(&self, text: &str, code: &str) -> String {
-        if self.color {
-            format!("\x1b[{}m{}\x1b[0m", code, text)
-        } else {
+    pub fn mark(&self, tone: Tone) -> String {
+        let glyph = match (tone, self.unicode) {
+            (Tone::Good, true) => "\u{2713}",
+            (Tone::Good, false) => "+",
+            (Tone::Bad, true) => "\u{2717}",
+            (Tone::Bad, false) => "x",
+            (Tone::Warn, _) => "!",
+            (Tone::Muted, true) | (Tone::Accent, true) => "\u{2022}",
+            (Tone::Muted, false) | (Tone::Accent, false) => "-",
+        };
+        self.tone(glyph, tone)
+    }
+
+    fn wrap(&self, text: &str, code: String) -> String {
+        if code.is_empty() {
             text.to_string()
+        } else {
+            format!("\x1b[{}m{}\x1b[0m", code, text)
         }
     }
 
+    pub fn banner(&self, tone: Tone, title: &str) {
+        let title = if tone == Tone::Good || tone == Tone::Accent {
+            self.heading(title)
+        } else {
+            self.bold(title)
+        };
+        println!("{} {}", self.mark(tone), title);
+    }
+
     pub fn fields(&self, rows: &[(&str, String)]) {
-        let width = rows.iter().map(|(label, _)| visible_len(label)).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|(label, _)| visible_len(label))
+            .max()
+            .unwrap_or(0);
         for (label, value) in rows {
             println!("  {}  {}", self.dim(&pad(label, width)), value);
+        }
+    }
+
+    pub fn steps(&self, rows: &[(String, String)]) {
+        let width = rows
+            .iter()
+            .map(|(text, _)| visible_len(text))
+            .max()
+            .unwrap_or(0);
+        for (index, (text, command)) in rows.iter().enumerate() {
+            println!(
+                "  {} {}  {}",
+                self.accent(&format!("{}.", index + 1)),
+                pad(text, width),
+                self.strong_accent(command)
+            );
         }
     }
 
@@ -139,10 +295,11 @@ impl Output {
         if self.json {
             return;
         }
-        let label = if self.err_color {
-            "\x1b[1;33mwarning:\x1b[0m"
+        let sequence = self.err_palette.sequence(Role::Warn);
+        let label = if sequence.is_empty() {
+            "warning:".to_string()
         } else {
-            "warning:"
+            format!("\x1b[1;{}mwarning:\x1b[0m", sequence)
         };
         eprintln!("{} {}", label, text.as_ref());
     }
@@ -154,16 +311,33 @@ impl Output {
             self.json(Value::Object(map));
             return;
         }
-        let label = if self.err_color {
-            "\x1b[1;31merror:\x1b[0m"
+        let sequence = self.err_palette.sequence(Role::Bad);
+        let label = if sequence.is_empty() {
+            "error:".to_string()
         } else {
-            "error:"
+            format!("\x1b[1;{}merror:\x1b[0m", sequence)
         };
         eprintln!("{} {}", label, err.message);
         if let Some(hint) = &err.hint {
             eprintln!("{}", hint);
         }
     }
+}
+
+fn unicode_ready() -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("TERM").is_some()
+        || std::env::var_os("TERM_PROGRAM").is_some()
+}
+
+fn vt_ready(stderr: bool, is_terminal: bool) -> bool {
+    if !is_terminal {
+        return true;
+    }
+    enable_ansi(stderr)
 }
 
 #[cfg(windows)]
@@ -247,6 +421,41 @@ pub fn format_timestamp(unix: i64) -> String {
     }
 }
 
+pub fn format_elapsed(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return format!("{} seconds", seconds);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return plural_unit(minutes, "minute");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return plural_unit(hours, "hour");
+    }
+    plural_unit(hours / 24, "day")
+}
+
+pub fn format_relative(unix: i64, now: i64) -> String {
+    let difference = now - unix;
+    if difference < 0 {
+        return format_timestamp(unix);
+    }
+    if difference < 45 {
+        return "just now".to_string();
+    }
+    format!("{} ago", format_elapsed(difference))
+}
+
+fn plural_unit(count: i64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {}", unit)
+    } else {
+        format!("{} {}s", count, unit)
+    }
+}
+
 pub fn title_case(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
@@ -258,6 +467,22 @@ pub fn title_case(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn painted(theme_choice: ThemeChoice) -> Output {
+        Output::assemble(
+            false,
+            ColorChoice::Always,
+            theme_choice,
+            true,
+            true,
+            true,
+            true,
+        )
+    }
+
+    fn plain() -> Output {
+        Output::build(false, ColorChoice::Never, ThemeChoice::Dark, true, true)
+    }
 
     #[test]
     fn envelope_always_carries_schema() {
@@ -271,5 +496,66 @@ mod tests {
     fn visible_len_ignores_color_codes() {
         assert_eq!(visible_len("\x1b[32mok\x1b[0m"), 2);
         assert_eq!(pad("\x1b[1mab\x1b[0m", 4), "\x1b[1mab\x1b[0m  ");
+    }
+
+    #[test]
+    fn json_mode_never_colors_or_animates() {
+        let out = Output::build(true, ColorChoice::Always, ThemeChoice::Dark, true, true);
+        assert!(!out.animates());
+        assert_eq!(out.accent("hi"), "hi");
+        assert_eq!(out.gradient("hi"), "hi");
+        assert_eq!(out.dim("hi"), "hi");
+    }
+
+    #[test]
+    fn color_never_leaves_the_text_bare() {
+        let out = plain();
+        assert_eq!(out.accent("hi"), "hi");
+        assert_eq!(out.tone("hi", Tone::Good), "hi");
+        assert_eq!(out.heading("hi"), "hi");
+        assert!(!out.animates());
+        assert!(!out.dot(Tone::Good).contains('\x1b'));
+    }
+
+    #[test]
+    fn a_pipe_gets_no_color_by_default() {
+        let out = Output::build(false, ColorChoice::Auto, ThemeChoice::Dark, false, false);
+        assert!(!out.ansi());
+        assert!(!out.animates());
+        assert_eq!(out.accent("hi"), "hi");
+    }
+
+    #[test]
+    fn light_and_dark_use_different_blues() {
+        let dark = painted(ThemeChoice::Dark).accent("aster");
+        let light = painted(ThemeChoice::Light).accent("aster");
+        assert!(dark.contains('\x1b'));
+        assert!(light.contains('\x1b'));
+        assert_ne!(dark, light);
+    }
+
+    #[test]
+    fn gradient_paints_every_character_and_resets() {
+        let out = painted(ThemeChoice::Dark);
+        let text = out.gradient("aster");
+        assert_eq!(visible_len(&text), 5);
+        assert!(text.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn marks_carry_meaning_without_color() {
+        let out = plain();
+        assert_ne!(out.mark(Tone::Good), out.mark(Tone::Bad));
+        assert_ne!(out.mark(Tone::Warn), out.mark(Tone::Good));
+    }
+
+    #[test]
+    fn elapsed_and_relative_read_as_sentences() {
+        assert_eq!(format_elapsed(5), "5 seconds");
+        assert_eq!(format_elapsed(60), "1 minute");
+        assert_eq!(format_elapsed(7200), "2 hours");
+        assert_eq!(format_elapsed(172_800), "2 days");
+        assert_eq!(format_relative(100, 110), "just now");
+        assert_eq!(format_relative(0, 120), "2 minutes ago");
     }
 }
