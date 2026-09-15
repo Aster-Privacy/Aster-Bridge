@@ -187,7 +187,7 @@ async fn run_session_erased(
     client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
 ) -> Result<()> {
-    run_session(stream, session, db, client, passwords, None).await
+    run_session_inner(stream, session, db, client, passwords, None, false).await
 }
 
 async fn run_session<S>(
@@ -201,11 +201,27 @@ async fn run_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_session_inner(stream, session, db, client, passwords, tls_config, true).await
+}
+
+async fn run_session_inner<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    greet: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let stls_capable = tls_config.is_some();
     let (read_half, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-
-    writer.write_all(b"+OK Aster Bridge POP3 ready\r\n").await?;
+    if greet {
+        writer.write_all(b"+OK Aster Bridge POP3 ready\r\n").await?;
+    }
 
     let mut authenticated = false;
     let mut user_received = false;
@@ -720,6 +736,50 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_after_stls_does_not_repeat_the_greeting() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(server_side);
+        let handle = tokio::spawn(run_session_erased(erased, session, db, client, passwords));
+
+        let (client_read, mut client_write) = tokio::io::split(client_side);
+        let mut reader = BufReader::new(client_read);
+        let mut line = String::new();
+
+        client_write.write_all(b"CAPA
+").await.unwrap();
+        client_write.flush().await.unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("+OK Capability list follows"),
+            "a session resumed after STLS answered {:?} first, so every later reply is off by one",
+            line
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
