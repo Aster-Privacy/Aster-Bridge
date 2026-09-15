@@ -57,10 +57,10 @@ fn run() -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
-            out.error(&exit::CliError::general(format!(
-                "Aster Bridge couldn't start: {}",
-                e
-            )));
+            out.error(&exit::CliError::coded(
+                exit::CODE_SERVER_START,
+                format!("Aster Bridge couldn't start: {}", e),
+            ));
             return exit::EXIT_ERROR;
         }
     };

@@ -321,10 +321,33 @@ impl Output {
             format!("\x1b[1;{}merror:\x1b[0m", sequence)
         };
         eprintln!("{} {}", label, err.message);
-        if let Some(hint) = &err.hint {
-            eprintln!("{}", hint);
+        for (name, value) in error_details(err) {
+            eprintln!("  {}  {}", self.err_dim(&pad(name, 9)), value);
         }
     }
+
+    fn err_dim(&self, text: &str) -> String {
+        let sequence = self.err_palette.sequence(Role::Muted);
+        if sequence.is_empty() {
+            return text.to_string();
+        }
+        format!("\x1b[{}m{}\x1b[0m", sequence, text)
+    }
+}
+
+pub fn error_details(err: &CliError) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    match err.reference() {
+        Some(reference) => rows.push(("reference", format!("{} ({})", reference, err.code))),
+        None => rows.push(("reference", err.code.clone())),
+    }
+    if let Some(hint) = &err.hint {
+        rows.push(("next step", hint.clone()));
+    }
+    if let Some(reference) = err.reference() {
+        rows.push(("help", format!("aster-bridge errors {}", reference)));
+    }
+    rows
 }
 
 fn unicode_ready() -> bool {

@@ -42,7 +42,11 @@ use super::common::{self, VERSION};
 use crate::context::{self, Context};
 use crate::control;
 use crate::events::{self, CliEvents, SinkGuard};
-use crate::exit::{CliError, CliResult, EXIT_ERROR, EXIT_NOT_READY, EXIT_OK};
+use crate::exit::{
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_OUTBOX_ALREADY_SENT, CODE_OUTBOX_NOT_FOUND,
+    CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
+    CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, EXIT_ERROR, EXIT_NOT_READY, EXIT_OK,
+};
 use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend::{self, map_store_error};
@@ -104,7 +108,7 @@ const SERVICE_HEALTHY_RUN: Duration = Duration::from_secs(300);
 fn plan_check_failed(detail: &str) -> CliError {
     CliError::new(
         EXIT_ERROR,
-        "plan_check_failed",
+        CODE_PLAN_CHECK,
         "Couldn't confirm your plan with Aster Mail, so Aster Bridge didn't start.",
     )
     .with_hint(format!(
@@ -152,7 +156,7 @@ fn start_error(error: StartError) -> CliError {
             } else {
                 CliError::new(
                     EXIT_ERROR,
-                    "port_unavailable",
+                    CODE_PORT_UNAVAILABLE,
                     format!("Port {} for {} isn't available: {}", port, service.label(), message),
                 )
                 .with_hint(hint)
@@ -165,7 +169,7 @@ fn start_error(error: StartError) -> CliError {
         StartError::NotSignedIn => CliError::not_signed_in(),
         StartError::DeviceRevoked => CliError::device_revoked(),
         StartError::Io(message) | StartError::Database(message) => {
-            CliError::general(format!("Aster Bridge couldn't start: {}", message))
+            CliError::coded(CODE_SERVER_START, format!("Aster Bridge couldn't start: {}", message))
         }
     }
 }
@@ -343,11 +347,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     }
     tracing::info!("aster-bridge is running");
 
-    let reason = tokio::select! {
-        reason = running.wait() => reason,
-        _ = signals::shutdown() => shutdown(ctx, &running, &db, ndjson).await,
-        _ = stop.notified() => shutdown(ctx, &running, &db, ndjson).await,
-    };
+    let reason = wait_for_stop(ctx, &running, &db, &stop, ndjson).await;
     drop(control_server);
 
     common::save_state(&dir, |s| {
@@ -388,10 +388,10 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
             common::forget_device(&dir);
             Err(CliError::device_revoked())
         }
-        StopReason::Fatal(message) => Err(CliError::general(format!(
-            "Aster Bridge stopped because of an error: {}",
-            message
-        ))),
+        StopReason::Fatal(message) => Err(CliError::coded(
+            CODE_SERVER_STOPPED,
+            format!("Aster Bridge stopped because of an error: {}", message),
+        )),
     }
 }
 
@@ -415,8 +415,83 @@ fn print_banner(ctx: &Context, email: &str, plan_code: &str, services: &[Value])
         "To create one, run: {}",
         out.strong_accent("aster-bridge app-password create")
     ));
-    out.blank();
-    out.line(out.dim("Press Control-C to stop."));
+}
+
+const RUNNING_LABEL: &str = "Listening for your email app";
+
+fn uptime_label(started: std::time::Instant) -> String {
+    let seconds = started.elapsed().as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds % 60)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+fn footer_detail(ctx: &Context, started: std::time::Instant) -> String {
+    let separator = if ctx.out.unicode() { "\u{b7}" } else { "-" };
+    format!(
+        "up {}  {}  Press Control-C to stop.",
+        uptime_label(started),
+        separator
+    )
+}
+
+async fn wait_for_stop(
+    ctx: &Context,
+    running: &RunningBridge,
+    db: &Database,
+    stop: &Notify,
+    ndjson: bool,
+) -> StopReason {
+    let wait = running.wait();
+    tokio::pin!(wait);
+    let signal = signals::shutdown();
+    tokio::pin!(signal);
+    let notified = stop.notified();
+    tokio::pin!(notified);
+
+    if ndjson || !ctx.out.animates() {
+        if !ndjson {
+            ctx.out.blank();
+            ctx.out.line(ctx.out.dim("Press Control-C to stop."));
+        }
+        return tokio::select! {
+            reason = &mut wait => reason,
+            _ = &mut signal => shutdown(ctx, running, db, ndjson).await,
+            _ = &mut notified => shutdown(ctx, running, db, ndjson).await,
+        };
+    }
+
+    ctx.out.blank();
+    let started = std::time::Instant::now();
+    let mut live = spinner::Spinner::start(&ctx.out, RUNNING_LABEL);
+    live.set_detail(footer_detail(ctx, started));
+    let mut tick = tokio::time::interval(spinner::FRAME_INTERVAL);
+    loop {
+        tokio::select! {
+            reason = &mut wait => {
+                live.clear();
+                return reason;
+            }
+            _ = &mut signal => {
+                live.clear();
+                return shutdown(ctx, running, db, ndjson).await;
+            }
+            _ = &mut notified => {
+                live.clear();
+                return shutdown(ctx, running, db, ndjson).await;
+            }
+            _ = tick.tick() => {
+                live.set_detail(footer_detail(ctx, started));
+                live.tick();
+            }
+        }
+    }
 }
 
 pub fn service_rows(services: &[Value]) -> Vec<Vec<String>> {
@@ -516,7 +591,7 @@ impl Shared {
                 self.running
                     .sync_now()
                     .await
-                    .map_err(|e| CliError::general(format!("Sync didn't finish: {}", e)))?;
+                    .map_err(|e| CliError::coded(CODE_SYNC, format!("Sync didn't finish: {}", e)))?;
                 Ok(json!({ "synced": true }))
             }
             "outbox_list" => common::outbox_list(&self.db),
@@ -525,11 +600,11 @@ impl Shared {
             "repair_cache" => {
                 self.db
                     .repair_cache()
-                    .map_err(|e| CliError::general(format!("Couldn't rebuild the cache: {}", e)))?;
+                    .map_err(|e| CliError::coded(CODE_CACHE_REBUILD, format!("Couldn't rebuild the cache: {}", e)))?;
                 self.running
                     .sync_now()
                     .await
-                    .map_err(|e| CliError::general(format!("The cache was rebuilt, but sync didn't finish: {}", e)))?;
+                    .map_err(|e| CliError::coded(CODE_SYNC, format!("The cache was rebuilt, but sync didn't finish: {}", e)))?;
                 Ok(json!({ "repaired": true, "synced": true }))
             }
             "app_password_create" => common::app_password_create(
@@ -614,11 +689,11 @@ impl Shared {
                 let row = self
                     .db
                     .outbox_get(id)
-                    .map_err(|e| CliError::general(format!("Couldn't read the outbox: {}", e)))?
+                    .map_err(|e| CliError::coded(CODE_OUTBOX_READ, format!("Couldn't read the outbox: {}", e)))?
                     .ok_or_else(|| {
                         CliError::new(
                             EXIT_ERROR,
-                            "not_found",
+                            CODE_OUTBOX_NOT_FOUND,
                             format!("No queued message has the ID {}.", id),
                         )
                         .with_hint("To see queued messages and their IDs, run: aster-bridge outbox list")
@@ -626,7 +701,7 @@ impl Shared {
                 if row.status == "sent" {
                     return Err(CliError::new(
                         EXIT_ERROR,
-                        "already_sent",
+                        CODE_OUTBOX_ALREADY_SENT,
                         format!("Message {} was already sent.", id),
                     ));
                 }
@@ -635,7 +710,7 @@ impl Shared {
             None => self
                 .db
                 .outbox_list_pending()
-                .map_err(|e| CliError::general(format!("Couldn't read the outbox: {}", e)))?
+                .map_err(|e| CliError::coded(CODE_OUTBOX_READ, format!("Couldn't read the outbox: {}", e)))?
                 .into_iter()
                 .filter(|row| row.status != "sending")
                 .map(|row| row.id)
@@ -645,7 +720,8 @@ impl Shared {
             match tokio::time::timeout(Duration::from_secs(5), trigger.send(*id)).await {
                 Ok(Ok(())) => {}
                 _ => {
-                    return Err(CliError::general(
+                    return Err(CliError::coded(
+                        CODE_OUTBOX_RETRY,
                         "The outbox is busy. Wait a moment and try again.",
                     ))
                 }

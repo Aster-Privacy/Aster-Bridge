@@ -24,7 +24,7 @@ use aster_bridge_core::secrets::{self, SecretBackend, CLI_KEYRING_SERVICE};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::SecretBackendChoice;
-use crate::exit::{CliError, CliResult};
+use crate::exit::{CliError, CliResult, CODE_INTERNAL};
 
 const RECORD_FILE: &str = "secret_backend";
 const SECRETS_DIR: &str = "secrets";
@@ -190,7 +190,7 @@ pub fn activate_or_create(data_dir: &Path, choice: SecretBackendChoice) -> CliRe
         return Ok(name);
     }
     let (record, backend) = choose(data_dir, choice)?;
-    let bytes = serde_json::to_vec(&record).map_err(|e| CliError::general(e.to_string()))?;
+    let bytes = serde_json::to_vec(&record).map_err(|e| CliError::coded(CODE_INTERNAL, e.to_string()))?;
     crate::state::write_private(&record_path(data_dir), &bytes).map_err(CliError::secret_store)?;
     let name = backend.name();
     secrets::install_backend(backend);
@@ -214,7 +214,7 @@ pub fn map_store_error(context: &str, message: String) -> CliError {
             "Check that the keyring or secret key file this folder was set up with is available.",
         )
     } else {
-        CliError::general(format!("{}: {}", context, message))
+        CliError::coded(CODE_INTERNAL, format!("{}: {}", context, message))
     }
 }
 

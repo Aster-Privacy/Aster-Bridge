@@ -28,7 +28,11 @@ use super::common;
 use crate::cli::ServiceCommand;
 use crate::context::Context;
 use crate::control;
-use crate::exit::{CliError, CliResult, EXIT_NOT_READY, EXIT_OK};
+use crate::exit::{
+    CliError, CliResult, CODE_PROGRAM_PATH, CODE_SERVICE_COMMAND, EXIT_NOT_READY, EXIT_OK,
+};
+#[cfg(not(windows))]
+use crate::exit::{CODE_SERVICE_FILE, CODE_SERVICE_UNSUPPORTED};
 use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend;
@@ -69,7 +73,7 @@ pub fn is_installed(data_dir: &Path) -> bool {
 
 fn current_exe() -> CliResult<PathBuf> {
     let exe = std::env::current_exe()
-        .map_err(|e| CliError::general(format!("Couldn't find the aster-bridge program: {}", e)))?;
+        .map_err(|e| CliError::coded(CODE_PROGRAM_PATH, format!("Couldn't find the aster-bridge program: {}", e)))?;
     let text = exe.display().to_string();
     Ok(match text.strip_prefix(r"\\?\") {
         Some(stripped) if !stripped.starts_with("UNC\\") => PathBuf::from(stripped),
@@ -259,19 +263,22 @@ async fn status(ctx: &Context) -> CliResult<i32> {
 fn run_tool(program: &str, args: &[&str]) -> CliResult<String> {
     let output = tool_command(program, args)
         .output()
-        .map_err(|e| CliError::general(format!("Couldn't run {}: {}", program, e)))?;
+        .map_err(|e| CliError::coded(CODE_SERVICE_COMMAND, format!("Couldn't run {}: {}", program, e)))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-    Err(CliError::general(format!(
-        "{} {} failed: {}",
-        program,
-        args.first().copied().unwrap_or_default(),
-        detail
-    )))
+    Err(CliError::coded(
+        CODE_SERVICE_COMMAND,
+        format!(
+            "{} {} failed: {}",
+            program,
+            args.first().copied().unwrap_or_default(),
+            detail
+        ),
+    ))
 }
 
 #[allow(dead_code)]
@@ -323,7 +330,7 @@ mod platform {
 
     pub fn supported() -> CliResult<()> {
         if probe_tool("systemctl", &["--user", "--version"]).is_none() {
-            return Err(CliError::general("systemd isn't available on this system.")
+            return Err(CliError::coded(CODE_SERVICE_UNSUPPORTED, "systemd isn't available on this system.")
                 .with_hint("To keep Aster Bridge running, start it with your own process manager: aster-bridge serve --service"));
         }
         Ok(())
@@ -379,14 +386,14 @@ mod platform {
 
     pub fn install(spec: &Spec) -> CliResult<()> {
         let path = unit_path(&spec.data_dir)
-            .ok_or_else(|| CliError::general("Couldn't find the systemd user folder."))?;
+            .ok_or_else(|| CliError::coded(CODE_SERVICE_FILE, "Couldn't find the systemd user folder."))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::general(format!("Couldn't create {}: {}", parent.display(), e))
+                CliError::coded(CODE_SERVICE_FILE, format!("Couldn't create {}: {}", parent.display(), e))
             })?;
         }
         std::fs::write(&path, unit(spec)?)
-            .map_err(|e| CliError::general(format!("Couldn't write {}: {}", path.display(), e)))?;
+            .map_err(|e| CliError::coded(CODE_SERVICE_FILE, format!("Couldn't write {}: {}", path.display(), e)))?;
         let name = unit_name(&spec.data_dir);
         run_tool("systemctl", &["--user", "daemon-reload"])?;
         run_tool("systemctl", &["--user", "enable", &name])?;
@@ -401,7 +408,7 @@ mod platform {
         let _ = run_tool("systemctl", &["--user", "disable", "--now", &name]);
         if let Some(path) = unit_path(data_dir) {
             std::fs::remove_file(&path).map_err(|e| {
-                CliError::general(format!("Couldn't remove {}: {}", path.display(), e))
+                CliError::coded(CODE_SERVICE_FILE, format!("Couldn't remove {}: {}", path.display(), e))
             })?;
         }
         let _ = run_tool("systemctl", &["--user", "daemon-reload"]);
@@ -514,16 +521,16 @@ mod platform {
 
     pub fn install(spec: &Spec) -> CliResult<()> {
         let path = plist_path(&spec.data_dir)
-            .ok_or_else(|| CliError::general("Couldn't find the LaunchAgents folder."))?;
+            .ok_or_else(|| CliError::coded(CODE_SERVICE_FILE, "Couldn't find the LaunchAgents folder."))?;
         let log_dir = aster_bridge_core::diagnostics::ensure_log_dir(&spec.data_dir)
-            .map_err(|e| CliError::general(format!("Couldn't create the log folder: {}", e)))?;
+            .map_err(|e| CliError::coded(CODE_SERVICE_FILE, format!("Couldn't create the log folder: {}", e)))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::general(format!("Couldn't create {}: {}", parent.display(), e))
+                CliError::coded(CODE_SERVICE_FILE, format!("Couldn't create {}: {}", parent.display(), e))
             })?;
         }
         std::fs::write(&path, plist(spec, &log_dir)?)
-            .map_err(|e| CliError::general(format!("Couldn't write {}: {}", path.display(), e)))?;
+            .map_err(|e| CliError::coded(CODE_SERVICE_FILE, format!("Couldn't write {}: {}", path.display(), e)))?;
         let domain = format!("gui/{}", uid()?);
         let target = format!("{}/{}", domain, label(&spec.data_dir));
         let _ = run_tool("launchctl", &["bootout", &target]);
@@ -538,7 +545,7 @@ mod platform {
                 Err(e) => last_error = Some(e),
             }
         }
-        Err(last_error.unwrap_or_else(|| CliError::general("launchctl bootstrap failed.")))
+        Err(last_error.unwrap_or_else(|| CliError::coded(CODE_SERVICE_COMMAND, "launchctl bootstrap failed.")))
     }
 
     pub fn before_uninstall(data_dir: &Path) {
@@ -550,7 +557,7 @@ mod platform {
     pub fn uninstall(data_dir: &Path) -> CliResult<()> {
         if let Some(path) = plist_path(data_dir) {
             std::fs::remove_file(&path).map_err(|e| {
-                CliError::general(format!("Couldn't remove {}: {}", path.display(), e))
+                CliError::coded(CODE_SERVICE_FILE, format!("Couldn't remove {}: {}", path.display(), e))
             })?;
         }
         Ok(())
@@ -643,7 +650,7 @@ mod platform {
             .stderr(Stdio::null())
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .spawn()
-            .map_err(|e| CliError::general(format!("Couldn't start Aster Bridge: {}", e)))?;
+            .map_err(|e| CliError::coded(CODE_SERVICE_COMMAND, format!("Couldn't start Aster Bridge: {}", e)))?;
         Ok(())
     }
 
@@ -670,7 +677,10 @@ mod platform {
     pub const MANAGER: &str = "none";
 
     pub fn supported() -> CliResult<()> {
-        Err(CliError::general("The background service isn't available on this system.")
+        Err(CliError::coded(
+            CODE_SERVICE_UNSUPPORTED,
+            "The background service isn't available on this system.",
+        )
             .with_hint("To keep Aster Bridge running, start it with your own process manager: aster-bridge serve --service"))
     }
 

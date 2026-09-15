@@ -27,7 +27,7 @@ use super::common::{self, VERSION};
 use crate::cli::ConfigCommand;
 use crate::context::Context;
 use crate::control;
-use crate::exit::{CliError, CliResult, EXIT_OK};
+use crate::exit::{self, CliError, CliResult, EXIT_OK};
 use crate::output::{Output, Tone};
 use crate::spinner;
 
@@ -43,6 +43,68 @@ pub fn version(out: &Output) -> CliResult<i32> {
         out.line(format!("aster-bridge {} ({} {})", VERSION, os, arch));
     }
     Ok(EXIT_OK)
+}
+
+pub fn errors(out: &Output, query: Option<&str>) -> CliResult<i32> {
+    match query {
+        Some(query) => one_error(out, query),
+        None => all_errors(out),
+    }
+}
+
+fn all_errors(out: &Output) -> CliResult<i32> {
+    if out.json {
+        let entries: Vec<Value> = exit::CATALOG.iter().map(error_json).collect();
+        out.json(json!({ "errors": entries }));
+        return Ok(EXIT_OK);
+    }
+    out.line(out.heading("Aster Bridge error reference"));
+    out.blank();
+    let rows: Vec<Vec<String>> = exit::CATALOG
+        .iter()
+        .map(|doc| {
+            vec![
+                doc.reference.to_string(),
+                doc.exit_code.to_string(),
+                doc.code.to_string(),
+                doc.summary.to_string(),
+            ]
+        })
+        .collect();
+    out.table(&["REFERENCE", "EXIT", "CODE", "SUMMARY"], &rows);
+    out.blank();
+    out.line(out.dim("To read one entry, run: aster-bridge errors ASTER-1005"));
+    Ok(EXIT_OK)
+}
+
+fn one_error(out: &Output, query: &str) -> CliResult<i32> {
+    let doc = exit::lookup(query).ok_or_else(|| {
+        CliError::usage(format!("{} isn't an Aster Bridge error code.", query))
+            .with_hint("To list every code, run: aster-bridge errors")
+    })?;
+    if out.json {
+        out.json(json!({ "error_code": error_json(doc) }));
+        return Ok(EXIT_OK);
+    }
+    out.line(out.heading(doc.reference));
+    out.blank();
+    out.fields(&[
+        ("Code", doc.code.to_string()),
+        ("Exit code", doc.exit_code.to_string()),
+        ("Summary", doc.summary.to_string()),
+        ("Resolution", doc.resolution.to_string()),
+    ]);
+    Ok(EXIT_OK)
+}
+
+fn error_json(doc: &exit::ErrorDoc) -> Value {
+    json!({
+        "reference": doc.reference,
+        "code": doc.code,
+        "exit_code": doc.exit_code,
+        "summary": doc.summary,
+        "resolution": doc.resolution,
+    })
 }
 
 pub async fn sync_now(ctx: &Context) -> CliResult<i32> {
@@ -72,10 +134,13 @@ pub fn tls_fingerprint(ctx: &Context) -> CliResult<i32> {
         None => {
             tls::install_default_crypto_provider();
             tls::ensure_cert(dir).map_err(|e| {
-                CliError::general(format!("Couldn't create the TLS certificate: {}", e))
+                CliError::coded(
+                    exit::CODE_TLS_CERTIFICATE,
+                    format!("Couldn't create the TLS certificate: {}", e),
+                )
             })?;
             tls::cert_fingerprint_sha256(dir)
-                .ok_or_else(|| CliError::general("Couldn't read the TLS certificate."))?
+                .ok_or_else(|| CliError::coded(exit::CODE_TLS_CERTIFICATE, "Couldn't read the TLS certificate."))?
         }
     };
     let path = tls::cert_pem_path(dir).display().to_string();
@@ -101,7 +166,7 @@ pub fn tls_fingerprint(ctx: &Context) -> CliResult<i32> {
 fn all_settings(config: &BridgeConfig) -> CliResult<Map<String, Value>> {
     match serde_json::to_value(config) {
         Ok(Value::Object(map)) => Ok(map),
-        _ => Err(CliError::general("Couldn't read the settings.")),
+        _ => Err(CliError::coded(exit::CODE_SETTINGS_READ, "Couldn't read the settings.")),
     }
 }
 
@@ -227,7 +292,7 @@ async fn config_set(ctx: &Context, key: &str, raw: &str) -> CliResult<i32> {
         .with_hint("To see the ports in use, run: aster-bridge config get"));
     }
     config::save_config(&updated)
-        .map_err(|e| CliError::general(format!("Couldn't save the settings: {}", e)))?;
+        .map_err(|e| CliError::coded(exit::CODE_SETTINGS_WRITE, format!("Couldn't save the settings: {}", e)))?;
 
     let running = control::running(&ctx.data_dir).await.is_some();
     let out = &ctx.out;
@@ -253,7 +318,7 @@ pub async fn repair_cache(ctx: &Context) -> CliResult<i32> {
             offline
                 .db
                 .repair_cache()
-                .map_err(|e| CliError::general(format!("Couldn't rebuild the cache: {}", e)))?;
+                .map_err(|e| CliError::coded(exit::CODE_CACHE_REBUILD, format!("Couldn't rebuild the cache: {}", e)))?;
             Ok(json!({ "repaired": true, "synced": false }))
         }),
     )

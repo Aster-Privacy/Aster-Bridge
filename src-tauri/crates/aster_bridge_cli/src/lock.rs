@@ -21,7 +21,7 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 
-use crate::exit::{CliError, CliResult};
+use crate::exit::{CliError, CliResult, CODE_DATA_DIR};
 
 const LOCK_FILE: &str = "bridge.lock";
 
@@ -44,16 +44,15 @@ impl InstanceLock {
             .truncate(false)
             .open(&path)
             .map_err(|e| {
-                CliError::general(format!("Couldn't open {}: {}", path.display(), e))
+                CliError::coded(CODE_DATA_DIR, format!("Couldn't open {}: {}", path.display(), e))
             })?;
         match file.try_lock() {
             Ok(()) => Ok(LockAttempt::Acquired(InstanceLock { _file: file })),
             Err(TryLockError::WouldBlock) => Ok(LockAttempt::Held),
-            Err(TryLockError::Error(e)) => Err(CliError::general(format!(
-                "Couldn't lock {}: {}",
-                path.display(),
-                e
-            ))),
+            Err(TryLockError::Error(e)) => Err(CliError::coded(
+                CODE_DATA_DIR,
+                format!("Couldn't lock {}: {}", path.display(), e),
+            )),
         }
     }
 

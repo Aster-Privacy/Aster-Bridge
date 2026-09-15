@@ -31,7 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
-use crate::exit::{CliError, EXIT_ERROR};
+use crate::exit::{CliError, CODE_CONTROL_UNREACHABLE, EXIT_ERROR};
 
 const CONTROL_FILE: &str = "control.json";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -230,7 +230,8 @@ pub async fn call_running(data_dir: &Path, op: &str, args: Value) -> Result<Opti
     match client.call(op, args).await {
         Ok(value) => Ok(Some(value)),
         Err(CallError::Remote(err)) => Err(err),
-        Err(CallError::Unreachable) => Err(CliError::general(
+        Err(CallError::Unreachable) => Err(CliError::coded(
+            CODE_CONTROL_UNREACHABLE,
             "Aster Bridge stopped responding while handling the request.",
         )),
     }

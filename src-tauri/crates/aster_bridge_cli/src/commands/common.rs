@@ -34,7 +34,11 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::context::{self, Context};
-use crate::exit::{CliError, CliResult, EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL};
+use crate::exit::{
+    CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_NETWORK,
+    CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_SETTINGS_READ, CODE_SIGN_IN, EXIT_ACCESS, EXIT_ERROR,
+    UPGRADE_URL,
+};
 use crate::lock::InstanceLock;
 use crate::output::title_case;
 use crate::secret_backend::{self, is_secret_error, map_store_error};
@@ -80,7 +84,7 @@ pub fn forget_device(data_dir: &Path) {
 
 pub fn load_config() -> CliResult<BridgeConfig> {
     config::load_config()
-        .map_err(|e| CliError::general(format!("Couldn't read the settings file: {}", e)))
+        .map_err(|e| CliError::coded(CODE_SETTINGS_READ, format!("Couldn't read the settings file: {}", e)))
 }
 
 pub fn plan_label(code: Option<&str>) -> String {
@@ -132,14 +136,14 @@ pub fn account_state_error(account_state: AccountState) -> CliError {
             format!("To continue, turn on two-factor authentication at {}/settings.", APP_URL),
         ),
         AccountState::Active => {
-            return CliError::general("Aster Mail refused the sign-in.");
+            return CliError::coded(CODE_SIGN_IN, "Aster Mail refused the sign-in.");
         }
     };
     CliError::new(EXIT_ACCESS, account_state.as_str(), message).with_hint(hint)
 }
 
 pub fn network_error(detail: &str) -> CliError {
-    CliError::new(EXIT_ERROR, "network", "Couldn't reach Aster Mail.").with_hint(format!(
+    CliError::new(EXIT_ERROR, CODE_NETWORK, "Couldn't reach Aster Mail.").with_hint(format!(
         "Check your internet connection and try again. Details: {}",
         detail
     ))
@@ -164,7 +168,7 @@ pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
             map_store_error("Couldn't read the device keys", message)
         }
         BridgeError::Network(e) => network_error(&e.to_string()),
-        other => CliError::general(format!("Couldn't sign in to Aster Mail: {}", other)),
+        other => CliError::coded(CODE_SIGN_IN, format!("Couldn't sign in to Aster Mail: {}", other)),
     }
 }
 
@@ -237,7 +241,7 @@ pub fn plan_from_result(
             checked_at: state::now(),
         }),
         Err(BridgeError::Network(e)) => Err(network_error(&e.to_string())),
-        Err(e) => Err(CliError::general(format!("Couldn't check your plan: {}", e))),
+        Err(e) => Err(CliError::coded(CODE_PLAN_CHECK, format!("Couldn't check your plan: {}", e))),
     }
 }
 
@@ -278,7 +282,7 @@ pub fn app_password_create(
     let password = Zeroizing::new(generate_app_password());
     let id = passwords
         .store(&label, &password)
-        .map_err(|e| CliError::general(format!("Couldn't save the app password: {}", e)))?;
+        .map_err(|e| CliError::coded(CODE_APP_PASSWORD_SAVE, format!("Couldn't save the app password: {}", e)))?;
     Ok(json!({ "id": id, "label": label, "password": password.as_str() }))
 }
 
@@ -312,7 +316,7 @@ pub fn app_password_revoke(passwords: &AppPasswords, id: &str) -> CliResult<Valu
     }
     passwords
         .delete(id)
-        .map_err(|e| CliError::general(format!("Couldn't revoke the app password: {}", e)))?;
+        .map_err(|e| CliError::coded(CODE_APP_PASSWORD_REVOKE, format!("Couldn't revoke the app password: {}", e)))?;
     Ok(json!({ "revoked": id }))
 }
 
@@ -325,7 +329,7 @@ fn parse_subject(raw_mime: &[u8]) -> Option<String> {
 pub fn outbox_list(db: &Database) -> CliResult<Value> {
     let rows = db
         .outbox_list_pending()
-        .map_err(|e| CliError::general(format!("Couldn't read the outbox: {}", e)))?;
+        .map_err(|e| CliError::coded(CODE_OUTBOX_READ, format!("Couldn't read the outbox: {}", e)))?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|row| {

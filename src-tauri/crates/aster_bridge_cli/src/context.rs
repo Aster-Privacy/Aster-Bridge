@@ -32,7 +32,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 use crate::cli::{GlobalArgs, LogLevel};
-use crate::exit::{CliError, CliResult};
+use crate::exit::{CliError, CliResult, CODE_DATA_DIR};
 use crate::output::Output;
 
 pub const DATA_DIR_NAME: &str = "com.astermail.bridge.cli";
@@ -86,11 +86,10 @@ impl Context {
         })?;
         let existed = dir.is_dir();
         std::fs::create_dir_all(&dir).map_err(|e| {
-            CliError::general(format!(
-                "Couldn't create the data folder {}: {}",
-                dir.display(),
-                e
-            ))
+            CliError::coded(
+                CODE_DATA_DIR,
+                format!("Couldn't create the data folder {}: {}", dir.display(), e),
+            )
         })?;
         if !existed {
             aster_bridge_core::secrets::restrict_permissions(&dir, true);
@@ -184,6 +183,20 @@ fn level_filter(level: LogLevel) -> LevelFilter {
     }
 }
 
+fn stderr_level(explicit: Option<LogLevel>, write_file: bool, stderr_is_terminal: bool) -> LevelFilter {
+    if let Some(level) = explicit {
+        return level_filter(level);
+    }
+    if !write_file {
+        return LevelFilter::ERROR;
+    }
+    if stderr_is_terminal {
+        LevelFilter::WARN
+    } else {
+        LevelFilter::INFO
+    }
+}
+
 pub struct LogGuard {
     _file: Option<WorkerGuard>,
 }
@@ -199,11 +212,7 @@ fn dependency_noise_filter(level: LevelFilter) -> Targets {
 }
 
 pub fn init_logging(ctx: &Context, write_file: bool) -> LogGuard {
-    let stderr_level = ctx.global.log_level.map(level_filter).unwrap_or(if write_file {
-        LevelFilter::INFO
-    } else {
-        LevelFilter::ERROR
-    });
+    let stderr_level = stderr_level(ctx.global.log_level, write_file, std::io::stderr().is_terminal());
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -261,5 +270,32 @@ mod noise_filter_tests {
         let filter = dependency_noise_filter(LevelFilter::INFO);
         assert!(filter.would_enable("aster_bridge_core::sync::poller", &Level::INFO));
         assert!(!filter.would_enable("aster_bridge_core::sync::poller", &Level::DEBUG));
+    }
+}
+
+#[cfg(test)]
+mod stderr_level_tests {
+    use super::*;
+
+    #[test]
+    fn serving_to_a_terminal_leaves_the_rendered_output_alone() {
+        assert_eq!(stderr_level(None, true, true), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn serving_to_a_pipe_keeps_full_logs() {
+        assert_eq!(stderr_level(None, true, false), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn short_commands_only_report_errors() {
+        assert_eq!(stderr_level(None, false, true), LevelFilter::ERROR);
+        assert_eq!(stderr_level(None, false, false), LevelFilter::ERROR);
+    }
+
+    #[test]
+    fn an_explicit_level_always_wins() {
+        assert_eq!(stderr_level(Some(LogLevel::Info), true, true), LevelFilter::INFO);
+        assert_eq!(stderr_level(Some(LogLevel::Trace), false, true), LevelFilter::TRACE);
     }
 }

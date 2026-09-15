@@ -125,6 +125,11 @@ pub enum Command {
     RepairCache,
     #[command(subcommand, about = "Run Aster Bridge in the background at sign-in")]
     Service(ServiceCommand),
+    #[command(about = "Explain an error code")]
+    Errors {
+        #[arg(value_name = "CODE", help = "Reference such as ASTER-1005, or a code such as sync_failed")]
+        code: Option<String>,
+    },
     #[command(about = "Show version and platform")]
     Version,
 }

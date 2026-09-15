@@ -38,6 +38,9 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
     if matches!(command, Command::Version) {
         return misc::version(&out);
     }
+    if let Command::Errors { code } = &command {
+        return misc::errors(&out, code.as_deref());
+    }
     let ctx = Context::new(global, out)?;
     let _log = match command {
         Command::Serve { .. } => None,
@@ -58,6 +61,7 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
         Command::Config(command) => misc::config(&ctx, command).await,
         Command::RepairCache => misc::repair_cache(&ctx).await,
         Command::Service(command) => service::run(&ctx, command).await,
+        Command::Errors { code } => misc::errors(&ctx.out, code.as_deref()),
         Command::Version => misc::version(&ctx.out),
     }
 }

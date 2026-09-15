@@ -35,7 +35,10 @@ use tokio::time::MissedTickBehavior;
 
 use super::common;
 use crate::context::{self, Context};
-use crate::exit::{CliError, CliResult, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, LINK_DEVICE_URL};
+use crate::exit::{
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CODE_EXPIRED, CODE_SIGN_IN,
+    CODE_SIGN_IN_CANCELED, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, LINK_DEVICE_URL,
+};
 use crate::lock::InstanceLock;
 use crate::output::{Output, Tone};
 use crate::secret_backend::{self, map_store_error};
@@ -86,7 +89,8 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
                 code: code.code,
                 normalized: code.normalized,
             };
-            state::save_pending(&dir, &pending).map_err(CliError::general)?;
+            state::save_pending(&dir, &pending)
+                .map_err(|e| CliError::coded(CODE_SIGN_IN, e))?;
             pending
         }
     };
@@ -105,7 +109,7 @@ fn request_error(error: BridgeError) -> CliError {
     match error {
         BridgeError::Network(e) => common::network_error(&e.to_string()),
         BridgeError::PlanUpgradeRequired(_) => common::access_denied(None),
-        other => CliError::general(format!("Couldn't get a sign-in code: {}", other)),
+        other => CliError::coded(CODE_SIGN_IN, format!("Couldn't get a sign-in code: {}", other)),
     }
 }
 
@@ -145,7 +149,7 @@ fn show_code(out: &Output, pending: &PendingLogin, no_wait: bool) {
 
 fn expired(dir: &Path) -> CliError {
     state::clear_pending(dir);
-    CliError::new(EXIT_DEVICE, "code_expired", "The sign-in code expired.")
+    CliError::new(EXIT_DEVICE, CODE_CODE_EXPIRED, "The sign-in code expired.")
         .with_hint("To get a new code, run: aster-bridge login")
 }
 
@@ -182,7 +186,7 @@ async fn wait_for_confirmation(
         }
         tokio::select! {
             _ = &mut cancel => {
-                break Err(CliError::new(EXIT_ERROR, "canceled", "Sign-in canceled.")
+                break Err(CliError::new(EXIT_ERROR, CODE_SIGN_IN_CANCELED, "Sign-in canceled.")
                     .with_hint("The code stays valid until it expires. To continue, run: aster-bridge login"));
             }
             _ = redraw.tick(), if animated => {
@@ -204,7 +208,7 @@ async fn wait_for_confirmation(
                     Err(BridgeError::Api(message)) if message.starts_with("404") || message.starts_with("410") => {
                         break Err(expired(dir));
                     }
-                    Err(e) => break Err(CliError::general(format!("Couldn't finish signing in: {}", e))),
+                    Err(e) => break Err(CliError::coded(CODE_SIGN_IN, format!("Couldn't finish signing in: {}", e))),
                 }
             }
         }
@@ -252,7 +256,10 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
     let previous_owner = state::load(dir).cache_user_id;
     if previous_owner.as_deref().is_some_and(|owner| owner != user_id) {
         db.clear_all_user_data().map_err(|e| {
-            CliError::general(format!("Couldn't clear the previous account's cache: {}", e))
+            CliError::coded(
+                CODE_CACHE_REBUILD,
+                format!("Couldn't clear the previous account's cache: {}", e),
+            )
         })?;
     }
     drop(db);
@@ -285,7 +292,7 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
         s.last_stop = None;
         s.last_sync = None;
     })
-    .map_err(|e| CliError::general(format!("Couldn't save the sign-in: {}", e)))?;
+    .map_err(|e| CliError::coded(CODE_SIGN_IN, format!("Couldn't save the sign-in: {}", e)))?;
 
     match access {
         Ok(grant) => {

@@ -231,8 +231,7 @@ pub fn appearance_from_env(read: impl Fn(&str) -> Option<String>) -> Appearance 
 pub fn appearance_from_colorfgbg(value: &str) -> Option<Appearance> {
     let background = value
         .split(';')
-        .filter(|part| !part.trim().is_empty())
-        .next_back()?
+        .rfind(|part| !part.trim().is_empty())?
         .trim()
         .parse::<u16>()
         .ok()?;
