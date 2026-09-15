@@ -243,3 +243,23 @@ pub fn init_logging(ctx: &Context, write_file: bool) -> LogGuard {
         .try_init();
     LogGuard { _file: guard }
 }
+
+#[cfg(test)]
+mod noise_filter_tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn the_pgp_dependency_cannot_warn_on_the_terminal() {
+        let filter = dependency_noise_filter(LevelFilter::INFO);
+        assert!(!filter.would_enable("pgp::composed::message::types", &Level::WARN));
+        assert!(filter.would_enable("pgp::composed::message::types", &Level::ERROR));
+    }
+
+    #[test]
+    fn our_own_targets_keep_their_level() {
+        let filter = dependency_noise_filter(LevelFilter::INFO);
+        assert!(filter.would_enable("aster_bridge_core::sync::poller", &Level::INFO));
+        assert!(!filter.would_enable("aster_bridge_core::sync::poller", &Level::DEBUG));
+    }
+}
