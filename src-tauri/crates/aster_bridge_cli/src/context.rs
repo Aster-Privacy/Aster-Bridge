@@ -26,7 +26,7 @@ use aster_bridge_core::api_client::ApiClient;
 use aster_bridge_core::config::BridgeConfig;
 use aster_bridge_core::runtime::RuntimeTuning;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -188,6 +188,16 @@ pub struct LogGuard {
     _file: Option<WorkerGuard>,
 }
 
+const NOISY_DEPENDENCY_TARGETS: [&str; 1] = ["pgp"];
+
+fn dependency_noise_filter(level: LevelFilter) -> Targets {
+    let mut targets = Targets::new().with_default(level);
+    for target in NOISY_DEPENDENCY_TARGETS {
+        targets = targets.with_target(target, LevelFilter::ERROR);
+    }
+    targets
+}
+
 pub fn init_logging(ctx: &Context, write_file: bool) -> LogGuard {
     let stderr_level = ctx.global.log_level.map(level_filter).unwrap_or(if write_file {
         LevelFilter::INFO
@@ -199,7 +209,7 @@ pub fn init_logging(ctx: &Context, write_file: bool) -> LogGuard {
         .with_writer(std::io::stderr)
         .with_ansi(!no_color && std::io::stderr().is_terminal())
         .with_target(false)
-        .with_filter(stderr_level);
+        .with_filter(dependency_noise_filter(stderr_level));
 
     let mut guard = None;
     let file_layer = if write_file {
@@ -214,7 +224,7 @@ pub fn init_logging(ctx: &Context, write_file: bool) -> LogGuard {
                     tracing_subscriber::fmt::layer()
                         .with_writer(writer)
                         .with_ansi(false)
-                        .with_filter(file_level),
+                        .with_filter(dependency_noise_filter(file_level)),
                 )
             }
             Err(e) => {

@@ -301,11 +301,28 @@ fn attachment_display_name(a: &EnvelopeAttachment) -> String {
 
 const ATTACHMENT_INLINE_DOWNLOADS_PER_PASS: usize = 25;
 const ATTACHMENT_BACKLOG_PER_PASS: i64 = 25;
-const ATTACHMENT_MAX_ATTEMPTS: i64 = 50;
+const ATTACHMENT_MAX_ATTEMPTS: i64 = 5;
 
 enum AttachmentFetchError {
     Transport(String),
+    Permanent(String),
     Content(String),
+}
+
+fn api_status_code(message: &str) -> Option<u16> {
+    message
+        .split_whitespace()
+        .next()
+        .map(|token| token.trim_end_matches(':'))
+        .and_then(|token| token.parse::<u16>().ok())
+}
+
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || (500..600).contains(&status)
+}
+
+fn is_permanent_status(status: u16) -> bool {
+    matches!(status, 404 | 410)
 }
 
 fn classify_api_error(e: BridgeError) -> AttachmentFetchError {
@@ -313,6 +330,23 @@ fn classify_api_error(e: BridgeError) -> AttachmentFetchError {
         BridgeError::Network(_) | BridgeError::Auth(_) => {
             AttachmentFetchError::Transport(e.to_string())
         }
+        BridgeError::Crypto(_) => AttachmentFetchError::Permanent(e.to_string()),
+        BridgeError::Api(ref message) => match api_status_code(message) {
+            Some(status) if is_transient_status(status) => {
+                AttachmentFetchError::Transport(e.to_string())
+            }
+            Some(status) if is_permanent_status(status) => {
+                AttachmentFetchError::Permanent(e.to_string())
+            }
+            _ => AttachmentFetchError::Content(e.to_string()),
+        },
+        other => AttachmentFetchError::Content(other.to_string()),
+    }
+}
+
+fn classify_decrypt_error(e: BridgeError) -> AttachmentFetchError {
+    match e {
+        BridgeError::Crypto(_) => AttachmentFetchError::Permanent(e.to_string()),
         other => AttachmentFetchError::Content(other.to_string()),
     }
 }
@@ -365,9 +399,12 @@ fn entry_for_row(
 }
 
 fn expected_attachment_count(item: &MailItem, entries: &[EnvelopeAttachment]) -> usize {
-    let declared = item.attachment_count.map(|n| n.max(0) as usize).unwrap_or(0);
+    let declared = item.attachment_count.map(|n| n.max(0) as usize);
+    if entries.is_empty() && declared == Some(0) {
+        return 0;
+    }
     let flagged = usize::from(item.has_attachments == Some(true));
-    entries.len().max(declared).max(flagged)
+    entries.len().max(declared.unwrap_or(0)).max(flagged)
 }
 
 fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachment]) -> String {
@@ -420,7 +457,7 @@ async fn fetch_and_decrypt_attachments(
         .await
         .map_err(classify_api_error)?;
     if resp.attachments.is_empty() {
-        return Err(AttachmentFetchError::Content(
+        return Err(AttachmentFetchError::Permanent(
             "server returned no attachment rows".to_string(),
         ));
     }
@@ -437,7 +474,7 @@ async fn fetch_and_decrypt_attachments(
             }
             let entry = entry_for_row(&entries, seq, position).map(key_entry);
             let att = decrypt_attachment(row, entry.as_ref(), &passphrase, identity_key.as_deref())
-                .map_err(|e| e.to_string())?;
+                .map_err(classify_decrypt_error)?;
             out.push(CachedAttachment {
                 seq: att.seq,
                 name: att.filename,
@@ -449,11 +486,10 @@ async fn fetch_and_decrypt_attachments(
             });
         }
         out.sort_by_key(|a| a.seq);
-        Ok::<Vec<CachedAttachment>, String>(out)
+        Ok::<Vec<CachedAttachment>, AttachmentFetchError>(out)
     })
     .await
     .map_err(|e| AttachmentFetchError::Content(format!("attachment decrypt task: {}", e)))?
-    .map_err(AttachmentFetchError::Content)
 }
 
 async fn refresh_attachment_keys(
@@ -491,6 +527,7 @@ async fn backfill_pending_attachments(
     skip: &HashSet<String>,
 ) -> Vec<String> {
     let mut updated: Vec<String> = Vec::new();
+    let mut unavailable: usize = 0;
     let backlog = match db.list_attachment_backlog(ATTACHMENT_BACKLOG_PER_PASS) {
         Ok(b) => b,
         Err(e) => {
@@ -524,10 +561,10 @@ async fn backfill_pending_attachments(
                 }
                 Ok(_) => {}
                 Err(AttachmentFetchError::Transport(e)) => {
-                    tracing::warn!("attachment key refresh for {} deferred: {}", aster_id, e);
+                    tracing::debug!("attachment key refresh for {} deferred: {}", aster_id, e);
                     break;
                 }
-                Err(AttachmentFetchError::Content(e)) => {
+                Err(AttachmentFetchError::Permanent(e)) | Err(AttachmentFetchError::Content(e)) => {
                     tracing::debug!("attachment key refresh for {} skipped: {}", aster_id, e);
                 }
             }
@@ -565,12 +602,18 @@ async fn backfill_pending_attachments(
                 updated.push(aster_id);
             }
             Err(AttachmentFetchError::Transport(e)) => {
-                tracing::warn!("attachment download for {} deferred: {}", aster_id, e);
+                tracing::debug!("attachment download for {} deferred: {}", aster_id, e);
                 break;
+            }
+            Err(AttachmentFetchError::Permanent(e)) => {
+                let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
+                tracing::debug!("attachment download for {} unavailable: {}", aster_id, e);
+                unavailable += 1;
+                updated.push(aster_id);
             }
             Err(AttachmentFetchError::Content(e)) => {
                 let attempts = db.bump_attachment_attempts(&aster_id).unwrap_or(0);
-                tracing::warn!(
+                tracing::debug!(
                     "attachment download for {} failed (attempt {}): {}",
                     aster_id,
                     attempts,
@@ -578,10 +621,17 @@ async fn backfill_pending_attachments(
                 );
                 if attempts >= ATTACHMENT_MAX_ATTEMPTS {
                     let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
+                    unavailable += 1;
                     updated.push(aster_id);
                 }
             }
         }
+    }
+    if unavailable > 0 {
+        tracing::info!(
+            "{} message(s) have attachments this device cannot read; they will not be retried",
+            unavailable
+        );
     }
     updated
 }
@@ -1303,6 +1353,7 @@ async fn run_sync_pass(
                             Prepared::Ready(prepared) => {
                                 let mut downloaded: Option<Vec<CachedAttachment>> = None;
                                 let mut content_failed = false;
+                                let mut permanently_unavailable = false;
                                 if prepared.expected_attachments > 0
                                     && inline_downloads < ATTACHMENT_INLINE_DOWNLOADS_PER_PASS
                                 {
@@ -1320,14 +1371,22 @@ async fn run_sync_pass(
                                     {
                                         Ok(list) => downloaded = Some(list),
                                         Err(AttachmentFetchError::Transport(e)) => {
-                                            tracing::warn!(
+                                            tracing::debug!(
                                                 "attachment download for {} deferred: {}",
                                                 item.id,
                                                 e
                                             );
                                         }
+                                        Err(AttachmentFetchError::Permanent(e)) => {
+                                            tracing::debug!(
+                                                "attachment download for {} unavailable: {}",
+                                                item.id,
+                                                e
+                                            );
+                                            permanently_unavailable = true;
+                                        }
                                         Err(AttachmentFetchError::Content(e)) => {
-                                            tracing::warn!(
+                                            tracing::debug!(
                                                 "attachment download for {} failed: {}",
                                                 item.id,
                                                 e
@@ -1343,7 +1402,10 @@ async fn run_sync_pass(
                                     prepared,
                                     downloaded,
                                 );
-                                if content_failed {
+                                if permanently_unavailable {
+                                    let _ =
+                                        db.set_attachments_state(&item.id, ATTACHMENTS_FAILED);
+                                } else if content_failed {
                                     let _ = db.bump_attachment_attempts(&item.id);
                                 }
                                 outcome
@@ -1806,6 +1868,120 @@ mod tests {
             has_attachments: None,
             attachment_count: None,
         }
+    }
+
+    fn matches_transport(e: &AttachmentFetchError) -> bool {
+        matches!(e, AttachmentFetchError::Transport(_))
+    }
+
+    fn matches_permanent(e: &AttachmentFetchError) -> bool {
+        matches!(e, AttachmentFetchError::Permanent(_))
+    }
+
+    fn matches_content(e: &AttachmentFetchError) -> bool {
+        matches!(e, AttachmentFetchError::Content(_))
+    }
+
+    #[test]
+    fn api_status_code_reads_the_leading_status() {
+        assert_eq!(api_status_code("503 Service Unavailable: busy"), Some(503));
+        assert_eq!(api_status_code("404:"), Some(404));
+        assert_eq!(api_status_code("no status here"), None);
+    }
+
+    #[test]
+    fn server_failures_are_transient_not_permanent() {
+        for message in ["500 Internal Server Error: x", "429 Too Many Requests: x", "408:"] {
+            let classified = classify_api_error(BridgeError::Api(message.to_string()));
+            assert!(matches_transport(&classified), "{} should defer", message);
+        }
+    }
+
+    #[test]
+    fn missing_rows_and_bad_requests_are_classified_apart() {
+        assert!(matches_permanent(&classify_api_error(BridgeError::Api(
+            "404 Not Found: gone".to_string()
+        ))));
+        assert!(matches_content(&classify_api_error(BridgeError::Api(
+            "400 Bad Request: nope".to_string()
+        ))));
+    }
+
+    #[test]
+    fn crypto_failures_are_permanent() {
+        assert!(matches_permanent(&classify_decrypt_error(
+            BridgeError::Crypto("attachment key unavailable".to_string())
+        )));
+        assert!(matches_permanent(&classify_api_error(BridgeError::Crypto(
+            "attachment key unavailable".to_string()
+        ))));
+        assert!(matches_content(&classify_decrypt_error(
+            BridgeError::Database("locked".to_string())
+        )));
+    }
+
+    #[test]
+    fn an_explicit_zero_count_skips_the_attachment_request() {
+        let json = serde_json::json!({"subject": "hi"});
+        let mut item = item_with_envelope("mail-flagged", &json);
+        item.has_attachments = Some(true);
+        item.attachment_count = Some(0);
+        assert_eq!(expected_attachment_count(&item, &[]), 0);
+        item.attachment_count = None;
+        assert_eq!(expected_attachment_count(&item, &[]), 1);
+        item.attachment_count = Some(3);
+        assert_eq!(expected_attachment_count(&item, &[]), 3);
+    }
+
+    #[test]
+    fn a_permanent_failure_leaves_the_backlog_at_once() {
+        let (_dir, db) = temp_db();
+        db.upsert_cached_message(
+            "mail-permanent",
+            "inbox",
+            Some("subject"),
+            None,
+            None,
+            None,
+            4,
+            Some("body"),
+            None,
+        )
+        .unwrap();
+        db.set_attachments_state("mail-permanent", ATTACHMENTS_PENDING)
+            .unwrap();
+        assert_eq!(db.list_attachment_backlog(10).unwrap().len(), 1);
+        db.set_attachments_state("mail-permanent", ATTACHMENTS_FAILED)
+            .unwrap();
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_retryable_failure_gives_up_after_the_attempt_cap() {
+        let (_dir, db) = temp_db();
+        db.upsert_cached_message(
+            "mail-retry",
+            "inbox",
+            Some("subject"),
+            None,
+            None,
+            None,
+            4,
+            Some("body"),
+            None,
+        )
+        .unwrap();
+        db.set_attachments_state("mail-retry", ATTACHMENTS_PENDING)
+            .unwrap();
+        let mut attempts = 0;
+        while attempts < ATTACHMENT_MAX_ATTEMPTS {
+            attempts = db.bump_attachment_attempts("mail-retry").unwrap();
+            assert!(attempts <= ATTACHMENT_MAX_ATTEMPTS);
+        }
+        assert_eq!(attempts, ATTACHMENT_MAX_ATTEMPTS);
+        db.set_attachments_state("mail-retry", ATTACHMENTS_FAILED)
+            .unwrap();
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
     }
 
     #[test]
@@ -2379,13 +2555,18 @@ mod tests {
             "has_more": false,
             "next_cursor": serde_json::Value::Null
         });
-        let app = Router::new().route(
-            "/bridge/v1/messages",
-            get(move || {
-                let body = body.clone();
-                async move { Json(body) }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/mail/v1/attachments/by-mail/:id",
+                get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -3330,7 +3511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecryptable_attachment_counts_an_attempt_and_stays_pending() {
+    async fn an_undecryptable_attachment_is_marked_failed_and_never_refetched() {
         let (_dir, db) = temp_db();
         let db = Arc::new(db);
         let envelope = serde_json::json!({
@@ -3350,18 +3531,22 @@ mod tests {
             .unwrap();
 
         let cached = db.get_cached_message("mail-broken").unwrap().unwrap();
-        assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
+        assert_eq!(cached.attachments_state, ATTACHMENTS_FAILED);
         assert_eq!(cached.body_text.as_deref(), Some("see attached"));
         assert!(cached.imap_uid > 0);
         assert!(db.get_message_attachments("mail-broken").unwrap().is_empty());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(db.bump_attachment_attempts("mail-broken").unwrap(), 2);
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
 
         run_sync_pass(&session, &client, &db, None, false)
             .await
             .unwrap();
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(db.attachments_state("mail-broken").unwrap(), ATTACHMENTS_PENDING);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a key we do not hold must not be retried every poll"
+        );
+        assert_eq!(db.attachments_state("mail-broken").unwrap(), ATTACHMENTS_FAILED);
     }
 
     #[tokio::test]
@@ -3385,7 +3570,12 @@ mod tests {
         let cached = db.get_cached_message("mail-offline").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
         assert_eq!(cached.body_text.as_deref(), Some("see attached"));
-        assert_eq!(db.bump_attachment_attempts("mail-offline").unwrap(), 2);
+        assert_eq!(
+            db.bump_attachment_attempts("mail-offline").unwrap(),
+            1,
+            "a server that is temporarily down must not burn an attempt"
+        );
+        assert_eq!(db.list_attachment_backlog(10).unwrap().len(), 1);
     }
 
 }

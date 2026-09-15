@@ -1269,8 +1269,9 @@ fn main() {
             let file_appender =
                 tracing_appender::rolling::daily(diagnostics::log_dir(&c.data_dir), "bridge.log");
             let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
-            let filter =
-                EnvFilter::from_default_env().add_directive("aster_bridge=info".parse().unwrap());
+            let filter = EnvFilter::from_default_env()
+                .add_directive("aster_bridge=info".parse().unwrap())
+                .add_directive("pgp=error".parse().unwrap());
             use tracing_subscriber::layer::SubscriberExt;
             use tracing_subscriber::util::SubscriberInitExt;
             let stdout_layer = tracing_subscriber::fmt::layer();
@@ -1288,7 +1289,8 @@ fn main() {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::from_default_env()
-                        .add_directive("aster_bridge=info".parse().unwrap()),
+                        .add_directive("aster_bridge=info".parse().unwrap())
+                        .add_directive("pgp=error".parse().unwrap()),
                 )
                 .init();
             None
