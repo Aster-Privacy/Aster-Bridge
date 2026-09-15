@@ -642,6 +642,17 @@ where
     Ok(())
 }
 
+fn sanitize_display_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(128)
+        .collect()
+}
+
 pub fn build_send_payload(
     raw_message: &[u8],
     from: Option<&str>,
@@ -740,6 +751,12 @@ pub fn build_send_payload(
         None => from.filter(|s| !s.is_empty()).map(|s| s.to_string()),
     };
 
+    let header_display_name = parsed
+        .from()
+        .and_then(|a| a.iter().next().and_then(|x| x.name()))
+        .map(sanitize_display_name)
+        .filter(|s| !s.is_empty());
+
     let mut payload = serde_json::json!({
         "to": effective_to,
         "cc": if cc_list.is_empty() { serde_json::Value::Null } else { serde_json::json!(cc_list) },
@@ -756,9 +773,12 @@ pub fn build_send_payload(
         if let Some(ref hash) = id.auth_hash_b64 {
             payload["sender_alias_hash"] = serde_json::json!(hash);
         }
-        if let Some(ref dn) = id.display_name {
+        let display_name = id.display_name.clone().or_else(|| header_display_name.clone());
+        if let Some(dn) = display_name {
             payload["sender_display_name"] = serde_json::json!(dn);
         }
+    } else if let Some(ref dn) = header_display_name {
+        payload["sender_display_name"] = serde_json::json!(dn);
     }
 
     if let Some(html) = body_html {
@@ -1264,6 +1284,22 @@ mod tests {
         assert_eq!(payload["sender_email"], "alias@example.com");
         assert_eq!(payload["sender_alias_hash"], "AAAA");
         assert_eq!(payload["sender_display_name"], "Sales");
+    }
+
+    #[test]
+    fn build_send_payload_sends_the_from_header_display_name() {
+        let raw = b"From: Ada Lovelace <primary@aster.test>\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["rcpt@example.com".to_string()];
+        let payload = build_send_payload(
+            raw,
+            Some("primary@aster.test"),
+            &recipients,
+            "primary@aster.test",
+            None,
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["sender_display_name"], "Ada Lovelace");
     }
 
     #[test]
