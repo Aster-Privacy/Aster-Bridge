@@ -139,6 +139,9 @@ impl Output {
     }
 
     pub fn bold(&self, text: &str) -> String {
+        if !self.ansi() {
+            return text.to_string();
+        }
         self.wrap(text, "1".to_string())
     }
 
@@ -505,6 +508,7 @@ mod tests {
         assert_eq!(out.accent("hi"), "hi");
         assert_eq!(out.gradient("hi"), "hi");
         assert_eq!(out.dim("hi"), "hi");
+        assert_eq!(out.bold("hi"), "hi");
     }
 
     #[test]
@@ -523,6 +527,14 @@ mod tests {
         assert!(!out.ansi());
         assert!(!out.animates());
         assert_eq!(out.accent("hi"), "hi");
+        assert_eq!(out.bold("hi"), "hi");
+    }
+
+    #[test]
+    fn a_muted_banner_writes_no_escapes_to_a_pipe() {
+        let out = Output::build(false, ColorChoice::Auto, ThemeChoice::Dark, false, false);
+        assert!(!out.bold("No app passwords").contains('\x1b'));
+        assert!(!out.mark(Tone::Muted).contains('\x1b'));
     }
 
     #[test]
