@@ -1,7 +1,12 @@
 name: Release
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      cli_only:
+        description: 'Attach only the command-line archives to the current version tag'
+        type: boolean
+        default: false
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -11,6 +16,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ !inputs.cli_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -284,12 +290,30 @@ jobs:
           set -euo pipefail
           V=$(node -p "require('./package.json').version")
           TAG="v${V}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::warning::no release $TAG to attach the command-line archive to"
             exit 0
           fi
 
           cd src-tauri
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            if [ -z "${VCToolsInstallDir:-}" ]; then
+              echo "::error::the MSVC environment is not set up, so rustc would link with the wrong link.exe"
+              exit 1
+            fi
+            VC_BIN="$(cygpath -u "$VCToolsInstallDir")"
+            VC_BIN="${VC_BIN%/}/bin/Hostx64/x64"
+            if [ ! -x "$VC_BIN/link.exe" ]; then
+              echo "::error::no MSVC linker at $VC_BIN"
+              exit 1
+            fi
+            export PATH="$VC_BIN:$PATH"
+            LINKER="$(command -v link)"
+            case "$LINKER" in
+              *MSVC*) ;;
+              *) echo "::error::link resolves to $LINKER instead of the MSVC linker"; exit 1 ;;
+            esac
+          fi
           case "$TARGET" in
             universal-apple-darwin)
               cargo build --release --locked -p aster-bridge-cli --target aarch64-apple-darwin
@@ -335,7 +359,7 @@ jobs:
             shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           fi
           cat "$ARCHIVE.sha256"
-          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
   update_latest_json:
     needs: build
