@@ -308,6 +308,12 @@ jobs:
               exit 1
             fi
             export PATH="$VC_BIN:$PATH"
+            if [ ! -x "/c/Strawberry/perl/bin/perl.exe" ]; then
+              echo "::error::Strawberry Perl is missing, so the vendored OpenSSL build would run the wrong perl"
+              exit 1
+            fi
+            export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
+            export PATH="/c/Strawberry/perl/bin:$PATH"
             LINKER="$(command -v link)"
             case "$LINKER" in
               *MSVC*) ;;
