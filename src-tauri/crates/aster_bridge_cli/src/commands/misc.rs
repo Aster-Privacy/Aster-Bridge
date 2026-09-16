@@ -178,6 +178,10 @@ fn visible_settings(config: &BridgeConfig) -> CliResult<Map<String, Value>> {
     Ok(map)
 }
 
+fn normalized_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase().replace('-', "_")
+}
+
 fn unknown_key(key: &str) -> CliError {
     CliError::usage(format!("There's no setting named {}.", key))
         .with_hint("To see every setting, run: aster-bridge config get")
@@ -213,9 +217,10 @@ fn config_get(ctx: &Context, key: Option<&str>) -> CliResult<i32> {
             }
         }
         Some(key) => {
-            let value = settings.get(key.trim()).ok_or_else(|| unknown_key(key))?;
+            let name = normalized_key(key);
+            let value = settings.get(&name).ok_or_else(|| unknown_key(key))?;
             if out.json {
-                out.json(json!({ "key": key.trim(), "value": value }));
+                out.json(json!({ "key": name, "value": value }));
             } else {
                 out.line(display_value(value));
             }
@@ -272,7 +277,8 @@ fn parse_value(key: &str, current: &Value, raw: &str) -> CliResult<Value> {
 }
 
 async fn config_set(ctx: &Context, key: &str, raw: &str) -> CliResult<i32> {
-    let key = key.trim();
+    let name = normalized_key(key);
+    let key = name.as_str();
     if HIDDEN_KEYS.contains(&key) {
         return Err(unknown_key(key));
     }
@@ -350,6 +356,14 @@ mod tests {
         assert!(parse_value("imap_port", &json!(1143), "70000").is_err());
         assert!(parse_value("poll_interval_secs", &json!(30), "2").is_err());
         assert_eq!(parse_value("poll_interval_secs", &json!(30), "60").unwrap(), json!(60));
+    }
+
+    #[test]
+    fn setting_names_accept_dashes_and_capitals() {
+        let map = visible_settings(&BridgeConfig::default()).unwrap();
+        assert!(map.contains_key(&normalized_key(" IMAP-Port ")));
+        assert!(map.contains_key(&normalized_key("poll-interval-secs")));
+        assert!(!map.contains_key(&normalized_key("imap port")));
     }
 
     #[test]
