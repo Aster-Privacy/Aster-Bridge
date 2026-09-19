@@ -1007,6 +1007,7 @@ mod tests {
             send_identities: Vec::new(),
             default_sender_id: None,
             account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(crate::api_client::ApiClient::new());
         let (tx, _rx) = broadcast::channel(8);
@@ -1411,6 +1412,7 @@ mod tests {
             send_identities: Vec::new(),
             default_sender_id: None,
             account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let (base, calls) = spawn_mock_backend(fail).await;
         let client = Arc::new(crate::api_client::ApiClient::new_with_base_url(&base));

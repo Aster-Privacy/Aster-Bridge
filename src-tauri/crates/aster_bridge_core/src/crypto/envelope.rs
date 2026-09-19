@@ -24,7 +24,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::inbound::{
     decrypt_inbound_envelope, InboundKeyCandidate, INBOUND_ECDH_MARKER, INBOUND_PQ_HYBRID_MARKER,
@@ -47,6 +47,24 @@ pub fn decrypt_envelope(
     identity_key: Option<&str>,
     inbound_keys: &[InboundKeyCandidate],
 ) -> Result<String> {
+    decrypt_envelope_with_previous_keys(
+        encrypted_data_b64,
+        nonce_b64,
+        passphrase,
+        identity_key,
+        &[],
+        inbound_keys,
+    )
+}
+
+pub fn decrypt_envelope_with_previous_keys(
+    encrypted_data_b64: &str,
+    nonce_b64: Option<&str>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[InboundKeyCandidate],
+) -> Result<String> {
     let nonce_bytes = match nonce_b64 {
         Some(n) if !n.is_empty() => STANDARD
             .decode(n)
@@ -55,7 +73,7 @@ pub fn decrypt_envelope(
     };
 
     if nonce_bytes.is_empty() {
-        return decrypt_pgp_or_plaintext(encrypted_data_b64, identity_key, passphrase);
+        return decrypt_pgp_or_plaintext(encrypted_data_b64, identity_key, previous_keys, passphrase);
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
@@ -184,24 +202,17 @@ fn decrypt_identity_key_envelope(
 fn decrypt_pgp_or_plaintext(
     encrypted_data_b64: &str,
     identity_key: Option<&str>,
-    _passphrase: &[u8],
+    previous_keys: &[String],
+    passphrase: &[u8],
 ) -> Result<String> {
     let data = STANDARD
         .decode(encrypted_data_b64)
         .map_err(|e| BridgeError::Crypto(format!("data decode: {}", e)))?;
 
-    if let Ok(text) = String::from_utf8(data.clone()) {
+    if let Ok(text) = String::from_utf8(data) {
         if text.starts_with("-----BEGIN PGP") {
-            let ik = identity_key
-                .ok_or_else(|| BridgeError::Crypto("PGP decrypt requires identity key".to_string()))?;
-
-            let key_pair = aster_crypto::import_secret_key(ik)
-                .map_err(|e| BridgeError::Crypto(format!("PGP key parse: {}", e)))?;
-
-            let decrypted = aster_crypto::decrypt_message(text.as_bytes(), &[&key_pair])
-                .map_err(|e| BridgeError::Crypto(format!("PGP decrypt: {}", e)))?;
-
-            return String::from_utf8(decrypted)
+            let decrypted = decrypt_own_pgp(&text, identity_key, previous_keys, passphrase)?;
+            return String::from_utf8(decrypted.to_vec())
                 .map_err(|e| BridgeError::Crypto(format!("PGP utf8: {}", e)));
         }
 
@@ -209,6 +220,33 @@ fn decrypt_pgp_or_plaintext(
     }
 
     Err(BridgeError::Crypto("cannot decrypt envelope".to_string()))
+}
+
+pub(crate) fn decrypt_own_pgp(
+    armored: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    passphrase: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let ik = identity_key
+        .ok_or_else(|| BridgeError::Crypto("PGP decrypt requires identity key".to_string()))?;
+    let own_keys: Vec<aster_crypto::KeyPair> = std::iter::once(ik)
+        .chain(previous_keys.iter().map(String::as_str))
+        .filter_map(|armored_key| aster_crypto::import_secret_key(armored_key).ok())
+        .collect();
+    if own_keys.is_empty() {
+        return Err(BridgeError::Crypto("PGP key parse failed".to_string()));
+    }
+    let key_refs: Vec<&aster_crypto::KeyPair> = own_keys.iter().collect();
+    let passphrase = Zeroizing::new(std::str::from_utf8(passphrase).unwrap_or("").to_string());
+    for candidate in [passphrase.as_str(), ""] {
+        if let Ok(plain) =
+            aster_crypto::decrypt_message_with_passphrase(armored.as_bytes(), &key_refs, candidate)
+        {
+            return Ok(Zeroizing::new(plain));
+        }
+    }
+    Err(BridgeError::Crypto("PGP decrypt failed".to_string()))
 }
 
 fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> {
@@ -536,5 +574,82 @@ mod tests {
         let b = derive_envelope_key(b"ik", b"v2").unwrap();
         assert_eq!(a, a_again);
         assert_ne!(a, b);
+    }
+
+    const VAULT_PASSPHRASE: &str = "vault passphrase 42";
+
+    fn pgp_envelope_for(key: &aster_crypto::KeyPair, plaintext: &str) -> String {
+        let public = key.public_key();
+        let armored = aster_crypto::encrypt_message(plaintext.as_bytes(), &[&public]).unwrap();
+        STANDARD.encode(armored)
+    }
+
+    #[test]
+    fn pgp_envelope_opens_with_a_protected_identity_key() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let owner_armored = owner.to_armored().unwrap();
+        let envelope = pgp_envelope_for(&owner, "{\"subject\":\"hi\"}");
+
+        let opened = decrypt_envelope(
+            &envelope,
+            None,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(&owner_armored),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened, "{\"subject\":\"hi\"}");
+        assert!(decrypt_envelope(&envelope, None, b"wrong passphrase", Some(&owner_armored), &[]).is_err());
+        assert!(decrypt_envelope(&envelope, None, VAULT_PASSPHRASE.as_bytes(), None, &[]).is_err());
+    }
+
+    #[test]
+    fn pgp_envelope_opens_with_a_previous_key() {
+        let old_key = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let new_key = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let envelope = pgp_envelope_for(&old_key, "old mail");
+        let new_armored = new_key.to_armored().unwrap();
+
+        assert!(decrypt_envelope(&envelope, Some(""), VAULT_PASSPHRASE.as_bytes(), Some(&new_armored), &[]).is_err());
+        let opened = decrypt_envelope_with_previous_keys(
+            &envelope,
+            Some(""),
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(&new_armored),
+            &[old_key.to_armored().unwrap()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened, "old mail");
+    }
+
+    #[test]
+    fn pgp_envelope_still_opens_with_an_unprotected_key() {
+        let owner = aster_crypto::generate_keypair("Owner", "owner@astermail.org").unwrap();
+        let envelope = pgp_envelope_for(&owner, "legacy");
+        let opened = decrypt_envelope(
+            &envelope,
+            None,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(&owner.to_armored().unwrap()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened, "legacy");
+    }
+
+    #[test]
+    fn unparseable_own_keys_fail_without_panic() {
+        let owner = aster_crypto::generate_keypair("Owner", "owner@astermail.org").unwrap();
+        let envelope = pgp_envelope_for(&owner, "x");
+        assert!(decrypt_envelope_with_previous_keys(
+            &envelope,
+            None,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some("not a key"),
+            &["also not a key".to_string()],
+            &[],
+        )
+        .is_err());
     }
 }

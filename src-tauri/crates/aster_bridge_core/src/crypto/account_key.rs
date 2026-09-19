@@ -158,7 +158,7 @@ pub fn context_keys(account_keys: &[AccountKey], context: &str) -> Vec<AccountKe
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -188,7 +188,7 @@ mod tests {
         aster_crypto::generate_keypair(name, &format!("{}@astermail.org", name)).unwrap()
     }
 
-    fn protected_keypair(passphrase: &str) -> aster_crypto::KeyPair {
+    pub(crate) fn protected_keypair(passphrase: &str) -> aster_crypto::KeyPair {
         use pgp::composed::{KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
         use pgp::crypto::ecc_curve::ECCCurve;
 

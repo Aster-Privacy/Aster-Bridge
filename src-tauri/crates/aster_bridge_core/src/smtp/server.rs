@@ -1211,9 +1211,9 @@ mod tests {
             seq_num: 0,
             created_at: None,
         };
-        let opened = crate::crypto::attachment::decrypt_attachment(&row, None, b"vault-pass", None).unwrap();
+        let opened = crate::crypto::attachment::decrypt_attachment(&row, None, b"vault-pass", None, &[]).unwrap();
         assert!(!opened.data.is_empty());
-        assert!(crate::crypto::attachment::decrypt_attachment(&row, None, b"wrong", None).is_err());
+        assert!(crate::crypto::attachment::decrypt_attachment(&row, None, b"wrong", None, &[]).is_err());
     }
 
     #[tokio::test]

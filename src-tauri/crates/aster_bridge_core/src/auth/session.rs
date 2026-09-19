@@ -78,6 +78,7 @@ pub struct Session {
     pub send_identities: Vec<SendIdentity>,
     pub default_sender_id: Option<String>,
     pub account_keys: Vec<crate::crypto::account_key::AccountKey>,
+    pub previous_keys: Zeroizing<Vec<String>>,
 }
 
 impl Session {
@@ -364,6 +365,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     session.ratchet_identity_public = material.ratchet_identity_public;
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
+    session.previous_keys = material.previous_keys;
 }
 
 pub async fn restore_or_login(
@@ -466,6 +468,7 @@ pub async fn login_with_passphrase(
         send_identities,
         default_sender_id,
         account_keys,
+        previous_keys,
     })
 }
 
@@ -690,6 +693,7 @@ pub async fn first_time_setup(
                     send_identities,
                     default_sender_id,
                     account_keys,
+                    previous_keys,
                 });
             }
             "expired" => {
@@ -720,6 +724,7 @@ mod tests {
             send_identities: Vec::new(),
             default_sender_id: None,
             account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }
     }
 
@@ -756,6 +761,7 @@ mod tests {
             send_identities: Vec::new(),
             default_sender_id: None,
             account_keys: Vec::new(),
+            previous_keys: Default::default(),
         };
         drop(s);
     }

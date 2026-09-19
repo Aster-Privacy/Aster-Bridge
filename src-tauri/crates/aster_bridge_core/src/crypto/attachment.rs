@@ -149,6 +149,7 @@ fn open_client_authored_meta(
     encrypted_meta: &[u8],
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
 ) -> Option<RowMeta> {
     if let Ok(text) = std::str::from_utf8(encrypted_meta) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -159,9 +160,13 @@ fn open_client_authored_meta(
             }
         }
         if text.starts_with("-----BEGIN PGP MESSAGE-----") {
-            let ik = identity_key?;
-            let key_pair = aster_crypto::import_secret_key(ik).ok()?;
-            let decrypted = aster_crypto::decrypt_message(text.as_bytes(), &[&key_pair]).ok()?;
+            let decrypted = crate::crypto::envelope::decrypt_own_pgp(
+                text,
+                identity_key,
+                previous_keys,
+                passphrase,
+            )
+            .ok()?;
             let parsed: serde_json::Value = serde_json::from_slice(&decrypted).ok()?;
             return row_meta_from_json(&parsed);
         }
@@ -206,6 +211,7 @@ pub fn decrypt_attachment(
     entry: Option<&AttachmentKeyEntry>,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
 ) -> Result<DecryptedAttachment> {
     let seq = row.seq_num as i64;
     let encrypted_meta = STANDARD
@@ -235,6 +241,7 @@ pub fn decrypt_attachment(
             &encrypted_meta,
             passphrase,
             identity_key,
+            previous_keys,
         );
     }
     let row_meta = row_meta.unwrap_or_default();
@@ -466,7 +473,7 @@ mod tests {
                 &sealed.sender_meta_nonce,
             )
         };
-        let opened = decrypt_attachment(&sender_row, None, b"vault-pass", None).unwrap();
+        let opened = decrypt_attachment(&sender_row, None, b"vault-pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"\x89PNG");
         assert_eq!(opened.filename, "logo.png");
         assert_eq!(opened.content_id.as_deref(), Some("logo@aster"));
@@ -484,7 +491,7 @@ mod tests {
             sealed.plain_meta.as_bytes(),
             &[0u8; 12],
         );
-        let opened = decrypt_attachment(&received_row, None, b"other-pass", None).unwrap();
+        let opened = decrypt_attachment(&received_row, None, b"other-pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"plain notes");
         assert_eq!(opened.filename, "notes.txt");
     }
@@ -629,7 +636,7 @@ mod tests {
             encrypted_meta: sealed_meta,
             ..row(0, &ct, &nonce, b"", &random_nonce())
         };
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "report.pdf");
         assert_eq!(out.content_type, "application/pdf");
         assert_eq!(out.data, plain);
@@ -656,7 +663,7 @@ mod tests {
             key: Some(STANDARD.encode(key)),
             ..Default::default()
         };
-        let out = decrypt_attachment(&r, Some(&entry), b"unrelated", None).unwrap();
+        let out = decrypt_attachment(&r, Some(&entry), b"unrelated", None, &[]).unwrap();
         assert_eq!(out.filename, "pic.png");
         assert_eq!(out.content_type, "image/png");
         assert_eq!(out.content_id.as_deref(), Some("cid-7"));
@@ -677,9 +684,38 @@ mod tests {
             content_id: None,
             size: Some(4),
         };
-        let out = decrypt_attachment(&r, Some(&entry), b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "from-envelope.bin");
         assert_eq!(out.content_type, "application/octet-stream");
+        assert_eq!(out.data, plain);
+    }
+
+    #[test]
+    fn pgp_meta_opens_with_a_protected_identity_key() {
+        let owner = crate::crypto::account_key::tests::protected_keypair("vault pass");
+        let key = random_key();
+        let nonce = random_nonce();
+        let plain = b"sent attachment".to_vec();
+        let ct = seal(&key, &nonce, &plain, b"");
+        let meta = serde_json::json!({
+            "filename": "sent.txt",
+            "content_type": "text/plain",
+            "session_key": STANDARD.encode(key)
+        })
+        .to_string();
+        let armored = aster_crypto::encrypt_message(meta.as_bytes(), &[&owner.public_key()]).unwrap();
+        let r = row(0, &ct, &nonce, &armored, &[0u8; 12]);
+        let owner_armored = owner.to_armored().unwrap();
+
+        let out = decrypt_attachment(&r, None, b"vault pass", Some(&owner_armored), &[]).unwrap();
+        assert_eq!(out.filename, "sent.txt");
+        assert_eq!(out.data, plain);
+        assert!(decrypt_attachment(&r, None, b"wrong", Some(&owner_armored), &[]).is_err());
+
+        let rotated = crate::crypto::account_key::tests::protected_keypair("vault pass");
+        let rotated_armored = rotated.to_armored().unwrap();
+        assert!(decrypt_attachment(&r, None, b"vault pass", Some(&rotated_armored), &[]).is_err());
+        let out = decrypt_attachment(&r, None, b"vault pass", Some(&rotated_armored), &[owner_armored]).unwrap();
         assert_eq!(out.data, plain);
     }
 
@@ -696,7 +732,7 @@ mod tests {
         })
         .to_string();
         let r = row(0, &ct, &nonce, meta.as_bytes(), &[0u8; 12]);
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "x.csv");
         assert_eq!(out.content_type, "text/csv");
         assert_eq!(out.data, plain);
@@ -706,12 +742,12 @@ mod tests {
     fn stored_plaintext_attachment_is_returned_only_with_the_zero_nonce() {
         let plain = b"raw stored bytes".to_vec();
         let r = row(0, &plain, &[0u8; 12], b"", &[0u8; 12]);
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.data, plain);
         assert_eq!(out.filename, "attachment-1.bin");
 
         let r = row(0, &plain, &random_nonce(), b"", &[0u8; 12]);
-        assert!(decrypt_attachment(&r, None, b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, None, b"pass", None, &[]).is_err());
     }
 
     #[test]
@@ -724,7 +760,7 @@ mod tests {
             key: Some(STANDARD.encode(random_key())),
             ..Default::default()
         };
-        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
     }
 
     #[test]
@@ -737,7 +773,7 @@ mod tests {
             key: Some(STANDARD.encode(key)),
             ..Default::default()
         };
-        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
     }
 
     #[test]
