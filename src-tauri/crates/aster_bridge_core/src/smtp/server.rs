@@ -678,6 +678,26 @@ pub fn build_send_payload(
     sender_identity: Option<&crate::auth::session::SendIdentity>,
     passphrase: &[u8],
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
+    build_send_payload_with_own_key(
+        raw_message,
+        from,
+        recipients,
+        session_email,
+        sender_identity,
+        passphrase,
+        None,
+    )
+}
+
+pub fn build_send_payload_with_own_key(
+    raw_message: &[u8],
+    from: Option<&str>,
+    recipients: &[String],
+    session_email: &str,
+    sender_identity: Option<&crate::auth::session::SendIdentity>,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     use mail_parser::MessageParser;
 
     let parsed = MessageParser::default()
@@ -804,7 +824,7 @@ pub fn build_send_payload(
 
     let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_DATA_SIZE);
     if !attachments.is_empty() {
-        let sealed = crate::crypto::attachment::seal_send_attachments(&attachments, passphrase)
+        let sealed = crate::crypto::attachment::seal_send_attachments_with_own_key(&attachments, passphrase, own_key)
             .map_err(|e| crate::error::BridgeError::Smtp(format!("attachment sealing failed: {}", e)))?;
         payload["attachments"] = serde_json::Value::Array(sealed);
     }
@@ -823,13 +843,18 @@ pub async fn build_send_payload_blocking(
     seal_to_identity: bool,
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     tokio::task::spawn_blocking(move || {
-        let mut payload = build_send_payload(
+        let own_key = identity_key
+            .as_deref()
+            .map(|k| k.as_str())
+            .filter(|_| seal_to_identity);
+        let mut payload = build_send_payload_with_own_key(
             &raw_message,
             from.as_deref(),
             &recipients,
             &session_email,
             sender_identity.as_ref(),
             &passphrase,
+            own_key,
         )?;
         let plain_text = mail_parser::MessageParser::default()
             .parse(&raw_message)
@@ -1238,6 +1263,61 @@ mod tests {
         .unwrap();
         assert_eq!(payload["attachments"].as_array().unwrap().len(), 2);
         assert_eq!(payload["client_source"], "bridge");
+    }
+
+    async fn blocking_payload(seal_to_identity: bool, key: &str) -> serde_json::Value {
+        build_send_payload_blocking(
+            ATTACHED_RAW.to_vec(),
+            Some("sender@aster.test".to_string()),
+            vec!["rcpt@example.com".to_string()],
+            "sender@aster.test".to_string(),
+            None,
+            zeroize::Zeroizing::new(b"correct horse battery staple".to_vec()),
+            Some(zeroize::Zeroizing::new(key.to_string())),
+            seal_to_identity,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn sender_metas(payload: &serde_json::Value) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        payload["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    b64.decode(a["sender_encrypted_meta"].as_str().unwrap()).unwrap(),
+                    b64.decode(a["sender_meta_nonce"].as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_seals_attachment_meta_when_enabled() {
+        let key = crate::crypto::account_key::tests::protected_keypair("correct horse battery staple")
+            .to_armored()
+            .unwrap();
+        let metas = sender_metas(&blocking_payload(true, &key).await);
+        assert_eq!(metas.len(), 2);
+        for (meta, nonce) in metas {
+            assert!(meta.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+            assert_eq!(nonce, vec![0u8; 12]);
+        }
+    }
+
+    #[tokio::test]
+    async fn build_send_payload_blocking_keeps_legacy_attachment_meta_when_disabled() {
+        let key = crate::crypto::account_key::tests::protected_keypair("correct horse battery staple")
+            .to_armored()
+            .unwrap();
+        for (meta, nonce) in sender_metas(&blocking_payload(false, &key).await) {
+            assert!(!meta.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+            assert!(nonce.iter().any(|b| *b != 0));
+        }
     }
 
     #[test]

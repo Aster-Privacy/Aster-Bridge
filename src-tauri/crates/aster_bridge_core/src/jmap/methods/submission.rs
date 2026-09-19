@@ -108,9 +108,22 @@ async fn submission_body(
             data: a.data,
         })
         .collect();
-    let passphrase = zeroize::Zeroizing::new(ctx.session.read().await.vault_passphrase.clone());
+    let (passphrase, identity_key, access_token) = {
+        let s = ctx.session.read().await;
+        (
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+            s.identity_key.clone().map(zeroize::Zeroizing::new),
+            s.access_token.clone(),
+        )
+    };
+    let seal_to_identity = identity_key.is_some()
+        && crate::crypto::sent_copy::format_writes_enabled(&ctx.client, &access_token).await;
     let sealed = tokio::task::spawn_blocking(move || {
-        crate::crypto::attachment::seal_send_attachments(&outgoing, &passphrase)
+        let own_key = identity_key
+            .as_deref()
+            .map(|k| k.as_str())
+            .filter(|_| seal_to_identity);
+        crate::crypto::attachment::seal_send_attachments_with_own_key(&outgoing, &passphrase, own_key)
     })
     .await;
     match sealed {
