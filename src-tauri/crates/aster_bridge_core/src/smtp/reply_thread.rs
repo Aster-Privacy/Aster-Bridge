@@ -387,6 +387,7 @@ pub fn attach_sent_copy(
     plain_text: Option<&str>,
     identity_key: Option<&str>,
     passphrase: &[u8],
+    seal_to_identity: bool,
 ) {
     let Some(identity_key) = identity_key.filter(|k| !k.is_empty()) else {
         tracing::warn!("session has no identity key; sent copy skipped");
@@ -403,6 +404,17 @@ pub fn attach_sent_copy(
         .unwrap_or(from_email)
         .to_string();
     let envelope = sent_envelope(payload, &sender, plain_text).to_string();
+    if seal_to_identity {
+        if let Some(sealed) =
+            crate::crypto::sent_copy::seal_sent_envelope(&envelope, identity_key, passphrase)
+        {
+            payload["encrypted_envelope"] = json!(sealed);
+            payload["envelope_nonce"] = json!("");
+            payload["folder_token"] = json!(sent_folder_token(identity_key));
+            return;
+        }
+        tracing::warn!("sent copy seal failed; using the legacy envelope");
+    }
     match crate::crypto::envelope::encrypt_pbkdf2_envelope(&envelope, passphrase) {
         Ok(encrypted) => {
             payload["encrypted_envelope"] = json!(encrypted);
@@ -618,7 +630,7 @@ mod tests {
     #[test]
     fn attach_sent_copy_encrypts_an_envelope_the_poller_can_open() {
         let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false, "sender_email": "alias@aster.test"});
-        attach_sent_copy(&mut payload, "me@aster.test", None, Some("ik"), b"vault-pass");
+        attach_sent_copy(&mut payload, "me@aster.test", None, Some("ik"), b"vault-pass", false);
         assert_eq!(payload["folder_token"], json!(sent_folder_token("ik")));
         let opened = crate::crypto::envelope::decrypt_envelope(
             payload["encrypted_envelope"].as_str().unwrap(),
@@ -634,9 +646,50 @@ mod tests {
     }
 
     #[test]
+    fn attach_sent_copy_seals_to_the_identity_key_when_enabled() {
+        let key = crate::crypto::account_key::tests::protected_keypair("vault-pass")
+            .to_armored()
+            .unwrap();
+        let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
+        attach_sent_copy(&mut payload, "me@aster.test", None, Some(&key), b"vault-pass", true);
+        assert_eq!(payload["envelope_nonce"], json!(""));
+        assert_eq!(payload["folder_token"], json!(sent_folder_token(&key)));
+        let opened = crate::crypto::envelope::decrypt_envelope(
+            payload["encrypted_envelope"].as_str().unwrap(),
+            payload["envelope_nonce"].as_str(),
+            b"vault-pass",
+            Some(&key),
+            &[],
+        )
+        .unwrap();
+        let env: Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(env["body_text"], "hello");
+        assert_eq!(env["from"]["email"], "me@aster.test");
+    }
+
+    #[test]
+    fn attach_sent_copy_falls_back_when_the_seal_fails() {
+        let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
+        attach_sent_copy(&mut payload, "me@aster.test", None, Some("ik"), b"vault-pass", true);
+        assert_eq!(
+            payload["envelope_nonce"],
+            json!(crate::crypto::envelope::pbkdf2_envelope_nonce_marker())
+        );
+        let opened = crate::crypto::envelope::decrypt_envelope(
+            payload["encrypted_envelope"].as_str().unwrap(),
+            payload["envelope_nonce"].as_str(),
+            b"vault-pass",
+            Some("ik"),
+            &[],
+        )
+        .unwrap();
+        assert!(opened.contains("hello"));
+    }
+
+    #[test]
     fn attach_sent_copy_skips_without_identity_key() {
         let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
-        attach_sent_copy(&mut payload, "me@aster.test", None, None, b"vault-pass");
+        attach_sent_copy(&mut payload, "me@aster.test", None, None, b"vault-pass", true);
         assert!(payload.get("encrypted_envelope").is_none());
         assert!(payload.get("folder_token").is_none());
     }

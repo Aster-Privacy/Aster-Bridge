@@ -775,6 +775,27 @@ impl ApiClient {
         Ok(body.entries)
     }
 
+    pub async fn get_account_key_format_writes(&self, access_token: &str) -> bool {
+        let resp = match self
+            .client
+            .get(format!(
+                "{}/crypto/v1/keys/account-key/capabilities",
+                self.base_url
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp,
+            _ => return false,
+        };
+
+        match resp.bytes().await {
+            Ok(body) => crate::crypto::sent_copy::parse_format_writes(&body),
+            Err(_) => false,
+        }
+    }
+
     pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {
         let resp = self.client
             .get(format!("{}/settings/v1/preferences/default-sender", self.base_url))

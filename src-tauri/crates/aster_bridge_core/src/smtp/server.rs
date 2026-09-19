@@ -820,6 +820,7 @@ pub async fn build_send_payload_blocking(
     sender_identity: Option<crate::auth::session::SendIdentity>,
     passphrase: zeroize::Zeroizing<Vec<u8>>,
     identity_key: Option<zeroize::Zeroizing<String>>,
+    seal_to_identity: bool,
 ) -> std::result::Result<serde_json::Value, crate::error::BridgeError> {
     tokio::task::spawn_blocking(move || {
         let mut payload = build_send_payload(
@@ -839,6 +840,7 @@ pub async fn build_send_payload_blocking(
             plain_text.as_deref(),
             identity_key.as_deref().map(|k| k.as_str()),
             &passphrase,
+            seal_to_identity,
         );
         Ok(payload)
     })
@@ -872,6 +874,8 @@ pub async fn build_threaded_send_payload(
     };
     let headers = crate::smtp::reply_thread::ReplyHeaders::from_mime(raw_message);
     let reply = crate::smtp::reply_thread::resolve_reply(db, &headers);
+    let seal_to_identity =
+        crate::crypto::sent_copy::format_writes_enabled(client, &access_token).await;
     let mut payload = build_send_payload_blocking(
         raw_message.to_vec(),
         from,
@@ -880,6 +884,7 @@ pub async fn build_threaded_send_payload(
         sender_identity,
         passphrase,
         identity_key,
+        seal_to_identity,
     )
     .await?;
     crate::smtp::reply_thread::apply_reply_thread(&mut payload, client, &access_token, &reply).await;
@@ -1227,6 +1232,7 @@ mod tests {
             None,
             zeroize::Zeroizing::new(b"pass".to_vec()),
             None,
+            false,
         )
         .await
         .unwrap();
