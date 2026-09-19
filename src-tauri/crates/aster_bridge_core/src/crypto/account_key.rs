@@ -439,17 +439,22 @@ pub(crate) mod tests {
     #[test]
     fn drafts_fall_back_to_account_key_and_keep_identity_key_first() {
         use crate::crypto::draft::{
-            decrypt_draft_content, decrypt_draft_content_with_account_keys, encrypt_draft_content,
-            DraftContent,
+            decrypt_draft_content, decrypt_draft_content_with_keys, encrypt_draft_content,
+            DraftContent, DraftKeys,
         };
 
         let account_keys = vec![test_account_key()];
+        let keys = DraftKeys {
+            identity_key: "ik",
+            previous_keys: &[],
+            account_keys: &account_keys,
+            passphrase: b"pass",
+        };
         let data_key = derive_context_key(&test_account_key(), DRAFT_CONTEXT);
         let (enc, nonce) = aes_encrypt(&data_key, br#"{"subject":"from account key"}"#);
 
         assert!(decrypt_draft_content(&enc, &nonce, "ik").is_err());
-        let content =
-            decrypt_draft_content_with_account_keys(&enc, &nonce, "ik", &account_keys).unwrap();
+        let content = decrypt_draft_content_with_keys(&enc, &nonce, &keys).unwrap();
         assert_eq!(content.subject, "from account key");
 
         let legacy = DraftContent {
@@ -457,8 +462,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let (enc, nonce) = encrypt_draft_content(&legacy, "ik").unwrap();
-        let content =
-            decrypt_draft_content_with_account_keys(&enc, &nonce, "ik", &account_keys).unwrap();
+        let content = decrypt_draft_content_with_keys(&enc, &nonce, &keys).unwrap();
         assert_eq!(content.subject, "from identity key");
     }
 }

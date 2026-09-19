@@ -1569,11 +1569,16 @@ async fn run_sync_pass(
                             if existing_versions.get(&d.id) == Some(&d.version) {
                                 continue;
                             }
-                            let content = match crate::crypto::draft::decrypt_draft_content_with_account_keys(
+                            let draft_keys = crate::crypto::draft::DraftKeys {
+                                identity_key: ik,
+                                previous_keys: &previous_keys,
+                                account_keys: &account_keys,
+                                passphrase: &passphrase,
+                            };
+                            let content = match crate::crypto::draft::decrypt_draft_content_with_keys(
                                 &d.encrypted_content,
                                 &d.content_nonce,
-                                ik,
-                                &account_keys,
+                                &draft_keys,
                             ) {
                                 Ok(c) => c,
                                 Err(_) => {
