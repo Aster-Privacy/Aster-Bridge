@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+use crate::crypto::account_key::{context_keys, AccountKey, DRAFT_CONTEXT};
 use crate::error::{BridgeError, Result};
 
 const DRAFT_KEY_VERSION: &str = "astermail-draft-v2";
@@ -96,6 +97,35 @@ pub fn decrypt_draft_content(
     nonce_b64: &str,
     identity_key: &str,
 ) -> Result<DraftContent> {
+    let mut key = derive_draft_key(identity_key);
+    let result = decrypt_draft_content_with_key(encrypted_b64, nonce_b64, &key);
+    key.zeroize();
+    result
+}
+
+pub fn decrypt_draft_content_with_account_keys(
+    encrypted_b64: &str,
+    nonce_b64: &str,
+    identity_key: &str,
+    account_keys: &[AccountKey],
+) -> Result<DraftContent> {
+    let first = decrypt_draft_content(encrypted_b64, nonce_b64, identity_key);
+    if first.is_ok() {
+        return first;
+    }
+    for key in context_keys(account_keys, DRAFT_CONTEXT) {
+        if let Ok(content) = decrypt_draft_content_with_key(encrypted_b64, nonce_b64, &key) {
+            return Ok(content);
+        }
+    }
+    first
+}
+
+fn decrypt_draft_content_with_key(
+    encrypted_b64: &str,
+    nonce_b64: &str,
+    key: &[u8; 32],
+) -> Result<DraftContent> {
     let ciphertext = STANDARD
         .decode(encrypted_b64)
         .map_err(|e| BridgeError::Crypto(format!("draft data decode: {}", e)))?;
@@ -106,10 +136,8 @@ pub fn decrypt_draft_content(
         return Err(BridgeError::Crypto("invalid draft nonce length".to_string()));
     }
 
-    let mut key = derive_draft_key(identity_key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
-    key.zeroize();
 
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher

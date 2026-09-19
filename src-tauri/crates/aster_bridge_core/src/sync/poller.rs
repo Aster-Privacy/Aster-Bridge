@@ -1526,6 +1526,7 @@ async fn run_sync_pass(
     .await;
     updated_ids.extend(backfilled);
 
+    let account_keys = session.read().await.account_keys.clone();
     match identity_key.as_deref() {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
@@ -1543,10 +1544,11 @@ async fn run_sync_pass(
                             if existing_versions.get(&d.id) == Some(&d.version) {
                                 continue;
                             }
-                            let content = match crate::crypto::draft::decrypt_draft_content(
+                            let content = match crate::crypto::draft::decrypt_draft_content_with_account_keys(
                                 &d.encrypted_content,
                                 &d.content_nonce,
                                 ik,
+                                &account_keys,
                             ) {
                                 Ok(c) => c,
                                 Err(_) => {
@@ -2544,6 +2546,7 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
         }))
     }
 
@@ -2644,6 +2647,7 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
         }))
     }
 

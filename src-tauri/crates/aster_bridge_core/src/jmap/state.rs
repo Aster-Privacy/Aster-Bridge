@@ -111,6 +111,7 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
         }));
         let client = Arc::new(crate::api_client::ApiClient::new());
         let (tx, _rx) = broadcast::channel(8);

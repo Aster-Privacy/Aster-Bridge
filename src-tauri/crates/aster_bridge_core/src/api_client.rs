@@ -396,6 +396,22 @@ pub struct PlanInfoResponse {
     pub has_bridge_access: bool,
 }
 
+#[derive(Deserialize)]
+pub struct AccountKeyTokenResponse {
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct AccountKeyTokenHistoryEntry {
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct AccountKeyTokenHistoryResponse {
+    #[serde(default)]
+    pub entries: Vec<AccountKeyTokenHistoryEntry>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PreferencesResponse {
     pub encrypted_preferences: Option<String>,
@@ -711,6 +727,52 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_account_key_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<AccountKeyTokenResponse>> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/account-key", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_account_key_token_history(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<AccountKeyTokenHistoryEntry>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/crypto/v1/keys/account-key/history",
+                self.base_url
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: AccountKeyTokenHistoryResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.entries)
     }
 
     pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {

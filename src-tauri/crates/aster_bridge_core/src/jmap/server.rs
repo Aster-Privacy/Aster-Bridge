@@ -264,6 +264,7 @@ mod e2e_tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
         }));
 
         let client = Arc::new(ApiClient::new());
@@ -435,6 +436,7 @@ mod e2e_tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
         }));
         let client = Arc::new(ApiClient::new());
         let basic = base64::engine::general_purpose::STANDARD
