@@ -31,7 +31,9 @@ pub const PREFERENCES_CONTEXT: &str = "astermail-preferences-v1";
 pub const DRAFT_CONTEXT: &str = "astermail-draft-v2";
 
 const TOKEN_TYPE: &str = "aster-account-key";
-const TOKEN_VERSION: u64 = 1;
+const TOKEN_VERSION: u64 = 2;
+const LEGACY_TOKEN_VERSION: u64 = 1;
+const MAX_SERIAL: u64 = 9_007_199_254_740_991;
 const DATA_SALT: &[u8] = b"aster-account-data-salt-v1";
 const DATA_INFO_PREFIX: &str = "aster-account-data-v1:";
 
@@ -46,15 +48,40 @@ pub fn derive_context_key(account_key: &[u8; ACCOUNT_KEY_LEN], context: &str) ->
     out
 }
 
-pub fn parse_token_payload(plaintext: &[u8]) -> Option<AccountKey> {
+fn is_fingerprint(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn parse_token_payload(plaintext: &[u8], owner_fingerprints: &[String]) -> Option<AccountKey> {
     let value: serde_json::Value = serde_json::from_slice(plaintext).ok()?;
     let payload = value.as_object()?;
     if payload.get("type")?.as_str()? != TOKEN_TYPE {
         return None;
     }
     let version = payload.get("version")?;
-    if !version.is_u64() || version.as_u64()? != TOKEN_VERSION {
+    if !version.is_u64() {
         return None;
+    }
+    match version.as_u64()? {
+        TOKEN_VERSION => {
+            let owner = payload.get("owner")?.as_str()?;
+            if !is_fingerprint(owner)
+                || !owner_fingerprints
+                    .iter()
+                    .any(|f| f.trim().eq_ignore_ascii_case(owner))
+            {
+                return None;
+            }
+            let serial = payload.get("serial")?;
+            if !serial.is_u64() || !(1..=MAX_SERIAL).contains(&serial.as_u64()?) {
+                return None;
+            }
+        }
+        LEGACY_TOKEN_VERSION => {}
+        _ => return None,
     }
     let decoded = Zeroizing::new(STANDARD.decode(payload.get("key")?.as_str()?).ok()?);
     if decoded.len() != ACCOUNT_KEY_LEN {
@@ -86,7 +113,8 @@ pub fn open_token(
         )
         .ok()?,
     );
-    parse_token_payload(&plaintext)
+    let owners: Vec<String> = own_keys.iter().map(|k| k.fingerprint()).collect();
+    parse_token_payload(&plaintext, &owners)
 }
 
 pub fn open_tokens(
@@ -257,7 +285,7 @@ pub(crate) mod tests {
     #[test]
     fn parses_valid_payload() {
         let key = test_account_key();
-        let parsed = parse_token_payload(payload(&key[..]).as_bytes()).unwrap();
+        let parsed = parse_token_payload(payload(&key[..]).as_bytes(), &[]).unwrap();
         assert_eq!(parsed[..], key[..]);
     }
 
@@ -289,14 +317,80 @@ pub(crate) mod tests {
             ),
             r#"{"type":"aster-account-key","version":1,"key":"***"}"#.to_string(),
             r#"{"type":"aster-account-key","version":1,"key":32}"#.to_string(),
+            payload_v2(&[1u8; 32], None, Some("1")),
+            payload_v2(&[1u8; 32], Some(OWNER), None),
+            payload_v2(&[1u8; 32], Some(OWNER), Some("0")),
+            payload_v2(&[1u8; 32], Some(OWNER), Some("1.5")),
+            payload_v2(&[1u8; 32], Some(OWNER), Some(r#""1""#)),
+            payload_v2(&[1u8; 32], Some(OWNER), Some("-1")),
+            payload_v2(&[1u8; 32], Some(OWNER), Some("9007199254740992")),
+            payload_v2(&[1u8; 32], Some(&OWNER.to_uppercase()), Some("1")),
+            payload_v2(&[1u8; 32], Some(&"cd".repeat(20)), Some("1")),
+            payload_v2(&[1u8; 32], Some("xyz"), Some("1")),
+            format!(
+                r#"{{"type":"aster-account-key","version":3,"key":"{}","owner":"{}","serial":1}}"#,
+                key_b64, OWNER
+            ),
         ];
         for p in bad.iter() {
             assert!(
-                parse_token_payload(p.as_bytes()).is_none(),
+                parse_token_payload(p.as_bytes(), &[OWNER.to_string()]).is_none(),
                 "accepted {}",
                 p
             );
         }
+    }
+
+    const OWNER: &str = "abababababababababababababababababababab";
+
+    fn payload_v2(key: &[u8], owner: Option<&str>, serial: Option<&str>) -> String {
+        let mut fields = vec![
+            r#""type":"aster-account-key""#.to_string(),
+            r#""version":2"#.to_string(),
+            format!(r#""key":"{}""#, STANDARD.encode(key)),
+        ];
+        if let Some(o) = owner {
+            fields.push(format!(r#""owner":"{}""#, o));
+        }
+        if let Some(n) = serial {
+            fields.push(format!(r#""serial":{}"#, n));
+        }
+        format!("{{{}}}", fields.join(","))
+    }
+
+    #[test]
+    fn parses_version_two_for_known_owner() {
+        let key = test_account_key();
+        let text = payload_v2(&key[..], Some(OWNER), Some("7"));
+        assert_eq!(
+            parse_token_payload(text.as_bytes(), &[OWNER.to_uppercase()]).unwrap()[..],
+            key[..]
+        );
+        assert!(parse_token_payload(text.as_bytes(), &[]).is_none());
+    }
+
+    #[test]
+    fn opens_version_two_token_only_for_its_owner() {
+        let owner = keypair("owner");
+        let other = keypair("other");
+        let key = test_account_key();
+        let own = seal(
+            &payload_v2(&key[..], Some(&owner.fingerprint()), Some("1")),
+            &owner,
+            &owner,
+            "",
+        );
+        let named_other = seal(
+            &payload_v2(&key[..], Some(&other.fingerprint()), Some("1")),
+            &owner,
+            &owner,
+            "",
+        );
+        assert_eq!(
+            open_token(&own, std::slice::from_ref(&owner), PASSPHRASE).unwrap()[..],
+            key[..]
+        );
+        assert!(open_token(&named_other, &[owner], PASSPHRASE).is_none());
     }
 
     #[test]
