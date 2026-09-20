@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "aster-bridge-cli"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "aster-bridge-core",
  "axum",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "aster-bridge-core"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "aster-bridge-desktop"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "aster-bridge-core",
  "mail-parser",
