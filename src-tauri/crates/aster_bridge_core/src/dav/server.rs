@@ -1073,6 +1073,7 @@ mod e2e_tests {
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
+            default_sender_id: None,
         }));
 
         let client = Arc::new(ApiClient::new_with_base_url(&api_base));

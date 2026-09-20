@@ -555,7 +555,7 @@ where
                     let (session_email, identity_ok) = {
                         let s = session.read().await;
                         let resolved = if from_addr.is_empty() {
-                            s.email.clone()
+                            s.default_sender_address()
                         } else {
                             from_addr.clone()
                         };
@@ -839,10 +839,11 @@ pub async fn build_threaded_send_payload(
 ) -> std::result::Result<(serde_json::Value, zeroize::Zeroizing<String>), crate::error::BridgeError> {
     let (session_email, sender_identity, access_token, passphrase, identity_key) = {
         let s = session.read().await;
+        let default_address = s.default_sender_address();
         let lookup_addr = from
             .as_deref()
             .filter(|v| !v.is_empty())
-            .unwrap_or(&s.email);
+            .unwrap_or(&default_address);
         let identity = s.find_send_identity(lookup_addr).cloned();
         (
             s.email.clone(),

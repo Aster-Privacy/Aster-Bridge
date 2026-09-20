@@ -76,6 +76,7 @@ pub struct Session {
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
     pub send_identities: Vec<SendIdentity>,
+    pub default_sender_id: Option<String>,
 }
 
 impl Session {
@@ -85,6 +86,25 @@ impl Session {
         self.send_identities
             .iter()
             .find(|i| i.address.eq_ignore_ascii_case(address))
+    }
+
+    // The identity the account sends as by default. Mirrors the web client, which
+    // applies users.default_sender_id on top of the primary address. Falls back to
+    // the primary whenever no default is set or the stored id no longer resolves.
+    pub fn default_identity(&self) -> Option<&SendIdentity> {
+        let id = self.default_sender_id.as_deref()?;
+        self.send_identities
+            .iter()
+            .find(|i| i.enabled && i.sender_id == id)
+    }
+
+    // The address this account presents as. Used for the status panel and as the
+    // MAIL FROM a client gets when it sends an empty one. `email` stays the account
+    // address everywhere the server keys on it.
+    pub fn default_sender_address(&self) -> String {
+        self.default_identity()
+            .map(|i| i.address.clone())
+            .unwrap_or_else(|| self.email.clone())
     }
 }
 
@@ -99,6 +119,18 @@ impl Drop for Session {
         }
         for keys in self.inbound_keys.iter_mut() {
             keys.zeroize();
+        }
+    }
+}
+
+// The account's chosen default sender. A failure here is non-fatal: the session
+// falls back to the primary address, which is what Bridge did before.
+pub async fn fetch_default_sender_id(client: &ApiClient, access_token: &str) -> Option<String> {
+    match client.get_default_sender(access_token).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("failed to read the default sender, using the primary address: {}", e);
+            None
         }
     }
 }
@@ -138,7 +170,18 @@ pub async fn build_send_identities(
                     a.is_random,
                 ) {
                     Ok(lp) if !lp.is_empty() => lp,
-                    _ => continue,
+                    other => {
+                        tracing::warn!(
+                            alias_id = %a.id,
+                            domain = %a.domain,
+                            "dropping alias send identity: local part did not decrypt ({});                              sending from this alias will be rejected as an unknown identity",
+                            match other {
+                                Ok(_) => "decrypted empty".to_string(),
+                                Err(e) => e.to_string(),
+                            }
+                        );
+                        continue;
+                    }
                 };
                 let display_name = match (&a.encrypted_display_name, &a.display_name_nonce) {
                     (Some(enc), Some(nonce)) => {
@@ -167,6 +210,11 @@ pub async fn build_send_identities(
         Ok(domains) => {
             for domain in domains.domains {
                 if domain.status != "active" {
+                    tracing::info!(
+                        domain = %domain.domain_name,
+                        status = %domain.status,
+                        "skipping custom domain send identities: domain is not active"
+                    );
                     continue;
                 }
                 let addrs = match client.list_domain_addresses(access_token, &domain.id).await {
@@ -186,7 +234,18 @@ pub async fn build_send_identities(
                         &addr.local_part_nonce,
                     ) {
                         Ok(lp) if !lp.is_empty() => lp,
-                        _ => continue,
+                        other => {
+                            tracing::warn!(
+                                address_id = %addr.id,
+                                domain = %domain.domain_name,
+                                "dropping custom-domain send identity: local part did not                                  decrypt ({}); sending from this address will be rejected as                                  an unknown identity",
+                                match other {
+                                    Ok(_) => "decrypted empty".to_string(),
+                                    Err(e) => e.to_string(),
+                                }
+                            );
+                            continue;
+                        }
                     };
                     let display_name = match (&addr.encrypted_display_name, &addr.display_name_nonce)
                     {
@@ -210,6 +269,21 @@ pub async fn build_send_identities(
     }
 
     derived_key.zeroize();
+
+    let custom_domain_count = identities
+        .iter()
+        .filter(|i| matches!(i.kind, SendIdentityKind::CustomDomain))
+        .count();
+    tracing::info!(
+        total = identities.len(),
+        aliases = identities
+            .iter()
+            .filter(|i| matches!(i.kind, SendIdentityKind::Alias))
+            .count(),
+        custom_domain = custom_domain_count,
+        "built send identities"
+    );
+
     identities
 }
 
@@ -331,6 +405,7 @@ pub async fn login_with_passphrase(
         &passphrase,
     )
     .await;
+    let default_sender_id = fetch_default_sender_id(client, &access_token).await;
 
     Ok(Session {
         user_id: login_resp.user_id,
@@ -345,6 +420,7 @@ pub async fn login_with_passphrase(
         ratchet_keys,
         inbound_keys,
         send_identities,
+        default_sender_id,
     })
 }
 
@@ -523,6 +599,7 @@ pub async fn first_time_setup(
                     &passphrase,
                 )
                 .await;
+                let default_sender_id = fetch_default_sender_id(client, &access_token).await;
 
                 return Ok(Session {
                     user_id: login_resp.user_id,
@@ -537,6 +614,7 @@ pub async fn first_time_setup(
                     ratchet_keys,
                     inbound_keys,
                     send_identities,
+                    default_sender_id,
                 });
             }
             "expired" => {
@@ -565,6 +643,7 @@ mod tests {
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
+            default_sender_id: None,
         }
     }
 
@@ -599,6 +678,7 @@ mod tests {
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
+            default_sender_id: None,
         };
         drop(s);
     }

@@ -199,7 +199,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
 
     if let Some(ref session) = guard.session {
         let session_guard = session.read().await;
-        email = session_guard.email.clone();
+        email = session_guard.default_sender_address();
         connected = true;
     }
 
@@ -638,7 +638,10 @@ async fn set_default_sender(
     client
         .set_default_sender(&token, sender_id.as_deref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    session_arc.write().await.default_sender_id = sender_id;
+    Ok(())
 }
 
 #[tauri::command]
