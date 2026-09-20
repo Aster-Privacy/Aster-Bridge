@@ -265,6 +265,7 @@ where
         data_buffer: Vec::new(),
     };
     let mut failed_auth: u32 = 0;
+    let mut refreshed_identities = false;
 
     let mut line_bytes: Vec<u8> = Vec::new();
 
@@ -552,7 +553,7 @@ where
 
                 if let Some(start) = find_ci_prefix(&args, "FROM:") {
                     let from_addr = extract_addr(&args[start + 5..]);
-                    let (session_email, identity_ok) = {
+                    let (session_email, mut identity_ok) = {
                         let s = session.read().await;
                         let resolved = if from_addr.is_empty() {
                             s.default_sender_address()
@@ -564,7 +565,23 @@ where
                                 .is_some_and(|i| i.enabled);
                         (resolved, ok)
                     };
+                    // An alias or custom-domain address added after sign-in is not in
+                    // the list yet, so rebuild it once per connection before refusing.
+                    if !identity_ok && !refreshed_identities {
+                        refreshed_identities = true;
+                        tracing::info!(
+                            "unknown sender offered, refreshing the send-as list from the server"
+                        );
+                        crate::auth::session::refresh_send_identities(&session, &client).await;
+                        let s = session.read().await;
+                        identity_ok = session_email.eq_ignore_ascii_case(&s.email)
+                            || s.find_send_identity(&session_email)
+                                .is_some_and(|i| i.enabled);
+                    }
                     if !identity_ok {
+                        tracing::warn!(
+                            "rejecting MAIL FROM: the address is not one of this account's send identities"
+                        );
                         writer.write_all(b"553 5.1.8 Sender address rejected: not authenticated identity\r\n").await?;
                         continue;
                     }

@@ -123,6 +123,32 @@ impl Drop for Session {
     }
 }
 
+// Rebuilds the send-as list from the server. Bridge builds it once at sign-in,
+// so an address added afterwards stays invisible until the next restart. The SMTP
+// server calls this when a client offers a sender it does not recognize.
+pub async fn refresh_send_identities(
+    session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
+    client: &ApiClient,
+) {
+    let (access_token, email, passphrase) = {
+        let s = session.read().await;
+        (
+            s.access_token.to_string(),
+            s.email.clone(),
+            s.vault_passphrase.clone(),
+        )
+    };
+
+    let identities = build_send_identities(client, &access_token, &email, None, &passphrase).await;
+    let default_sender_id = fetch_default_sender_id(client, &access_token).await;
+
+    let mut s = session.write().await;
+    s.send_identities = identities;
+    if default_sender_id.is_some() {
+        s.default_sender_id = default_sender_id;
+    }
+}
+
 // The account's chosen default sender. A failure here is non-fatal: the session
 // falls back to the primary address, which is what Bridge did before.
 pub async fn fetch_default_sender_id(client: &ApiClient, access_token: &str) -> Option<String> {
