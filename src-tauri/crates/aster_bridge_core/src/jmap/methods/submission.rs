@@ -108,9 +108,22 @@ async fn submission_body(
             data: a.data,
         })
         .collect();
-    let passphrase = zeroize::Zeroizing::new(ctx.session.read().await.vault_passphrase.clone());
+    let (passphrase, identity_key, access_token) = {
+        let s = ctx.session.read().await;
+        (
+            zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+            s.identity_key.clone().map(zeroize::Zeroizing::new),
+            s.access_token.clone(),
+        )
+    };
+    let seal_to_identity = identity_key.is_some()
+        && crate::crypto::sent_copy::format_writes_enabled(&ctx.client, &access_token).await;
     let sealed = tokio::task::spawn_blocking(move || {
-        crate::crypto::attachment::seal_send_attachments(&outgoing, &passphrase)
+        let own_key = identity_key
+            .as_deref()
+            .map(|k| k.as_str())
+            .filter(|_| seal_to_identity);
+        crate::crypto::attachment::seal_send_attachments_with_own_key(&outgoing, &passphrase, own_key)
     })
     .await;
     match sealed {
@@ -140,14 +153,17 @@ fn draft_reply(
 }
 
 async fn attach_sent_copy(ctx: &Arc<JmapContext>, body: &mut Value) {
-    let (from_email, identity_key, passphrase) = {
+    let (from_email, identity_key, passphrase, access_token) = {
         let s = ctx.session.read().await;
         (
             s.email.clone(),
             s.identity_key.clone().map(zeroize::Zeroizing::new),
             zeroize::Zeroizing::new(s.vault_passphrase.clone()),
+            s.access_token.clone(),
         )
     };
+    let seal_to_identity =
+        crate::crypto::sent_copy::format_writes_enabled(&ctx.client, &access_token).await;
     let mut payload = std::mem::take(body);
     let joined = tokio::task::spawn_blocking(move || {
         crate::smtp::reply_thread::attach_sent_copy(
@@ -156,6 +172,7 @@ async fn attach_sent_copy(ctx: &Arc<JmapContext>, body: &mut Value) {
             None,
             identity_key.as_deref().map(|k| k.as_str()),
             &passphrase,
+            seal_to_identity,
         );
         payload
     })
@@ -392,6 +409,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(crate::api_client::ApiClient::new());
         let (tx, _rx) = broadcast::channel(8);

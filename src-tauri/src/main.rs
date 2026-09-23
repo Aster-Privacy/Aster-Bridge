@@ -424,10 +424,10 @@ async fn get_user_preferences(
     let client = guard.client.clone();
     drop(guard);
 
-    let (token, identity_key) = {
+    let (token, identity_key, account_keys) = {
         let s = session_arc.read().await;
         match &s.identity_key {
-            Some(k) => ((*s.access_token).clone(), k.clone()),
+            Some(k) => ((*s.access_token).clone(), k.clone(), s.account_keys.clone()),
             None => return Ok(UserPreferencesResponse::default()),
         }
     };
@@ -445,7 +445,12 @@ async fn get_user_preferences(
         _ => return Ok(UserPreferencesResponse::default()),
     };
 
-    match crypto::preferences::decrypt_preferences(&identity_key, &encrypted, &nonce) {
+    match crypto::preferences::decrypt_preferences_with_account_keys(
+        &identity_key,
+        &account_keys,
+        &encrypted,
+        &nonce,
+    ) {
         Ok(p) => Ok(UserPreferencesResponse {
             theme: p.theme,
             color_theme: p.color_theme,

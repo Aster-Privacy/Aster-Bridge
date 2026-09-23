@@ -18,6 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
+pub mod account_key;
 pub mod alias;
 pub mod attachment;
 pub mod contacts;
@@ -30,4 +31,5 @@ pub mod internal_send;
 pub mod metadata;
 pub mod preferences;
 pub mod ratchet;
+pub mod sent_copy;
 pub mod vault;

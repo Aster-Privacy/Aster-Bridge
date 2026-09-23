@@ -149,6 +149,7 @@ fn open_client_authored_meta(
     encrypted_meta: &[u8],
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
 ) -> Option<RowMeta> {
     if let Ok(text) = std::str::from_utf8(encrypted_meta) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -159,9 +160,13 @@ fn open_client_authored_meta(
             }
         }
         if text.starts_with("-----BEGIN PGP MESSAGE-----") {
-            let ik = identity_key?;
-            let key_pair = aster_crypto::import_secret_key(ik).ok()?;
-            let decrypted = aster_crypto::decrypt_message(text.as_bytes(), &[&key_pair]).ok()?;
+            let decrypted = crate::crypto::envelope::decrypt_own_pgp(
+                text,
+                identity_key,
+                previous_keys,
+                passphrase,
+            )
+            .ok()?;
             let parsed: serde_json::Value = serde_json::from_slice(&decrypted).ok()?;
             return row_meta_from_json(&parsed);
         }
@@ -206,6 +211,7 @@ pub fn decrypt_attachment(
     entry: Option<&AttachmentKeyEntry>,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
 ) -> Result<DecryptedAttachment> {
     let seq = row.seq_num as i64;
     let encrypted_meta = STANDARD
@@ -235,6 +241,7 @@ pub fn decrypt_attachment(
             &encrypted_meta,
             passphrase,
             identity_key,
+            previous_keys,
         );
     }
     let row_meta = row_meta.unwrap_or_default();
@@ -347,6 +354,14 @@ pub fn mime_attachments(parsed: &mail_parser::Message<'_>, max_bytes: usize) -> 
 }
 
 pub fn seal_attachment(attachment: &OutgoingAttachment, passphrase: &[u8]) -> Result<SealedAttachment> {
+    seal_attachment_with_own_key(attachment, passphrase, None)
+}
+
+pub fn seal_attachment_with_own_key(
+    attachment: &OutgoingAttachment,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+) -> Result<SealedAttachment> {
     use rand_core::{OsRng, RngCore};
 
     let mut session_key = Zeroizing::new([0u8; SESSION_KEY_LEN]);
@@ -370,9 +385,20 @@ pub fn seal_attachment(attachment: &OutgoingAttachment, passphrase: &[u8]) -> Re
         })
         .to_string(),
     );
-    let sender_meta = encrypt_pbkdf2_envelope(&plain_meta, passphrase)?;
+    let own_sealed = own_key.and_then(|key| {
+        crate::crypto::sent_copy::seal_sent_envelope(&plain_meta, key, passphrase)
+    });
     let mut sender_meta_nonce = [0u8; DATA_NONCE_LEN];
-    OsRng.fill_bytes(&mut sender_meta_nonce);
+    let sender_meta = match own_sealed {
+        Some(sealed) => sealed,
+        None => {
+            if own_key.is_some() {
+                tracing::warn!("attachment meta seal to the identity key failed, using the passphrase envelope");
+            }
+            OsRng.fill_bytes(&mut sender_meta_nonce);
+            encrypt_pbkdf2_envelope(&plain_meta, passphrase)?
+        }
+    };
     Ok(SealedAttachment {
         encrypted_data,
         data_nonce,
@@ -396,9 +422,19 @@ pub fn seal_send_attachments(
     attachments: &[OutgoingAttachment],
     passphrase: &[u8],
 ) -> Result<Vec<serde_json::Value>> {
+    seal_send_attachments_with_own_key(attachments, passphrase, None)
+}
+
+pub fn seal_send_attachments_with_own_key(
+    attachments: &[OutgoingAttachment],
+    passphrase: &[u8],
+    own_key: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
     attachments
         .iter()
-        .map(|a| seal_attachment(a, passphrase).map(|s| send_attachment_value(&s)))
+        .map(|a| {
+            seal_attachment_with_own_key(a, passphrase, own_key).map(|s| send_attachment_value(&s))
+        })
         .collect()
 }
 
@@ -466,7 +502,7 @@ mod tests {
                 &sealed.sender_meta_nonce,
             )
         };
-        let opened = decrypt_attachment(&sender_row, None, b"vault-pass", None).unwrap();
+        let opened = decrypt_attachment(&sender_row, None, b"vault-pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"\x89PNG");
         assert_eq!(opened.filename, "logo.png");
         assert_eq!(opened.content_id.as_deref(), Some("logo@aster"));
@@ -484,7 +520,7 @@ mod tests {
             sealed.plain_meta.as_bytes(),
             &[0u8; 12],
         );
-        let opened = decrypt_attachment(&received_row, None, b"other-pass", None).unwrap();
+        let opened = decrypt_attachment(&received_row, None, b"other-pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"plain notes");
         assert_eq!(opened.filename, "notes.txt");
     }
@@ -629,7 +665,7 @@ mod tests {
             encrypted_meta: sealed_meta,
             ..row(0, &ct, &nonce, b"", &random_nonce())
         };
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "report.pdf");
         assert_eq!(out.content_type, "application/pdf");
         assert_eq!(out.data, plain);
@@ -656,7 +692,7 @@ mod tests {
             key: Some(STANDARD.encode(key)),
             ..Default::default()
         };
-        let out = decrypt_attachment(&r, Some(&entry), b"unrelated", None).unwrap();
+        let out = decrypt_attachment(&r, Some(&entry), b"unrelated", None, &[]).unwrap();
         assert_eq!(out.filename, "pic.png");
         assert_eq!(out.content_type, "image/png");
         assert_eq!(out.content_id.as_deref(), Some("cid-7"));
@@ -677,9 +713,38 @@ mod tests {
             content_id: None,
             size: Some(4),
         };
-        let out = decrypt_attachment(&r, Some(&entry), b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "from-envelope.bin");
         assert_eq!(out.content_type, "application/octet-stream");
+        assert_eq!(out.data, plain);
+    }
+
+    #[test]
+    fn pgp_meta_opens_with_a_protected_identity_key() {
+        let owner = crate::crypto::account_key::tests::protected_keypair("vault pass");
+        let key = random_key();
+        let nonce = random_nonce();
+        let plain = b"sent attachment".to_vec();
+        let ct = seal(&key, &nonce, &plain, b"");
+        let meta = serde_json::json!({
+            "filename": "sent.txt",
+            "content_type": "text/plain",
+            "session_key": STANDARD.encode(key)
+        })
+        .to_string();
+        let armored = aster_crypto::encrypt_message(meta.as_bytes(), &[&owner.public_key()]).unwrap();
+        let r = row(0, &ct, &nonce, &armored, &[0u8; 12]);
+        let owner_armored = owner.to_armored().unwrap();
+
+        let out = decrypt_attachment(&r, None, b"vault pass", Some(&owner_armored), &[]).unwrap();
+        assert_eq!(out.filename, "sent.txt");
+        assert_eq!(out.data, plain);
+        assert!(decrypt_attachment(&r, None, b"wrong", Some(&owner_armored), &[]).is_err());
+
+        let rotated = crate::crypto::account_key::tests::protected_keypair("vault pass");
+        let rotated_armored = rotated.to_armored().unwrap();
+        assert!(decrypt_attachment(&r, None, b"vault pass", Some(&rotated_armored), &[]).is_err());
+        let out = decrypt_attachment(&r, None, b"vault pass", Some(&rotated_armored), &[owner_armored]).unwrap();
         assert_eq!(out.data, plain);
     }
 
@@ -696,7 +761,7 @@ mod tests {
         })
         .to_string();
         let r = row(0, &ct, &nonce, meta.as_bytes(), &[0u8; 12]);
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "x.csv");
         assert_eq!(out.content_type, "text/csv");
         assert_eq!(out.data, plain);
@@ -706,12 +771,12 @@ mod tests {
     fn stored_plaintext_attachment_is_returned_only_with_the_zero_nonce() {
         let plain = b"raw stored bytes".to_vec();
         let r = row(0, &plain, &[0u8; 12], b"", &[0u8; 12]);
-        let out = decrypt_attachment(&r, None, b"pass", None).unwrap();
+        let out = decrypt_attachment(&r, None, b"pass", None, &[]).unwrap();
         assert_eq!(out.data, plain);
         assert_eq!(out.filename, "attachment-1.bin");
 
         let r = row(0, &plain, &random_nonce(), b"", &[0u8; 12]);
-        assert!(decrypt_attachment(&r, None, b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, None, b"pass", None, &[]).is_err());
     }
 
     #[test]
@@ -724,7 +789,7 @@ mod tests {
             key: Some(STANDARD.encode(random_key())),
             ..Default::default()
         };
-        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
     }
 
     #[test]
@@ -737,7 +802,7 @@ mod tests {
             key: Some(STANDARD.encode(key)),
             ..Default::default()
         };
-        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None).is_err());
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
     }
 
     #[test]
@@ -748,5 +813,135 @@ mod tests {
         );
         assert_eq!(placeholder_filename(2, "image/jpeg"), "attachment-3.jpg");
         assert_eq!(placeholder_filename(1, "weird/thing"), "attachment-2.bin");
+    }
+
+    const OWN_PASS: &str = "correct horse battery staple";
+
+    fn own_key() -> String {
+        crate::crypto::account_key::tests::protected_keypair(OWN_PASS)
+            .to_armored()
+            .unwrap()
+    }
+
+    fn sender_row(sealed: &SealedAttachment) -> AttachmentResponse {
+        AttachmentResponse {
+            encrypted_meta: sealed.sender_meta.clone(),
+            ..row(
+                0,
+                &sealed.encrypted_data,
+                &sealed.data_nonce,
+                b"",
+                &sealed.sender_meta_nonce,
+            )
+        }
+    }
+
+    #[test]
+    fn own_key_seal_writes_armored_meta_with_a_zero_nonce() {
+        let key = own_key();
+        let att = outgoing("report.pdf", "application/pdf", None, b"pdf bytes");
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let armored = String::from_utf8(STANDARD.decode(&sealed.sender_meta).unwrap()).unwrap();
+        assert!(armored.starts_with("-----BEGIN PGP MESSAGE-----"));
+        assert!(!armored.contains("report.pdf"));
+        assert_eq!(sealed.sender_meta_nonce, [0u8; 12]);
+        let value = send_attachment_value(&sealed);
+        assert_eq!(
+            STANDARD.decode(value["sender_meta_nonce"].as_str().unwrap()).unwrap(),
+            vec![0u8; 12]
+        );
+        let (plain, meta) = server_decrypt(&value);
+        assert_eq!(plain, b"pdf bytes");
+        assert_eq!(meta["filename"], "report.pdf");
+    }
+
+    #[test]
+    fn own_key_sealed_meta_opens_through_the_reader() {
+        let key = own_key();
+        let att = outgoing("logo.png", "image/png", Some("logo@aster"), b"logo bytes");
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let opened =
+            decrypt_attachment(&sender_row(&sealed), None, OWN_PASS.as_bytes(), Some(&key), &[])
+                .unwrap();
+        assert_eq!(opened.data, b"logo bytes");
+        assert_eq!(opened.filename, "logo.png");
+        assert_eq!(opened.content_id.as_deref(), Some("logo@aster"));
+        assert!(opened.is_inline);
+    }
+
+    #[test]
+    fn own_key_sealed_meta_opens_from_previous_keys() {
+        let key = own_key();
+        let current = own_key();
+        let att = outgoing("a.txt", "text/plain", None, b"moved key");
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let opened = decrypt_attachment(
+            &sender_row(&sealed),
+            None,
+            OWN_PASS.as_bytes(),
+            Some(&current),
+            &[key],
+        )
+        .unwrap();
+        assert_eq!(opened.data, b"moved key");
+        assert_eq!(opened.filename, "a.txt");
+    }
+
+    #[test]
+    fn own_key_sealed_meta_is_closed_to_another_key() {
+        let key = own_key();
+        let other = own_key();
+        let att = outgoing("secret.txt", "text/plain", None, b"secret");
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let opened =
+            decrypt_attachment(&sender_row(&sealed), None, OWN_PASS.as_bytes(), Some(&other), &[]);
+        assert!(opened.map(|a| a.data != b"secret").unwrap_or(true));
+    }
+
+    #[test]
+    fn own_key_seal_falls_back_to_the_passphrase_envelope() {
+        let att = outgoing("b.txt", "text/plain", None, b"fallback");
+        for key in [Some(r#"{"kty":"EC"}"#), None] {
+            let sealed = seal_attachment_with_own_key(&att, b"vault-pass", key).unwrap();
+            let raw = STANDARD.decode(&sealed.sender_meta).unwrap();
+            assert!(!String::from_utf8_lossy(&raw).contains("BEGIN PGP"));
+            assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
+            let opened =
+                decrypt_attachment(&sender_row(&sealed), None, b"vault-pass", None, &[]).unwrap();
+            assert_eq!(opened.data, b"fallback");
+            assert_eq!(opened.filename, "b.txt");
+        }
+    }
+
+    #[test]
+    fn own_key_seal_falls_back_for_a_wrong_passphrase() {
+        let key = own_key();
+        let att = outgoing("c.txt", "text/plain", None, b"wrong pass");
+        let sealed = seal_attachment_with_own_key(&att, b"not the key pass", Some(&key)).unwrap();
+        assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
+        let opened =
+            decrypt_attachment(&sender_row(&sealed), None, b"not the key pass", None, &[]).unwrap();
+        assert_eq!(opened.data, b"wrong pass");
+    }
+
+    #[test]
+    fn seal_send_attachments_with_own_key_seals_every_part() {
+        let key = own_key();
+        let list = seal_send_attachments_with_own_key(
+            &[
+                outgoing("x.txt", "text/plain", None, b"x"),
+                outgoing("y.txt", "text/plain", None, b"y"),
+            ],
+            OWN_PASS.as_bytes(),
+            Some(&key),
+        )
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        for value in &list {
+            let raw = STANDARD
+                .decode(value["sender_encrypted_meta"].as_str().unwrap())
+                .unwrap();
+            assert!(raw.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+        }
     }
 }

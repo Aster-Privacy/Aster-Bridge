@@ -56,6 +56,7 @@ pub struct VaultContents {
     pub ratchet_pq_identity_key: Option<String>,
     pub ratchet_pq_identity_seed: Option<String>,
     pub ratchet_previous_keys: Option<Vec<RatchetKeySet>>,
+    pub previous_keys: Option<Vec<String>>,
 }
 
 pub fn decrypt_vault(

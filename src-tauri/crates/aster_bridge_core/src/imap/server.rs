@@ -3466,6 +3466,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
         let (tx, _rx) = broadcast::channel(16);
@@ -3516,6 +3518,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);
@@ -3800,6 +3804,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 
@@ -3897,6 +3903,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 

@@ -967,6 +967,7 @@ pub async fn append_imported_message(
                 &item,
                 &passphrase,
                 Some(&identity_key),
+                &[],
                 &inbound_keys,
             );
 

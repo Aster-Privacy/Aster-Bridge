@@ -77,6 +77,8 @@ pub struct Session {
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
     pub send_identities: Vec<SendIdentity>,
     pub default_sender_id: Option<String>,
+    pub account_keys: Vec<crate::crypto::account_key::AccountKey>,
+    pub previous_keys: Zeroizing<Vec<String>>,
 }
 
 impl Session {
@@ -319,6 +321,7 @@ pub struct VaultKeyMaterial {
     pub ratchet_identity_public: Option<String>,
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
+    pub previous_keys: Zeroizing<Vec<String>>,
 }
 
 pub fn decrypt_vault_key_material(
@@ -333,6 +336,7 @@ pub fn decrypt_vault_key_material(
         ratchet_identity_public: v.ratchet_identity_public.clone(),
         ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
+        previous_keys: Zeroizing::new(v.previous_keys.clone().unwrap_or_default()),
     })
 }
 
@@ -361,6 +365,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     session.ratchet_identity_public = material.ratchet_identity_public;
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
+    session.previous_keys = material.previous_keys;
 }
 
 pub async fn restore_or_login(
@@ -401,7 +406,7 @@ pub async fn login_with_passphrase(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
-    let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys) =
+    let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys) =
         match decrypt_vault_key_material(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
@@ -413,13 +418,14 @@ pub async fn login_with_passphrase(
                 m.ratchet_identity_public,
                 m.ratchet_keys,
                 m.inbound_keys,
+                m.previous_keys,
             ),
             Err(e) => {
                 tracing::error!(
                     "vault decrypt failed during sign-in: {}; encrypted mail cannot be decrypted until you sign in again",
                     e
                 );
-                (None, None, None, Vec::new(), Vec::new())
+                (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()))
             }
         };
 
@@ -432,6 +438,20 @@ pub async fn login_with_passphrase(
     )
     .await;
     let default_sender_id = fetch_default_sender_id(client, &access_token).await;
+
+    let account_keys = match identity_key.as_deref() {
+        Some(ik) => {
+            crate::crypto::account_key::load_account_keys(
+                client,
+                &access_token,
+                ik,
+                &previous_keys,
+                &passphrase,
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
 
     Ok(Session {
         user_id: login_resp.user_id,
@@ -447,6 +467,8 @@ pub async fn login_with_passphrase(
         inbound_keys,
         send_identities,
         default_sender_id,
+        account_keys,
+        previous_keys,
     })
 }
 
@@ -505,9 +527,23 @@ pub async fn refresh_access_token(
         &login_resp.vault_nonce,
         &passphrase,
     );
+    let loaded_account_keys = match &material {
+        Ok(m) => {
+            crate::crypto::account_key::load_account_keys(
+                client,
+                &access_token,
+                &m.identity_key,
+                &m.previous_keys,
+                &passphrase,
+            )
+            .await
+        }
+        Err(_) => Vec::new(),
+    };
     let mut s = session.write().await;
     s.access_token = access_token;
     s.refresh_token = login_resp.refresh_token.map(Zeroizing::new);
+    crate::crypto::account_key::merge_account_keys(&mut s.account_keys, loaded_account_keys);
     match material {
         Ok(m) => apply_vault_key_material(&mut s, m),
         Err(e) => tracing::warn!(
@@ -595,7 +631,7 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
-                let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys) =
+                let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys) =
                     match decrypt_vault_key_material(
                         &login_resp.encrypted_vault,
                         &login_resp.vault_nonce,
@@ -607,13 +643,14 @@ pub async fn first_time_setup(
                             m.ratchet_identity_public,
                             m.ratchet_keys,
                             m.inbound_keys,
+                            m.previous_keys,
                         ),
                         Err(e) => {
                             tracing::error!(
                                 "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
                                 e
                             );
-                            (None, None, None, Vec::new(), Vec::new())
+                            (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()))
                         }
                     };
 
@@ -626,6 +663,20 @@ pub async fn first_time_setup(
                 )
                 .await;
                 let default_sender_id = fetch_default_sender_id(client, &access_token).await;
+
+                let account_keys = match identity_key.as_deref() {
+                    Some(ik) => {
+                        crate::crypto::account_key::load_account_keys(
+                            client,
+                            &access_token,
+                            ik,
+                            &previous_keys,
+                            &passphrase,
+                        )
+                        .await
+                    }
+                    None => Vec::new(),
+                };
 
                 return Ok(Session {
                     user_id: login_resp.user_id,
@@ -641,6 +692,8 @@ pub async fn first_time_setup(
                     inbound_keys,
                     send_identities,
                     default_sender_id,
+                    account_keys,
+                    previous_keys,
                 });
             }
             "expired" => {
@@ -670,6 +723,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }
     }
 
@@ -705,6 +760,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         };
         drop(s);
     }

@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
-use crate::crypto::envelope::decrypt_envelope;
+use crate::crypto::envelope::decrypt_envelope_with_previous_keys;
 use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
 use crate::db::{
     CachedAttachment, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
@@ -451,6 +451,7 @@ async fn fetch_and_decrypt_attachments(
     entries: &[EnvelopeAttachment],
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
 ) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
     let resp = client
         .list_attachments_for_mail(access_token, mail_id)
@@ -465,6 +466,7 @@ async fn fetch_and_decrypt_attachments(
     let entries: Vec<EnvelopeAttachment> = entries.to_vec();
     let passphrase = Zeroizing::new(passphrase.to_vec());
     let identity_key = identity_key.map(str::to_string);
+    let previous_keys = Zeroizing::new(previous_keys.to_vec());
     tokio::task::spawn_blocking(move || {
         let mut out: Vec<CachedAttachment> = Vec::with_capacity(rows.len());
         for (position, row) in rows.iter().enumerate() {
@@ -473,7 +475,13 @@ async fn fetch_and_decrypt_attachments(
                 continue;
             }
             let entry = entry_for_row(&entries, seq, position).map(key_entry);
-            let att = decrypt_attachment(row, entry.as_ref(), &passphrase, identity_key.as_deref())
+            let att = decrypt_attachment(
+                row,
+                entry.as_ref(),
+                &passphrase,
+                identity_key.as_deref(),
+                &previous_keys,
+            )
                 .map_err(classify_decrypt_error)?;
             out.push(CachedAttachment {
                 seq: att.seq,
@@ -498,17 +506,19 @@ async fn refresh_attachment_keys(
     aster_id: &str,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> std::result::Result<Vec<EnvelopeAttachment>, AttachmentFetchError> {
     let item = client
         .fetch_mail_item(access_token, aster_id)
         .await
         .map_err(classify_api_error)?;
-    let plaintext = decrypt_envelope(
+    let plaintext = decrypt_envelope_with_previous_keys(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
+        previous_keys,
         inbound_keys,
     )
     .map_err(|_| AttachmentFetchError::Content("envelope decrypt failed".to_string()))?;
@@ -523,6 +533,7 @@ async fn backfill_pending_attachments(
     access_token: &str,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
     skip: &HashSet<String>,
 ) -> Vec<String> {
@@ -551,6 +562,7 @@ async fn backfill_pending_attachments(
                 &aster_id,
                 passphrase,
                 identity_key,
+                previous_keys,
                 inbound_keys,
             )
             .await
@@ -576,6 +588,7 @@ async fn backfill_pending_attachments(
             &entries,
             passphrase,
             identity_key,
+            previous_keys,
         )
         .await
         {
@@ -775,6 +788,7 @@ fn prepare_mail_item(
     item: &MailItem,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> Prepared {
     if !is_valid_item_id(&item.id) {
@@ -799,11 +813,12 @@ fn prepare_mail_item(
         }
     }
 
-    let plaintext_result = decrypt_envelope(
+    let plaintext_result = decrypt_envelope_with_previous_keys(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
+        previous_keys,
         inbound_keys,
     );
 
@@ -993,9 +1008,10 @@ pub(crate) fn cache_mail_item(
     item: &MailItem,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> CacheOutcome {
-    match prepare_mail_item(db, folder, item, passphrase, identity_key, inbound_keys) {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
         Prepared::Done(outcome) => outcome,
         Prepared::Ready(prepared) => commit_mail_item(db, folder, item, prepared, None),
     }
@@ -1135,6 +1151,7 @@ async fn try_decrypt_internal_mail(
     our_email: &str,
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     ratchet_keys: &[crate::crypto::ratchet::RatchetReceiverKeys],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
     sync_key: Option<&[u8; 32]>,
@@ -1145,11 +1162,12 @@ async fn try_decrypt_internal_mail(
         return None;
     }
 
-    let plaintext_env = decrypt_envelope(
+    let plaintext_env = decrypt_envelope_with_previous_keys(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
+        previous_keys,
         inbound_keys,
     )
     .ok()?;
@@ -1255,12 +1273,13 @@ fn retry_failed_inbound_items(
     failed: &[(&'static str, MailItem)],
     passphrase: &[u8],
     identity_key: Option<&str>,
+    previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> (Vec<String>, Vec<String>) {
     let mut new_ids = Vec::new();
     let mut updated_ids = Vec::new();
     for (folder, item) in failed {
-        let outcome = cache_mail_item(db, folder, item, passphrase, identity_key, inbound_keys);
+        let outcome = cache_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys);
         if outcome.was_new {
             new_ids.push(item.id.clone());
         } else if outcome.flags_changed {
@@ -1303,12 +1322,13 @@ async fn run_sync_pass(
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
 
-    let (access_token, passphrase, identity_key, our_email, ratchet_keys, inbound_keys) = {
+    let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys) = {
         let s = session.read().await;
         (
             s.access_token.clone(),
             Zeroizing::new(s.vault_passphrase.clone()),
             s.identity_key.clone(),
+            s.previous_keys.clone(),
             s.email.clone(),
             s.ratchet_keys.clone(),
             s.inbound_keys.clone(),
@@ -1347,6 +1367,7 @@ async fn run_sync_pass(
                             item,
                             &passphrase,
                             identity_key.as_deref(),
+                            &previous_keys,
                             &inbound_keys,
                         ) {
                             Prepared::Done(outcome) => outcome,
@@ -1366,6 +1387,7 @@ async fn run_sync_pass(
                                         &prepared.attachments,
                                         &passphrase,
                                         identity_key.as_deref(),
+                                        &previous_keys,
                                     )
                                     .await
                                     {
@@ -1426,6 +1448,7 @@ async fn run_sync_pass(
                                 &our_email,
                                 &passphrase,
                                 identity_key.as_deref(),
+                                &previous_keys,
                                 &ratchet_keys,
                                 &inbound_keys,
                                 sync_key.as_ref(),
@@ -1490,15 +1513,16 @@ async fn run_sync_pass(
             failed_inbound.len()
         );
         if heal_inbound_keys(session, client).await {
-            let (fresh_identity_key, fresh_inbound_keys) = {
+            let (fresh_identity_key, fresh_previous_keys, fresh_inbound_keys) = {
                 let s = session.read().await;
-                (s.identity_key.clone(), s.inbound_keys.clone())
+                (s.identity_key.clone(), s.previous_keys.clone(), s.inbound_keys.clone())
             };
             let (healed_new, healed_updated) = retry_failed_inbound_items(
                 db,
                 &failed_inbound,
                 &passphrase,
                 fresh_identity_key.as_deref(),
+                &fresh_previous_keys,
                 &fresh_inbound_keys,
             );
             if !healed_new.is_empty() {
@@ -1520,12 +1544,14 @@ async fn run_sync_pass(
         &access_token,
         &passphrase,
         identity_key.as_deref(),
+        &previous_keys,
         &inbound_keys,
         &attachments_handled,
     )
     .await;
     updated_ids.extend(backfilled);
 
+    let account_keys = session.read().await.account_keys.clone();
     match identity_key.as_deref() {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
@@ -1543,10 +1569,16 @@ async fn run_sync_pass(
                             if existing_versions.get(&d.id) == Some(&d.version) {
                                 continue;
                             }
-                            let content = match crate::crypto::draft::decrypt_draft_content(
+                            let draft_keys = crate::crypto::draft::DraftKeys {
+                                identity_key: ik,
+                                previous_keys: &previous_keys,
+                                account_keys: &account_keys,
+                                passphrase: &passphrase,
+                            };
+                            let content = match crate::crypto::draft::decrypt_draft_content_with_keys(
                                 &d.encrypted_content,
                                 &d.content_nonce,
-                                ik,
+                                &draft_keys,
                             ) {
                                 Ok(c) => c,
                                 Err(_) => {
@@ -2088,7 +2120,7 @@ mod tests {
         let json = serde_json::json!({"subject": "x", "body_text": "y"});
         let mut item = item_with_envelope("good", &json);
         item.id = "bad id".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         assert!(db.get_cached_message("bad id").unwrap().is_none());
     }
 
@@ -2104,7 +2136,7 @@ mod tests {
             "message_id": "mid-1@test"
         });
         let item = item_with_envelope("msg-new", &json);
-        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new;
+        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new;
         assert!(was_new);
 
         let cached = db.get_cached_message("msg-new").unwrap().unwrap();
@@ -2125,7 +2157,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
         let item = item_with_envelope("msg-plain", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-plain").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain words"));
         let raw = cached.raw_headers.unwrap();
@@ -2141,7 +2173,7 @@ mod tests {
             "body_text": "ciphertext-blob"
         });
         let item = item_with_envelope("msg-ratchet", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-ratchet").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.contains("end-to-end encrypted"));
@@ -2154,12 +2186,12 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-move", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let first = db.get_cached_message("msg-move").unwrap().unwrap();
         assert_eq!(first.folder, "inbox");
         let inbox_uid = first.imap_uid;
 
-        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None, &[]).was_new;
+        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None, &[], &[]).was_new;
         assert!(!was_new, "already-body-cached item must not count as new");
 
         let moved = db.get_cached_message("msg-move").unwrap().unwrap();
@@ -2176,8 +2208,8 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-dedup", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
@@ -2186,7 +2218,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let mut item = item_with_envelope("msg-bad-env", &serde_json::json!({"subject": "x"}));
         item.encrypted_envelope = "!!!not-base64!!!".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         assert!(db.get_cached_message("msg-bad-env").unwrap().is_none());
     }
 
@@ -2196,7 +2228,7 @@ mod tests {
         let big = "a".repeat(6 * 1024 * 1024);
         let json = serde_json::json!({"subject": "s", "body_text": big});
         let item = item_with_envelope("msg-big", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-big").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.len() < 6 * 1024 * 1024);
@@ -2211,7 +2243,7 @@ mod tests {
 
         let mut first = item_with_envelope("msg-replay", &json);
         first.envelope_nonce = nonce_pbkdf2.clone();
-        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None, &[]);
+        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None, &[], &[]);
         assert!(
             db.replay_check_and_record("msg-replay", &nonce_pbkdf2).unwrap(),
             "same nonce must be accepted"
@@ -2230,13 +2262,13 @@ mod tests {
         let mut undecryptable = item_with_envelope("msg-rotate", &json);
         undecryptable.envelope_nonce = STANDARD.encode([0x09u8]);
         undecryptable.encrypted_envelope = STANDARD.encode(b"not decryptable");
-        let first = cache_mail_item(&db, "inbox", &undecryptable, b"pass", None, &[]);
+        let first = cache_mail_item(&db, "inbox", &undecryptable, b"pass", None, &[], &[]);
         assert!(!first.was_new, "an undecryptable item must not be cached");
         assert!(!db.body_cached("msg-rotate"));
 
         let re_encrypted = item_with_envelope("msg-rotate", &json);
         assert!(
-            cache_mail_item(&db, "inbox", &re_encrypted, b"pass", None, &[]).was_new,
+            cache_mail_item(&db, "inbox", &re_encrypted, b"pass", None, &[], &[]).was_new,
             "the re-encrypted copy must still be accepted after the nonce changed"
         );
         assert!(db.body_cached("msg-rotate"));
@@ -2259,7 +2291,7 @@ mod tests {
             "the fixture must be recognized as inbound so the no-keys branch is reached"
         );
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
 
         assert!(!outcome.was_new, "inbound mail must not be cached without keys");
         assert!(
@@ -2337,7 +2369,7 @@ mod tests {
         let item = inbound_item("msg-heal", &json, &recipient);
 
         let stale_keys = [inbound_candidate(&wrong)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &stale_keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &stale_keys);
         assert!(!outcome.was_new);
         assert!(outcome.inbound_decrypt_failed);
         assert!(!db.body_cached("msg-heal"));
@@ -2345,7 +2377,7 @@ mod tests {
         let fresh_keys = [inbound_candidate(&recipient)];
         let failed = vec![("inbox", item.clone())];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &fresh_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &fresh_keys);
         assert_eq!(new_ids, vec!["msg-heal".to_string()]);
         assert!(updated_ids.is_empty());
         let cached = db.get_cached_message("msg-heal").unwrap().unwrap();
@@ -2362,12 +2394,12 @@ mod tests {
         let item = inbound_item("msg-unhealable", &json, &recipient);
 
         let stale_keys = [inbound_candidate(&wrong)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &stale_keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &stale_keys);
         assert!(outcome.inbound_decrypt_failed);
 
         let failed = vec![("inbox", item)];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &stale_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &stale_keys);
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         assert!(!db.body_cached("msg-unhealable"));
@@ -2380,7 +2412,7 @@ mod tests {
         let json = serde_json::json!({"subject": "ok", "body_text": "b"});
         let item = inbound_item("msg-inbound-ok", &json, &recipient);
         let keys = [inbound_candidate(&recipient)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &keys);
         assert!(outcome.was_new);
         assert!(!outcome.inbound_decrypt_failed);
     }
@@ -2402,7 +2434,7 @@ mod tests {
             "date": "Wed, 21 May 2026 10:00:00 +0000"
         });
         let item = item_with_envelope("msg-date-norm", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-date-norm").unwrap().unwrap();
         let stored = cached.date.unwrap();
         assert!(
@@ -2459,7 +2491,7 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-new", &json);
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(outcome.was_new);
         assert!(!outcome.flags_changed);
         let cached = db.get_cached_message("msg-read-new").unwrap().unwrap();
@@ -2472,14 +2504,14 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-sync", &json);
         item.is_read = Some(false);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         assert_eq!(
             db.get_cached_message("msg-read-sync").unwrap().unwrap().flags & 1,
             0
         );
 
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(!outcome.was_new);
         assert!(outcome.flags_changed);
         assert_eq!(
@@ -2487,7 +2519,7 @@ mod tests {
             1
         );
 
-        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(!repeat.flags_changed, "no-op flag sync must not report change");
     }
 
@@ -2496,10 +2528,10 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-star-sync", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
 
         item.is_starred = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -2507,7 +2539,7 @@ mod tests {
         );
 
         item.is_starred = Some(false);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -2520,11 +2552,11 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-noflags", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let uid = db.get_cached_message("msg-noflags").unwrap().unwrap().imap_uid;
         db.update_message_flags(uid as i64, "inbox", 5).unwrap();
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
         assert!(!outcome.flags_changed);
         assert_eq!(db.get_cached_message("msg-noflags").unwrap().unwrap().flags, 5);
     }
@@ -2544,6 +2576,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }))
     }
 
@@ -2644,6 +2678,8 @@ mod tests {
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
         }))
     }
 
@@ -2806,7 +2842,7 @@ mod tests {
             "stale-1",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-1", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -2846,7 +2882,7 @@ mod tests {
             "stale-2",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-2", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -2870,7 +2906,7 @@ mod tests {
             "stale-3",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
 
         use axum::{routing::get, Router};
         let app = Router::new().route(
@@ -2904,7 +2940,7 @@ mod tests {
             "read-on-web",
             &serde_json::json!({"subject": "s", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None, &[], &[]).was_new);
 
         let mut item = server_item_json("read-on-web", "s");
         item["is_read"] = serde_json::json!(true);
@@ -3024,7 +3060,7 @@ mod tests {
                 ]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
 
         let cached = db.get_cached_message("described-attachments").unwrap().unwrap();
         let meta: serde_json::Value =
@@ -3046,7 +3082,7 @@ mod tests {
             "no-attachment-list",
             &serde_json::json!({"subject": "hi", "body_text": "plain"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("no-attachment-list").unwrap().unwrap();
         let meta: serde_json::Value =
             serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
@@ -3060,7 +3096,7 @@ mod tests {
             "no-attachments",
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
 
         let cached = db.get_cached_message("no-attachments").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain body"));
@@ -3147,7 +3183,7 @@ mod tests {
                 ]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
 
         let cached = db.get_cached_message("with-attachments").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("see attached"));
@@ -3178,7 +3214,7 @@ mod tests {
                 }]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("html-injection").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("<p>hello</p>"));
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
@@ -3194,7 +3230,7 @@ mod tests {
                 "attachment_keys": [{"seq": 0, "key": "k0"}]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("only-attachments").unwrap().unwrap();
         assert!(cached.body_text.as_deref().unwrap_or("").is_empty());
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
@@ -3208,7 +3244,7 @@ mod tests {
             "no-attachments-state",
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("no-attachments-state").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
         assert!(db.list_attachment_backlog(10).unwrap().is_empty());
@@ -3222,7 +3258,7 @@ mod tests {
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
         item.attachment_count = Some(1);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
         let cached = db.get_cached_message("count-only").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
         let meta: serde_json::Value =

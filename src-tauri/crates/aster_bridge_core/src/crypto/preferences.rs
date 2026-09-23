@@ -28,6 +28,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+use crate::crypto::account_key::{context_keys, AccountKey, PREFERENCES_CONTEXT};
 use crate::error::{BridgeError, Result};
 
 const PREFERENCES_KEY_SUFFIX: &str = "astermail-preferences-v1";
@@ -69,6 +70,35 @@ pub fn decrypt_preferences(
     encrypted_b64: &str,
     nonce_b64: &str,
 ) -> Result<UserPreferences> {
+    let mut key = derive_preferences_key(identity_key);
+    let result = decrypt_preferences_with_key(&key, encrypted_b64, nonce_b64);
+    key.zeroize();
+    result
+}
+
+pub fn decrypt_preferences_with_account_keys(
+    identity_key: &str,
+    account_keys: &[AccountKey],
+    encrypted_b64: &str,
+    nonce_b64: &str,
+) -> Result<UserPreferences> {
+    let first = decrypt_preferences(identity_key, encrypted_b64, nonce_b64);
+    if first.is_ok() {
+        return first;
+    }
+    for key in context_keys(account_keys, PREFERENCES_CONTEXT) {
+        if let Ok(prefs) = decrypt_preferences_with_key(&key, encrypted_b64, nonce_b64) {
+            return Ok(prefs);
+        }
+    }
+    first
+}
+
+fn decrypt_preferences_with_key(
+    key: &[u8; 32],
+    encrypted_b64: &str,
+    nonce_b64: &str,
+) -> Result<UserPreferences> {
     let ciphertext = STANDARD
         .decode(encrypted_b64)
         .map_err(|e| BridgeError::Crypto(format!("preferences data decode: {}", e)))?;
@@ -83,10 +113,8 @@ pub fn decrypt_preferences(
         ));
     }
 
-    let mut key = derive_preferences_key(identity_key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
-    key.zeroize();
 
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher
