@@ -288,7 +288,7 @@ pub fn restrict_permissions(path: &Path, is_dir: bool) {
             } else {
                 format!("{}:(F)", user)
             };
-            let _ = std::process::Command::new("icacls")
+            let _ = crate::system_tools::icacls_command()
                 .args([
                     path.to_string_lossy().as_ref(),
                     "/inheritance:r",

@@ -37,7 +37,7 @@ fn restrict_dir_permissions(dir: &Path) {
         use std::os::windows::process::CommandExt;
         if let Ok(user) = std::env::var("USERNAME") {
             if !user.is_empty() {
-                let _ = std::process::Command::new("icacls")
+                let _ = crate::system_tools::icacls_command()
                     .args([
                         dir.to_string_lossy().as_ref(),
                         "/inheritance:r",
