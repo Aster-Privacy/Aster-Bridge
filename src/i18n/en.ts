@@ -311,6 +311,7 @@ const en = {
   time_minutes_ago: "{{n}}m ago",
   time_hours_ago: "{{n}}h ago",
   time_days_ago: "{{n}}d ago",
+  app_name: "Aster Bridge",
 };
 
 export default en;

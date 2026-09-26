@@ -891,7 +891,10 @@ function SetupView({
     <div className="fixed inset-0 overflow-y-auto" style={{ backgroundColor: "var(--bg-secondary)" }}>
       <div className="min-h-full flex items-center justify-center px-4 py-8">
         <div className="flex flex-col items-center w-full max-w-sm px-4">
-          <img alt="Aster" className="h-12" decoding="async" draggable={false} src="/text_logo.png" />
+          <div className="flex items-center gap-3">
+            <img alt="" className="w-12 h-12 select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
+            <span className="text-[26px] font-bold tracking-tight text-txt-primary">{t("app_name")}</span>
+          </div>
 
           {state === "idle" && (
             <>
@@ -919,13 +922,13 @@ function SetupView({
               <div className="w-full mt-6">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-xs font-medium text-txt-muted">{t("setup_expires_in", { time: format_time(time_left) })}</span>
-                  <button className="p-1.5 rounded-md transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08] text-txt-muted" onClick={handle_copy_code}>
+                  <button type="button" aria-label={t("setup_copy_code")} className="p-1.5 rounded-[var(--aster-radius-item)] transition-colors hover:bg-[var(--aster-field-hover)] text-txt-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" onClick={handle_copy_code}>
                     <CopyIcon copied={code_copied} />
                   </button>
                 </div>
                 <div className="grid grid-cols-8 gap-2 cursor-pointer" onClick={handle_copy_code}>
                   {code_chars.map((char, i) => (
-                    <div key={i} className="relative overflow-hidden rounded-[var(--aster-radius-item)] py-2.5 text-center transition-colors hover:opacity-80 bg-[var(--aster-field-bg)]">
+                    <div key={i} className="relative overflow-hidden rounded-[var(--aster-radius-item)] py-2.5 text-center transition-colors bg-[var(--aster-field-bg)] hover:bg-[var(--aster-field-hover)]">
                       <span className="text-base font-mono font-bold text-txt-primary">{char}</span>
                     </div>
                   ))}
@@ -1065,10 +1068,10 @@ function Sidebar({
           onClick={() => set_show_menu(!show_menu)}
         >
           <div className="w-9 h-9 flex-shrink-0">
-            <img alt="Aster Bridge" className="w-full h-full select-none rounded-lg" decoding="async" draggable={false} src="/mail_logo.webp" />
+            <img alt="" className="w-full h-full select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
           </div>
           <div className="flex flex-col items-start min-w-0 flex-1">
-            <span className="text-[15px] font-semibold text-txt-primary">Aster Bridge</span>
+            <span className="text-[15px] font-semibold text-txt-primary">{t("app_name")}</span>
             <span className="text-[11px] truncate w-full text-left text-txt-muted">
               {display_name || email || t("not_connected")}
             </span>
