@@ -482,21 +482,21 @@ function UpdateBanner() {
           </p>
           <div className="mt-2 flex items-center gap-2">
             <Button
-              disabled={installing}
               is_loading={installing}
               size="sm"
               variant="depth"
               onClick={handle_install}
             >
-              {installing ? i18next.t("update_installing") : i18next.t("update_install")}
+              {i18next.t("update_install")}
             </Button>
-            <button
-              className="h-7 px-3 rounded-[var(--aster-radius-item)] bg-[var(--aster-field-bg)] text-xs font-medium text-txt-primary hover:bg-[var(--aster-field-hover)]"
+            <Button
               disabled={installing}
+              size="sm"
+              variant="secondary"
               onClick={handle_dismiss}
             >
               {i18next.t("update_dismiss")}
-            </button>
+            </Button>
           </div>
         </div>
         <button
@@ -1535,8 +1535,8 @@ function PasswordsPanel({
           onChange={(e) => set_new_password_label(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") handle_generate(); }}
         />
-        <Button disabled={generating} variant="depth" size="lg" onClick={handle_generate}>
-          {generating ? t("generating") : t("generate")}
+        <Button is_loading={generating} variant="depth" size="lg" onClick={handle_generate}>
+          {t("generate")}
         </Button>
       </div>
       <div className="flex flex-wrap items-center gap-1.5 mb-4">
@@ -1587,7 +1587,7 @@ function PasswordsPanel({
         </ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_delete_target(null)}>{t("cancel")}</Button>
-          <Button disabled={deleting} variant="destructive" size="md" onClick={handle_delete}>{deleting ? t("deleting") : t("delete")}</Button>
+          <Button is_loading={deleting} variant="destructive" size="md" onClick={handle_delete}>{t("delete")}</Button>
         </ModalActions>
       </Modal>
     </div>
@@ -2032,8 +2032,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
         {ports_dirty && (
           <div className="flex justify-end py-2.5">
-            <Button variant="depth" size="sm" disabled={saving_ports} onClick={handle_save_ports}>
-              {saving_ports ? t("saving") : t("save")}
+            <Button variant="depth" size="sm" is_loading={saving_ports} onClick={handle_save_ports}>
+              {t("save")}
             </Button>
           </div>
         )}
@@ -2062,11 +2062,12 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
               <Button
                 variant="outline"
                 size="sm"
-                disabled={!bridge_running || outbox_retrying_id === item.id || item.status === "sending"}
+                disabled={!bridge_running || item.status === "sending"}
+                is_loading={outbox_retrying_id === item.id}
                 title={!bridge_running ? t("start_bridge_to_retry") : undefined}
                 onClick={() => handle_outbox_retry(item.id)}
               >
-                {outbox_retrying_id === item.id ? t("retrying") : t("retry_now")}
+                {t("retry_now")}
               </Button>
             </div>
           ))}
@@ -2080,20 +2081,20 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         <SettingRow label={t("diagnostics_bundle_label")} sublabel={t("diagnostics_bundle_sub")}>
-          <Button variant="secondary" size="sm" disabled={copying_bundle} onClick={handle_copy_bundle}>
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+          <Button variant="secondary" size="sm" is_loading={copying_bundle} onClick={handle_copy_bundle}>
+            <svg className={`w-3.5 h-3.5 ${copying_bundle ? "opacity-0" : ""}`} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <rect height="13" rx="2" width="13" x="9" y="9" />
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            {copying_bundle ? t("building") : t("copy")}
+            {t("copy")}
           </Button>
         </SettingRow>
         {logs_open && (
           <div className="py-3">
             <div className="flex items-center justify-between mb-2">
               <span className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("show_recent_logs")}</span>
-              <Button variant="ghost" size="sm" disabled={logs_loading} onClick={handle_refresh_logs}>
-                {logs_loading ? t("loading") : t("refresh")}
+              <Button variant="ghost" size="sm" is_loading={logs_loading} onClick={handle_refresh_logs}>
+                {t("refresh")}
               </Button>
             </div>
             <div
@@ -2118,14 +2119,14 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             {update_info.notes && (
               <p className="text-[12px] text-txt-muted mb-2.5 line-clamp-3 leading-snug">{update_info.notes}</p>
             )}
-            <Button variant="depth" size="sm" disabled={update_installing} onClick={handle_install_update}>
-              {update_installing ? t("update_installing") : t("update_install")}
+            <Button variant="depth" size="sm" is_loading={update_installing} onClick={handle_install_update}>
+              {t("update_install")}
             </Button>
           </div>
         )}
         <SettingRow label={t("updates_app_row")} sublabel={app_version ? `${t("app_version")} ${app_version}` : undefined}>
-          <Button variant="outline" size="sm" disabled={update_checking || update_installing} onClick={handle_check_updates}>
-            {update_checking ? t("update_checking") : t("update_check_now")}
+          <Button variant="outline" size="sm" disabled={update_installing} is_loading={update_checking} onClick={handle_check_updates}>
+            {t("update_check_now")}
           </Button>
         </SettingRow>
       </SettingsGroup>
@@ -2152,8 +2153,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             </svg>
           }
         >
-          <Button variant="secondary" size="sm" disabled={repairing} onClick={() => set_show_repair_modal(true)}>
-            {repairing ? t("rebuilding_cache") : t("repair")}
+          <Button variant="secondary" size="sm" is_loading={repairing} onClick={() => set_show_repair_modal(true)}>
+            {t("repair")}
           </Button>
         </SettingRow>
         <SettingRow
@@ -2179,7 +2180,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" disabled={repairing} onClick={() => set_show_repair_modal(false)}>{t("cancel")}</Button>
-          <Button disabled={repairing} variant="destructive" size="md" onClick={handle_repair}>{repairing ? t("rebuilding") : t("repair")}</Button>
+          <Button is_loading={repairing} variant="destructive" size="md" onClick={handle_repair}>{t("repair")}</Button>
         </ModalActions>
       </Modal>
 
@@ -2191,7 +2192,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_show_reset_modal(false)}>{t("cancel")}</Button>
-          <Button disabled={resetting} variant="destructive" size="md" onClick={handle_reset}>{resetting ? t("resetting") : t("reset")}</Button>
+          <Button is_loading={resetting} variant="destructive" size="md" onClick={handle_reset}>{t("reset")}</Button>
         </ModalActions>
       </Modal>
 
