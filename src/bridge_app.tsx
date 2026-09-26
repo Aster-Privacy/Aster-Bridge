@@ -49,6 +49,7 @@ import {
 } from "./updater";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
 import { notify_native } from "@/notify";
+import { DEFAULT_PROFILE_COLOR, HEX_COLOR, profile_gradient_background } from "@/lib/profile_palette";
 import {
   Button,
   UpgradeBtn,
@@ -104,7 +105,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
 
   if (!progress.active) {
     return (
-      <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+      <div className="aster_island mb-4 flex items-center justify-between gap-3 px-4 py-3">
         <div className="flex items-center gap-2 min-w-0">
           <CheckIcon className="w-4 h-4 flex-shrink-0 text-brand" />
           <p className="text-xs text-txt-primary truncate">
@@ -130,7 +131,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
   }
 
   return (
-    <div className="mb-4 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+    <div className="aster_island mb-4 px-4 py-3">
       <div className="flex items-end justify-between mb-1.5 gap-3">
         <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
           <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
@@ -172,20 +173,6 @@ type ToastType = "success" | "error" | "info" | "warning";
 
 const LINK_DEVICE_URL = "https://app.astermail.org/link-device";
 
-const GRADIENT_CONFIGS: Record<
-  string,
-  { top_left: string; bottom_right: string }
-> = {
-  "#6366f1": { top_left: "#6366f1", bottom_right: "#312e81" },
-  "#3b82f6": { top_left: "#3b82f6", bottom_right: "#312e81" },
-  "#8b5cf6": { top_left: "#7c3aed", bottom_right: "#1e3a5f" },
-  "#ec4899": { top_left: "#ec4899", bottom_right: "#581c87" },
-  "#ef4444": { top_left: "#d97706", bottom_right: "#7f1d1d" },
-  "#f97316": { top_left: "#eab308", bottom_right: "#78350f" },
-  "#22c55e": { top_left: "#4ade80", bottom_right: "#064e3b" },
-  "#14b8a6": { top_left: "#2dd4bf", bottom_right: "#134e4a" },
-  "#6b7280": { top_left: "#9ca3af", bottom_right: "#111827" },
-};
 
 // Write to the clipboard via the native pasteboard (Tauri plugin), falling back
 // to the web clipboard API. The plugin path does not depend on webview
@@ -221,16 +208,6 @@ function clear_clipboard_if_unchanged(value: string): void {
   }, 30_000);
 }
 
-const HEX_COLOR = /^#[0-9a-f]{6}$/i;
-
-function get_gradient_background(color: string): string {
-  const fallback = HEX_COLOR.test(color) ? color : "#6b7280";
-  const config = GRADIENT_CONFIGS[color] || {
-    top_left: fallback,
-    bottom_right: fallback,
-  };
-  return `linear-gradient(135deg, ${config.top_left} 0%, ${config.bottom_right} 100%)`;
-}
 
 function format_date(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -424,7 +401,7 @@ function ToastContainer() {
             layout={reduce_motion ? false : "position"}
             transition={{ duration: reduce_motion ? 0 : 0.15, layout: { duration: 0.2 } }}
           >
-            <div className="px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 bg-modal-bg border border-edge-secondary">
+            <div className="aster_floating px-4 py-2.5 flex items-center gap-2">
               <span className="flex-shrink-0 text-txt-primary">
                 {get_toast_icon(toast.type)}
               </span>
@@ -495,12 +472,7 @@ function UpdateBanner() {
 
   return (
     <div
-      className="fixed bottom-4 right-4 z-[9999] max-w-sm rounded-xl border shadow-2xl p-3"
-      style={{
-        backgroundColor: "var(--bg-primary)",
-        borderColor: "var(--border-primary)",
-        color: "var(--text-primary)",
-      }}
+      className="aster_floating fixed bottom-4 right-4 z-[9999] max-w-sm p-3"
     >
       <div className="flex items-start gap-3">
         <ArrowDownTrayIcon className="w-5 h-5 mt-0.5 text-txt-primary flex-shrink-0" />
@@ -517,7 +489,7 @@ function UpdateBanner() {
               {installing ? i18next.t("update_installing") : i18next.t("update_install")}
             </button>
             <button
-              className="h-7 px-3 rounded-lg border border-edge-secondary bg-surf-tertiary text-xs font-medium text-txt-primary hover:opacity-80"
+              className="h-7 px-3 rounded-[var(--aster-radius-item)] bg-[var(--aster-field-bg)] text-xs font-medium text-txt-primary hover:bg-[var(--aster-field-hover)]"
               disabled={installing}
               onClick={handle_dismiss}
             >
@@ -631,7 +603,7 @@ function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?:
 
 function ServerCard({ icon, title, hint, children }: { icon?: ReactNode; title: string; hint?: ReactNode; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-edge-primary bg-surf-primary px-5 py-4">
+    <section className="aster_island px-5 py-4">
       <div className="flex items-center gap-2 mb-2.5">
         {icon && <span className="w-[17px] h-[17px] flex-shrink-0 text-txt-secondary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
         <h3 className="text-[14px] font-semibold text-txt-primary">{title}</h3>
@@ -784,13 +756,13 @@ function UserAvatar({
     );
   }
 
-  const color = profile_color || "#6366f1";
+  const color = profile_color || DEFAULT_PROFILE_COLOR;
   const logo_size = Math.round(size * 0.55);
 
   return (
     <div
       className="rounded-full flex-shrink-0 flex items-center justify-center"
-      style={{ width: size, height: size, minWidth: size, minHeight: size, background: get_gradient_background(color) }}
+      style={{ width: size, height: size, minWidth: size, minHeight: size, background: profile_gradient_background(color) }}
     >
       <img
         alt={email}
@@ -951,7 +923,7 @@ function SetupView({
                 </div>
                 <div className="grid grid-cols-8 gap-2 cursor-pointer" onClick={handle_copy_code}>
                   {code_chars.map((char, i) => (
-                    <div key={i} className="relative overflow-hidden rounded-lg py-2.5 border text-center transition-colors hover:opacity-80 bg-surf-tertiary border-edge-secondary">
+                    <div key={i} className="relative overflow-hidden rounded-[var(--aster-radius-item)] py-2.5 text-center transition-colors hover:opacity-80 bg-[var(--aster-field-bg)]">
                       <span className="text-base font-mono font-bold text-txt-primary">{char}</span>
                     </div>
                   ))}
@@ -1030,7 +1002,7 @@ function SidebarNavButton({
       </span>
       <span className="flex-1 text-left">{label}</span>
       {badge != null && badge > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#ef4444]/15 text-[#ef4444] font-mono font-medium min-w-[18px] text-center">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-aster-danger/15 text-aster-danger font-mono font-medium min-w-[18px] text-center">
           {badge}
         </span>
       )}
@@ -1113,16 +1085,11 @@ function Sidebar({
         {show_menu && (
           <div
             ref={menu_ref}
-            className="absolute left-3 right-3 mt-2 rounded-2xl overflow-hidden z-50 animate-dropdown-in"
-            style={{
-              backgroundColor: "var(--dropdown-bg)",
-              border: "1px solid var(--border-secondary)",
-              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)",
-            }}
+            className="aster_floating absolute left-3 right-3 mt-2 overflow-hidden z-50 animate-dropdown-in"
           >
             <div className="p-1.5 pb-0">
               <button
-                className="w-full px-2.5 py-2 rounded-lg text-left flex items-center gap-2.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                className="w-full px-2.5 py-2 rounded-[var(--aster-radius-item)] text-left flex items-center gap-2.5 transition-colors hover:bg-[var(--aster-floating-hover)]"
                 onClick={() => {
                   if (email) {
                     navigator.clipboard.writeText(email).catch(() => {});
@@ -1163,7 +1130,7 @@ function Sidebar({
               </button>
             </div>
 
-            <div className="h-px my-1.5 mx-1.5" style={{ backgroundColor: "var(--border-secondary)" }} />
+            <div className="h-px my-1.5 mx-1.5" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
 
             <div className="p-1.5 pt-0 space-y-1">
               <Button
@@ -1290,7 +1257,7 @@ function ConfigPanel({
   const email_value = email || "-";
 
   const avatar_letter = (display_name || email || "?")[0].toUpperCase();
-  const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : "#6366f1";
+  const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : DEFAULT_PROFILE_COLOR;
 
   return (
     <div className="p-6">
@@ -1311,7 +1278,7 @@ function ConfigPanel({
       </div>
 
       <div
-        className="flex items-center justify-between gap-4 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+        className="aster_island flex items-center justify-between gap-4 px-5 py-4 mb-5"
         title={bridge_running
           ? (connected_since
               ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
@@ -1556,8 +1523,7 @@ function PasswordsPanel({
 
       <div className="flex gap-2 mb-2 items-stretch">
         <input
-          className="flex-1 h-9 rounded-lg border px-3 text-sm text-txt-primary placeholder-txt-muted focus:outline-none transition-colors"
-          style={{ backgroundColor: "var(--bg-tertiary)", borderColor: "var(--border-secondary)" }}
+          className="bridge_field flex-1 h-9 px-3 text-sm text-txt-primary placeholder-txt-muted focus:outline-none"
           placeholder={t("password_label_placeholder")}
           type="text"
           value={new_password_label}
@@ -1574,8 +1540,8 @@ function PasswordsPanel({
           <button
             key={s}
             type="button"
-            className="text-[11px] px-2 py-0.5 rounded-full border transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-            style={{ borderColor: "var(--border-secondary)", color: "var(--text-secondary)" }}
+            className="text-[11px] px-2 py-0.5 rounded-full bg-[var(--aster-field-bg)] transition-colors hover:bg-[var(--aster-field-hover)]"
+            style={{ color: "var(--text-secondary)" }}
             onClick={() => set_new_password_label(s)}
           >
             {s}
@@ -1596,7 +1562,7 @@ function PasswordsPanel({
                 : t("last_used", { time: format_relative_time(pw.last_used_at) })
               : t("never_used");
             return (
-              <div key={pw.id} className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-secondary)" }}>
+              <div key={pw.id} className="aster_island flex items-center justify-between p-3">
                 <div className="min-w-0 pr-3">
                   <p className="text-sm font-medium text-txt-primary truncate">{pw.label}</p>
                   <p className="text-[11px] text-txt-muted mt-0.5">{t("created_date", { date: format_date(pw.created_at) })}</p>
@@ -1715,7 +1681,7 @@ function IdentitiesGroup() {
           value={query}
           onChange={(e) => set_query(e.target.value)}
           placeholder={t("search_addresses")}
-          className="w-full mb-2 h-8 rounded-lg border border-edge-secondary bg-surf-tertiary px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
+          className="bridge_field w-full mb-2 h-8 px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
         />
       )}
 
@@ -2046,8 +2012,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={imap_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_imap_port(v); set_ports_dirty(true); }}
-            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
           />
         </SettingRow>
         <SettingRow label={t("smtp_port")}>
@@ -2057,8 +2022,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={smtp_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_smtp_port(v); set_ports_dirty(true); }}
-            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
           />
         </SettingRow>
         {ports_dirty && (
@@ -2129,8 +2093,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             </div>
             <div
               ref={log_container_ref}
-              className="rounded-lg p-3 text-[11px] font-mono whitespace-pre overflow-auto border border-edge-secondary"
-              style={{ backgroundColor: "var(--bg-secondary)", maxHeight: "240px", color: "var(--text-secondary)" }}
+              className="rounded-[var(--aster-radius-panel)] p-3 text-[11px] font-mono whitespace-pre overflow-auto bg-[var(--aster-field-bg)]"
+              style={{ maxHeight: "240px", color: "var(--text-secondary)" }}
             >
               {logs_loading && log_lines.length === 0 ? t("loading") : null}
               {!logs_loading && log_lines.length === 0 ? t("no_log_entries") : null}
@@ -2279,7 +2243,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                     <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
                     <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
                     <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--border-secondary)" }} />
+                    <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
                     <SetupGroupLabel>{t("ol_outgoing_mail")}</SetupGroupLabel>
                     <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
                     <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
@@ -2310,7 +2274,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                     <SetupGroupLabel>{t("am_incoming_server")}</SetupGroupLabel>
                     <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
                     <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--border-secondary)" }} />
+                    <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
                     <SetupGroupLabel>{t("am_outgoing_server")}</SetupGroupLabel>
                     <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
                     <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
@@ -2319,7 +2283,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
                 </SetupStep>
               </>
             )}
-            <div className="flex gap-3 items-start rounded-xl border border-edge-secondary bg-surf-tertiary px-3.5 py-3">
+            <div className="aster_island flex gap-3 items-start px-3.5 py-3">
               <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
                 <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
@@ -2441,7 +2405,7 @@ function DashboardView({
       />
       <div className="flex-1 p-2 min-h-0 min-w-0 flex flex-col overflow-hidden">
         {!is_online && (
-          <div className="flex items-center gap-2 px-3 py-1.5 mb-1.5 rounded-lg text-[12px] font-medium" style={{ backgroundColor: "color-mix(in srgb, var(--color-warning, #f59e0b) 12%, transparent)", color: "var(--color-warning, #f59e0b)", border: "1px solid color-mix(in srgb, var(--color-warning, #f59e0b) 25%, transparent)" }}>
+          <div className="flex items-center gap-2 px-3 py-1.5 mb-1.5 rounded-lg text-[12px] font-medium" style={{ backgroundColor: "color-mix(in srgb, var(--color-warning) 12%, transparent)", color: "var(--color-warning)" }}>
             <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -2449,8 +2413,8 @@ function DashboardView({
           </div>
         )}
         <div
-          className="flex-1 w-full rounded-xl border overflow-hidden transition-colors duration-200"
-          style={{ backgroundColor: "var(--bg-primary)", borderColor: "var(--border-primary)" }}
+          className="flex-1 w-full rounded-[var(--aster-island-radius)] overflow-hidden transition-colors duration-200"
+          style={{ backgroundColor: "var(--bg-primary)" }}
         >
           <div className="h-full overflow-y-auto">
             <div className="mx-auto w-full max-w-5xl">
