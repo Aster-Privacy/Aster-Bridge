@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, ImportProgress } from "@/api";
@@ -567,7 +567,7 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       onClick={on_copy}
       title={t("copy_to_clipboard")}
       aria-label={t("copy_to_clipboard")}
-      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 rounded-md px-2 py-1 cursor-pointer hover:bg-black/[0.05] dark:hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
+      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 h-8 rounded-[var(--aster-radius-item)] px-2 cursor-pointer transition-colors hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
     >
       <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
       <span className="flex-shrink-0 text-txt-muted group-hover:text-txt-primary">
@@ -589,12 +589,11 @@ function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?:
   return (
     <section className="mb-6">
       {title && (
-        <div className="mb-2">
+        <div className="mb-1">
           <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
             {icon && <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
             {title}
           </h3>
-          <div className="mt-2 h-px bg-edge-secondary" />
         </div>
       )}
       <div>{children}</div>
@@ -635,7 +634,7 @@ function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }:
       type="button"
       onClick={on_click}
       disabled={disabled}
-      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-lg text-left transition-colors duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] disabled:opacity-50 disabled:pointer-events-none"
+      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-[var(--aster-radius-item)] text-left transition-colors duration-150 hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary disabled:opacity-50 disabled:pointer-events-none"
     >
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
@@ -664,7 +663,7 @@ function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: 
 
 function InfoRow({ label, value, copy = true, mono = true }: { label: string; value: string; copy?: boolean; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-2">
+    <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
       <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
       {copy
         ? <CopyValue value={value} mono={mono} />
@@ -1200,9 +1199,7 @@ function Sidebar({
 
       <Modal open={show_sign_out_modal} on_close={() => set_show_sign_out_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("sign_out_title")}</p>
-        <ModalBody>
-          <span>{t("sign_out_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("sign_out_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_show_sign_out_modal(false)}>{t("cancel")}</Button>
           <Button variant="destructive" size="md" onClick={() => { set_show_sign_out_modal(false); on_sign_out(); }}>{t("sign_out")}</Button>
@@ -1267,7 +1264,7 @@ function ConfigPanel({
   return (
     <div className="p-6">
       <div className="flex items-center gap-3 mb-5">
-        <div className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden">
+        <div className="w-10 h-10 rounded-[var(--aster-radius-item)] flex-shrink-0 overflow-hidden">
           {profile_picture ? (
             <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
           ) : (
@@ -1316,7 +1313,7 @@ function ConfigPanel({
       </div>
 
       {bridge_running && sync_progress && (
-        <div className="mb-4">
+        <div className="aster_island px-4 py-3 mb-4">
           <div className="flex items-end justify-between mb-1.5 gap-3">
             <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
               <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
@@ -1424,7 +1421,7 @@ function TlsInfoBlock({
     <ServerCard title={t("section_tls")} icon={<LockClosedIcon />} hint={t("tls_hint")}>
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
       <InfoRow label={t("tls_cert_sha256")} value={fingerprint} />
-      <div className="flex items-center justify-between gap-4 py-2">
+      <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
         <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
         <span className="inline-flex items-center justify-end gap-2 min-w-0">
           <span className="text-[13px] text-txt-primary font-mono truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
@@ -1582,9 +1579,7 @@ function PasswordsPanel({
 
       <Modal open={!!delete_target} on_close={() => set_delete_target(null)}>
         <p className="text-base font-semibold text-txt-primary">{t("delete_password_title")}</p>
-        <ModalBody>
-          <span>{t("delete_password_confirm", { label: delete_display?.label ?? "" })}</span>
-        </ModalBody>
+        <ModalBody>{t("delete_password_confirm", { label: delete_display?.label ?? "" })}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_delete_target(null)}>{t("cancel")}</Button>
           <Button is_loading={deleting} variant="destructive" size="md" onClick={handle_delete}>{t("delete")}</Button>
@@ -1667,11 +1662,12 @@ function IdentitiesGroup() {
   };
 
   return (
-    <section className="mb-5">
-      <div className="flex items-center justify-between gap-2 px-1 mb-2">
-        <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-txt-tertiary">
+    <section className="mb-6">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
+          <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full"><AtSymbolIcon /></span>
           {t("section_send_addresses")}
-          {identities !== null && <span className="ml-1.5 text-txt-muted normal-case tracking-normal">({enabled.length})</span>}
+          {identities !== null && <span className="text-[13px] font-normal text-txt-muted">({enabled.length})</span>}
         </h3>
         {enabled.length > 3 && (
           <button type="button" onClick={copy_all} className="text-[11px] font-medium text-txt-muted hover:text-txt-primary">
@@ -1718,7 +1714,7 @@ function IdentitiesGroup() {
           })
         )}
       </div>
-      <p className="text-[11px] text-txt-muted px-1 mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
+      <p className="text-[12px] text-txt-muted mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
     </section>
   );
 }
@@ -2175,9 +2171,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
       <Modal open={show_repair_modal} on_close={() => !repairing && set_show_repair_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("repair_cache_title")}</p>
-        <ModalBody>
-          <span>{t("repair_cache_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("repair_cache_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" disabled={repairing} onClick={() => set_show_repair_modal(false)}>{t("cancel")}</Button>
           <Button is_loading={repairing} variant="destructive" size="md" onClick={handle_repair}>{t("repair")}</Button>
@@ -2187,9 +2181,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>
-        <ModalBody>
-          <span>{t("reset_bridge_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("reset_bridge_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_show_reset_modal(false)}>{t("cancel")}</Button>
           <Button is_loading={resetting} variant="destructive" size="md" onClick={handle_reset}>{t("reset")}</Button>
@@ -2198,105 +2190,103 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
       <Modal open={!!setup_client} on_close={() => set_setup_client(null)} size="lg">
         <p className="text-base font-semibold text-txt-primary">{t("setup_with_client", { client: setup_display ?? "" })}</p>
-        <ModalBody>
-          <div className="space-y-5">
-            {setup_display === "Thunderbird" && (
-              <>
-                <SetupStep n={1} title={t("tb_step1_title")}>
-                  <SetupNote>{t("tb_step1_desc")}</SetupNote>
-                  <SetupBox>
-                    <SetupRow label={t("tb_field_full_name")} hint={t("tb_field_full_name_hint")} />
-                    <SetupRow label={t("field_email_address")} value={email || "-"} />
-                    <SetupRow label={t("tb_field_password")} hint={t("tb_field_password_hint")} />
-                  </SetupBox>
-                  <SetupNote>{t("tb_step1_note")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("tb_step2_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("field_protocol")} value="IMAP" />
-                    <SetupRow label={t("field_hostname")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
-                    <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
-                    <SetupRow label={t("field_username")} value={email || "-"} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={3} title={t("tb_step3_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("field_hostname")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                    <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
-                    <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
-                    <SetupRow label={t("field_username")} value={email || "-"} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={4} title={t("tb_step4_title")}>
-                  <SetupNote>{t("tb_step4_desc")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            {setup_display === "Outlook" && (
-              <>
-                <SetupStep n={1} title={t("ol_step1_title")}>
-                  <SetupNote>{t("ol_step1_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("ol_step2_title")}>
-                  <SetupNote>{t("ol_step2_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={3} title={t("ol_step3_title")}>
-                  <SetupBox>
-                    <SetupGroupLabel>{t("ol_incoming_mail")}</SetupGroupLabel>
-                    <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
-                    <SetupGroupLabel>{t("ol_outgoing_mail")}</SetupGroupLabel>
-                    <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                    <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={4} title={t("ol_step4_title")}>
-                  <SetupNote>{t("ol_step4_desc")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            {setup_display === "Apple Mail" && (
-              <>
-                <SetupStep n={1} title={t("am_step1_title")}>
-                  <SetupNote>{t("am_step1_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("am_step2_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("am_field_name")} hint={t("am_field_name_hint")} />
-                    <SetupRow label={t("field_email_address")} value={email || "-"} />
-                    <SetupRow label={t("field_password")} hint={t("am_field_password_hint")} />
-                  </SetupBox>
-                  <SetupNote>{t("am_step2_note")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={3} title={t("am_step3_title")}>
-                  <SetupNote>{t("am_step3_desc")}</SetupNote>
-                  <SetupBox>
-                    <SetupGroupLabel>{t("am_incoming_server")}</SetupGroupLabel>
-                    <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
-                    <SetupGroupLabel>{t("am_outgoing_server")}</SetupGroupLabel>
-                    <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                  </SetupBox>
-                  <SetupNote>{t("am_step3_note")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            <div className="aster_island flex gap-3 items-start px-3.5 py-3">
-              <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
-                <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              <p className="text-[13px] leading-relaxed text-txt-tertiary">{t("setup_guide_no_encryption_note")}</p>
-            </div>
+        <div className="aster_modal_body space-y-5">
+          {setup_display === "Thunderbird" && (
+            <>
+              <SetupStep n={1} title={t("tb_step1_title")}>
+                <SetupNote>{t("tb_step1_desc")}</SetupNote>
+                <SetupBox>
+                  <SetupRow label={t("tb_field_full_name")} hint={t("tb_field_full_name_hint")} />
+                  <SetupRow label={t("field_email_address")} value={email || "-"} />
+                  <SetupRow label={t("tb_field_password")} hint={t("tb_field_password_hint")} />
+                </SetupBox>
+                <SetupNote>{t("tb_step1_note")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("tb_step2_title")}>
+                <SetupBox>
+                  <SetupRow label={t("field_protocol")} value="IMAP" />
+                  <SetupRow label={t("field_hostname")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
+                  <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
+                  <SetupRow label={t("field_username")} value={email || "-"} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={3} title={t("tb_step3_title")}>
+                <SetupBox>
+                  <SetupRow label={t("field_hostname")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                  <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
+                  <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
+                  <SetupRow label={t("field_username")} value={email || "-"} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={4} title={t("tb_step4_title")}>
+                <SetupNote>{t("tb_step4_desc")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          {setup_display === "Outlook" && (
+            <>
+              <SetupStep n={1} title={t("ol_step1_title")}>
+                <SetupNote>{t("ol_step1_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("ol_step2_title")}>
+                <SetupNote>{t("ol_step2_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={3} title={t("ol_step3_title")}>
+                <SetupBox>
+                  <SetupGroupLabel>{t("ol_incoming_mail")}</SetupGroupLabel>
+                  <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
+                  <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
+                  <SetupGroupLabel>{t("ol_outgoing_mail")}</SetupGroupLabel>
+                  <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                  <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={4} title={t("ol_step4_title")}>
+                <SetupNote>{t("ol_step4_desc")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          {setup_display === "Apple Mail" && (
+            <>
+              <SetupStep n={1} title={t("am_step1_title")}>
+                <SetupNote>{t("am_step1_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("am_step2_title")}>
+                <SetupBox>
+                  <SetupRow label={t("am_field_name")} hint={t("am_field_name_hint")} />
+                  <SetupRow label={t("field_email_address")} value={email || "-"} />
+                  <SetupRow label={t("field_password")} hint={t("am_field_password_hint")} />
+                </SetupBox>
+                <SetupNote>{t("am_step2_note")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={3} title={t("am_step3_title")}>
+                <SetupNote>{t("am_step3_desc")}</SetupNote>
+                <SetupBox>
+                  <SetupGroupLabel>{t("am_incoming_server")}</SetupGroupLabel>
+                  <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
+                  <SetupGroupLabel>{t("am_outgoing_server")}</SetupGroupLabel>
+                  <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                </SetupBox>
+                <SetupNote>{t("am_step3_note")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          <div className="aster_island flex gap-3 items-start px-3.5 py-3">
+            <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
+              <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <p className="text-[13px] leading-relaxed text-txt-tertiary">{t("setup_guide_no_encryption_note")}</p>
           </div>
-        </ModalBody>
+        </div>
         <ModalActions>
           <Button variant="depth" size="md" onClick={() => set_setup_client(null)}>{t("done")}</Button>
         </ModalActions>
@@ -2814,9 +2804,7 @@ export function BridgeApp() {
       />
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>
-        <ModalBody>
-          <span>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</span>
-        </ModalBody>
+        <ModalBody>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_provision_label(null)}>{i18next.t("cancel")}</Button>
           <Button variant="depth" size="md" onClick={handle_provision_confirm}>{i18next.t("provision_allow")}</Button>

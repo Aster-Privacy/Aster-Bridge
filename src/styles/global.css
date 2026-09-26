@@ -156,7 +156,6 @@ input[type="number"] {
   .sidebar-nav-btn:not(.sidebar-active):hover {
     color: var(--text-primary) !important;
     background-color: var(--indicator-bg) !important;
-    border-radius: 8px;
   }
 
   .sidebar-nav-btn:not(.sidebar-active):hover span {
@@ -261,16 +260,6 @@ input[type="number"] {
   box-shadow: var(--aster-dialog-shadow) !important;
   border: 0 !important;
   border-radius: var(--aster-island-radius) !important;
-}
-
-.bridge_island {
-  background: color-mix(in srgb, var(--bg-primary) 96%, black);
-  border: 0;
-  border-radius: var(--aster-island-radius);
-}
-
-.dark .bridge_island {
-  background: color-mix(in srgb, var(--bg-primary) 94.5%, white);
 }
 
 .bridge_field {
