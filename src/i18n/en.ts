@@ -312,6 +312,12 @@ const en = {
   time_hours_ago: "{{n}}h ago",
   time_days_ago: "{{n}}d ago",
   app_name: "Aster Bridge",
+  tls_unavailable: "Unavailable",
+  app_password_default_label: "App Password",
+  provision_default_label: "Auto-provisioned",
+  elapsed_hours_minutes: "{{hours}}h {{minutes}}m",
+  elapsed_minutes: "{{minutes}}m",
+  elapsed_seconds: "{{seconds}}s",
 };
 
 export default en;

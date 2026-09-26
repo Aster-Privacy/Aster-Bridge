@@ -80,9 +80,9 @@ function format_elapsed(ms: number): string {
   const total_seconds = Math.max(0, Math.floor(ms / 1000));
   const hours = Math.floor(total_seconds / 3600);
   const minutes = Math.floor((total_seconds % 3600) / 60);
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${total_seconds}s`;
+  if (hours > 0) return i18next.t("elapsed_hours_minutes", { hours, minutes });
+  if (minutes > 0) return i18next.t("elapsed_minutes", { minutes });
+  return i18next.t("elapsed_seconds", { seconds: total_seconds });
 }
 
 function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_dismiss: () => void }) {
@@ -1415,23 +1415,25 @@ function TlsInfoBlock({
     api.get_tls_info().then((info) => { if (!cancelled) set_tls_info(info); }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
-  const fingerprint = tls_info?.fingerprint_sha256 || "(unavailable)";
-  const cert_path = tls_info?.cert_path || "(unavailable)";
+  const fingerprint = tls_info?.fingerprint_sha256 || t("tls_unavailable");
+  const cert_path = tls_info?.cert_path || t("tls_unavailable");
   return (
     <ServerCard title={t("section_tls")} icon={<LockClosedIcon />} hint={t("tls_hint")}>
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
-      <InfoRow label={t("tls_cert_sha256")} value={fingerprint} />
+      <InfoRow label={t("tls_cert_sha256")} value={fingerprint} copy={!!tls_info?.fingerprint_sha256} mono={!!tls_info?.fingerprint_sha256} />
       <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
         <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
         <span className="inline-flex items-center justify-end gap-2 min-w-0">
-          <span className="text-[13px] text-txt-primary font-mono truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
-          <button
-            type="button"
-            className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0"
-            onClick={() => api.open_tls_cert().catch(() => {})}
-          >
-            {t("tls_open_cert_folder")}
-          </button>
+          <span className={`text-[13px] text-txt-primary truncate max-w-[140px] ${tls_info?.cert_path ? "font-mono" : ""}`} title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
+          {tls_info?.cert_path && (
+            <button
+              type="button"
+              className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0 rounded-[4px] focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary"
+              onClick={() => api.open_tls_cert().catch(() => {})}
+            >
+              {t("tls_open_cert_folder")}
+            </button>
+          )}
         </span>
       </div>
       <InfoRow label={t("tls_jmap_scheme")} value={jmap_https_enabled ? "https://" : "http://"} copy={false} />
@@ -1480,7 +1482,7 @@ function PasswordsPanel({
 
   const handle_generate = async () => {
     set_generating(true);
-    const label = new_password_label.trim() || "App Password";
+    const label = new_password_label.trim() || t("app_password_default_label");
     const password = await on_generate_password(label);
     if (password) { set_generated_password(password); set_new_password_label(""); }
     set_generating(false);
@@ -2729,10 +2731,10 @@ export function BridgeApp() {
         const url = new URL(payload);
         if (url.protocol !== "aster-mail:") return;
         if (url.hostname !== "provision" && url.pathname !== "//provision" && url.pathname !== "/provision") return;
-        const raw_label = url.searchParams.get("label") || "Auto-provisioned";
+        const raw_label = url.searchParams.get("label") || i18next.t("provision_default_label");
         // Deep links arrive from arbitrary local apps; the label is untrusted.
         // Strip control chars and cap length before it is shown in the confirm modal.
-        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || "Auto-provisioned";
+        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || i18next.t("provision_default_label");
         set_provision_label(label);
       } catch {
         /* ignore malformed deep link */
