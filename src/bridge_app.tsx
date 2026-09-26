@@ -144,7 +144,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
           {t("import_messages_count", { count: total })}
         </span>
       </div>
-      <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
+      <div className="h-1.5 rounded-full overflow-hidden bg-[var(--aster-field-bg)]">
         <div className="h-full w-full rounded-full bg-brand animate-pulse" />
       </div>
       <p className="text-[11px] text-txt-muted mt-1.5 tabular-nums">
@@ -481,13 +481,15 @@ function UpdateBanner() {
             {i18next.t("update_available", { version: info.version })}
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <button
-              className="h-7 px-3 rounded-lg bg-indigo-600 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            <Button
               disabled={installing}
+              is_loading={installing}
+              size="sm"
+              variant="depth"
               onClick={handle_install}
             >
               {installing ? i18next.t("update_installing") : i18next.t("update_install")}
-            </button>
+            </Button>
             <button
               className="h-7 px-3 rounded-[var(--aster-radius-item)] bg-[var(--aster-field-bg)] text-xs font-medium text-txt-primary hover:bg-[var(--aster-field-hover)]"
               disabled={installing}
@@ -1326,7 +1328,7 @@ function ConfigPanel({
                 : `${sync_progress.done.toLocaleString()} / ${sync_progress.total.toLocaleString()}`}
             </span>
           </div>
-          <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
+          <div className="h-1.5 rounded-full overflow-hidden bg-[var(--aster-field-bg)]">
             <div
               className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
               style={{ width: `${sync_bar_fraction(sync_progress) * 100}%` }}
@@ -1500,24 +1502,24 @@ function PasswordsPanel({
       </p>
 
       {generated_password && (
-        <div className="mb-4 rounded-lg p-4" style={{ backgroundColor: "var(--accent-color)" }}>
+        <div className="aster_island aster_island_tone_accent mb-4 p-4">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium text-white">{t("password_created_banner")}</span>
-            <button className="p-1 rounded-lg transition-all duration-150 hover:opacity-70" onClick={() => set_generated_password(null)}>
-              <svg className="w-4 h-4 text-white/70" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <span className="text-sm font-medium text-txt-primary">{t("password_created_banner")}</span>
+            <button className="h-7 w-7 flex items-center justify-center rounded-full text-txt-muted transition-colors duration-150 hover:bg-[var(--aster-field-hover)] hover:text-txt-primary" aria-label={t("dismiss")} onClick={() => set_generated_password(null)}>
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                 <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <code className="flex-1 text-sm font-mono text-white px-3 py-2 rounded-md select-all" style={{ backgroundColor: "rgba(255, 255, 255, 0.15)" }}>
+            <code className="bridge_field flex-1 text-sm font-mono text-txt-primary px-3 py-2 select-all">
               {generated_password}
             </code>
-            <button className="p-2 rounded-md transition-all duration-150 hover:opacity-70" style={{ backgroundColor: "rgba(255, 255, 255, 0.2)" }} onClick={async () => { await handle_copy(generated_password); set_banner_copied(true); setTimeout(() => set_banner_copied(false), 1500); }}>
+            <button className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary" aria-label={t("copy")} onClick={async () => { await handle_copy(generated_password); set_banner_copied(true); setTimeout(() => set_banner_copied(false), 1500); }}>
               <CopyIcon copied={banner_copied} />
             </button>
           </div>
-          <p className="mt-2 text-xs" style={{ color: "rgba(255, 255, 255, 0.7)" }}>{t("password_copy_hint")}</p>
+          <p className="mt-2 text-xs text-txt-muted">{t("password_copy_hint")}</p>
         </div>
       )}
 
@@ -2405,7 +2407,7 @@ function DashboardView({
       />
       <div className="flex-1 p-2 min-h-0 min-w-0 flex flex-col overflow-hidden">
         {!is_online && (
-          <div className="flex items-center gap-2 px-3 py-1.5 mb-1.5 rounded-lg text-[12px] font-medium" style={{ backgroundColor: "color-mix(in srgb, var(--color-warning) 12%, transparent)", color: "var(--color-warning)" }}>
+          <div className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium" style={{ color: "var(--color-warning)" }}>
             <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
