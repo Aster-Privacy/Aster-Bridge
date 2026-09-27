@@ -214,6 +214,17 @@ pub async fn check_bridge_access(
     Err(StartError::PlanCheckFailed(last_error))
 }
 
+pub fn token_refresh_wait(tuning: &RuntimeTuning, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return tuning.token_refresh_interval;
+    }
+    let exponent = (consecutive_failures - 1).min(6);
+    tuning
+        .token_retry_interval
+        .saturating_mul(1u32 << exponent)
+        .min(tuning.token_refresh_interval.max(tuning.token_retry_interval))
+}
+
 pub fn is_definitive_device_failure(error: &BridgeError) -> bool {
     match error {
         BridgeError::Api(msg) => msg.starts_with("401") || msg.starts_with("404"),
@@ -677,11 +688,7 @@ impl BridgeRuntime {
                 tokio::spawn(async move {
                     let mut consecutive_failures: u32 = 0;
                     loop {
-                        let wait = if consecutive_failures == 0 {
-                            tuning.token_refresh_interval
-                        } else {
-                            tuning.token_retry_interval
-                        };
+                        let wait = token_refresh_wait(&tuning, consecutive_failures);
                         tokio::time::sleep(wait).await;
                         match crate::auth::session::refresh_access_token(
                             &s,
@@ -756,5 +763,20 @@ impl BridgeRuntime {
             outbox_trigger: outbox_tx,
             stop_rx,
         })
+    }
+}
+
+#[cfg(test)]
+mod token_refresh_wait_tests {
+    use super::*;
+
+    #[test]
+    fn failed_refreshes_back_off_up_to_the_normal_interval() {
+        let tuning = RuntimeTuning::for_config(&BridgeConfig::default());
+        let waits: Vec<u64> = (0..10)
+            .map(|failures| token_refresh_wait(&tuning, failures).as_secs())
+            .collect();
+
+        assert_eq!(waits, vec![3000, 60, 120, 240, 480, 960, 1920, 3000, 3000, 3000]);
     }
 }
