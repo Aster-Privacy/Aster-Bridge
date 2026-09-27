@@ -300,6 +300,7 @@ fn cached_header_value(msg: &CachedMessage, field: &str) -> Option<String> {
         "date" => msg.date.clone(),
         "cc" => meta_string("cc"),
         "bcc" => meta_string("bcc"),
+        "reply-to" => meta_string("reply_to"),
         "message-id" => meta_string("message_id"),
         "in-reply-to" => meta_string("in_reply_to"),
         "references" => meta_string("references"),
@@ -2952,6 +2953,13 @@ async fn handle_fetch(
             let bcc_list = imap_address_list(
                 env_meta.get("bcc").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
             );
+            // RFC 3501: with no Reply-To the envelope repeats the From.
+            let reply_to_list = env_meta
+                .get("reply_to")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| imap_address_list(Some(s)))
+                .unwrap_or_else(|| from_list.clone());
             let in_reply_to = match env_meta
                 .get("in_reply_to")
                 .and_then(|v| v.as_str())
@@ -2962,11 +2970,12 @@ async fn handle_fetch(
                 None => "NIL".to_string(),
             };
             items.push(format!(
-                "ENVELOPE ({} {} {} {} NIL {} {} {} {} {})",
+                "ENVELOPE ({} {} {} {} {} {} {} {} {} {})",
                 imap_quote(&date),
                 imap_quote(&subject),
                 from_list,
                 from_list,
+                reply_to_list,
                 to_list,
                 cc_list,
                 bcc_list,

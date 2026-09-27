@@ -407,6 +407,14 @@ fn top_headers(msg: &CachedMessage, meta: &serde_json::Value) -> String {
     if let Some(bcc) = bcc {
         out.push_str(&format!("Bcc: {}\r\n", bcc));
     }
+    if let Some(reply_to) = meta
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(sanitize_header)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("Reply-To: {}\r\n", reply_to));
+    }
     out.push_str(&format!("Subject: {}\r\n", subject));
     out.push_str(&message_id_header(meta, &msg.aster_id));
     out.push_str(&reference_header(meta, "in_reply_to", "In-Reply-To"));
@@ -774,6 +782,23 @@ mod tests {
         assert!(r.text.contains("Message-ID: <abc@example.com>"));
         assert!(r.text.contains("In-Reply-To: <parent@example.com>"));
         assert!(r.text.contains("References: <root@example.com> <parent@example.com>"));
+    }
+
+    #[test]
+    fn cc_and_reply_to_headers_come_from_the_cached_metadata() {
+        let raw = "{\"is_html\":false,\"cc\":\"Carol <carol@example.com>, dan@example.com\",\"reply_to\":\"Team <team@example.com>\"}";
+        let m = msg(Some("body"), Some(raw), 0);
+        let r = render(&m, &[], true);
+        assert!(r.text.contains("Cc: Carol <carol@example.com>, dan@example.com\r\n"));
+        assert!(r.text.contains("Reply-To: Team <team@example.com>\r\n"));
+    }
+
+    #[test]
+    fn reply_to_header_is_omitted_when_the_metadata_has_none() {
+        let m = msg(Some("body"), Some("{\"is_html\":false}"), 0);
+        let r = render(&m, &[], true);
+        assert!(!r.text.contains("Reply-To:"));
+        assert!(!r.text.contains("Cc:"));
     }
 
     #[test]

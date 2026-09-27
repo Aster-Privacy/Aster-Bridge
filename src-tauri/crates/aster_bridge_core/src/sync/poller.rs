@@ -727,6 +727,30 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
     }
 }
 
+/// Reply-To as the envelope carries it: a plain string (imported mail), a
+/// list or a single `{name, email}` object, or only the preserved raw header.
+fn extract_reply_to(v: &serde_json::Value) -> Option<String> {
+    for key in ["reply_to", "replyTo"] {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                return Some(s.trim().to_string());
+            }
+            Some(serde_json::Value::Array(_)) => {
+                if let Some(list) = extract_recipients(v, key) {
+                    return Some(list);
+                }
+            }
+            Some(obj @ serde_json::Value::Object(_)) => {
+                if let Some(one) = extract_from_field(&serde_json::json!({ "from": obj })) {
+                    return Some(one);
+                }
+            }
+            _ => {}
+        }
+    }
+    envelope_header(v, "reply-to")
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CacheOutcome {
     was_new: bool,
@@ -773,6 +797,9 @@ struct PreparedMessage {
     message_id: Option<String>,
     in_reply_to: Option<String>,
     references: Option<String>,
+    cc: Option<String>,
+    bcc: Option<String>,
+    reply_to: Option<String>,
     attachments: Vec<EnvelopeAttachment>,
     expected_attachments: usize,
 }
@@ -897,6 +924,9 @@ fn prepare_mail_item(
         .or_else(|| envelope_header(&parsed, "in-reply-to"));
     let references = json_str(&parsed, "references")
         .or_else(|| envelope_header(&parsed, "references"));
+    let cc = extract_recipients(&parsed, "cc");
+    let bcc = extract_recipients(&parsed, "bcc");
+    let reply_to = extract_reply_to(&parsed);
     Prepared::Ready(PreparedMessage {
         subject,
         sender,
@@ -907,6 +937,9 @@ fn prepare_mail_item(
         message_id,
         in_reply_to,
         references,
+        cc,
+        bcc,
+        reply_to,
         attachments,
         expected_attachments,
     })
@@ -940,6 +973,17 @@ fn commit_mail_item(
     }
     if let Some(ref value) = prepared.references {
         raw_headers_map.insert("references".to_string(), serde_json::json!(value));
+    }
+    // Kept as the same comma-separated strings drafts already store, which is
+    // what the IMAP renderer and the JMAP serializer read.
+    for (key, value) in [
+        ("cc", &prepared.cc),
+        ("bcc", &prepared.bcc),
+        ("reply_to", &prepared.reply_to),
+    ] {
+        if let Some(value) = value {
+            raw_headers_map.insert(key.to_string(), serde_json::json!(value));
+        }
     }
     if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
@@ -2150,6 +2194,52 @@ mod tests {
         let raw = cached.raw_headers.unwrap();
         assert!(raw.contains("\"is_html\":true"));
         assert!(raw.contains("mid-1@test"));
+    }
+
+    #[test]
+    fn cache_mail_item_keeps_cc_bcc_and_reply_to() {
+        let (_dir, db) = temp_db();
+        // The web app's envelope: recipients as {name, email} objects.
+        let json = serde_json::json!({
+            "subject": "Plans",
+            "from": {"name": "Alice", "email": "alice@example.com"},
+            "to": [{"name": "Bob", "email": "bob@example.com"}],
+            "cc": [{"name": "Carol", "email": "carol@example.com"}, {"name": "", "email": "dan@example.com"}],
+            "bcc": [{"name": "", "email": "erin@example.com"}],
+            "date": "Wed, 21 May 2026 10:00:00 +0000",
+            "body_text": "hi",
+            "raw_headers": [{"name": "Reply-To", "value": "Team <team@example.com>"}]
+        });
+        let item = item_with_envelope("msg-cc", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value =
+            serde_json::from_str(&db.get_cached_message("msg-cc").unwrap().unwrap().raw_headers.unwrap()).unwrap();
+        assert_eq!(meta["cc"], "Carol <carol@example.com>, dan@example.com");
+        assert_eq!(meta["bcc"], "erin@example.com");
+        assert_eq!(meta["reply_to"], "Team <team@example.com>");
+    }
+
+    #[test]
+    fn cache_mail_item_reads_imported_string_recipients() {
+        let (_dir, db) = temp_db();
+        // Imported mail: recipients as plain strings, reply_to as a string.
+        let json = serde_json::json!({
+            "subject": "Invoice",
+            "from": "shop@example.com",
+            "to": ["me@example.com"],
+            "cc": ["accounts@example.com"],
+            "reply_to": "billing@example.com",
+            "body_text": "attached"
+        });
+        let item = item_with_envelope("msg-imported", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value = serde_json::from_str(
+            &db.get_cached_message("msg-imported").unwrap().unwrap().raw_headers.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["cc"], "accounts@example.com");
+        assert_eq!(meta["reply_to"], "billing@example.com");
+        assert!(meta.get("bcc").is_none());
     }
 
     #[test]

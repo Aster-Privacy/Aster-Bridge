@@ -206,9 +206,9 @@ fn serialize_email(
     full_map.insert("sender".to_string(), from.clone());
     full_map.insert("from".to_string(), from);
     full_map.insert("to".to_string(), to);
-    full_map.insert("cc".to_string(), Value::Null);
-    full_map.insert("bcc".to_string(), Value::Null);
-    full_map.insert("replyTo".to_string(), Value::Null);
+    full_map.insert("cc".to_string(), meta_address_list(&meta, "cc"));
+    full_map.insert("bcc".to_string(), meta_address_list(&meta, "bcc"));
+    full_map.insert("replyTo".to_string(), meta_address_list(&meta, "reply_to"));
     full_map.insert("subject".to_string(), json!(subject));
     full_map.insert("sentAt".to_string(), json!(received_at));
     full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0 || !attachments.is_empty()));
@@ -251,6 +251,10 @@ fn parse_from(s: &Option<String>) -> Value {
         }
     }
     json!([{ "name": Value::Null, "email": trimmed }])
+}
+
+fn meta_address_list(meta: &Value, key: &str) -> Value {
+    parse_address_list(&meta.get(key).and_then(|v| v.as_str()).map(|s| s.to_string()))
 }
 
 fn parse_address_list(s: &Option<String>) -> Value {
@@ -1078,6 +1082,23 @@ mod tests {
                 {"name": Value::Null, "email": "b@y.com"}
             ])
         );
+    }
+
+    #[test]
+    fn meta_address_list_reads_cc_and_reply_to() {
+        let meta = json!({"cc": "Carol <carol@example.com>, dan@example.com", "reply_to": "team@example.com"});
+        assert_eq!(
+            meta_address_list(&meta, "cc"),
+            json!([
+                {"name": "Carol", "email": "carol@example.com"},
+                {"name": Value::Null, "email": "dan@example.com"}
+            ])
+        );
+        assert_eq!(
+            meta_address_list(&meta, "reply_to"),
+            json!([{"name": Value::Null, "email": "team@example.com"}])
+        );
+        assert_eq!(meta_address_list(&meta, "bcc"), Value::Null);
     }
 
     #[test]
