@@ -535,14 +535,7 @@ function Spinner({ class_name = "" }: { class_name?: string }) {
   );
 }
 
-function CopyIcon({ copied }: { copied: boolean }) {
-  if (copied) {
-    return (
-      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-        <path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  }
+function CopyIcon() {
   return (
     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
       <rect height="13" rx="2" width="13" x="9" y="9" />
@@ -571,7 +564,7 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
     >
       <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
       <span className="flex-shrink-0 text-txt-muted group-hover:text-txt-primary">
-        <CopyIcon copied={false} />
+        <CopyIcon />
       </span>
     </button>
   );
@@ -794,8 +787,6 @@ function SetupView({
   const [state, set_state] = useState<SetupState>("idle");
   const [code, set_code] = useState<string | null>(null);
   const [time_left, set_time_left] = useState(0);
-  const [code_copied, set_code_copied] = useState(false);
-  const [link_copied, set_link_copied] = useState(false);
 
   const poll_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdown_ref = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -865,8 +856,6 @@ function SetupView({
     try {
       await copy_text(code.replace(/-/g, ""));
       show_toast(t("copied_to_clipboard"), "success");
-      set_code_copied(true);
-      setTimeout(() => set_code_copied(false), 1500);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -876,8 +865,6 @@ function SetupView({
     try {
       await navigator.clipboard.writeText(LINK_DEVICE_URL);
       show_toast(t("copied_to_clipboard"), "success");
-      set_link_copied(true);
-      setTimeout(() => set_link_copied(false), 1500);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -922,7 +909,7 @@ function SetupView({
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-xs font-medium text-txt-muted">{t("setup_expires_in", { time: format_time(time_left) })}</span>
                   <button type="button" aria-label={t("setup_copy_code")} className="p-1.5 rounded-[var(--aster-radius-item)] transition-colors hover:bg-[var(--aster-field-hover)] text-txt-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" onClick={handle_copy_code}>
-                    <CopyIcon copied={code_copied} />
+                    <CopyIcon />
                   </button>
                 </div>
                 <div className="grid grid-cols-8 gap-2 cursor-pointer" onClick={handle_copy_code}>
@@ -939,7 +926,7 @@ function SetupView({
               </div>
               <button className="mt-4 flex items-center gap-1.5 text-xs text-txt-muted hover:text-txt-tertiary transition-colors" onClick={handle_copy_link}>
                 <span className="underline underline-offset-2">{LINK_DEVICE_URL}</span>
-                <CopyIcon copied={link_copied} />
+                <CopyIcon />
               </button>
               <div className="mt-6 flex items-center gap-2">
                 <Spinner class_name="w-4 h-4 text-txt-muted" />
@@ -1455,7 +1442,6 @@ function PasswordsPanel({
   const [new_password_label, set_new_password_label] = useState("");
   const [generated_password, set_generated_password] = useState<string | null>(null);
   const [generating, set_generating] = useState(false);
-  const [banner_copied, set_banner_copied] = useState(false);
   const [delete_target, set_delete_target] = useState<{ id: string; label: string } | null>(null);
   const delete_display = use_frozen(delete_target);
   const [deleting, set_deleting] = useState(false);
@@ -1517,8 +1503,8 @@ function PasswordsPanel({
             <code className="bridge_field flex-1 text-sm font-mono text-txt-primary px-3 py-2 select-all">
               {generated_password}
             </code>
-            <button className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary" aria-label={t("copy")} onClick={async () => { await handle_copy(generated_password); set_banner_copied(true); setTimeout(() => set_banner_copied(false), 1500); }}>
-              <CopyIcon copied={banner_copied} />
+            <button className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary" aria-label={t("copy")} onClick={() => void handle_copy(generated_password)}>
+              <CopyIcon />
             </button>
           </div>
           <p className="mt-2 text-xs text-txt-muted">{t("password_copy_hint")}</p>
