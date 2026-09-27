@@ -1944,7 +1944,21 @@ pub(crate) async fn append_draft(
 /// different message that happens to share a subject.
 const SENT_COPY_SUBJECT_WINDOW_SECS: i64 = 10 * 60;
 
+/// The subject fallback is for a message sent moments ago, so it only runs
+/// when the appended message's `Date` is this recent. Older mail copied in
+/// from another account never qualifies, however close two of its replies
+/// were to each other.
+const SENT_COPY_RECENT_SECS: i64 = 60 * 60;
+
 fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
+    find_appended_sent_copy_at(db, raw_message, chrono::Utc::now())
+}
+
+fn find_appended_sent_copy_at(
+    db: &Database,
+    raw_message: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u32> {
     use mail_parser::MessageParser;
     let parsed = MessageParser::default().parse(raw_message)?;
     let message_id = parsed
@@ -1975,6 +1989,9 @@ fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
     let (Some(subj), Some(sent_at)) = (subject, sent_at) else {
         return None;
     };
+    if (now - sent_at).num_seconds().abs() > SENT_COPY_RECENT_SECS {
+        return None;
+    }
     messages
         .iter()
         .rev()
@@ -4110,8 +4127,29 @@ mod tests {
         let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
         seed(&db, "sent-2", "sent", "quarterly report");
         let raw = b"Message-ID: <unknown@apple-mail>\r\nDate: Wed, 21 May 2026 10:01:30 +0000\r\nSubject: quarterly report\r\n\r\nbody";
-        let uid = find_appended_sent_copy(&db, raw);
+        let uid = find_appended_sent_copy_at(&db, raw, sent_moments_ago());
         assert!(uid.is_some());
+    }
+
+    /// "Now", a couple of minutes after the seeded messages were sent.
+    fn sent_moments_ago() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-21T10:03:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_quick_replies_in_old_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // Two replies in one thread, sent two minutes apart years ago, being
+        // copied in: the second is not a copy of the first.
+        seed(&db, "sent-7", "sent", "Re: plans");
+        let raw = b"Message-ID: <second-reply@example.com>\r\nDate: Wed, 21 May 2026 10:02:00 +0000\r\nSubject: Re: plans\r\n\r\nbody";
+        let years_later = chrono::DateTime::parse_from_rfc3339("2029-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(find_appended_sent_copy_at(&db, raw, years_later).is_none());
     }
 
     #[test]
