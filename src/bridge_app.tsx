@@ -472,7 +472,7 @@ function UpdateBanner() {
 
   return (
     <div
-      className="aster_floating fixed bottom-4 right-4 z-[9999] max-w-sm p-3"
+      className="aster_floating fixed bottom-4 end-4 z-[9999] max-w-sm p-3"
     >
       <div className="flex items-start gap-3">
         <ArrowDownTrayIcon className="w-5 h-5 mt-0.5 text-txt-primary flex-shrink-0" />
@@ -560,7 +560,7 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       onClick={on_copy}
       title={t("copy_to_clipboard")}
       aria-label={t("copy_to_clipboard")}
-      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 h-8 rounded-[var(--aster-radius-item)] px-2 cursor-pointer transition-colors hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
+      className="group ms-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 h-8 rounded-[var(--aster-radius-item)] px-2 cursor-pointer transition-colors hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
     >
       <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
       <span className="flex-shrink-0 text-txt-muted group-hover:text-txt-primary">
@@ -627,7 +627,7 @@ function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }:
       type="button"
       onClick={on_click}
       disabled={disabled}
-      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-[var(--aster-radius-item)] text-left transition-colors duration-150 hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary disabled:opacity-50 disabled:pointer-events-none"
+      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-[var(--aster-radius-item)] text-start transition-colors duration-150 hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary disabled:opacity-50 disabled:pointer-events-none"
     >
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
@@ -649,7 +649,7 @@ function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: 
       onClick={on_click}
       className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors disabled:opacity-50 ${checked ? "bg-brand" : "bg-edge-secondary"}`}
     >
-      <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4" : ""}`} />
+      <span className={`absolute top-0.5 start-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4 rtl:-translate-x-4" : ""}`} />
     </button>
   );
 }
@@ -924,7 +924,7 @@ function SetupView({
                 <Button className="flex-1" size="xl" variant="secondary" onClick={handle_copy_code}>{t("setup_copy_code")}</Button>
                 <Button className="flex-1" size="xl" variant="depth" onClick={() => api.open_url(LINK_DEVICE_URL)}>{t("setup_open_browser")}</Button>
               </div>
-              <button className="mt-4 flex items-center gap-1.5 text-xs text-txt-muted hover:text-txt-tertiary transition-colors" onClick={handle_copy_link}>
+              <button type="button" className="mt-4 flex items-center gap-1.5 rounded-[var(--aster-radius-item)] text-xs text-txt-muted hover:text-txt-tertiary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" onClick={handle_copy_link}>
                 <span className="underline underline-offset-2">{LINK_DEVICE_URL}</span>
                 <CopyIcon />
               </button>
@@ -991,7 +991,7 @@ function SidebarNavButton({
       >
         {icon}
       </span>
-      <span className="flex-1 text-left">{label}</span>
+      <span className="flex-1 text-start">{label}</span>
       {badge != null && badge > 0 && (
         <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-aster-danger/15 text-aster-danger font-mono font-medium min-w-[18px] text-center">
           {badge}
@@ -1058,7 +1058,7 @@ function Sidebar({
           </div>
           <div className="flex flex-col items-start min-w-0 flex-1">
             <span className="text-[15px] font-semibold text-txt-primary">{t("app_name")}</span>
-            <span className="text-[11px] truncate w-full text-left text-txt-muted">
+            <span className="text-[11px] truncate w-full text-start text-txt-muted">
               {display_name || email || t("not_connected")}
             </span>
           </div>
@@ -1076,11 +1076,11 @@ function Sidebar({
         {show_menu && (
           <div
             ref={menu_ref}
-            className="aster_floating absolute left-3 right-3 mt-2 overflow-hidden z-50 animate-dropdown-in"
+            className="aster_floating absolute inset-x-3 mt-2 overflow-hidden z-50 animate-dropdown-in"
           >
             <div className="p-1.5 pb-0">
               <button
-                className="w-full px-2.5 py-2 rounded-[var(--aster-radius-item)] text-left flex items-center gap-2.5 transition-colors hover:bg-[var(--aster-floating-hover)]"
+                className="w-full px-2.5 py-2 rounded-[var(--aster-radius-item)] text-start flex items-center gap-2.5 transition-colors hover:bg-[var(--aster-floating-hover)]"
                 onClick={() => {
                   if (email) {
                     navigator.clipboard.writeText(email).catch(() => {});
@@ -1098,7 +1098,7 @@ function Sidebar({
                   />
                   {bridge_running && (
                     <div
-                      className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2"
+                      className="absolute -bottom-0.5 -end-0.5 w-2.5 h-2.5 rounded-full border-2"
                       style={{
                         backgroundColor: "var(--color-success)",
                         borderColor: "var(--dropdown-bg)",
@@ -1142,7 +1142,7 @@ function Sidebar({
 
       <nav className="flex-1 px-2.5 pt-0.5 pb-2 relative">
         <div
-          className="sidebar-indicator absolute left-2.5 right-2.5 rounded-[12px] pointer-events-none"
+          className="sidebar-indicator absolute inset-x-2.5 rounded-[12px] pointer-events-none"
           style={{
             height: 32,
             backgroundColor: "var(--indicator-bg)",
@@ -1493,7 +1493,7 @@ function PasswordsPanel({
         <div className="aster_island aster_island_tone_accent mb-4 p-4">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium text-txt-primary">{t("password_created_banner")}</span>
-            <button className="h-7 w-7 flex items-center justify-center rounded-full text-txt-muted transition-colors duration-150 hover:bg-[var(--aster-field-hover)] hover:text-txt-primary" aria-label={t("dismiss")} onClick={() => set_generated_password(null)}>
+            <button type="button" className="h-7 w-7 flex items-center justify-center rounded-full text-txt-muted transition-colors duration-150 hover:bg-[var(--aster-field-hover)] hover:text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("dismiss")} onClick={() => set_generated_password(null)}>
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                 <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
@@ -1503,7 +1503,7 @@ function PasswordsPanel({
             <code className="bridge_field flex-1 text-sm font-mono text-txt-primary px-3 py-2 select-all">
               {generated_password}
             </code>
-            <button className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary" aria-label={t("copy")} onClick={() => void handle_copy(generated_password)}>
+            <button type="button" className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("copy")} onClick={() => void handle_copy(generated_password)}>
               <CopyIcon />
             </button>
           </div>
@@ -1553,7 +1553,7 @@ function PasswordsPanel({
               : t("never_used");
             return (
               <div key={pw.id} className="aster_island flex items-center justify-between p-3">
-                <div className="min-w-0 pr-3">
+                <div className="min-w-0 pe-3">
                   <p className="text-sm font-medium text-txt-primary truncate">{pw.label}</p>
                   <p className="text-[11px] text-txt-muted mt-0.5">{t("created_date", { date: format_date(pw.created_at) })}</p>
                   <p className="text-[11px] text-txt-muted mt-0.5 truncate" title={last_used_label}>{last_used_label}</p>
@@ -2389,8 +2389,8 @@ function DashboardView({
       />
       <div className="flex-1 p-2 min-h-0 min-w-0 flex flex-col overflow-hidden">
         {!is_online && (
-          <div className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium" style={{ color: "var(--color-warning)" }}>
-            <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+          <div className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium text-txt-primary">
+            <svg className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "var(--color-warning)" }} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
             {t("offline_banner")}
