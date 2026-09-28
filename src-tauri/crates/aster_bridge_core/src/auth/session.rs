@@ -472,16 +472,31 @@ pub async fn login_with_passphrase(
     })
 }
 
+static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn is_transient_refresh_error(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Network(_) => true,
+        BridgeError::Api(msg) => msg.starts_with("429") || msg.starts_with('5'),
+        _ => false,
+    }
+}
+
 pub async fn refresh_access_token(
     session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
     device_id: uuid::Uuid,
     signing_key: &ed25519_dalek::SigningKey,
     client: &ApiClient,
 ) -> Result<()> {
+    let observed = session.read().await.refresh_token.clone();
+    let _gate = REFRESH_GATE.lock().await;
     let (user_id, refresh_token) = {
         let s = session.read().await;
         (s.user_id, s.refresh_token.clone())
     };
+    if refresh_token.as_ref().map(|t| t.as_str()) != observed.as_ref().map(|t| t.as_str()) {
+        return Ok(());
+    }
 
     if let Some(refresh_token) = refresh_token {
         match client
@@ -502,7 +517,7 @@ pub async fn refresh_access_token(
                 }
                 tracing::warn!("session refresh returned no access token; signing in with the device key");
             }
-            Err(BridgeError::Network(e)) => return Err(BridgeError::Network(e)),
+            Err(e) if is_transient_refresh_error(&e) => return Err(e),
             Err(e) => {
                 tracing::warn!("session refresh failed ({}); signing in with the device key", e);
             }
@@ -885,6 +900,112 @@ mod tests {
         assert_eq!(s.identity_key.as_deref(), Some("identity-key"));
         assert_eq!(s.inbound_keys.len(), 1);
         assert_eq!(s.inbound_keys[0].ecdh_secret_d, vec![9u8; 32]);
+    }
+
+    struct RefreshServerState {
+        current: std::sync::Mutex<String>,
+        refresh_calls: std::sync::atomic::AtomicUsize,
+        replays: std::sync::atomic::AtomicUsize,
+        challenge_calls: std::sync::atomic::AtomicUsize,
+        rate_limited: bool,
+    }
+
+    async fn spawn_refresh_server(rate_limited: bool) -> (String, std::sync::Arc<RefreshServerState>) {
+        use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+        use std::sync::atomic::Ordering;
+        let state = std::sync::Arc::new(RefreshServerState {
+            current: std::sync::Mutex::new("refresh-1".to_string()),
+            refresh_calls: Default::default(),
+            replays: Default::default(),
+            challenge_calls: Default::default(),
+            rate_limited,
+        });
+        let app = Router::new()
+            .route(
+                "/core/v1/auth/refresh",
+                post(
+                    |State(state): State<std::sync::Arc<RefreshServerState>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if state.rate_limited {
+                            return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+                        }
+                        let mut current = state.current.lock().unwrap();
+                        if body["refresh_token"].as_str() != Some(current.as_str()) {
+                            state.replays.fetch_add(1, Ordering::SeqCst);
+                            return (StatusCode::UNAUTHORIZED, "replayed").into_response();
+                        }
+                        let next = format!("refresh-{}", state.refresh_calls.load(Ordering::SeqCst) + 1);
+                        *current = next.clone();
+                        Json(serde_json::json!({
+                            "access_token": format!("access-for-{}", next),
+                            "refresh_token": next,
+                        }))
+                        .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/core/v1/auth/device/challenge",
+                post(|State(state): State<std::sync::Arc<RefreshServerState>>| async move {
+                    state.challenge_calls.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "unused").into_response()
+                }),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), state)
+    }
+
+    fn session_with_refresh_token() -> std::sync::Arc<tokio::sync::RwLock<Session>> {
+        let mut session = sample_session();
+        session.refresh_token = Some(Zeroizing::new("refresh-1".to_string()));
+        std::sync::Arc::new(tokio::sync::RwLock::new(session))
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_rotate_once_without_replaying_the_spent_token() {
+        use std::sync::atomic::Ordering;
+        let (base, state) = spawn_refresh_server(false).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let session = session_with_refresh_token();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+
+        let (first, second) = tokio::join!(
+            refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client),
+            refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client),
+        );
+
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.replays.load(Ordering::SeqCst), 0);
+        assert_eq!(state.challenge_calls.load(Ordering::SeqCst), 0);
+        let s = session.read().await;
+        assert_eq!(s.refresh_token.as_ref().map(|t| t.as_str()), Some("refresh-2"));
+        assert_eq!(s.access_token.as_str(), "access-for-refresh-2");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_refresh_waits_instead_of_signing_in_again() {
+        use std::sync::atomic::Ordering;
+        let (base, state) = spawn_refresh_server(true).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let session = session_with_refresh_token();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+
+        let result = refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client).await;
+
+        assert!(result.is_err());
+        assert_eq!(state.challenge_calls.load(Ordering::SeqCst), 0);
+        let s = session.read().await;
+        assert_eq!(s.refresh_token.as_ref().map(|t| t.as_str()), Some("refresh-1"));
+        assert_eq!(s.access_token.as_str(), "token-abc");
     }
 
     #[test]
