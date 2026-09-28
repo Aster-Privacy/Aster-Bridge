@@ -36,6 +36,12 @@ export interface ImportProgress {
   duplicates: number;
 }
 
+export interface PortConflict {
+  service: string;
+  port: number;
+  held_by_bridge: boolean;
+}
+
 export interface BridgeState {
   enrolled: boolean;
   email: string | null;
@@ -48,6 +54,7 @@ export interface BridgeState {
   has_bridge_access: boolean;
   plan_info_loaded: boolean;
   import_progress: ImportProgress | null;
+  port_conflict: PortConflict | null;
 }
 
 async function tauri_invoke<T>(
@@ -74,6 +81,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     has_bridge_access: boolean;
     plan_info_loaded: boolean;
     import_progress: ImportProgress | null;
+    port_conflict: PortConflict | null;
   }>("get_bridge_status");
 
   let passwords: AppPassword[] = [];
@@ -97,6 +105,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     has_bridge_access: status.has_bridge_access,
     plan_info_loaded: status.plan_info_loaded ?? false,
     import_progress: status.import_progress ?? null,
+    port_conflict: status.port_conflict ?? null,
   };
 }
 
@@ -144,6 +153,14 @@ export async function check_setup_confirmation(): Promise<"confirmed" | "expired
 
 export async function start_bridge(): Promise<void> {
   return tauri_invoke("start_bridge");
+}
+
+export async function restart_bridge(): Promise<void> {
+  return tauri_invoke("restart_bridge");
+}
+
+export async function use_alternate_ports(): Promise<void> {
+  return tauri_invoke("use_alternate_ports");
 }
 
 export async function stop_bridge(): Promise<void> {

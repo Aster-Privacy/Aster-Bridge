@@ -145,6 +145,44 @@ pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
     ))
 }
 
+pub const ALTERNATE_IMAP_PORT: u16 = 2143;
+pub const ALTERNATE_SMTP_PORT: u16 = 2025;
+const MAX_ALTERNATE_ROUNDS: u32 = 10;
+
+fn pick_free_port_avoiding(host: &str, preferred: u16, avoid: &[u16]) -> Result<u16, String> {
+    let mut start = preferred;
+    for _ in 0..MAX_ALTERNATE_ROUNDS {
+        let candidate = pick_available_port(host, start)?;
+        if !avoid.contains(&candidate) {
+            return Ok(candidate);
+        }
+        start = candidate
+            .checked_add(1)
+            .ok_or_else(|| format!("no free port above {}", preferred))?;
+    }
+    Err(format!("no free port near {}", preferred))
+}
+
+pub fn pick_alternate_ports(
+    host: &str,
+    config: &crate::config::BridgeConfig,
+) -> Result<(u16, u16), String> {
+    let mut avoid = vec![
+        config.imap_port,
+        config.smtp_port,
+        config.imap_implicit_tls_port,
+        config.smtp_implicit_tls_port,
+        config.jmap_port,
+        config.pop3_port,
+        config.pop3s_port,
+        config.carddav_port,
+    ];
+    let imap = pick_free_port_avoiding(host, ALTERNATE_IMAP_PORT, &avoid)?;
+    avoid.push(imap);
+    let smtp = pick_free_port_avoiding(host, ALTERNATE_SMTP_PORT, &avoid)?;
+    Ok((imap, smtp))
+}
+
 const BIND_RETRIES: u32 = 5;
 
 pub async fn bind_loopback_listener(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
@@ -310,5 +348,57 @@ mod tests {
         drop(probe);
         assert_eq!(probe_occupant("127.0.0.1", port), Occupant::Free);
         assert_eq!(pick_startup_port("127.0.0.1", port), Ok(port));
+    }
+
+    #[test]
+    fn a_held_port_is_skipped_when_picking_a_free_one() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let picked = pick_free_port_avoiding("127.0.0.1", port, &[]).unwrap();
+        assert_ne!(picked, port);
+        drop(held);
+    }
+
+    #[test]
+    fn a_free_port_in_the_avoid_list_is_skipped() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let picked = pick_free_port_avoiding("127.0.0.1", port, &[port]).unwrap();
+        assert_ne!(picked, port);
+    }
+
+    #[test]
+    fn alternate_ports_differ_from_every_configured_port() {
+        let config = crate::config::BridgeConfig::default();
+        let (imap, smtp) = pick_alternate_ports("127.0.0.1", &config).unwrap();
+        assert_ne!(imap, smtp);
+        for taken in [
+            config.imap_port,
+            config.smtp_port,
+            config.imap_implicit_tls_port,
+            config.smtp_implicit_tls_port,
+            config.jmap_port,
+            config.pop3_port,
+            config.pop3s_port,
+            config.carddav_port,
+        ] {
+            assert_ne!(imap, taken);
+            assert_ne!(smtp, taken);
+        }
+        let mut candidate = config.clone();
+        candidate.imap_port = imap;
+        candidate.smtp_port = smtp;
+        assert!(crate::config::validate_ports(&candidate).is_ok());
+    }
+
+    #[test]
+    fn alternate_ports_move_again_when_already_on_the_alternates() {
+        let mut config = crate::config::BridgeConfig::default();
+        config.imap_port = ALTERNATE_IMAP_PORT;
+        config.smtp_port = ALTERNATE_SMTP_PORT;
+        let (imap, smtp) = pick_alternate_ports("127.0.0.1", &config).unwrap();
+        assert_ne!(imap, ALTERNATE_IMAP_PORT);
+        assert_ne!(smtp, ALTERNATE_SMTP_PORT);
     }
 }
