@@ -88,7 +88,7 @@ fn set_file_permissions_restrictive(path: &Path) -> Result<(), String> {
         let user = whoami::fallible::username()
             .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
         if !user.is_empty() {
-            match std::process::Command::new("icacls")
+            match crate::system_tools::icacls_command()
                 .args([
                     path.to_string_lossy().as_ref(),
                     "/inheritance:r",

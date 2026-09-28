@@ -157,7 +157,7 @@ fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
     let user = whoami::fallible::username().unwrap_or_else(|_| {
         std::env::var("USERNAME").unwrap_or_else(|_| "SYSTEM".to_string())
     });
-    let acl_ok = match std::process::Command::new("icacls")
+    let acl_ok = match crate::system_tools::icacls_command()
         .args([p.as_ref(), "/inheritance:r", "/grant:r", &format!("{}:(F)", user)])
         .creation_flags(0x0800_0000)
         .output()

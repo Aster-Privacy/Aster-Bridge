@@ -433,7 +433,7 @@ fn restrict_db_file_permissions(db_path: &Path) {
             let user = whoami::fallible::username()
                 .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
             if !user.is_empty() {
-                let _ = std::process::Command::new("icacls")
+                let _ = crate::system_tools::icacls_command()
                     .args([
                         p.to_string_lossy().as_ref(),
                         "/inheritance:r",
