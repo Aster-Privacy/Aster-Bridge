@@ -2,6 +2,18 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.36 - 2026-09-28
+
+### What's new
+- Aster Bridge has a refreshed design with filled panels and fields, clearer banners and progress bars, and a new button for installing updates.
+- When another app is already using a port that Aster Bridge needs, Bridge tells you which port is taken and suggests free ports that you can use instead.
+
+### Fixed
+- Aster Bridge refreshes your session in the background instead of signing in again every 50 minutes, and it waits before it retries a refresh that fails.
+- You can send messages up to 70 MB, and when the server refuses an attachment, your mail app shows the reason instead of a general error.
+- On Windows, Aster Bridge runs the tool that protects its data folder from the Windows system folder only, so a program with the same name in another folder cannot run in its place.
+- Copy buttons keep their icon after you copy, buttons keep their size while they load, labels and elapsed times are translated, and layouts display correctly in right-to-left languages.
+
 ## 0.4.35 - 2026-09-28
 
 ### What's new
