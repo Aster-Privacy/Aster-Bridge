@@ -386,16 +386,9 @@ fn top_headers(msg: &CachedMessage, meta: &serde_json::Value) -> String {
     let from = sanitize_header(msg.sender.as_deref().unwrap_or("unknown@astermail.org"));
     let to = sanitize_header(msg.recipients.as_deref().unwrap_or(""));
     let subject = sanitize_header(msg.subject.as_deref().unwrap_or(""));
-    let cc = meta
-        .get("cc")
-        .and_then(|v| v.as_str())
-        .map(sanitize_header)
-        .filter(|s| !s.is_empty());
-    let bcc = meta
-        .get("bcc")
-        .and_then(|v| v.as_str())
-        .map(sanitize_header)
-        .filter(|s| !s.is_empty());
+    let cc = crate::address::meta_address_text(meta, "cc").map(|s| sanitize_header(&s));
+    let bcc = crate::address::meta_address_text(meta, "bcc").map(|s| sanitize_header(&s));
+    let reply_to = crate::address::meta_address_text(meta, "reply_to").map(|s| sanitize_header(&s));
     out.push_str(&format!("Date: {}\r\n", date));
     out.push_str(&format!("From: {}\r\n", from));
     if !to.is_empty() {
@@ -406,6 +399,9 @@ fn top_headers(msg: &CachedMessage, meta: &serde_json::Value) -> String {
     }
     if let Some(bcc) = bcc {
         out.push_str(&format!("Bcc: {}\r\n", bcc));
+    }
+    if let Some(reply_to) = reply_to {
+        out.push_str(&format!("Reply-To: {}\r\n", reply_to));
     }
     out.push_str(&format!("Subject: {}\r\n", subject));
     out.push_str(&message_id_header(meta, &msg.aster_id));

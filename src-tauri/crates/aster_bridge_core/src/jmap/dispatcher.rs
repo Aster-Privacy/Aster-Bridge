@@ -195,7 +195,7 @@ async fn dispatch_one(
         "Mailbox/get" => methods::mailbox::get(ctx, args).await,
         "Mailbox/query" => methods::mailbox::query(ctx, args).await,
         "Mailbox/changes" => methods::mailbox::changes(ctx, args).await,
-        "Mailbox/set" => methods::mailbox::set(ctx, args).await,
+        "Mailbox/set" => methods::mailbox::set(ctx, args, created_ids_out).await,
         "Email/get" => methods::email::get(ctx, args).await,
         "Email/query" => methods::email::query(ctx, args).await,
         "Email/queryChanges" => methods::email::query_changes(ctx, args).await,

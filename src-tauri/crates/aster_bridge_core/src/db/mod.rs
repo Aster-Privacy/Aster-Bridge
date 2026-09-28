@@ -247,6 +247,10 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
         "jmap_mailbox",
         &["id", "name", "parent_id", "role", "sort_order", "folder_label"],
     ),
+    (
+        "custom_folder",
+        &["label_token", "server_id", "name", "parent_token", "sort_order", "created_at"],
+    ),
     ("jmap_state", &["type", "counter"]),
     ("jmap_change_log", &["seq", "type", "state", "object_id", "op", "ts"]),
     ("jmap_blob", &["blob_id", "data", "content_type", "size", "created_ts"]),
@@ -608,6 +612,17 @@ impl Database {
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS custom_folder (
+                label_token TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                parent_token TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT
+             );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS envelope_nonces (
                 aster_id TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
@@ -835,6 +850,16 @@ impl Database {
                 }
             }
             Ok(was_inserted)
+        })
+    }
+
+    pub fn set_cached_raw_headers(&self, aster_id: &str, raw_headers: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET raw_headers = ?2 WHERE aster_id = ?1",
+                rusqlite::params![aster_id, raw_headers],
+            )?;
+            Ok(())
         })
     }
 
@@ -1393,7 +1418,7 @@ impl Database {
     }
 
     pub fn list_jmap_mailboxes(&self) -> Result<Vec<JmapMailboxRow>, String> {
-        self.with_conn(|conn| {
+        let mut rows = self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, parent_id, role, sort_order, folder_label FROM jmap_mailbox ORDER BY sort_order",
             )?;
@@ -1410,7 +1435,115 @@ impl Database {
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
+        })?;
+        let custom = self.list_custom_folders()?;
+        rows.extend(crate::folders::jmap_rows(&crate::folders::build_tree(&custom)));
+        Ok(rows)
+    }
+
+    pub fn list_custom_folders(&self) -> Result<Vec<CustomFolder>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT label_token, server_id, name, parent_token, sort_order, created_at
+                 FROM custom_folder ORDER BY label_token",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CustomFolder {
+                        label_token: r.get(0)?,
+                        server_id: r.get(1)?,
+                        name: r.get(2)?,
+                        parent_token: r.get(3)?,
+                        sort_order: r.get(4)?,
+                        created_at: r.get(5)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
+    }
+
+    pub fn replace_custom_folders(&self, folders: &[CustomFolder]) -> Result<bool, String> {
+        let mut incoming: Vec<CustomFolder> = folders.to_vec();
+        incoming.sort_by(|a, b| a.label_token.cmp(&b.label_token));
+        incoming.dedup_by(|a, b| a.label_token == b.label_token);
+        if self.list_custom_folders()? == incoming {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_folder", [])?;
+            for f in &incoming {
+                tx.execute(
+                    "INSERT INTO custom_folder (label_token, server_id, name, parent_token, sort_order, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![f.label_token, f.server_id, f.name, f.parent_token, f.sort_order, f.created_at],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn upsert_custom_folder(&self, folder: &CustomFolder) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO custom_folder (label_token, server_id, name, parent_token, sort_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(label_token) DO UPDATE SET
+                    server_id = excluded.server_id,
+                    name = excluded.name,
+                    parent_token = excluded.parent_token,
+                    sort_order = excluded.sort_order,
+                    created_at = excluded.created_at",
+                rusqlite::params![
+                    folder.label_token,
+                    folder.server_id,
+                    folder.name,
+                    folder.parent_token,
+                    folder.sort_order,
+                    folder.created_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_custom_folder(&self, label_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_folder WHERE label_token = ?1", [label_token])?;
+            tx.execute(
+                "UPDATE custom_folder SET parent_token = NULL WHERE parent_token = ?1",
+                [label_token],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn relocate_folder_messages(&self, from: &str, to: &str) -> Result<Vec<String>, String> {
+        let ids = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids = {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_cache WHERE folder = ?1")?;
+                let ids = stmt
+                    .query_map([from], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                ids
+            };
+            tx.execute(
+                "UPDATE message_cache SET folder = ?2 WHERE folder = ?1",
+                rusqlite::params![from, to],
+            )?;
+            tx.execute("DELETE FROM uid_map WHERE folder = ?1", [from])?;
+            tx.commit()?;
+            Ok(ids)
+        })?;
+        for id in &ids {
+            self.assign_uid_if_missing(to, id)?;
+        }
+        Ok(ids)
     }
 
     pub fn recache_messages_without_message_id(&self) -> Result<usize, String> {
@@ -2004,6 +2137,16 @@ impl Database {
         })
     }
 
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFolder {
+    pub label_token: String,
+    pub server_id: String,
+    pub name: String,
+    pub parent_token: Option<String>,
+    pub sort_order: i64,
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]

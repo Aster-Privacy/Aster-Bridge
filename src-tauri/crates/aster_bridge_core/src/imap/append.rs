@@ -859,6 +859,7 @@ pub async fn append_imported_message(
                         has_attachments: attachment_count > 0,
                         attachment_count: attachment_count.min(i16::MAX as usize) as i16,
                         thread_token: None,
+                        folder_token: crate::folders::token_of_label(folder),
                     }],
                 },
             )
@@ -938,6 +939,7 @@ pub async fn append_imported_message(
         is_starred: Some(flags.flagged),
         has_attachments: Some(attachment_count > 0),
         attachment_count: Some(attachment_count.min(i16::MAX as usize) as i16),
+        labels: None,
     };
 
     let local_attachments: Vec<crate::db::CachedAttachment> = message
