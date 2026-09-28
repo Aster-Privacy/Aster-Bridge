@@ -1927,35 +1927,90 @@ pub(crate) async fn append_draft(
     Ok((uid, created.id))
 }
 
+/// How far apart the appended copy's `Date` and a stored Sent message's date
+/// may be for a subject match to count as the same message. A client saving
+/// what it just sent does so within moments; anything further apart is a
+/// different message that happens to share a subject.
+const SENT_COPY_SUBJECT_WINDOW_SECS: i64 = 10 * 60;
+
+/// The subject fallback is for a message sent moments ago, so it only runs
+/// when the appended message's `Date` is this recent. Older mail copied in
+/// from another account never qualifies, however close two of its replies
+/// were to each other.
+const SENT_COPY_RECENT_SECS: i64 = 60 * 60;
+
 fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
+    find_appended_sent_copy_at(db, raw_message, chrono::Utc::now())
+}
+
+fn find_appended_sent_copy_at(
+    db: &Database,
+    raw_message: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u32> {
     use mail_parser::MessageParser;
     let parsed = MessageParser::default().parse(raw_message)?;
     let message_id = parsed
         .message_id()
-        .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
+        .map(normalize_message_id)
         .filter(|s| !s.is_empty());
     let subject = parsed.subject().map(|s| s.to_string());
+    let sent_at = parsed
+        .date()
+        .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
     let messages = db.list_cached_message_meta("sent").ok()?;
     if let Some(mid) = message_id {
-        if let Some(m) = messages.iter().rev().find(|m| {
-            m.raw_headers
-                .as_deref()
-                .is_some_and(|rh| rh.contains(mid.as_str()))
-        }) {
-            return Some(m.imap_uid);
-        }
-    }
-    if let Some(subj) = subject {
+        // The stored message's own Message-ID, not any id in its metadata:
+        // a reply lists the message it answers in `in_reply_to` and
+        // `references`, and matching those treated the original as already
+        // saved and dropped it.
         if let Some(m) = messages
             .iter()
             .rev()
-            .take(20)
-            .find(|m| m.subject.as_deref() == Some(subj.as_str()))
+            .find(|m| stored_message_id(m).is_some_and(|s| s.eq_ignore_ascii_case(&mid)))
         {
             return Some(m.imap_uid);
         }
     }
-    None
+    // Only a copy of something sent moments ago falls back to the subject:
+    // replies in a thread, and older mail being copied in, share subjects
+    // with messages that are already stored.
+    let (Some(subj), Some(sent_at)) = (subject, sent_at) else {
+        return None;
+    };
+    if (now - sent_at).num_seconds().abs() > SENT_COPY_RECENT_SECS {
+        return None;
+    }
+    messages
+        .iter()
+        .rev()
+        .take(20)
+        .find(|m| {
+            m.subject.as_deref() == Some(subj.as_str())
+                && m.date
+                    .as_deref()
+                    .and_then(parse_cached_date)
+                    .is_some_and(|d| {
+                        (d - sent_at).num_seconds().abs() <= SENT_COPY_SUBJECT_WINDOW_SECS
+                    })
+        })
+        .map(|m| m.imap_uid)
+}
+
+fn normalize_message_id(raw: &str) -> String {
+    raw.trim().trim_matches(&['<', '>'][..]).trim().to_string()
+}
+
+fn stored_message_id(m: &CachedMessage) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.raw_headers.as_deref()?).ok()?;
+    meta.get("message_id")
+        .and_then(|v| v.as_str())
+        .map(normalize_message_id)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_cached_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_datetime_lenient(raw).map(|d| d.with_timezone(&chrono::Utc))
 }
 
 const APPEND_KEEPALIVE_SECS: u64 = 20;
@@ -4402,9 +4457,89 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
         seed(&db, "sent-2", "sent", "quarterly report");
-        let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: quarterly report\r\n\r\nbody";
-        let uid = find_appended_sent_copy(&db, raw);
+        let raw = b"Message-ID: <unknown@apple-mail>\r\nDate: Wed, 21 May 2026 10:01:30 +0000\r\nSubject: quarterly report\r\n\r\nbody";
+        let uid = find_appended_sent_copy_at(&db, raw, sent_moments_ago());
         assert!(uid.is_some());
+    }
+
+    /// "Now", a couple of minutes after the seeded messages were sent.
+    fn sent_moments_ago() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-21T10:03:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_quick_replies_in_old_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // Two replies in one thread, sent two minutes apart years ago, being
+        // copied in: the second is not a copy of the first.
+        seed(&db, "sent-7", "sent", "Re: plans");
+        let raw = b"Message-ID: <second-reply@example.com>\r\nDate: Wed, 21 May 2026 10:02:00 +0000\r\nSubject: Re: plans\r\n\r\nbody";
+        let years_later = chrono::DateTime::parse_from_rfc3339("2029-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(find_appended_sent_copy_at(&db, raw, years_later).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_far_apart_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-4", "sent", "Re: quarterly report");
+        // An older reply in the same thread, being copied in from another
+        // account: same subject, different message.
+        let raw = b"Message-ID: <older-reply@example.com>\r\nDate: Tue, 20 May 2025 09:00:00 +0000\r\nSubject: Re: quarterly report\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_without_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-5", "sent", "no date here");
+        let raw = b"Message-ID: <undated@example.com>\r\nSubject: no date here\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_ids_in_references_and_in_reply_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // A stored reply that points at the original it answers.
+        db.upsert_cached_message(
+            "reply-1",
+            "sent",
+            Some("Re: plans"),
+            Some("alice@example.com"),
+            Some("bob@example.com"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("reply body"),
+            Some(
+                &serde_json::json!({
+                    "is_html": false,
+                    "message_id": "reply-1@test",
+                    "in_reply_to": "<original@test>",
+                    "references": "<root@test> <original@test>"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("sent", "reply-1");
+        let raw = b"Message-ID: <original@test>\r\nDate: Mon, 19 May 2025 08:00:00 +0000\r\nSubject: plans\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_matches_message_id_with_or_without_brackets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-6", "sent", "anything");
+        let raw = b"Message-ID: sent-6@test\r\nSubject: something else\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_some());
     }
 
     #[test]
