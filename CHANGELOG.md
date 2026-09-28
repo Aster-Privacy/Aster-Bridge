@@ -2,6 +2,26 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.35 - 2026-09-28
+
+### What's new
+- Your custom folders and subfolders appear in your mail app over IMAP and JMAP, nested under their parent folders.
+- You can create, rename, move, and delete folders from your mail app, and each change also appears in the Aster apps.
+- You can copy and move messages into and out of your custom folders.
+
+### Fixed
+- Messages show their Cc and Reply-To addresses in your mail app, so Reply All includes everyone who was copied.
+- Messages that you import from an MBOX file, or add from your mail app, keep their Cc and Reply-To addresses.
+- When your mail app saves a message to Sent, Aster Bridge no longer mistakes it for an earlier message with the same subject and drops it.
+
+## 0.4.34 - 2026-09-20
+
+### Fixed
+- Aster Bridge now signs in with your default sending address instead of always using your primary Aster address.
+- You can send from a custom domain address in the mail app you connect to Bridge.
+- Bridge refreshes your list of sending addresses when your mail app offers one it does not recognize, so an address you add after signing in works without signing in again.
+- Bridge records which sending addresses it skipped at sign-in, which makes a missing address easier to diagnose.
+
 ## 0.4.33 - 2026-09-15
 
 ### What's new
