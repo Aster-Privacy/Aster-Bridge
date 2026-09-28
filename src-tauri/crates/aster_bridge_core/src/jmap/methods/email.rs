@@ -206,9 +206,9 @@ fn serialize_email(
     full_map.insert("sender".to_string(), from.clone());
     full_map.insert("from".to_string(), from);
     full_map.insert("to".to_string(), to);
-    full_map.insert("cc".to_string(), Value::Null);
-    full_map.insert("bcc".to_string(), Value::Null);
-    full_map.insert("replyTo".to_string(), Value::Null);
+    full_map.insert("cc".to_string(), meta_addresses(&meta, "cc"));
+    full_map.insert("bcc".to_string(), meta_addresses(&meta, "bcc"));
+    full_map.insert("replyTo".to_string(), meta_addresses(&meta, "reply_to"));
     full_map.insert("subject".to_string(), json!(subject));
     full_map.insert("sentAt".to_string(), json!(received_at));
     full_map.insert("hasAttachment".to_string(), json!(attachment_count > 0 || !attachments.is_empty()));
@@ -254,29 +254,11 @@ fn parse_from(s: &Option<String>) -> Value {
 }
 
 fn parse_address_list(s: &Option<String>) -> Value {
-    let Some(s) = s else { return Value::Null };
-    let mut out = Vec::new();
-    for chunk in s.split(',') {
-        let trimmed = chunk.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match (trimmed.find('<'), trimmed.rfind('>')) {
-            (Some(open), Some(close)) if close > open => {
-                let name = trimmed[..open].trim().trim_matches('"').to_string();
-                let email = trimmed[open + 1..close].trim().to_string();
-                out.push(json!({ "name": if name.is_empty() { Value::Null } else { Value::String(name) }, "email": email }));
-            }
-            _ => {
-                out.push(json!({ "name": Value::Null, "email": trimmed }));
-            }
-        }
-    }
-    if out.is_empty() {
-        Value::Null
-    } else {
-        Value::Array(out)
-    }
+    crate::address::jmap_addresses(s.as_deref())
+}
+
+fn meta_addresses(meta: &Value, key: &str) -> Value {
+    crate::address::jmap_addresses(crate::address::meta_address_text(meta, key).as_deref())
 }
 
 fn preview_of(body: Option<&str>) -> String {
@@ -738,13 +720,31 @@ async fn apply_update_patch(
 
     if let Some(target) = &move_target {
         if target != &existing.folder {
-            let Some(backend_flags) = move_flags_for_label(target) else {
+            let target_token = crate::folders::token_of_label(target);
+            let source_token = crate::folders::token_of_label(&existing.folder);
+            let backend_flags = match (target_token, existing.folder.as_str()) {
+                (Some(_), "drafts") => None,
+                (Some(_), _) => move_flags_for_label("inbox"),
+                (None, _) => move_flags_for_label(target),
+            };
+            let Some(backend_flags) = backend_flags else {
                 return PatchOutcome::Rejected(json!({
                     "type": "invalidProperties",
                     "properties": ["mailboxIds"],
                     "description": "cannot move messages into that mailbox"
                 }));
             };
+            let ids = vec![id.to_string()];
+            let relabel = match (target_token, source_token) {
+                (Some(label), _) => ctx.client.move_to_folder(access_token, &ids, label).await,
+                (None, Some(label)) => ctx.client.remove_from_folder(access_token, &ids, label).await,
+                (None, None) => Ok(()),
+            };
+            if let Err(e) = relabel {
+                return PatchOutcome::Rejected(
+                    json!({"type": "serverFail", "description": e.to_string()}),
+                );
+            }
             if let Err(e) = ctx
                 .client
                 .set_mailbox_flags(access_token, id, backend_flags)
@@ -1078,6 +1078,23 @@ mod tests {
                 {"name": Value::Null, "email": "b@y.com"}
             ])
         );
+    }
+
+    #[test]
+    fn meta_addresses_reads_cc_and_reply_to() {
+        let meta = json!({"cc": "Carol <carol@example.com>, dan@example.com", "reply_to": "team@example.com"});
+        assert_eq!(
+            meta_addresses(&meta, "cc"),
+            json!([
+                {"name": "Carol", "email": "carol@example.com"},
+                {"name": Value::Null, "email": "dan@example.com"}
+            ])
+        );
+        assert_eq!(
+            meta_addresses(&meta, "reply_to"),
+            json!([{"name": Value::Null, "email": "team@example.com"}])
+        );
+        assert_eq!(meta_addresses(&meta, "bcc"), Value::Null);
     }
 
     #[test]

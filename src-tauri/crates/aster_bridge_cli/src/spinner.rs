@@ -243,15 +243,7 @@ mod tests {
     }
 
     fn animating() -> Output {
-        Output::assemble(
-            false,
-            ColorChoice::Always,
-            ThemeChoice::Dark,
-            true,
-            true,
-            true,
-            true,
-        )
+        Output::true_color()
     }
 
     #[test]

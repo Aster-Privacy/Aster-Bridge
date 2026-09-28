@@ -152,6 +152,19 @@ impl Output {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn true_color() -> Self {
+        let appearance = theme::detect_appearance(ThemeChoice::Dark);
+        Self {
+            json: false,
+            palette: Palette::new(appearance, ColorDepth::TrueColor),
+            err_palette: Palette::new(appearance, ColorDepth::TrueColor),
+            animate: true,
+            unicode: true,
+            rich_unicode: true,
+        }
+    }
+
     pub fn ansi(&self) -> bool {
         self.palette.depth != ColorDepth::None
     }
@@ -993,15 +1006,7 @@ mod tests {
 
     #[test]
     fn sweep_frames_differ_so_the_line_animates() {
-        let out = Output::assemble(
-            false,
-            ColorChoice::Always,
-            ThemeChoice::Dark,
-            true,
-            true,
-            true,
-            true,
-        );
+        let out = Output::true_color();
         let text = "Listening for your email app";
         let first = out.sweep(text, 10);
         assert_ne!(first, out.sweep(text, 11));

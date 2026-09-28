@@ -29,7 +29,7 @@ use crate::auth::session::Session;
 use crate::crypto::envelope::decrypt_envelope_with_previous_keys;
 use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
 use crate::db::{
-    CachedAttachment, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
+    CachedAttachment, CachedMessage, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
     ATTACHMENTS_STORED,
 };
 use crate::error::BridgeError;
@@ -423,6 +423,114 @@ fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachmen
     serde_json::Value::Object(map).to_string()
 }
 
+const ADDRESS_META_VERSION_KEY: &str = "addresses_v";
+const ADDRESS_META_KEYS: [&str; 3] = ["cc", "bcc", "reply_to"];
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct EnvelopeAddresses {
+    cc: Option<String>,
+    bcc: Option<String>,
+    reply_to: Option<String>,
+}
+
+impl EnvelopeAddresses {
+    fn from_envelope(envelope: &serde_json::Value) -> Self {
+        Self {
+            cc: crate::address::envelope_cc(envelope),
+            bcc: crate::address::envelope_bcc(envelope),
+            reply_to: crate::address::envelope_reply_to(envelope),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cc.is_none() && self.bcc.is_none() && self.reply_to.is_none()
+    }
+
+    fn write_to(&self, meta: &mut serde_json::Map<String, serde_json::Value>) {
+        for (key, value) in [("cc", &self.cc), ("bcc", &self.bcc), ("reply_to", &self.reply_to)] {
+            if let Some(v) = value {
+                meta.insert(key.to_string(), serde_json::json!(v));
+            }
+        }
+        meta.insert(ADDRESS_META_VERSION_KEY.to_string(), serde_json::json!(1));
+    }
+}
+
+fn cached_meta_map(db: &Database, aster_id: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let existing = db.get_cached_message(aster_id).ok()??;
+    meta_map_of(&existing)
+}
+
+fn meta_map_of(msg: &CachedMessage) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(msg.raw_headers.as_deref()?).ok()? {
+        serde_json::Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn backfill_cached_addresses(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> bool {
+    let Ok(Some(cached)) = db.get_cached_message(&item.id) else {
+        return false;
+    };
+    let Some(mut meta) = meta_map_of(&cached) else {
+        return false;
+    };
+    if meta.contains_key(ADDRESS_META_VERSION_KEY) || meta.contains_key("draft_api") {
+        return false;
+    }
+    let Ok(plaintext) = decrypt_envelope_with_previous_keys(
+        &item.encrypted_envelope,
+        Some(&item.envelope_nonce),
+        passphrase,
+        identity_key,
+        previous_keys,
+        inbound_keys,
+    ) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&plaintext) else {
+        return false;
+    };
+    let addresses = EnvelopeAddresses::from_envelope(&parsed);
+    addresses.write_to(&mut meta);
+    let raw = serde_json::Value::Object(meta).to_string();
+    if let Err(e) = db.set_cached_raw_headers(&item.id, &raw) {
+        tracing::warn!("address backfill failed for {}: {}", item.id, e);
+        return false;
+    }
+    if addresses.is_empty() {
+        return false;
+    }
+    if cached.imap_uid > 0 {
+        let _ = db.remove_uid_mapping(cached.imap_uid as i64, folder);
+    }
+    let _ = db.assign_uid_if_missing(folder, &item.id);
+    true
+}
+
+fn carry_address_meta(
+    db: &Database,
+    aster_id: &str,
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(existing) = cached_meta_map(db, aster_id) else {
+        return;
+    };
+    for key in ADDRESS_META_KEYS.iter().chain(std::iter::once(&ADDRESS_META_VERSION_KEY)) {
+        if let Some(v) = existing.get(*key) {
+            meta.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
 fn carry_attachment_meta(
     db: &Database,
     aster_id: &str,
@@ -773,6 +881,7 @@ struct PreparedMessage {
     message_id: Option<String>,
     in_reply_to: Option<String>,
     references: Option<String>,
+    addresses: EnvelopeAddresses,
     attachments: Vec<EnvelopeAttachment>,
     expected_attachments: usize,
 }
@@ -799,9 +908,19 @@ fn prepare_mail_item(
     if db.body_cached(&item.id) {
         let _ = db.set_folder_if_changed(&item.id, folder);
         let _ = db.assign_uid_if_missing(folder, &item.id);
+        let addresses_added = backfill_cached_addresses(
+            db,
+            folder,
+            item,
+            passphrase,
+            identity_key,
+            previous_keys,
+            inbound_keys,
+        );
+        let flags_changed = reconcile_server_flags(db, item);
         return Prepared::Done(CacheOutcome {
             was_new: false,
-            flags_changed: reconcile_server_flags(db, item),
+            flags_changed: flags_changed || addresses_added,
             inbound_decrypt_failed: false,
         });
     }
@@ -897,6 +1016,7 @@ fn prepare_mail_item(
         .or_else(|| envelope_header(&parsed, "in-reply-to"));
     let references = json_str(&parsed, "references")
         .or_else(|| envelope_header(&parsed, "references"));
+    let addresses = EnvelopeAddresses::from_envelope(&parsed);
     Prepared::Ready(PreparedMessage {
         subject,
         sender,
@@ -907,6 +1027,7 @@ fn prepare_mail_item(
         message_id,
         in_reply_to,
         references,
+        addresses,
         attachments,
         expected_attachments,
     })
@@ -941,6 +1062,7 @@ fn commit_mail_item(
     if let Some(ref value) = prepared.references {
         raw_headers_map.insert("references".to_string(), serde_json::json!(value));
     }
+    prepared.addresses.write_to(&mut raw_headers_map);
     if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
             "attachments".to_string(),
@@ -1270,7 +1392,7 @@ async fn heal_inbound_keys(session: &Arc<RwLock<Session>>, client: &Arc<ApiClien
 
 fn retry_failed_inbound_items(
     db: &Database,
-    failed: &[(&'static str, MailItem)],
+    failed: &[(String, MailItem)],
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
@@ -1287,6 +1409,121 @@ fn retry_failed_inbound_items(
         }
     }
     (new_ids, updated_ids)
+}
+
+const CUSTOM_FOLDER_PAGE: i64 = 100;
+const CUSTOM_FOLDER_MAX_ITEMS: usize = 2000;
+
+fn is_custom_folder_definition(def: &crate::api_client::FolderDefinition) -> bool {
+    !def.is_system
+        && !def.is_password_protected
+        && matches!(def.folder_type.as_deref(), None | Some("custom") | Some("folder"))
+}
+
+pub(crate) fn folders_from_definitions(
+    defs: &[crate::api_client::FolderDefinition],
+    identity_key: &str,
+    previous_keys: &[String],
+) -> Vec<crate::db::CustomFolder> {
+    defs.iter()
+        .filter(|d| is_custom_folder_definition(d) && !d.label_token.is_empty())
+        .filter_map(|d| {
+            let name = crate::crypto::folder::decrypt_folder_name(
+                &d.encrypted_name,
+                &d.name_nonce,
+                identity_key,
+                previous_keys,
+            )?;
+            Some(crate::db::CustomFolder {
+                label_token: d.label_token.clone(),
+                server_id: d.id.clone(),
+                name,
+                parent_token: d.parent_token.clone().filter(|p| !p.is_empty()),
+                sort_order: d.sort_order as i64,
+                created_at: d.created_at.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn record_mailbox_diff(
+    db: &Database,
+    before: &[crate::db::CustomFolder],
+    after: &[crate::db::CustomFolder],
+) -> bool {
+    let rows = |folders: &[crate::db::CustomFolder]| -> HashMap<String, (String, Option<String>, i32)> {
+        crate::folders::jmap_rows(&crate::folders::build_tree(folders))
+            .into_iter()
+            .map(|r| (r.id, (r.name, r.parent_id, r.sort_order)))
+            .collect()
+    };
+    let old = rows(before);
+    let new = rows(after);
+    let created: Vec<&str> = new.keys().filter(|k| !old.contains_key(*k)).map(|k| k.as_str()).collect();
+    let destroyed: Vec<&str> = old.keys().filter(|k| !new.contains_key(*k)).map(|k| k.as_str()).collect();
+    let updated: Vec<&str> = new
+        .iter()
+        .filter(|(k, v)| old.get(*k).is_some_and(|o| o != *v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !created.is_empty() {
+        let _ = db.jmap_record_sync_batch("Mailbox", &created);
+    }
+    if !updated.is_empty() {
+        let _ = db.jmap_record_updated_batch("Mailbox", &updated);
+    }
+    if !destroyed.is_empty() {
+        let _ = db.jmap_record_destroyed_batch("Mailbox", &destroyed);
+    }
+    !(created.is_empty() && updated.is_empty() && destroyed.is_empty())
+}
+
+async fn sync_custom_folders(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+) -> Result<bool, String> {
+    let Some(identity_key) = identity_key else {
+        return Ok(false);
+    };
+    let defs = client
+        .list_folders(access_token)
+        .await
+        .map_err(|e| format!("failed to sync folders: {}", e))?;
+    let folders = folders_from_definitions(&defs, identity_key, previous_keys);
+    let before = db.list_custom_folders()?;
+    if !db.replace_custom_folders(&folders)? {
+        return Ok(false);
+    }
+    let after = db.list_custom_folders()?;
+    Ok(record_mailbox_diff(db, &before, &after))
+}
+
+fn custom_folder_of(item: &MailItem, known: &HashSet<String>) -> Option<String> {
+    item.labels
+        .as_ref()?
+        .iter()
+        .find(|l| known.contains(&l.token))
+        .map(|l| crate::folders::folder_label(&l.token))
+}
+
+fn target_folder(system_label: &str, item: &MailItem, known: &HashSet<String>) -> String {
+    if matches!(system_label, "sent" | "archive") {
+        if let Some(label) = custom_folder_of(item, known) {
+            return label;
+        }
+    }
+    system_label.to_string()
+}
+
+struct FolderPage {
+    label: String,
+    items: Vec<MailItem>,
+    total: usize,
+    has_more: bool,
+    next_cursor: Option<String>,
 }
 
 const MESSAGE_ID_BACKFILL_KEY: &str = "message_id_backfill_v1";
@@ -1318,7 +1555,8 @@ async fn run_sync_pass(
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut updated_ids: Vec<String> = Vec::new();
     let mut all_folders_complete = true;
-    let mut failed_inbound: Vec<(&'static str, MailItem)> = Vec::new();
+    let mut failed_inbound: Vec<(String, MailItem)> = Vec::new();
+    let mut mailboxes_changed = false;
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
 
@@ -1338,22 +1576,75 @@ async fn run_sync_pass(
 
     backfill_missing_message_ids(db);
 
+    match sync_custom_folders(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
+        Ok(changed) => mailboxes_changed = changed,
+        Err(msg) => {
+            tracing::warn!("{}", msg);
+            last_err = Some(msg);
+            all_folders_complete = false;
+        }
+    }
+    let custom_folders = db.list_custom_folders().unwrap_or_default();
+    let known_tokens: HashSet<String> = custom_folders.iter().map(|f| f.label_token.clone()).collect();
+
     let queries = build_folder_queries();
-    let total_folders = queries.len();
-    for (folder_idx, folder_query) in queries.iter().enumerate() {
-        emit_sync_progress(folder_query.label, folder_idx, total_folders, 0, 0);
+    let total_folders = queries.len() + custom_folders.len();
+    for folder_idx in 0..total_folders {
+        let system_query = queries.get(folder_idx);
+        let custom_folder = folder_idx
+            .checked_sub(queries.len())
+            .and_then(|i| custom_folders.get(i));
+        let progress_label = match (system_query, custom_folder) {
+            (Some(q), _) => q.label,
+            _ => "folders",
+        };
+        emit_sync_progress(progress_label, folder_idx, total_folders, 0, 0);
         let mut cursor: Option<String> = None;
+        let mut offset: i64 = 0;
         let mut total_fetched = 0usize;
-        let max_per_folder = 2000usize;
+        let max_per_folder = if custom_folder.is_some() {
+            CUSTOM_FOLDER_MAX_ITEMS
+        } else {
+            2000usize
+        };
         loop {
-            let mut q = folder_query.query.clone();
-            q.cursor = cursor.clone();
-            match client.list_mail(&access_token, &q).await {
+            let page: Result<FolderPage, BridgeError> = match (system_query, custom_folder) {
+                (Some(folder_query), _) => {
+                    let mut q = folder_query.query.clone();
+                    q.cursor = cursor.clone();
+                    client.list_mail(&access_token, &q).await.map(|resp| FolderPage {
+                        label: folder_query.label.to_string(),
+                        total: resp.total.max(0) as usize,
+                        has_more: resp.has_more,
+                        next_cursor: resp.next_cursor,
+                        items: resp.items,
+                    })
+                }
+                (None, Some(folder)) => client
+                    .list_folder_mail(&access_token, &folder.label_token, CUSTOM_FOLDER_PAGE, offset)
+                    .await
+                    .map(|resp| {
+                        let fetched = resp.items.len();
+                        FolderPage {
+                            label: crate::folders::folder_label(&folder.label_token),
+                            total: resp.total.max(0) as usize,
+                            has_more: resp.has_more && fetched > 0,
+                            next_cursor: (resp.has_more && fetched > 0).then(String::new),
+                            items: resp
+                                .items
+                                .into_iter()
+                                .filter(|i| i.is_spam != Some(true) && !seen_ids.contains(&i.id))
+                                .collect(),
+                        }
+                    }),
+                (None, None) => break,
+            };
+            match page {
                 Ok(resp) => {
-                    let folder_total = (resp.total as usize).min(max_per_folder);
+                    let folder_total = resp.total.min(max_per_folder);
                     tracing::debug!(
                         "Synced {} page - {} items (total: {}, has_more: {})",
-                        folder_query.label,
+                        progress_label,
                         resp.items.len(),
                         resp.total,
                         resp.has_more
@@ -1361,9 +1652,14 @@ async fn run_sync_pass(
                     let mut new_ids: Vec<String> = Vec::new();
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
+                        let item_folder = if custom_folder.is_some() {
+                            resp.label.clone()
+                        } else {
+                            target_folder(&resp.label, item, &known_tokens)
+                        };
                         let outcome = match prepare_mail_item(
                             db,
-                            folder_query.label,
+                            &item_folder,
                             item,
                             &passphrase,
                             identity_key.as_deref(),
@@ -1419,7 +1715,7 @@ async fn run_sync_pass(
                                 }
                                 let outcome = commit_mail_item(
                                     db,
-                                    folder_query.label,
+                                    &item_folder,
                                     item,
                                     prepared,
                                     downloaded,
@@ -1439,7 +1735,7 @@ async fn run_sync_pass(
                         if outcome.inbound_decrypt_failed
                             && failed_inbound.len() < INBOUND_HEAL_RETRY_CAP
                         {
-                            failed_inbound.push((folder_query.label, item.clone()));
+                            failed_inbound.push((item_folder.clone(), item.clone()));
                         }
                         if outcome.was_new {
                             new_ids.push(item.id.clone());
@@ -1465,6 +1761,7 @@ async fn run_sync_pass(
                                 meta_map
                                     .insert("message_id".to_string(), serde_json::Value::Null);
                                 carry_attachment_meta(db, &item.id, &mut meta_map);
+                                carry_address_meta(db, &item.id, &mut meta_map);
                                 let meta = serde_json::Value::Object(meta_map).to_string();
                                 let _ = db.update_cached_body(&item.id, &plaintext, Some(&meta));
                             }
@@ -1477,7 +1774,7 @@ async fn run_sync_pass(
                     }
                     total_fetched += resp.items.len();
                     emit_sync_progress(
-                        folder_query.label,
+                        progress_label,
                         folder_idx,
                         total_folders,
                         total_fetched.min(folder_total),
@@ -1485,7 +1782,8 @@ async fn run_sync_pass(
                     );
                     let page_all_cached = !resp.items.is_empty() && new_ids.is_empty();
                     let reached_end = !resp.has_more || resp.next_cursor.is_none();
-                    let capped = total_fetched >= max_per_folder;
+                    let capped = total_fetched >= max_per_folder
+                        || (custom_folder.is_some() && offset + CUSTOM_FOLDER_PAGE >= CUSTOM_FOLDER_MAX_ITEMS as i64);
                     let done_with_folder =
                         reached_end || capped || (!deep && page_all_cached);
                     if done_with_folder {
@@ -1495,9 +1793,10 @@ async fn run_sync_pass(
                         break;
                     }
                     cursor = resp.next_cursor;
+                    offset += CUSTOM_FOLDER_PAGE;
                 }
                 Err(e) => {
-                    let msg = format!("failed to sync {}: {}", folder_query.label, e);
+                    let msg = format!("failed to sync {}: {}", progress_label, e);
                     tracing::warn!("{}", msg);
                     last_err = Some(msg);
                     all_folders_complete = false;
@@ -1648,7 +1947,7 @@ async fn run_sync_pass(
         let _ = db.jmap_record_updated_batch("Email", &refs);
     }
 
-    if any_inserted || !destroyed_ids.is_empty() || !updated_ids.is_empty() {
+    if any_inserted || mailboxes_changed || !destroyed_ids.is_empty() || !updated_ids.is_empty() {
         let email_state = db.jmap_state_get("Email").unwrap_or(0);
         let mailbox_state = db.jmap_state_bump("Mailbox").unwrap_or(0);
         let thread_state = db.jmap_state_bump("Thread").unwrap_or(0);
@@ -1899,6 +2198,7 @@ mod tests {
             is_starred: None,
             has_attachments: None,
             attachment_count: None,
+            labels: None,
         }
     }
 
@@ -2153,6 +2453,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_mail_item_keeps_cc_bcc_and_reply_to() {
+        let (_dir, db) = temp_db();
+        // The web app's envelope: recipients as {name, email} objects.
+        let json = serde_json::json!({
+            "subject": "Plans",
+            "from": {"name": "Alice", "email": "alice@example.com"},
+            "to": [{"name": "Bob", "email": "bob@example.com"}],
+            "cc": [{"name": "Carol", "email": "carol@example.com"}, {"name": "", "email": "dan@example.com"}],
+            "bcc": [{"name": "", "email": "erin@example.com"}],
+            "date": "Wed, 21 May 2026 10:00:00 +0000",
+            "body_text": "hi",
+            "raw_headers": [{"name": "Reply-To", "value": "Team <team@example.com>"}]
+        });
+        let item = item_with_envelope("msg-cc", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value =
+            serde_json::from_str(&db.get_cached_message("msg-cc").unwrap().unwrap().raw_headers.unwrap()).unwrap();
+        assert_eq!(meta["cc"], "Carol <carol@example.com>, dan@example.com");
+        assert_eq!(meta["bcc"], "erin@example.com");
+        assert_eq!(meta["reply_to"], "Team <team@example.com>");
+    }
+
+    #[test]
+    fn cache_mail_item_reads_imported_string_recipients() {
+        let (_dir, db) = temp_db();
+        // Imported mail: recipients as plain strings, reply_to as a string.
+        let json = serde_json::json!({
+            "subject": "Invoice",
+            "from": "shop@example.com",
+            "to": ["me@example.com"],
+            "cc": ["accounts@example.com"],
+            "reply_to": "billing@example.com",
+            "body_text": "attached"
+        });
+        let item = item_with_envelope("msg-imported", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value = serde_json::from_str(
+            &db.get_cached_message("msg-imported").unwrap().unwrap().raw_headers.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["cc"], "accounts@example.com");
+        assert_eq!(meta["reply_to"], "billing@example.com");
+        assert!(meta.get("bcc").is_none());
+    }
+
+    #[test]
     fn cache_mail_item_prefers_plain_body_when_no_html() {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
@@ -2375,7 +2721,7 @@ mod tests {
         assert!(!db.body_cached("msg-heal"));
 
         let fresh_keys = [inbound_candidate(&recipient)];
-        let failed = vec![("inbox", item.clone())];
+        let failed = vec![("inbox".to_string(), item.clone())];
         let (new_ids, updated_ids) =
             retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &fresh_keys);
         assert_eq!(new_ids, vec!["msg-heal".to_string()]);
@@ -2397,7 +2743,7 @@ mod tests {
         let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &stale_keys);
         assert!(outcome.inbound_decrypt_failed);
 
-        let failed = vec![("inbox", item)];
+        let failed = vec![("inbox".to_string(), item)];
         let (new_ids, updated_ids) =
             retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &stale_keys);
         assert!(new_ids.is_empty());
@@ -2561,6 +2907,107 @@ mod tests {
         assert_eq!(db.get_cached_message("msg-noflags").unwrap().unwrap().flags, 5);
     }
 
+    #[test]
+    fn received_mail_keeps_cc_bcc_and_reply_to_from_the_envelope() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({
+            "subject": "team",
+            "body_text": "b",
+            "from": {"name": "Ann", "email": "ann@x.test"},
+            "to": [{"name": "", "email": "me@aster.test"}],
+            "cc": [{"name": "Carol", "email": "carol@x.test"}, {"name": "Doe, John", "email": "john@x.test"}],
+            "bcc": [],
+            "raw_headers": [{"name": "Reply-To", "value": "Help Desk <desk@x.test>"}]
+        });
+        let item = item_with_envelope("msg-cc", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let cached = db.get_cached_message("msg-cc").unwrap().unwrap();
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["cc"], "Carol <carol@x.test>, \"Doe, John\" <john@x.test>");
+        assert!(meta.get("bcc").is_none());
+        assert_eq!(meta["reply_to"], "Help Desk <desk@x.test>");
+
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(rendered.contains("Cc: Carol <carol@x.test>, \"Doe, John\" <john@x.test>\r\n"));
+        assert!(rendered.contains("Reply-To: Help Desk <desk@x.test>\r\n"));
+        assert!(!rendered.contains("Bcc:"));
+    }
+
+    #[test]
+    fn bridge_sent_and_appended_mail_keeps_string_array_cc() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({
+            "subject": "s",
+            "body_text": "b",
+            "cc": ["bob@old.example", "eve@old.example"],
+            "bcc": ["hidden@old.example"],
+            "reply_to": "list@old.example"
+        });
+        let item = item_with_envelope("msg-append-cc", &json);
+        assert!(cache_mail_item(&db, "sent", &item, b"pass", None, &[], &[]).was_new);
+        let cached = db.get_cached_message("msg-append-cc").unwrap().unwrap();
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(rendered.contains("Cc: bob@old.example, eve@old.example\r\n"));
+        assert!(rendered.contains("Bcc: hidden@old.example\r\n"));
+        assert!(rendered.contains("Reply-To: list@old.example\r\n"));
+    }
+
+    #[test]
+    fn a_cached_message_without_addresses_is_backfilled_once() {
+        let (_dir, db) = temp_db();
+        let legacy_meta = serde_json::json!({"is_html": false, "message_id": "<m@x.test>"}).to_string();
+        db.upsert_cached_message(
+            "msg-legacy-cc",
+            "inbox",
+            Some("old"),
+            Some("ann@x.test"),
+            Some("me@aster.test"),
+            Some("2026-06-14T00:00:00Z"),
+            1,
+            Some("b"),
+            Some(&legacy_meta),
+        )
+        .unwrap();
+        let first_uid = db.assign_uid_if_missing("inbox", "msg-legacy-cc").unwrap();
+        let json = serde_json::json!({
+            "subject": "old",
+            "body_text": "fresh body must not replace the cached one",
+            "cc": [{"name": "", "email": "carol@x.test"}]
+        });
+        let item = item_with_envelope("msg-legacy-cc", &json);
+
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        assert!(!outcome.was_new);
+        assert!(outcome.flags_changed, "backfill must be reported so JMAP clients refetch");
+        let cached = db.get_cached_message("msg-legacy-cc").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("b"));
+        assert!(cached.imap_uid > first_uid, "IMAP clients must refetch the message");
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["cc"], "carol@x.test");
+        assert_eq!(meta["message_id"], "<m@x.test>");
+        assert_eq!(meta[ADDRESS_META_VERSION_KEY], 1);
+
+        let again = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        assert!(!again.flags_changed);
+        assert_eq!(db.get_cached_message("msg-legacy-cc").unwrap().unwrap().imap_uid, cached.imap_uid);
+    }
+
+    #[test]
+    fn a_cached_message_with_no_addresses_keeps_its_uid() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b"});
+        let item = item_with_envelope("msg-no-cc", &json);
+        db.upsert_cached_message("msg-no-cc", "inbox", Some("s"), None, None, None, 1, Some("b"), Some("{\"is_html\":false}"))
+            .unwrap();
+        let uid = db.assign_uid_if_missing("inbox", "msg-no-cc").unwrap();
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        assert!(!outcome.flags_changed);
+        let cached = db.get_cached_message("msg-no-cc").unwrap().unwrap();
+        assert_eq!(cached.imap_uid, uid);
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta[ADDRESS_META_VERSION_KEY], 1);
+    }
+
     fn mock_session() -> Arc<RwLock<crate::auth::session::Session>> {
         Arc::new(RwLock::new(crate::auth::session::Session {
             data_kek: None,
@@ -2654,6 +3101,10 @@ mod tests {
                     let drafts_body = drafts_body.clone();
                     async move { Json(drafts_body) }
                 }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2681,6 +3132,129 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
         }))
+    }
+
+    async fn spawn_mock_server_with_folders(
+        labels: Vec<serde_json::Value>,
+        folder_items: Vec<(&'static str, serde_json::Value)>,
+    ) -> String {
+        use axum::extract::Query;
+        use axum::{routing::get, Json, Router};
+        let labels_body = serde_json::json!({"labels": labels, "has_more": false});
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let items: Vec<serde_json::Value> = match q.get("label_token") {
+                        Some(token) => folder_items
+                            .iter()
+                            .filter(|(t, _)| t == token)
+                            .map(|(_, item)| item.clone())
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    async move {
+                        let total = items.len();
+                        Json(serde_json::json!({
+                            "items": items,
+                            "total": total,
+                            "has_more": false,
+                            "next_cursor": serde_json::Value::Null
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                get(|| async {
+                    Json(serde_json::json!({"items": [], "has_more": false, "next_cursor": null}))
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(move || {
+                    let labels_body = labels_body.clone();
+                    async move { Json(labels_body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn label_json(id: &str, token: &str, name: &str, parent: Option<&str>) -> serde_json::Value {
+        let (encrypted_name, name_nonce) =
+            crate::crypto::folder::encrypt_folder_name(name, "test-ik").unwrap();
+        serde_json::json!({
+            "id": id,
+            "label_token": token,
+            "encrypted_name": encrypted_name,
+            "name_nonce": name_nonce,
+            "is_system": false,
+            "is_password_protected": false,
+            "sort_order": 0,
+            "parent_token": parent,
+            "folder_type": "custom"
+        })
+    }
+
+    #[tokio::test]
+    async fn sync_pass_pulls_custom_folders_and_their_mail() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let labels = vec![
+            label_json("srv-w", "tok_w", "Work", None),
+            label_json("srv-r", "tok_r", "Reports", Some("tok_w")),
+            label_json("srv-locked", "tok_locked", "Hidden", None),
+            serde_json::json!({
+                "id": "srv-sys",
+                "label_token": "tok_sys",
+                "encrypted_name": "x",
+                "name_nonce": "y",
+                "is_system": true
+            }),
+        ];
+        let mut labels = labels;
+        labels[2]["is_password_protected"] = serde_json::json!(true);
+        let base = spawn_mock_server_with_folders(
+            labels,
+            vec![
+                ("tok_w", server_item_json("in-work", "work mail")),
+                ("tok_r", server_item_json("in-reports", "quarterly report")),
+            ],
+        )
+        .await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session_with_identity_key("test-ik");
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        let mut folders = db.list_custom_folders().unwrap();
+        folders.sort_by(|a, b| a.label_token.cmp(&b.label_token));
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].label_token, "tok_r");
+        assert_eq!(folders[0].name, "Reports");
+        assert_eq!(folders[0].parent_token.as_deref(), Some("tok_w"));
+        assert_eq!(folders[0].server_id, "srv-r");
+        assert_eq!(folders[1].name, "Work");
+        assert_eq!(folders[1].parent_token, None);
+
+        assert_eq!(db.get_cached_message("in-work").unwrap().unwrap().folder, "folder:tok_w");
+        assert_eq!(
+            db.get_cached_message("in-reports").unwrap().unwrap().folder,
+            "folder:tok_r"
+        );
+
+        let mailboxes = db.list_jmap_mailboxes().unwrap();
+        let reports = mailboxes
+            .iter()
+            .find(|m| m.name == "Reports")
+            .expect("Reports mailbox");
+        let work = mailboxes.iter().find(|m| m.name == "Work").expect("Work mailbox");
+        assert_eq!(reports.parent_id.as_deref(), Some(work.id.as_str()));
     }
 
     #[tokio::test]

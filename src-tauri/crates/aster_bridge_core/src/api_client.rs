@@ -231,6 +231,8 @@ pub struct ImportedEmail<'a> {
     pub attachment_count: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_token: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -458,6 +460,65 @@ pub struct MailItem {
     pub has_attachments: Option<bool>,
     #[serde(default)]
     pub attachment_count: Option<i16>,
+    #[serde(default)]
+    pub labels: Option<Vec<MailItemLabel>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MailItemLabel {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FolderDefinition {
+    pub id: String,
+    pub label_token: String,
+    pub encrypted_name: String,
+    pub name_nonce: String,
+    #[serde(default)]
+    pub is_system: bool,
+    #[serde(default)]
+    pub is_password_protected: bool,
+    #[serde(default)]
+    pub sort_order: i16,
+    #[serde(default)]
+    pub parent_token: Option<String>,
+    #[serde(default)]
+    pub folder_type: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FolderListResponse {
+    pub labels: Vec<FolderDefinition>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFolderResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateFolderBody<'a> {
+    pub label_token: &'a str,
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
+    pub folder_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct UpdateFolderBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_nonce: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1273,6 +1334,139 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub const MAX_BULK_FOLDER_ITEMS: usize = 100;
+    pub const FOLDER_PAGE_LIMIT: i64 = 500;
+
+    pub async fn list_folders(&self, access_token: &str) -> Result<Vec<FolderDefinition>> {
+        let mut out = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let resp = self
+                .client
+                .get(format!("{}/mail/v1/labels", self.base_url))
+                .bearer_auth(access_token)
+                .query(&[
+                    ("include_system", "false".to_string()),
+                    ("limit", Self::FOLDER_PAGE_LIMIT.to_string()),
+                    ("offset", offset.to_string()),
+                ])
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+            let page: FolderListResponse = resp.json().await?;
+            let fetched = page.labels.len() as i64;
+            out.extend(page.labels);
+            if !page.has_more || fetched == 0 || offset >= 20_000 {
+                return Ok(out);
+            }
+            offset += fetched;
+        }
+    }
+
+    pub async fn create_folder(&self, access_token: &str, body: &CreateFolderBody<'_>) -> Result<String> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/labels", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        let parsed: CreateFolderResponse = resp.json().await?;
+        Ok(parsed.id)
+    }
+
+    pub async fn update_folder(
+        &self,
+        access_token: &str,
+        folder_id: &str,
+        body: &UpdateFolderBody<'_>,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!("{}/mail/v1/labels/{}", self.base_url, urlencoding_path(folder_id)))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_folder(&self, access_token: &str, folder_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/labels/{}", self.base_url, urlencoding_path(folder_id)))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({"purge_contents": false}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn move_to_folder(&self, access_token: &str, item_ids: &[String], label_token: &str) -> Result<()> {
+        self.bulk_folder_request(access_token, "bulk/labels", item_ids, label_token).await
+    }
+
+    pub async fn remove_from_folder(&self, access_token: &str, item_ids: &[String], label_token: &str) -> Result<()> {
+        self.bulk_folder_request(access_token, "bulk/labels/remove", item_ids, label_token).await
+    }
+
+    async fn bulk_folder_request(
+        &self,
+        access_token: &str,
+        route: &str,
+        item_ids: &[String],
+        label_token: &str,
+    ) -> Result<()> {
+        for chunk in item_ids.chunks(Self::MAX_BULK_FOLDER_ITEMS) {
+            let resp = self
+                .client
+                .post(format!("{}/bridge/v1/messages/{}", self.base_url, route))
+                .bearer_auth(access_token)
+                .json(&serde_json::json!({"ids": chunk, "label_token": label_token}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_folder_mail(
+        &self,
+        access_token: &str,
+        label_token: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<MailListResponse> {
+        let resp = self
+            .client
+            .get(format!("{}/bridge/v1/messages", self.base_url))
+            .bearer_auth(access_token)
+            .query(&[
+                ("label_token", label_token.to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        resp.json().await.map_err(BridgeError::from)
     }
 
     pub async fn send_mail(

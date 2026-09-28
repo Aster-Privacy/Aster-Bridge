@@ -19,6 +19,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 pub mod accept;
+pub mod address;
 pub mod account_state;
 pub mod api_client;
 pub mod auth;
@@ -30,6 +31,8 @@ pub mod db;
 pub mod diagnostics;
 pub mod error;
 pub mod events;
+pub mod folder_ops;
+pub mod folders;
 pub mod imap;
 pub mod jmap;
 pub mod message_render;

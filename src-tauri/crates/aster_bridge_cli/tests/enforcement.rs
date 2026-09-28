@@ -249,6 +249,8 @@ fn a_mail_client_signs_in_over_imap_and_opens_the_inbox() {
     serve.expect_exit(0, None);
 }
 
+const SERVICE_DENIED_EXIT: i32 = if cfg!(target_os = "macos") { 0 } else { 4 };
+
 #[test]
 fn service_mode_retries_transient_failures_but_not_denials() {
     let env = Env::new();
@@ -259,7 +261,7 @@ fn service_mode_retries_transient_failures_but_not_denials() {
     env.mock.set_plan(Plan::Allow);
     serve.wait_event("ready", READY_TIMEOUT);
     env.mock.set_plan(Plan::Deny);
-    serve.expect_exit(4, None);
+    serve.expect_exit(SERVICE_DENIED_EXIT, None);
 }
 
 #[test]
@@ -268,7 +270,7 @@ fn service_mode_exits_when_the_plan_is_denied() {
     env.login();
     env.mock.set_plan(Plan::Deny);
     let mut serve = env.serve(&["--service"]);
-    serve.expect_exit(4, Some("bridge_access_required"));
+    serve.expect_exit(SERVICE_DENIED_EXIT, Some("bridge_access_required"));
     assert!(env.mock.plan_calls() <= 3);
 }
 

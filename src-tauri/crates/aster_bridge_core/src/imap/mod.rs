@@ -20,4 +20,5 @@
 //
 pub mod append;
 pub mod heartbeat;
+pub mod mutf7;
 pub mod server;

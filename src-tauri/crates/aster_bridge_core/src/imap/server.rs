@@ -29,6 +29,7 @@ use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
 use crate::db::{CachedMessage, Database};
 use crate::error::Result;
+use crate::folder_ops::FolderOpError;
 use crate::jmap::state::StateChange;
 
 const IDLE_KEEPALIVE_SECS: u64 = 5 * 60;
@@ -298,8 +299,9 @@ fn cached_header_value(msg: &CachedMessage, field: &str) -> Option<String> {
         "from" | "sender" => msg.sender.clone(),
         "to" => msg.recipients.clone(),
         "date" => msg.date.clone(),
-        "cc" => meta_string("cc"),
-        "bcc" => meta_string("bcc"),
+        "cc" => crate::address::meta_address_text(&meta(), "cc"),
+        "bcc" => crate::address::meta_address_text(&meta(), "bcc"),
+        "reply-to" => crate::address::meta_address_text(&meta(), "reply_to"),
         "message-id" => meta_string("message_id"),
         "in-reply-to" => meta_string("in_reply_to"),
         "references" => meta_string("references"),
@@ -534,24 +536,21 @@ fn flags_to_str(flags: u32) -> String {
     list.join(" ")
 }
 
-const IMAP_FOLDERS: &[(&str, &str, &str)] = &[
-    ("INBOX", "inbox", ""),
-    ("Sent", "sent", "\\Sent"),
-    ("Drafts", "drafts", "\\Drafts"),
-    ("Trash", "trash", "\\Trash"),
-    ("Junk", "spam", "\\Junk"),
-    ("Archive", "archive", "\\Archive"),
-];
-
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
 const MAX_DRAINABLE_APPEND_BYTES: usize = 256 * 1024 * 1024;
 
-fn existing_mailbox(name: &str) -> Option<&'static str> {
-    let cleaned = name.trim().trim_matches('"').trim_end_matches(['/', '.']);
-    IMAP_FOLDERS
-        .iter()
-        .find(|(display, _, _)| display.eq_ignore_ascii_case(cleaned))
-        .map(|(_, internal, _)| *internal)
+fn mailbox_directory(db: &Database) -> crate::folders::Directory {
+    crate::folders::Directory::build(&db.list_custom_folders().unwrap_or_default())
+}
+
+fn resolve_mailbox(db: &Database, raw: &str) -> Option<crate::folders::MailboxEntry> {
+    mailbox_directory(db)
+        .resolve(&crate::imap::mutf7::decode_lenient(raw))
+        .cloned()
+}
+
+fn quote_imap_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -941,38 +940,33 @@ where
             }
             "LIST" => {
                 require_auth!(conn, writer, tag);
-                handle_list(&mut writer, &tag, &args).await?;
+                handle_list(&mut writer, &db, &tag, &args, "LIST").await?;
             }
             "LSUB" => {
                 require_auth!(conn, writer, tag);
-                handle_lsub(&mut writer, &tag, &args).await?;
+                handle_list(&mut writer, &db, &tag, &args, "LSUB").await?;
             }
             "SUBSCRIBE" | "UNSUBSCRIBE" => {
                 require_auth!(conn, writer, tag);
                 write_ok(&mut writer, &tag, "completed").await?;
             }
-            "CREATE" => {
+            "CREATE" | "DELETE" | "RENAME" => {
                 require_auth!(conn, writer, tag);
-                let requested = parse_imap_atom_or_quoted(args.trim()).0;
-                if existing_mailbox(&requested).is_some() {
-                    write_ok(&mut writer, &tag, "CREATE completed").await?;
-                } else {
-                    write_no(
-                        &mut writer,
-                        &tag,
-                        "[CANNOT] folder management is not supported; folders mirror your Aster account",
-                    )
-                    .await?;
+                let outcome = match command.as_str() {
+                    "CREATE" => handle_create(&db, &client, &session, &args).await,
+                    "DELETE" => handle_delete(&db, &client, &session, &args).await,
+                    _ => handle_rename(&db, &client, &session, &args).await,
+                };
+                match outcome {
+                    Ok(changed) => {
+                        if changed {
+                            announce_mailbox_change(&db, &broadcaster);
+                            crate::sync::poller::try_kick_sync();
+                        }
+                        write_ok(&mut writer, &tag, &format!("{} completed", command)).await?;
+                    }
+                    Err(msg) => write_no(&mut writer, &tag, &msg).await?,
                 }
-            }
-            "DELETE" | "RENAME" => {
-                require_auth!(conn, writer, tag);
-                write_no(
-                    &mut writer,
-                    &tag,
-                    "[CANNOT] folder management is not supported; folders mirror your Aster account",
-                )
-                .await?;
             }
             "SORT" | "THREAD" => {
                 require_auth!(conn, writer, tag);
@@ -1428,26 +1422,23 @@ where
             }
             "STATUS" => {
                 require_auth!(conn, writer, tag);
-                let mailbox = args.split(' ').next().unwrap_or("").trim_matches('"');
-                let aster_folder = match IMAP_FOLDERS
-                    .iter()
-                    .find(|(imap, _, _)| imap.eq_ignore_ascii_case(mailbox))
-                    .map(|(_, f, _)| *f)
-                {
-                    Some(f) => f,
+                let mailbox = parse_imap_atom_or_quoted(&args).0;
+                let entry = match resolve_mailbox(&db, &mailbox) {
+                    Some(entry) => entry,
                     None => {
                         write_no(&mut writer, &tag, "[NONEXISTENT] No such mailbox").await?;
                         continue;
                     }
                 };
+                let aster_folder = entry.label.as_str();
                 let count = db.count_cached_messages(aster_folder).unwrap_or(0);
                 let max_uid = db.max_uid(aster_folder).unwrap_or(0);
                 let unseen = db.count_unread_messages(aster_folder).unwrap_or(0);
                 writer
                     .write_all(
                         format!(
-                            "* STATUS \"{}\" (MESSAGES {} RECENT 0 UNSEEN {} UIDVALIDITY {} UIDNEXT {})\r\n",
-                            mailbox,
+                            "* STATUS {} (MESSAGES {} RECENT 0 UNSEEN {} UIDVALIDITY {} UIDNEXT {})\r\n",
+                            quote_imap_string(&mailbox),
                             count,
                             unseen,
                             uid_validity(&db),
@@ -1461,12 +1452,10 @@ where
             "APPEND" => {
                 require_auth!(conn, writer, tag);
                 let command = crate::imap::append::parse_append_command(&args);
-                let target_folder = command.as_ref().and_then(|cmd| {
-                    IMAP_FOLDERS
-                        .iter()
-                        .find(|(imap, _, _)| imap.eq_ignore_ascii_case(&cmd.mailbox))
-                        .map(|(_, f, _)| *f)
-                });
+                let target_folder: Option<String> = command
+                    .as_ref()
+                    .and_then(|cmd| resolve_mailbox(&db, &cmd.mailbox))
+                    .map(|entry| entry.label);
                 match command {
                     Some(cmd) if cmd.literal_len > MAX_APPEND_BYTES => {
                         if cmd.non_sync {
@@ -1501,7 +1490,7 @@ where
                         }
                         let mut trailer = [0u8; 2];
                         let _ = reader.read_exact(&mut trailer).await;
-                        match target_folder {
+                        match target_folder.as_deref() {
                             None => {
                                 write_no(&mut writer, &tag, "[TRYCREATE] No such mailbox").await?;
                             }
@@ -1938,35 +1927,90 @@ pub(crate) async fn append_draft(
     Ok((uid, created.id))
 }
 
+/// How far apart the appended copy's `Date` and a stored Sent message's date
+/// may be for a subject match to count as the same message. A client saving
+/// what it just sent does so within moments; anything further apart is a
+/// different message that happens to share a subject.
+const SENT_COPY_SUBJECT_WINDOW_SECS: i64 = 10 * 60;
+
+/// The subject fallback is for a message sent moments ago, so it only runs
+/// when the appended message's `Date` is this recent. Older mail copied in
+/// from another account never qualifies, however close two of its replies
+/// were to each other.
+const SENT_COPY_RECENT_SECS: i64 = 60 * 60;
+
 fn find_appended_sent_copy(db: &Database, raw_message: &[u8]) -> Option<u32> {
+    find_appended_sent_copy_at(db, raw_message, chrono::Utc::now())
+}
+
+fn find_appended_sent_copy_at(
+    db: &Database,
+    raw_message: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u32> {
     use mail_parser::MessageParser;
     let parsed = MessageParser::default().parse(raw_message)?;
     let message_id = parsed
         .message_id()
-        .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
+        .map(normalize_message_id)
         .filter(|s| !s.is_empty());
     let subject = parsed.subject().map(|s| s.to_string());
+    let sent_at = parsed
+        .date()
+        .and_then(|d| chrono::DateTime::from_timestamp(d.to_timestamp(), 0));
     let messages = db.list_cached_message_meta("sent").ok()?;
     if let Some(mid) = message_id {
-        if let Some(m) = messages.iter().rev().find(|m| {
-            m.raw_headers
-                .as_deref()
-                .is_some_and(|rh| rh.contains(mid.as_str()))
-        }) {
-            return Some(m.imap_uid);
-        }
-    }
-    if let Some(subj) = subject {
+        // The stored message's own Message-ID, not any id in its metadata:
+        // a reply lists the message it answers in `in_reply_to` and
+        // `references`, and matching those treated the original as already
+        // saved and dropped it.
         if let Some(m) = messages
             .iter()
             .rev()
-            .take(20)
-            .find(|m| m.subject.as_deref() == Some(subj.as_str()))
+            .find(|m| stored_message_id(m).is_some_and(|s| s.eq_ignore_ascii_case(&mid)))
         {
             return Some(m.imap_uid);
         }
     }
-    None
+    // Only a copy of something sent moments ago falls back to the subject:
+    // replies in a thread, and older mail being copied in, share subjects
+    // with messages that are already stored.
+    let (Some(subj), Some(sent_at)) = (subject, sent_at) else {
+        return None;
+    };
+    if (now - sent_at).num_seconds().abs() > SENT_COPY_RECENT_SECS {
+        return None;
+    }
+    messages
+        .iter()
+        .rev()
+        .take(20)
+        .find(|m| {
+            m.subject.as_deref() == Some(subj.as_str())
+                && m.date
+                    .as_deref()
+                    .and_then(parse_cached_date)
+                    .is_some_and(|d| {
+                        (d - sent_at).num_seconds().abs() <= SENT_COPY_SUBJECT_WINDOW_SECS
+                    })
+        })
+        .map(|m| m.imap_uid)
+}
+
+fn normalize_message_id(raw: &str) -> String {
+    raw.trim().trim_matches(&['<', '>'][..]).trim().to_string()
+}
+
+fn stored_message_id(m: &CachedMessage) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.raw_headers.as_deref()?).ok()?;
+    meta.get("message_id")
+        .and_then(|v| v.as_str())
+        .map(normalize_message_id)
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_cached_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_datetime_lenient(raw).map(|d| d.with_timezone(&chrono::Utc))
 }
 
 const APPEND_KEEPALIVE_SECS: u64 = 20;
@@ -2127,95 +2171,317 @@ pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
 }
 
 fn imap_glob_match(pattern: &str, name: &str) -> bool {
-    if pattern == "*" { return true; }
-    let p = pattern.to_ascii_uppercase();
-    let n = name.to_ascii_uppercase();
-    if p.contains('*') {
-        let parts: Vec<&str> = p.split('*').collect();
-        let mut pos = 0usize;
-        for part in &parts {
-            if part.is_empty() { continue; }
-            if let Some(idx) = n[pos..].find(part as &str) {
-                pos += idx + part.len();
-            } else {
-                return false;
-            }
+    let p: Vec<char> = pattern.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let n: Vec<char> = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let mut matches = vec![vec![false; n.len() + 1]; p.len() + 1];
+    matches[p.len()][n.len()] = true;
+    for i in (0..p.len()).rev() {
+        for j in (0..=n.len()).rev() {
+            matches[i][j] = match p[i] {
+                '*' => matches[i + 1][j] || (j < n.len() && matches[i][j + 1]),
+                '%' => matches[i + 1][j] || (j < n.len() && n[j] != '/' && matches[i][j + 1]),
+                c => j < n.len() && n[j] == c && matches[i + 1][j + 1],
+            };
         }
-        return true;
     }
-    if p.contains('%') {
-        let parts: Vec<&str> = p.split('%').collect();
-        let mut pos = 0usize;
-        for part in &parts {
-            if part.is_empty() { continue; }
-            if let Some(idx) = n[pos..].find(part as &str) {
-                if n[pos..pos + idx].contains('/') { return false; }
-                pos += idx + part.len();
-            } else {
-                return false;
-            }
+    matches[0][0]
+}
+
+fn skip_list_selection(args: &str) -> &str {
+    let trimmed = args.trim_start();
+    if !trimmed.starts_with('(') {
+        return trimmed;
+    }
+    match trimmed.find(')') {
+        Some(close) => trimmed[close + 1..].trim_start(),
+        None => "",
+    }
+}
+
+fn parse_list_patterns(input: &str) -> Vec<String> {
+    let trimmed = input.trim_start();
+    let Some(inner) = trimmed.strip_prefix('(') else {
+        return vec![parse_imap_atom_or_quoted(trimmed).0];
+    };
+    let mut rest = match inner.find(')') {
+        Some(close) => &inner[..close],
+        None => inner,
+    };
+    let mut patterns = Vec::new();
+    while !rest.trim().is_empty() {
+        let (pattern, remainder) = parse_imap_atom_or_quoted(rest);
+        if remainder.len() >= rest.len() {
+            break;
         }
-        return !n[pos..].contains('/');
+        patterns.push(pattern);
+        rest = remainder;
     }
-    p == n
+    patterns
+}
+
+fn list_attributes(entry: &crate::folders::MailboxEntry) -> String {
+    let children = if entry.has_children {
+        "\\HasChildren"
+    } else {
+        "\\HasNoChildren"
+    };
+    if entry.special_use.is_empty() {
+        children.to_string()
+    } else {
+        format!("{} {}", children, entry.special_use)
+    }
 }
 
 async fn handle_list(
     writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
     tag: &str,
     args: &str,
+    verb: &str,
 ) -> std::io::Result<()> {
-    let (_, rest) = parse_imap_atom_or_quoted(args);
-    let rest = rest.trim();
-    let (pattern, _) = parse_imap_atom_or_quoted(rest);
+    let (reference, rest) = parse_imap_atom_or_quoted(skip_list_selection(args));
+    let patterns = parse_list_patterns(rest);
 
-    if pattern.is_empty() {
-        writer.write_all(b"* LIST (\\Noselect) \"/\" \"\"\r\n").await?;
-        return write_ok(writer, tag, "LIST completed").await;
+    if patterns.iter().all(|p| p.is_empty()) {
+        writer
+            .write_all(format!("* {} (\\Noselect) \"/\" \"\"\r\n", verb).as_bytes())
+            .await?;
+        return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
 
-    for (imap_name, _, flags) in IMAP_FOLDERS {
-        if imap_glob_match(&pattern, imap_name) {
-            let attrs = if flags.is_empty() {
-                "\\HasNoChildren".to_string()
-            } else {
-                format!("\\HasNoChildren {}", flags)
-            };
-            writer
-                .write_all(format!("* LIST ({}) \"/\" \"{}\"\r\n", attrs, imap_name).as_bytes())
-                .await?;
+    let full_patterns: Vec<String> = patterns
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{}{}", reference, p))
+        .collect();
+    for entry in &mailbox_directory(db).entries {
+        let encoded = crate::imap::mutf7::encode(&entry.path);
+        if !full_patterns.iter().any(|p| imap_glob_match(p, &encoded)) {
+            continue;
         }
+        writer
+            .write_all(
+                format!(
+                    "* {} ({}) \"/\" {}\r\n",
+                    verb,
+                    list_attributes(entry),
+                    quote_imap_string(&encoded)
+                )
+                .as_bytes(),
+            )
+            .await?;
     }
-    write_ok(writer, tag, "LIST completed").await
+    write_ok(writer, tag, &format!("{} completed", verb)).await
 }
 
-async fn handle_lsub(
-    writer: &mut (impl AsyncWrite + Unpin),
-    tag: &str,
-    args: &str,
-) -> std::io::Result<()> {
-    let (_, rest) = parse_imap_atom_or_quoted(args);
-    let rest = rest.trim();
-    let (pattern, _) = parse_imap_atom_or_quoted(rest);
+fn announce_mailbox_change(db: &Database, broadcaster: &broadcast::Sender<StateChange>) {
+    let email_state = db.jmap_state_get("Email").unwrap_or(0);
+    let mailbox_state = db.jmap_state_get("Mailbox").unwrap_or(0);
+    let thread_state = db.jmap_state_get("Thread").unwrap_or(0);
+    let mut changed = std::collections::HashMap::new();
+    changed.insert("Email".to_string(), email_state.to_string());
+    changed.insert("Mailbox".to_string(), mailbox_state.to_string());
+    changed.insert("Thread".to_string(), thread_state.to_string());
+    let _ = broadcaster.send(StateChange { changed });
+}
 
-    if pattern.is_empty() {
-        writer.write_all(b"* LSUB (\\Noselect) \"/\" \"\"\r\n").await?;
-        return write_ok(writer, tag, "LSUB completed").await;
+async fn folder_credentials(
+    session: &Arc<RwLock<Session>>,
+) -> std::result::Result<(String, String), FolderOpError> {
+    let s = session.read().await;
+    match s.identity_key.clone() {
+        Some(key) => Ok((s.access_token.to_string(), key)),
+        None => Err(FolderOpError::Locked),
     }
+}
 
-    for (imap_name, _, flags) in IMAP_FOLDERS {
-        if imap_glob_match(&pattern, imap_name) {
-            let attrs = if flags.is_empty() {
-                "\\HasNoChildren".to_string()
-            } else {
-                format!("\\HasNoChildren {}", flags)
-            };
-            writer
-                .write_all(format!("* LSUB ({}) \"/\" \"{}\"\r\n", attrs, imap_name).as_bytes())
-                .await?;
+async fn ensure_folder_path(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: &str,
+    segments: &[String],
+    forbidden_ancestor: Option<&str>,
+) -> std::result::Result<Option<String>, FolderOpError> {
+    let directory = mailbox_directory(db);
+    let mut parent: Option<String> = None;
+    let mut first_missing = segments.len();
+    for i in 0..segments.len() {
+        let path = segments[..=i].join("/");
+        match directory.resolve(&path).and_then(|e| e.folder.as_ref()) {
+            Some(node) => {
+                if let Some(ancestor) = forbidden_ancestor {
+                    if directory.is_descendant(&node.token, ancestor) {
+                        return Err(FolderOpError::Cycle);
+                    }
+                }
+                parent = Some(node.token.clone());
+            }
+            None => {
+                first_missing = i;
+                break;
+            }
         }
     }
-    write_ok(writer, tag, "LSUB completed").await
+    let mut names = Vec::new();
+    for segment in &segments[first_missing..] {
+        let name = crate::folders::segment_to_name(segment);
+        crate::folders::validate_name(name.trim())
+            .map_err(|msg| FolderOpError::Invalid(msg.to_string()))?;
+        names.push(name);
+    }
+    for name in names {
+        let token = crate::folder_ops::create(
+            db,
+            client,
+            access_token,
+            identity_key,
+            &name,
+            parent.as_deref(),
+        )
+        .await?;
+        parent = Some(token);
+    }
+    Ok(parent)
+}
+
+fn parse_folder_path(raw: &str) -> std::result::Result<Vec<String>, FolderOpError> {
+    let decoded = crate::imap::mutf7::decode_lenient(raw);
+    let segments = crate::folders::split_path(&decoded)
+        .ok_or_else(|| FolderOpError::Invalid("invalid mailbox name".to_string()))?;
+    if crate::folders::system_mailbox(&segments[0]).is_some() {
+        return Err(FolderOpError::Invalid(format!(
+            "{} cannot contain folders; create the folder at the top level instead",
+            segments[0]
+        )));
+    }
+    Ok(segments)
+}
+
+async fn handle_create(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let raw = parse_imap_atom_or_quoted(args).0;
+    if let Some(entry) = resolve_mailbox(db, &raw) {
+        if entry.folder.is_none() {
+            return Ok(false);
+        }
+        return Err(FolderOpError::AlreadyExists.imap_response());
+    }
+    let segments = parse_folder_path(&raw).map_err(|e| e.imap_response())?;
+    let (access_token, identity_key) =
+        folder_credentials(session).await.map_err(|e| e.imap_response())?;
+    let before = db.list_custom_folders()?;
+    let created =
+        ensure_folder_path(db, client, &access_token, &identity_key, &segments, None).await;
+    let after = db.list_custom_folders()?;
+    let changed = crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    created.map(|_| changed).map_err(|e| e.imap_response())
+}
+
+async fn handle_delete(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let raw = parse_imap_atom_or_quoted(args).0;
+    let Some(entry) = resolve_mailbox(db, &raw) else {
+        return Err(FolderOpError::NotFound.imap_response());
+    };
+    let Some(node) = entry.folder.as_ref() else {
+        return Err("[CANNOT] system mailboxes cannot be deleted".to_string());
+    };
+    let access_token = session.read().await.access_token.to_string();
+    let before = db.list_custom_folders()?;
+    crate::folder_ops::delete(db, client, &access_token, &node.token)
+        .await
+        .map_err(|e| e.imap_response())?;
+    let after = db.list_custom_folders()?;
+    crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    Ok(true)
+}
+
+async fn handle_rename(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    args: &str,
+) -> std::result::Result<bool, String> {
+    let (old_raw, rest) = parse_imap_atom_or_quoted(args);
+    let new_raw = parse_imap_atom_or_quoted(rest).0;
+    let directory = mailbox_directory(db);
+    let Some(source) = directory
+        .resolve(&crate::imap::mutf7::decode_lenient(&old_raw))
+        .cloned()
+    else {
+        return Err(FolderOpError::NotFound.imap_response());
+    };
+    let Some(node) = source.folder.clone() else {
+        return Err("[CANNOT] system mailboxes cannot be renamed".to_string());
+    };
+    let new_path = crate::imap::mutf7::decode_lenient(&new_raw);
+    if let Some(existing) = directory.resolve(&new_path) {
+        if existing.label != source.label {
+            return Err(FolderOpError::AlreadyExists.imap_response());
+        }
+    }
+    let segments = parse_folder_path(&new_raw).map_err(|e| e.imap_response())?;
+    let Some((last, parents)) = segments.split_last() else {
+        return Err("[CANNOT] invalid mailbox name".to_string());
+    };
+    let new_name = crate::folders::segment_to_name(last);
+    let (access_token, identity_key) =
+        folder_credentials(session).await.map_err(|e| e.imap_response())?;
+    let before = db.list_custom_folders()?;
+    let renamed = rename_folder(
+        db,
+        client,
+        &access_token,
+        &identity_key,
+        parents,
+        &node.token,
+        &new_name,
+    )
+    .await;
+    let after = db.list_custom_folders()?;
+    let changed = crate::sync::poller::record_mailbox_diff(db, &before, &after);
+    renamed.map(|_| changed).map_err(|e| e.imap_response())
+}
+
+async fn rename_folder(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: &str,
+    parents: &[String],
+    token: &str,
+    new_name: &str,
+) -> std::result::Result<(), FolderOpError> {
+    crate::folders::validate_name(new_name.trim())
+        .map_err(|msg| FolderOpError::Invalid(msg.to_string()))?;
+    let parent = ensure_folder_path(
+        db,
+        client,
+        access_token,
+        identity_key,
+        parents,
+        Some(token),
+    )
+    .await?;
+    crate::folder_ops::update(
+        db,
+        client,
+        access_token,
+        identity_key,
+        token,
+        Some(new_name),
+        Some(parent.as_deref()),
+    )
+    .await
 }
 
 fn move_flags_for(internal: &str) -> Option<serde_json::Value> {
@@ -2247,6 +2513,31 @@ async fn bulk_move_chunk(
                 }
                 return false;
             }
+        }
+    }
+}
+
+async fn relabel_with_backoff(
+    client: &Arc<ApiClient>,
+    token: &str,
+    ids: &[String],
+    add: Option<&str>,
+    remove: Option<&str>,
+) -> crate::error::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        let result = match (add, remove) {
+            (Some(label), _) => client.move_to_folder(token, ids, label).await,
+            (None, Some(label)) => client.remove_from_folder(token, ids, label).await,
+            (None, None) => Ok(()),
+        };
+        match result {
+            Err(e) if crate::imap::append::is_rate_limited(&e) && attempt < 3 => {
+                let wait = crate::imap::append::rate_limit_backoff(attempt);
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            other => return other,
         }
     }
 }
@@ -2296,20 +2587,23 @@ async fn handle_copy_move(
         Some((s, m)) => (s.trim(), m.trim()),
         None => return write_bad(writer, tag, "command requires a message set and mailbox").await,
     };
-    let mailbox = mailbox_raw.trim().trim_matches('"');
-    let target_internal = match IMAP_FOLDERS
-        .iter()
-        .find(|(disp, _, _)| disp.eq_ignore_ascii_case(mailbox))
-        .map(|(_, internal, _)| *internal)
-    {
-        Some(f) => f,
+    let mailbox = parse_imap_atom_or_quoted(mailbox_raw).0;
+    let target_internal = match resolve_mailbox(db, &mailbox) {
+        Some(entry) => entry.label,
         None => return write_no(writer, tag, "[TRYCREATE] mailbox does not exist").await,
     };
-    let flags = match move_flags_for(target_internal) {
+    let target_token = crate::folders::token_of_label(&target_internal).map(str::to_string);
+    let source_token = crate::folders::token_of_label(&source_folder).map(str::to_string);
+    let flags = match (&target_token, source_folder.as_str()) {
+        (Some(_), "drafts") => None,
+        (Some(_), _) => move_flags_for("inbox"),
+        (None, _) => move_flags_for(&target_internal),
+    };
+    let flags = match flags {
         Some(f) => f,
         None => return write_no(writer, tag, "[CANNOT] cannot move messages into that mailbox").await,
     };
-    if target_internal == source_folder.as_str() {
+    if target_internal == source_folder {
         return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
 
@@ -2343,6 +2637,19 @@ async fn handle_copy_move(
             .await
             .unwrap_or(1)
     };
+    let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
+    if let Err(e) = relabel_with_backoff(
+        client,
+        &token,
+        &selected_ids,
+        target_token.as_deref(),
+        source_token.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("{} folder update failed: {}", verb, e);
+        return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
+    }
     for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
         let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
         if bulk_move_chunk(client, &token, &ids, &flags).await {
@@ -2369,6 +2676,7 @@ async fn handle_copy_move(
     let (src_uids, tgt_uids, mut moved_seqs) = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
+        let target = target_internal.clone();
         let entries = selected.clone();
         tokio::task::spawn_blocking(move || {
             let mut src: Vec<u32> = Vec::new();
@@ -2377,7 +2685,7 @@ async fn handle_copy_move(
             for (seq, m) in &entries {
                 let _ = db.upsert_cached_message(
                     &m.aster_id,
-                    target_internal,
+                    &target,
                     m.subject.as_deref(),
                     m.sender.as_deref(),
                     m.recipients.as_deref(),
@@ -2388,7 +2696,7 @@ async fn handle_copy_move(
                 );
                 let _ = db.remove_uid_mapping(m.imap_uid as i64, &folder);
                 src.push(m.imap_uid);
-                tgt.push(db.assign_uid_if_missing(target_internal, &m.aster_id).unwrap_or(0));
+                tgt.push(db.assign_uid_if_missing(&target, &m.aster_id).unwrap_or(0));
                 seqs.push(*seq);
             }
             (src, tgt, seqs)
@@ -2437,28 +2745,21 @@ async fn handle_select(
     args: &str,
     command: &str,
 ) -> std::io::Result<()> {
-    let mailbox = {
-        let s = args.trim();
-        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 { &s[1..s.len()-1] } else { s }
-    };
-
-    let folder_entry = IMAP_FOLDERS
-        .iter()
-        .find(|(imap, _, _)| imap.eq_ignore_ascii_case(mailbox));
-
-    let aster_folder = match folder_entry {
-        Some((_, f, _)) => *f,
+    let requested = parse_imap_atom_or_quoted(args).0;
+    let entry = match resolve_mailbox(db, &requested) {
+        Some(entry) => entry,
         None => {
             return write_no(writer, tag, "[NONEXISTENT] No such mailbox").await;
         }
     };
+    let aster_folder = entry.label.as_str();
 
     let count = db.count_cached_messages(aster_folder).unwrap_or(0);
     if count == 0 {
         crate::sync::poller::try_kick_sync();
     }
 
-    conn.selected_mailbox = Some(mailbox.to_string());
+    conn.selected_mailbox = Some(entry.path.clone());
     conn.selected_folder = Some(aster_folder.to_string());
     conn.state = ImapState::Selected;
     conn.message_count = count;
@@ -2511,15 +2812,7 @@ fn imap_quote(s: &str) -> String {
 }
 
 fn parse_address(addr: &str) -> (String, String, String) {
-    let trimmed = addr.trim();
-    let (name, email) = match (trimmed.find('<'), trimmed.rfind('>')) {
-        (Some(open), Some(close)) if close > open => {
-            let name_part = trimmed[..open].trim().trim_matches('"').to_string();
-            let email_part = trimmed[open + 1..close].trim().to_string();
-            (name_part, email_part)
-        }
-        _ => (String::new(), trimmed.to_string()),
-    };
+    let (name, email) = crate::address::parse_mailbox(addr);
     let (mailbox, host) = if let Some(at) = email.find('@') {
         (email[..at].to_string(), email[at + 1..].to_string())
     } else {
@@ -2534,8 +2827,8 @@ fn imap_address_list(addr_str: Option<&str>) -> String {
         _ => return "NIL".to_string(),
     };
     let mut parts = Vec::new();
-    for addr in s.split(',') {
-        let (name, mailbox, host) = parse_address(addr);
+    for addr in crate::address::split_address_list(s) {
+        let (name, mailbox, host) = parse_address(&addr);
         let name_field = if name.is_empty() { "NIL".to_string() } else { imap_quote(&name) };
         let host_field = if host.is_empty() { "NIL".to_string() } else { imap_quote(&host) };
         let mailbox_field = if mailbox.is_empty() { "NIL".to_string() } else { imap_quote(&mailbox) };
@@ -2947,11 +3240,15 @@ async fn handle_fetch(
                 None => format!("<{}@aster-bridge>", msg.aster_id),
             };
             let cc_list = imap_address_list(
-                env_meta.get("cc").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+                crate::address::meta_address_text(&env_meta, "cc").as_deref(),
             );
             let bcc_list = imap_address_list(
-                env_meta.get("bcc").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+                crate::address::meta_address_text(&env_meta, "bcc").as_deref(),
             );
+            let reply_to_list = match crate::address::meta_address_text(&env_meta, "reply_to") {
+                Some(reply_to) => imap_address_list(Some(&reply_to)),
+                None => from_list.clone(),
+            };
             let in_reply_to = match env_meta
                 .get("in_reply_to")
                 .and_then(|v| v.as_str())
@@ -2962,11 +3259,12 @@ async fn handle_fetch(
                 None => "NIL".to_string(),
             };
             items.push(format!(
-                "ENVELOPE ({} {} {} {} NIL {} {} {} {} {})",
+                "ENVELOPE ({} {} {} {} {} {} {} {} {} {})",
                 imap_quote(&date),
                 imap_quote(&subject),
                 from_list,
                 from_list,
+                reply_to_list,
                 to_list,
                 cc_list,
                 bcc_list,
@@ -3131,6 +3429,12 @@ mod tests {
         let c6 = calls.clone();
         let c7 = calls.clone();
         let c_blip = calls.clone();
+        let c_label_create = calls.clone();
+        let c_label_update = calls.clone();
+        let c_label_delete = calls.clone();
+        let c_label_add = calls.clone();
+        let c_label_remove = calls.clone();
+        let label_ids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stored_writer = stored.clone();
@@ -3320,6 +3624,12 @@ mod tests {
                             .lock()
                             .await
                             .push(("POST_IMPORT_EMAILS".to_string(), hash.clone()));
+                        if let Some(token) = email.get("folder_token").and_then(|v| v.as_str()) {
+                            calls
+                                .lock()
+                                .await
+                                .push(("IMPORT_FOLDER_TOKEN".to_string(), token.to_string()));
+                        }
                         if fail {
                             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
                                 .into_response();
@@ -3353,6 +3663,82 @@ mod tests {
                             "quota_exceeded": false
                         }))
                         .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_create.clone();
+                    let label_ids = label_ids.clone();
+                    async move {
+                        let field = |k: &str| {
+                            body.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                        };
+                        calls.lock().await.push((
+                            "CREATE_LABEL".to_string(),
+                            format!("{}|{}|{}", field("label_token"), field("parent_token"), field("folder_type")),
+                        ));
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                        let n = label_ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({"id": format!("srv-{}", n), "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/labels/:id",
+                put(move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_update.clone();
+                    async move {
+                        let parent = body
+                            .get("parent_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<absent>")
+                            .to_string();
+                        calls
+                            .lock()
+                            .await
+                            .push(("UPDATE_LABEL".to_string(), format!("{}|{}", id, parent)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                })
+                .delete(move |AxumPath(id): AxumPath<String>| {
+                    let calls = c_label_delete.clone();
+                    async move {
+                        calls.lock().await.push(("DELETE_LABEL".to_string(), id));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/labels",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_add.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("label_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("ADD_LABEL".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/labels/remove",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_label_remove.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("label_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("REMOVE_LABEL".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
                     }
                 }),
             )
@@ -4071,9 +4457,89 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
         seed(&db, "sent-2", "sent", "quarterly report");
-        let raw = b"Message-ID: <unknown@apple-mail>\r\nSubject: quarterly report\r\n\r\nbody";
-        let uid = find_appended_sent_copy(&db, raw);
+        let raw = b"Message-ID: <unknown@apple-mail>\r\nDate: Wed, 21 May 2026 10:01:30 +0000\r\nSubject: quarterly report\r\n\r\nbody";
+        let uid = find_appended_sent_copy_at(&db, raw, sent_moments_ago());
         assert!(uid.is_some());
+    }
+
+    /// "Now", a couple of minutes after the seeded messages were sent.
+    fn sent_moments_ago() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-21T10:03:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_quick_replies_in_old_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // Two replies in one thread, sent two minutes apart years ago, being
+        // copied in: the second is not a copy of the first.
+        seed(&db, "sent-7", "sent", "Re: plans");
+        let raw = b"Message-ID: <second-reply@example.com>\r\nDate: Wed, 21 May 2026 10:02:00 +0000\r\nSubject: Re: plans\r\n\r\nbody";
+        let years_later = chrono::DateTime::parse_from_rfc3339("2029-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(find_appended_sent_copy_at(&db, raw, years_later).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_far_apart_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-4", "sent", "Re: quarterly report");
+        // An older reply in the same thread, being copied in from another
+        // account: same subject, different message.
+        let raw = b"Message-ID: <older-reply@example.com>\r\nDate: Tue, 20 May 2025 09:00:00 +0000\r\nSubject: Re: quarterly report\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_subject_match_without_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-5", "sent", "no date here");
+        let raw = b"Message-ID: <undated@example.com>\r\nSubject: no date here\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_ignores_ids_in_references_and_in_reply_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        // A stored reply that points at the original it answers.
+        db.upsert_cached_message(
+            "reply-1",
+            "sent",
+            Some("Re: plans"),
+            Some("alice@example.com"),
+            Some("bob@example.com"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("reply body"),
+            Some(
+                &serde_json::json!({
+                    "is_html": false,
+                    "message_id": "reply-1@test",
+                    "in_reply_to": "<original@test>",
+                    "references": "<root@test> <original@test>"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("sent", "reply-1");
+        let raw = b"Message-ID: <original@test>\r\nDate: Mon, 19 May 2025 08:00:00 +0000\r\nSubject: plans\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_none());
+    }
+
+    #[test]
+    fn find_appended_sent_copy_matches_message_id_with_or_without_brackets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "sent-6", "sent", "anything");
+        let raw = b"Message-ID: sent-6@test\r\nSubject: something else\r\n\r\nbody";
+        assert!(find_appended_sent_copy(&db, raw).is_some());
     }
 
     #[test]
@@ -4543,7 +5009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_accepts_an_existing_folder_and_refuses_new_ones() {
+    async fn create_accepts_existing_system_folders_and_needs_keys_for_new_ones() {
         let (addr, _db, _tx, _dir) = start_test_server().await;
         let (mut reader, mut writer) = login_and_select(addr).await;
 
@@ -4553,7 +5019,205 @@ mod tests {
         assert!(resp.contains("c2 OK"), "inbox refused: {}", resp);
         let resp = imap_cmd_lines(&mut reader, &mut writer, "c3", "CREATE \"Old Mail\"").await;
         assert!(resp.contains("c3 NO"), "expected NO: {}", resp);
-        assert!(resp.contains("CANNOT"), "expected CANNOT: {}", resp);
+        assert!(resp.contains("UNAVAILABLE"), "expected UNAVAILABLE: {}", resp);
+    }
+
+    fn add_folder(db: &Database, token: &str, name: &str, parent: Option<&str>) {
+        db.upsert_custom_folder(&crate::db::CustomFolder {
+            label_token: token.to_string(),
+            server_id: format!("srv-{}", token),
+            name: name.to_string(),
+            parent_token: parent.map(str::to_string),
+            sort_order: 0,
+            created_at: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn imap_glob_match_handles_wildcards_and_hierarchy() {
+        assert!(imap_glob_match("*", "Work/Reports"));
+        assert!(imap_glob_match("%", "Work"));
+        assert!(!imap_glob_match("%", "Work/Reports"));
+        assert!(imap_glob_match("Work/%", "Work/Reports"));
+        assert!(!imap_glob_match("Work/%", "Work/Reports/2026"));
+        assert!(imap_glob_match("Work/*", "Work/Reports/2026"));
+        assert!(imap_glob_match("inbox", "INBOX"));
+        assert!(imap_glob_match("*Rep*", "Work/Reports"));
+        assert!(!imap_glob_match("Work", "Workshop"));
+        assert!(imap_glob_match("%/%", "Work/Reports"));
+        assert!(!imap_glob_match("", "INBOX"));
+    }
+
+    #[tokio::test]
+    async fn list_shows_custom_folders_with_hierarchy() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        add_folder(&db, "tok_r", "Reports", Some("tok_w"));
+        add_folder(&db, "tok_c", "Caf\u{e9}", None);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let all = imap_cmd_lines(&mut reader, &mut writer, "l1", "LIST \"\" \"*\"").await;
+        assert!(all.contains("* LIST (\\HasChildren) \"/\" \"Work\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren) \"/\" \"Work/Reports\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren) \"/\" \"Caf&AOk-\""), "{}", all);
+        assert!(all.contains("* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\""), "{}", all);
+        assert!(all.contains("l1 OK"), "{}", all);
+
+        let top = imap_cmd_lines(&mut reader, &mut writer, "l2", "LIST \"\" %").await;
+        assert!(top.contains("\"Work\""), "{}", top);
+        assert!(!top.contains("Work/Reports"), "{}", top);
+
+        let nested = imap_cmd_lines(&mut reader, &mut writer, "l3", "LIST \"Work/\" %").await;
+        assert!(nested.contains("\"Work/Reports\""), "{}", nested);
+        assert!(!nested.contains("\"INBOX\""), "{}", nested);
+
+        let lsub = imap_cmd_lines(&mut reader, &mut writer, "l4", "LSUB \"\" \"*\"").await;
+        assert!(lsub.contains("* LSUB (\\HasNoChildren) \"/\" \"Work/Reports\""), "{}", lsub);
+
+        let root = imap_cmd_lines(&mut reader, &mut writer, "l5", "LIST \"\" \"\"").await;
+        assert!(root.contains("* LIST (\\Noselect) \"/\" \"\""), "{}", root);
+
+        let multi = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "l6",
+            "LIST (SUBSCRIBED) \"\" (\"INBOX\" \"Caf&AOk-\")",
+        )
+        .await;
+        assert!(multi.contains("\"INBOX\""), "{}", multi);
+        assert!(multi.contains("\"Caf&AOk-\""), "{}", multi);
+        assert!(!multi.contains("\"Work\""), "{}", multi);
+
+        let status = imap_cmd_lines(&mut reader, &mut writer, "l7", "STATUS \"Work/Reports\" (MESSAGES)").await;
+        assert!(status.contains("* STATUS \"Work/Reports\""), "{}", status);
+        assert!(status.contains("l7 OK"), "{}", status);
+    }
+
+    #[tokio::test]
+    async fn create_rename_and_delete_manage_custom_folders() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "CREATE \"Projects/2026\"").await;
+        assert!(resp.contains("f1 OK"), "{}", resp);
+        let folders = db.list_custom_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        let parent = folders.iter().find(|f| f.name == "Projects").unwrap().clone();
+        let child = folders.iter().find(|f| f.name == "2026").unwrap().clone();
+        assert_eq!(parent.parent_token, None);
+        assert_eq!(child.parent_token.as_deref(), Some(parent.label_token.as_str()));
+        assert_eq!(parent.server_id, "srv-1");
+        assert_eq!(child.server_id, "srv-2");
+        let creates: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "CREATE_LABEL")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            creates,
+            vec![
+                format!("{}||custom", parent.label_token),
+                format!("{}|{}|custom", child.label_token, parent.label_token),
+            ]
+        );
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f2", "LIST \"\" \"Projects/*\"").await;
+        assert!(resp.contains("\"Projects/2026\""), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f3", "CREATE Projects").await;
+        assert!(resp.contains("f3 NO [ALREADYEXISTS]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f4", "CREATE \"INBOX/Child\"").await;
+        assert!(resp.contains("f4 NO [CANNOT]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f5", "DELETE Projects").await;
+        assert!(resp.contains("f5 NO [CANNOT]"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f6", "RENAME Projects \"Projects/2026/Inner\"").await;
+        assert!(resp.contains("f6 NO [CANNOT]"), "{}", resp);
+        assert_eq!(db.list_custom_folders().unwrap().len(), 2);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f7", "RENAME INBOX Elsewhere").await;
+        assert!(resp.contains("f7 NO"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f8", "DELETE Trash").await;
+        assert!(resp.contains("f8 NO"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f9", "RENAME \"Projects/2026\" \"Caf&AOk-\"").await;
+        assert!(resp.contains("f9 OK"), "{}", resp);
+        let moved = db
+            .list_custom_folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.label_token == child.label_token)
+            .unwrap();
+        assert_eq!(moved.name, "Caf\u{e9}");
+        assert_eq!(moved.parent_token, None);
+        assert!(calls
+            .lock()
+            .await
+            .iter()
+            .any(|(m, v)| m == "UPDATE_LABEL" && v == "srv-2|"));
+
+        seed(&db, "msg-in-folder", &crate::folders::folder_label(&child.label_token), "kept");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "DELETE \"Caf&AOk-\"").await;
+        assert!(resp.contains("g1 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-in-folder").unwrap().unwrap().folder, "inbox");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "DELETE Projects").await;
+        assert!(resp.contains("g2 OK"), "{}", resp);
+        assert!(db.list_custom_folders().unwrap().is_empty());
+        let deletes: Vec<String> = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, _)| m == "DELETE_LABEL")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(deletes, vec!["srv-2".to_string(), "srv-1".to_string()]);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "DELETE Projects").await;
+        assert!(resp.contains("g3 NO [NONEXISTENT]"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_into_and_out_of_a_custom_folder_relabels_on_the_server() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        seed(&db, "msg-relabel", "inbox", "to file");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Work").await;
+        assert!(resp.contains("m1 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-relabel").unwrap().unwrap().folder, "folder:tok_w");
+        assert!(calls.lock().await.iter().any(|(m, v)| m == "ADD_LABEL" && v == "tok_w|1"));
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m2", "SELECT Work").await;
+        assert!(resp.contains("* 1 EXISTS"), "{}", resp);
+        assert!(resp.contains("m2 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m3", "MOVE 1 INBOX").await;
+        assert!(resp.contains("m3 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-relabel").unwrap().unwrap().folder, "inbox");
+        assert!(calls.lock().await.iter().any(|(m, v)| m == "REMOVE_LABEL" && v == "tok_w|1"));
+    }
+
+    #[tokio::test]
+    async fn append_to_a_custom_folder_sends_its_token() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        add_folder(&db, "tok_r", "Reports", Some("tok_w"));
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let raw = b"Message-ID: <filed-1@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nCc: carol@old.example\r\nSubject: filed mail\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody";
+        let resp = append_literal(&mut reader, &mut writer, "ap9", "Work/Reports", raw).await;
+        assert!(resp.contains("ap9 OK"), "append rejected: {}", resp);
+        assert!(calls
+            .lock()
+            .await
+            .iter()
+            .any(|(m, v)| m == "IMPORT_FOLDER_TOKEN" && v == "tok_r"));
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "folder:tok_r");
     }
 
     #[tokio::test]
@@ -4733,12 +5397,25 @@ mod tests {
     }
 
     #[test]
-    fn existing_mailbox_resolves_display_names() {
-        assert_eq!(existing_mailbox("INBOX"), Some("inbox"));
-        assert_eq!(existing_mailbox("\"Archive\""), Some("archive"));
-        assert_eq!(existing_mailbox("junk"), Some("spam"));
-        assert_eq!(existing_mailbox("Archive/"), Some("archive"));
-        assert_eq!(existing_mailbox("Old Mail"), None);
+    fn resolve_mailbox_handles_system_and_custom_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_custom_folder(&crate::db::CustomFolder {
+            label_token: "tok_a".to_string(),
+            server_id: "srv-a".to_string(),
+            name: "Caf\u{e9}".to_string(),
+            parent_token: None,
+            sort_order: 0,
+            created_at: None,
+        })
+        .unwrap();
+        let label = |raw: &str| resolve_mailbox(&db, raw).map(|e| e.label);
+        assert_eq!(label("INBOX").as_deref(), Some("inbox"));
+        assert_eq!(label(&parse_imap_atom_or_quoted("\"Archive\"").0).as_deref(), Some("archive"));
+        assert_eq!(label("junk").as_deref(), Some("spam"));
+        assert_eq!(label("Archive/").as_deref(), Some("archive"));
+        assert_eq!(label("Caf&AOk-").as_deref(), Some("folder:tok_a"));
+        assert_eq!(label("Old Mail"), None);
     }
 
     #[test]
