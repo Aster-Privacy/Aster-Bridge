@@ -26,7 +26,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, ImportProgress } from "@/api";
+import type { ConnectionInfo, ImportProgress, PortConflict } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -1240,6 +1240,52 @@ function Sidebar({
   );
 }
 
+function PortConflictNotice({
+  conflict,
+  on_use_alternate_ports,
+}: {
+  conflict: PortConflict;
+  on_use_alternate_ports: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [moving, set_moving] = useState(false);
+
+  const handle_use_alternate_ports = async () => {
+    set_moving(true);
+    try {
+      await on_use_alternate_ports();
+    } finally {
+      set_moving(false);
+    }
+  };
+
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+    >
+      <ExclamationTriangleIcon className="w-5 h-5 flex-shrink-0 mt-0.5" style={{ color: "var(--color-danger)" }} />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold text-txt-primary leading-tight">
+          {t("port_conflict_title", { port: conflict.port })}
+        </p>
+        <p className="text-[12px] text-txt-muted mt-1">
+          {conflict.held_by_bridge
+            ? t("port_conflict_bridge_body", { port: conflict.port })
+            : t("port_conflict_body", { port: conflict.port, service: conflict.service })}
+        </p>
+        {!conflict.held_by_bridge && (
+          <div className="flex justify-end mt-3">
+            <Button variant="depth" size="sm" disabled={moving} onClick={handle_use_alternate_ports}>
+              {moving ? t("saving") : t("port_conflict_use_other_ports")}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ConfigPanel({
   email,
   display_name,
@@ -1252,6 +1298,8 @@ function ConfigPanel({
   sync_progress,
   import_progress,
   on_dismiss_import,
+  port_conflict,
+  on_use_alternate_ports,
 }: {
   email: string | null;
   display_name: string | null;
@@ -1264,6 +1312,8 @@ function ConfigPanel({
   sync_progress: SyncProgress | null;
   import_progress: ImportProgress | null;
   on_dismiss_import: () => void;
+  port_conflict: PortConflict | null;
+  on_use_alternate_ports: () => Promise<void>;
 }) {
   const { t } = useTranslation();
   const imap_host = conn_info?.imap_host || "127.0.0.1";
@@ -1342,6 +1392,10 @@ function ConfigPanel({
           {bridge_running ? t("disconnect") : t("connect")}
         </Button>
       </div>
+
+      {!bridge_running && port_conflict && (
+        <PortConflictNotice conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} />
+      )}
 
       {bridge_running && sync_progress && (
         <div className="mb-4">
@@ -1940,7 +1994,16 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     try {
       await api.update_connection_settings(imap, smtp);
       set_ports_dirty(false);
-      show_toast(t("toast_ports_updated"), "success");
+      if (bridge_running) {
+        try {
+          await api.restart_bridge();
+          show_toast(t("toast_ports_applied"), "success");
+        } catch (restart_error) {
+          show_toast(restart_error === "port_unavailable" ? t("toast_port_conflict") : t("toast_bridge_status_failed"), "error");
+        }
+      } else {
+        show_toast(t("toast_ports_updated"), "success");
+      }
     } catch (e) {
       const detail = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
       show_toast(`${t("toast_ports_failed")}: ${detail}`, "error");
@@ -2382,7 +2445,7 @@ function DashboardView({
   email, display_name, profile_picture, profile_color, bridge_running, conn_info, passwords,
   on_toggle_bridge, on_generate_password, on_delete_password, on_sign_out, on_reset, on_retry_plan,
   has_bridge_access, plan_info_loaded, outbox_count, connected_since, sync_progress, is_online,
-  import_progress, on_dismiss_import,
+  import_progress, on_dismiss_import, port_conflict, on_use_alternate_ports,
 }: {
   email: string | null; display_name: string | null; profile_picture: string | null;
   profile_color: string | null; bridge_running: boolean; conn_info: ConnectionInfo | null;
@@ -2401,6 +2464,8 @@ function DashboardView({
   is_online: boolean;
   import_progress: ImportProgress | null;
   on_dismiss_import: () => void;
+  port_conflict: PortConflict | null;
+  on_use_alternate_ports: () => Promise<void>;
 }) {
   const { t } = useTranslation();
   const show_upgrade_banner = plan_info_loaded && !has_bridge_access;
@@ -2459,7 +2524,7 @@ function DashboardView({
             ) : (
               <>
                 {active_tab === "status" && (
-                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} />
+                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} port_conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} />
                 )}
                 {active_tab === "passwords" && !plan_info_loaded && (
                   <div className="p-5 text-sm text-txt-muted text-center">{t("loading")}</div>
@@ -2494,6 +2559,7 @@ export function BridgeApp() {
   const [was_enrolled, set_was_enrolled] = useState(false);
   const [has_bridge_access, set_has_bridge_access] = useState(false);
   const [plan_info_loaded, set_plan_info_loaded] = useState(false);
+  const [port_conflict, set_port_conflict] = useState<PortConflict | null>(null);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
@@ -2534,6 +2600,7 @@ export function BridgeApp() {
         set_passwords(state.passwords);
         set_has_bridge_access(state.has_bridge_access);
         set_plan_info_loaded(state.plan_info_loaded);
+        set_port_conflict(state.port_conflict);
         apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();
@@ -2667,10 +2734,24 @@ export function BridgeApp() {
     } catch (e) {
       if (typeof e === "string" && e.includes("bridge_access_required")) {
         show_toast(i18next.t("toast_bridge_upgrade_required"), "error");
+      } else if (e === "port_unavailable") {
+        show_toast(i18next.t("toast_port_conflict"), "error");
+        await load_state();
       } else {
         show_toast(i18next.t("toast_bridge_status_failed"), "error");
       }
     }
+  };
+
+  const handle_use_alternate_ports = async () => {
+    try {
+      await api.use_alternate_ports();
+      const info = await api.get_connection_info();
+      show_toast(i18next.t("toast_ports_moved", { imap: info.imap_port, smtp: info.smtp_port }), "success");
+    } catch (e) {
+      show_toast(i18next.t(e === "port_unavailable" ? "toast_port_conflict" : "toast_ports_move_failed"), "error");
+    }
+    await load_state();
   };
 
   const toggle_ref = useRef(handle_toggle_bridge);
@@ -2841,6 +2922,7 @@ export function BridgeApp() {
         plan_info_loaded={plan_info_loaded} outbox_count={outbox_count}
         connected_since={connected_since} sync_progress={sync_progress} is_online={is_online}
         import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
+        port_conflict={port_conflict} on_use_alternate_ports={handle_use_alternate_ports}
       />
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>

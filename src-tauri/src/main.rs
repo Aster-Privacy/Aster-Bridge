@@ -24,7 +24,7 @@
 mod dock_icon;
 mod shell;
 
-use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, runtime, sync, tls};
+use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sync, tls};
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -50,6 +50,14 @@ struct BridgeState {
     plan_code: Option<String>,
     has_bridge_access: bool,
     plan_info_loaded: bool,
+    port_conflict: Option<PortConflict>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct PortConflict {
+    service: &'static str,
+    port: u16,
+    held_by_bridge: bool,
 }
 
 impl BridgeState {
@@ -113,6 +121,7 @@ struct BridgeStatusResponse {
     has_bridge_access: bool,
     plan_info_loaded: bool,
     import_progress: Option<imap::append::ImportProgress>,
+    port_conflict: Option<PortConflict>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -224,6 +233,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         has_bridge_access: guard.has_bridge_access,
         plan_info_loaded: guard.plan_info_loaded,
         import_progress: imap::append::current_import_progress(),
+        port_conflict: guard.port_conflict.clone(),
     })
 }
 
@@ -235,10 +245,75 @@ async fn start_bridge(app: tauri::AppHandle, state: State<'_, AppState>) -> Resu
 }
 
 async fn start_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
-    start_runtime(&state.0).await.map_err(|e| e.to_string())
+    start_runtime(&state.0).await.map_err(|e| match e {
+        runtime::StartError::PortUnavailable { .. } => e.code().to_string(),
+        other => other.to_string(),
+    })
+}
+
+const RESTART_ATTEMPTS: u32 = 6;
+const RESTART_RETRY_DELAY_MS: u64 = 300;
+
+#[tauri::command]
+async fn restart_bridge(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.0.lock().await.stop_runtime(runtime::StopReason::UserRequested);
+    let mut result = start_bridge_inner(&state).await;
+    for _ in 1..RESTART_ATTEMPTS {
+        if !matches!(&result, Err(code) if code == "port_unavailable") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(RESTART_RETRY_DELAY_MS)).await;
+        result = start_bridge_inner(&state).await;
+    }
+    shell::refresh_tray(&app);
+    let _ = app.emit("state_updated", ());
+    result
+}
+
+#[tauri::command]
+async fn use_alternate_ports(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut guard = state.0.lock().await;
+        if guard.running() {
+            return Err("bridge_running".to_string());
+        }
+        let (imap_port, smtp_port) =
+            port_picker::pick_alternate_ports(runtime::LOOPBACK_HOST, &guard.config)?;
+        let mut candidate = guard.config.clone();
+        candidate.imap_port = imap_port;
+        candidate.smtp_port = smtp_port;
+        config::validate_ports(&candidate)?;
+        config::save_config(&candidate)?;
+        tracing::info!("moved IMAP to port {} and SMTP to port {}", imap_port, smtp_port);
+        guard.config = candidate;
+        guard.port_conflict = None;
+    }
+    let result = start_bridge_inner(&state).await;
+    shell::refresh_tray(&app);
+    let _ = app.emit("state_updated", ());
+    result
 }
 
 async fn start_runtime(shared: &SharedBridgeState) -> Result<(), runtime::StartError> {
+    let result = start_runtime_inner(shared).await;
+    let mut guard = shared.lock().await;
+    guard.port_conflict = match &result {
+        Err(runtime::StartError::PortUnavailable {
+            service,
+            port,
+            held_by_bridge,
+            ..
+        }) => Some(PortConflict {
+            service: service.label(),
+            port: *port,
+            held_by_bridge: *held_by_bridge,
+        }),
+        _ => None,
+    };
+    result
+}
+
+async fn start_runtime_inner(shared: &SharedBridgeState) -> Result<(), runtime::StartError> {
     let (session, client, retry_delay) = {
         let guard = shared.lock().await;
         if guard.running() {
@@ -1339,6 +1414,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_bridge_status,
             start_bridge,
+            restart_bridge,
+            use_alternate_ports,
             stop_bridge,
             sign_out,
             reset_bridge_data,
@@ -1443,6 +1520,7 @@ fn main() {
             plan_code: None,
             has_bridge_access: false,
             plan_info_loaded: false,
+            port_conflict: None,
         }));
             app.manage(AppState(bridge_state));
 
