@@ -40,6 +40,7 @@ fn user_agent() -> String {
 }
 const API_BASE_URL: &str = "https://app.astermail.org/api";
 const ERR_BODY_MAX: usize = 256;
+const SEND_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[allow(dead_code)]
 async fn err_body(resp: reqwest::Response) -> String {
@@ -65,6 +66,20 @@ async fn map_response_error(resp: reqwest::Response) -> BridgeError {
                     .unwrap_or("Aster Bridge requires a Star plan or higher.")
                     .to_string();
                 return BridgeError::PlanUpgradeRequired(msg);
+            }
+        }
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+            if parsed.get("code").and_then(|v| v.as_str()) == Some("ATTACHMENTS_TOO_LARGE") {
+                let msg = parsed
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("attachments exceed the size limit for your plan")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return BridgeError::MessageTooLarge(msg);
             }
         }
     }
@@ -1478,6 +1493,7 @@ impl ApiClient {
             .post(format!("{}/bridge/v1/send", self.base_url))
             .bearer_auth(access_token)
             .json(body)
+            .timeout(SEND_MAIL_TIMEOUT)
             .send()
             .await?;
 

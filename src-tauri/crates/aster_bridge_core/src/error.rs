@@ -54,6 +54,9 @@ pub enum BridgeError {
 
     #[error("plan_upgrade_required: {0}")]
     PlanUpgradeRequired(String),
+
+    #[error("message too large: {0}")]
+    MessageTooLarge(String),
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
