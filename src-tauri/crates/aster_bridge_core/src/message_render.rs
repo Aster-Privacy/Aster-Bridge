@@ -773,6 +773,23 @@ mod tests {
     }
 
     #[test]
+    fn cc_and_reply_to_headers_come_from_the_cached_metadata() {
+        let raw = "{\"is_html\":false,\"cc\":\"Carol <carol@example.com>, dan@example.com\",\"reply_to\":\"Team <team@example.com>\"}";
+        let m = msg(Some("body"), Some(raw), 0);
+        let r = render(&m, &[], true);
+        assert!(r.text.contains("Cc: Carol <carol@example.com>, dan@example.com\r\n"));
+        assert!(r.text.contains("Reply-To: Team <team@example.com>\r\n"));
+    }
+
+    #[test]
+    fn reply_to_header_is_omitted_when_the_metadata_has_none() {
+        let m = msg(Some("body"), Some("{\"is_html\":false}"), 0);
+        let r = render(&m, &[], true);
+        assert!(!r.text.contains("Reply-To:"));
+        assert!(!r.text.contains("Cc:"));
+    }
+
+    #[test]
     fn threading_headers_are_omitted_when_the_metadata_has_none() {
         let m = msg(Some("body"), Some("{\"is_html\":false}"), 0);
         let r = render(&m, &[], true);

@@ -2453,6 +2453,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_mail_item_keeps_cc_bcc_and_reply_to() {
+        let (_dir, db) = temp_db();
+        // The web app's envelope: recipients as {name, email} objects.
+        let json = serde_json::json!({
+            "subject": "Plans",
+            "from": {"name": "Alice", "email": "alice@example.com"},
+            "to": [{"name": "Bob", "email": "bob@example.com"}],
+            "cc": [{"name": "Carol", "email": "carol@example.com"}, {"name": "", "email": "dan@example.com"}],
+            "bcc": [{"name": "", "email": "erin@example.com"}],
+            "date": "Wed, 21 May 2026 10:00:00 +0000",
+            "body_text": "hi",
+            "raw_headers": [{"name": "Reply-To", "value": "Team <team@example.com>"}]
+        });
+        let item = item_with_envelope("msg-cc", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value =
+            serde_json::from_str(&db.get_cached_message("msg-cc").unwrap().unwrap().raw_headers.unwrap()).unwrap();
+        assert_eq!(meta["cc"], "Carol <carol@example.com>, dan@example.com");
+        assert_eq!(meta["bcc"], "erin@example.com");
+        assert_eq!(meta["reply_to"], "Team <team@example.com>");
+    }
+
+    #[test]
+    fn cache_mail_item_reads_imported_string_recipients() {
+        let (_dir, db) = temp_db();
+        // Imported mail: recipients as plain strings, reply_to as a string.
+        let json = serde_json::json!({
+            "subject": "Invoice",
+            "from": "shop@example.com",
+            "to": ["me@example.com"],
+            "cc": ["accounts@example.com"],
+            "reply_to": "billing@example.com",
+            "body_text": "attached"
+        });
+        let item = item_with_envelope("msg-imported", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let meta: serde_json::Value = serde_json::from_str(
+            &db.get_cached_message("msg-imported").unwrap().unwrap().raw_headers.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["cc"], "accounts@example.com");
+        assert_eq!(meta["reply_to"], "billing@example.com");
+        assert!(meta.get("bcc").is_none());
+    }
+
+    #[test]
     fn cache_mail_item_prefers_plain_body_when_no_html() {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});

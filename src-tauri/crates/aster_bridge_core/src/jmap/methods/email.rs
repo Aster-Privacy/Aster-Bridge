@@ -1081,6 +1081,23 @@ mod tests {
     }
 
     #[test]
+    fn meta_addresses_reads_cc_and_reply_to() {
+        let meta = json!({"cc": "Carol <carol@example.com>, dan@example.com", "reply_to": "team@example.com"});
+        assert_eq!(
+            meta_addresses(&meta, "cc"),
+            json!([
+                {"name": "Carol", "email": "carol@example.com"},
+                {"name": Value::Null, "email": "dan@example.com"}
+            ])
+        );
+        assert_eq!(
+            meta_addresses(&meta, "reply_to"),
+            json!([{"name": Value::Null, "email": "team@example.com"}])
+        );
+        assert_eq!(meta_addresses(&meta, "bcc"), Value::Null);
+    }
+
+    #[test]
     fn parse_address_list_empty_yields_null() {
         assert_eq!(parse_address_list(&None), Value::Null);
         assert_eq!(parse_address_list(&Some(" , , ".to_string())), Value::Null);
