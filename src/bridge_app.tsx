@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, ImportProgress, PortConflict } from "@/api";
@@ -49,6 +49,7 @@ import {
 } from "./updater";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
 import { notify_native } from "@/notify";
+import { DEFAULT_PROFILE_COLOR, HEX_COLOR, profile_gradient_background } from "@/lib/profile_palette";
 import {
   Button,
   UpgradeBtn,
@@ -79,9 +80,9 @@ function format_elapsed(ms: number): string {
   const total_seconds = Math.max(0, Math.floor(ms / 1000));
   const hours = Math.floor(total_seconds / 3600);
   const minutes = Math.floor((total_seconds % 3600) / 60);
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${total_seconds}s`;
+  if (hours > 0) return i18next.t("elapsed_hours_minutes", { hours, minutes });
+  if (minutes > 0) return i18next.t("elapsed_minutes", { minutes });
+  return i18next.t("elapsed_seconds", { seconds: total_seconds });
 }
 
 function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_dismiss: () => void }) {
@@ -104,7 +105,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
 
   if (!progress.active) {
     return (
-      <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+      <div className="aster_island mb-4 flex items-center justify-between gap-3 px-4 py-3">
         <div className="flex items-center gap-2 min-w-0">
           <CheckIcon className="w-4 h-4 flex-shrink-0 text-brand" />
           <p className="text-xs text-txt-primary truncate">
@@ -130,7 +131,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
   }
 
   return (
-    <div className="mb-4 rounded-xl border border-edge-primary bg-surf-primary px-4 py-3">
+    <div className="aster_island mb-4 px-4 py-3">
       <div className="flex items-end justify-between mb-1.5 gap-3">
         <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
           <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
@@ -143,7 +144,7 @@ function ImportPanel({ progress, on_dismiss }: { progress: ImportProgress; on_di
           {t("import_messages_count", { count: total })}
         </span>
       </div>
-      <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
+      <div className="h-1.5 rounded-full overflow-hidden bg-[var(--aster-field-bg)]">
         <div className="h-full w-full rounded-full bg-brand animate-pulse" />
       </div>
       <p className="text-[11px] text-txt-muted mt-1.5 tabular-nums">
@@ -172,20 +173,6 @@ type ToastType = "success" | "error" | "info" | "warning";
 
 const LINK_DEVICE_URL = "https://app.astermail.org/link-device";
 
-const GRADIENT_CONFIGS: Record<
-  string,
-  { top_left: string; bottom_right: string }
-> = {
-  "#6366f1": { top_left: "#6366f1", bottom_right: "#312e81" },
-  "#3b82f6": { top_left: "#3b82f6", bottom_right: "#312e81" },
-  "#8b5cf6": { top_left: "#7c3aed", bottom_right: "#1e3a5f" },
-  "#ec4899": { top_left: "#ec4899", bottom_right: "#581c87" },
-  "#ef4444": { top_left: "#d97706", bottom_right: "#7f1d1d" },
-  "#f97316": { top_left: "#eab308", bottom_right: "#78350f" },
-  "#22c55e": { top_left: "#4ade80", bottom_right: "#064e3b" },
-  "#14b8a6": { top_left: "#2dd4bf", bottom_right: "#134e4a" },
-  "#6b7280": { top_left: "#9ca3af", bottom_right: "#111827" },
-};
 
 // Write to the clipboard via the native pasteboard (Tauri plugin), falling back
 // to the web clipboard API. The plugin path does not depend on webview
@@ -221,16 +208,6 @@ function clear_clipboard_if_unchanged(value: string): void {
   }, 30_000);
 }
 
-const HEX_COLOR = /^#[0-9a-f]{6}$/i;
-
-function get_gradient_background(color: string): string {
-  const fallback = HEX_COLOR.test(color) ? color : "#6b7280";
-  const config = GRADIENT_CONFIGS[color] || {
-    top_left: fallback,
-    bottom_right: fallback,
-  };
-  return `linear-gradient(135deg, ${config.top_left} 0%, ${config.bottom_right} 100%)`;
-}
 
 function format_date(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -424,7 +401,7 @@ function ToastContainer() {
             layout={reduce_motion ? false : "position"}
             transition={{ duration: reduce_motion ? 0 : 0.15, layout: { duration: 0.2 } }}
           >
-            <div className="px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 bg-modal-bg border border-edge-secondary">
+            <div className="aster_floating px-4 py-2.5 flex items-center gap-2">
               <span className="flex-shrink-0 text-txt-primary">
                 {get_toast_icon(toast.type)}
               </span>
@@ -495,12 +472,7 @@ function UpdateBanner() {
 
   return (
     <div
-      className="fixed bottom-4 right-4 z-[9999] max-w-sm rounded-xl border shadow-2xl p-3"
-      style={{
-        backgroundColor: "var(--bg-primary)",
-        borderColor: "var(--border-primary)",
-        color: "var(--text-primary)",
-      }}
+      className="aster_floating fixed bottom-4 end-4 z-[9999] max-w-sm p-3"
     >
       <div className="flex items-start gap-3">
         <ArrowDownTrayIcon className="w-5 h-5 mt-0.5 text-txt-primary flex-shrink-0" />
@@ -509,20 +481,22 @@ function UpdateBanner() {
             {i18next.t("update_available", { version: info.version })}
           </p>
           <div className="mt-2 flex items-center gap-2">
-            <button
-              className="h-7 px-3 rounded-lg bg-indigo-600 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={installing}
+            <Button
+              is_loading={installing}
+              size="sm"
+              variant="depth"
               onClick={handle_install}
             >
-              {installing ? i18next.t("update_installing") : i18next.t("update_install")}
-            </button>
-            <button
-              className="h-7 px-3 rounded-lg border border-edge-secondary bg-surf-tertiary text-xs font-medium text-txt-primary hover:opacity-80"
+              {i18next.t("update_install")}
+            </Button>
+            <Button
               disabled={installing}
+              size="sm"
+              variant="secondary"
               onClick={handle_dismiss}
             >
               {i18next.t("update_dismiss")}
-            </button>
+            </Button>
           </div>
         </div>
         <button
@@ -561,14 +535,7 @@ function Spinner({ class_name = "" }: { class_name?: string }) {
   );
 }
 
-function CopyIcon({ copied }: { copied: boolean }) {
-  if (copied) {
-    return (
-      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-        <path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  }
+function CopyIcon() {
   return (
     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
       <rect height="13" rx="2" width="13" x="9" y="9" />
@@ -593,11 +560,11 @@ function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
       onClick={on_copy}
       title={t("copy_to_clipboard")}
       aria-label={t("copy_to_clipboard")}
-      className="group ml-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 rounded-md px-2 py-1 cursor-pointer hover:bg-black/[0.05] dark:hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
+      className="group ms-auto inline-flex items-center justify-end gap-1.5 max-w-full min-w-0 h-8 rounded-[var(--aster-radius-item)] px-2 cursor-pointer transition-colors hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary"
     >
       <span title={value} className={`truncate text-txt-primary ${mono ? "font-mono" : ""}`}>{value}</span>
       <span className="flex-shrink-0 text-txt-muted group-hover:text-txt-primary">
-        <CopyIcon copied={false} />
+        <CopyIcon />
       </span>
     </button>
   );
@@ -615,12 +582,11 @@ function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?:
   return (
     <section className="mb-6">
       {title && (
-        <div className="mb-2">
+        <div className="mb-1">
           <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
             {icon && <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
             {title}
           </h3>
-          <div className="mt-2 h-px bg-edge-secondary" />
         </div>
       )}
       <div>{children}</div>
@@ -631,7 +597,7 @@ function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?:
 
 function ServerCard({ icon, title, hint, children }: { icon?: ReactNode; title: string; hint?: ReactNode; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-edge-primary bg-surf-primary px-5 py-4">
+    <section className="aster_island px-5 py-4">
       <div className="flex items-center gap-2 mb-2.5">
         {icon && <span className="w-[17px] h-[17px] flex-shrink-0 text-txt-secondary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
         <h3 className="text-[14px] font-semibold text-txt-primary">{title}</h3>
@@ -661,7 +627,7 @@ function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }:
       type="button"
       onClick={on_click}
       disabled={disabled}
-      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-lg text-left transition-colors duration-150 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] disabled:opacity-50 disabled:pointer-events-none"
+      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-[var(--aster-radius-item)] text-start transition-colors duration-150 hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary disabled:opacity-50 disabled:pointer-events-none"
     >
       {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
       <div className="min-w-0 flex-1">
@@ -683,14 +649,14 @@ function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: 
       onClick={on_click}
       className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors disabled:opacity-50 ${checked ? "bg-brand" : "bg-edge-secondary"}`}
     >
-      <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4" : ""}`} />
+      <span className={`absolute top-0.5 start-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4 rtl:-translate-x-4" : ""}`} />
     </button>
   );
 }
 
 function InfoRow({ label, value, copy = true, mono = true }: { label: string; value: string; copy?: boolean; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-2">
+    <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
       <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
       {copy
         ? <CopyValue value={value} mono={mono} />
@@ -784,13 +750,13 @@ function UserAvatar({
     );
   }
 
-  const color = profile_color || "#6366f1";
+  const color = profile_color || DEFAULT_PROFILE_COLOR;
   const logo_size = Math.round(size * 0.55);
 
   return (
     <div
       className="rounded-full flex-shrink-0 flex items-center justify-center"
-      style={{ width: size, height: size, minWidth: size, minHeight: size, background: get_gradient_background(color) }}
+      style={{ width: size, height: size, minWidth: size, minHeight: size, background: profile_gradient_background(color) }}
     >
       <img
         alt={email}
@@ -821,8 +787,6 @@ function SetupView({
   const [state, set_state] = useState<SetupState>("idle");
   const [code, set_code] = useState<string | null>(null);
   const [time_left, set_time_left] = useState(0);
-  const [code_copied, set_code_copied] = useState(false);
-  const [link_copied, set_link_copied] = useState(false);
 
   const poll_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdown_ref = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -892,8 +856,6 @@ function SetupView({
     try {
       await copy_text(code.replace(/-/g, ""));
       show_toast(t("copied_to_clipboard"), "success");
-      set_code_copied(true);
-      setTimeout(() => set_code_copied(false), 1500);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -903,8 +865,6 @@ function SetupView({
     try {
       await navigator.clipboard.writeText(LINK_DEVICE_URL);
       show_toast(t("copied_to_clipboard"), "success");
-      set_link_copied(true);
-      setTimeout(() => set_link_copied(false), 1500);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -917,7 +877,10 @@ function SetupView({
     <div className="fixed inset-0 overflow-y-auto" style={{ backgroundColor: "var(--bg-secondary)" }}>
       <div className="min-h-full flex items-center justify-center px-4 py-8">
         <div className="flex flex-col items-center w-full max-w-sm px-4">
-          <img alt="Aster" className="h-12" decoding="async" draggable={false} src="/text_logo.png" />
+          <div className="flex items-center gap-3">
+            <img alt="" className="w-12 h-12 select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
+            <span className="text-[26px] font-bold tracking-tight text-txt-primary">{t("app_name")}</span>
+          </div>
 
           {state === "idle" && (
             <>
@@ -945,13 +908,13 @@ function SetupView({
               <div className="w-full mt-6">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-xs font-medium text-txt-muted">{t("setup_expires_in", { time: format_time(time_left) })}</span>
-                  <button className="p-1.5 rounded-md transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08] text-txt-muted" onClick={handle_copy_code}>
-                    <CopyIcon copied={code_copied} />
+                  <button type="button" aria-label={t("setup_copy_code")} className="p-1.5 rounded-[var(--aster-radius-item)] transition-colors hover:bg-[var(--aster-field-hover)] text-txt-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" onClick={handle_copy_code}>
+                    <CopyIcon />
                   </button>
                 </div>
                 <div className="grid grid-cols-8 gap-2 cursor-pointer" onClick={handle_copy_code}>
                   {code_chars.map((char, i) => (
-                    <div key={i} className="relative overflow-hidden rounded-lg py-2.5 border text-center transition-colors hover:opacity-80 bg-surf-tertiary border-edge-secondary">
+                    <div key={i} className="relative overflow-hidden rounded-[var(--aster-radius-item)] py-2.5 text-center transition-colors bg-[var(--aster-field-bg)] hover:bg-[var(--aster-field-hover)]">
                       <span className="text-base font-mono font-bold text-txt-primary">{char}</span>
                     </div>
                   ))}
@@ -961,9 +924,9 @@ function SetupView({
                 <Button className="flex-1" size="xl" variant="secondary" onClick={handle_copy_code}>{t("setup_copy_code")}</Button>
                 <Button className="flex-1" size="xl" variant="depth" onClick={() => api.open_url(LINK_DEVICE_URL)}>{t("setup_open_browser")}</Button>
               </div>
-              <button className="mt-4 flex items-center gap-1.5 text-xs text-txt-muted hover:text-txt-tertiary transition-colors" onClick={handle_copy_link}>
+              <button type="button" className="mt-4 flex items-center gap-1.5 rounded-[var(--aster-radius-item)] text-xs text-txt-muted hover:text-txt-tertiary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" onClick={handle_copy_link}>
                 <span className="underline underline-offset-2">{LINK_DEVICE_URL}</span>
-                <CopyIcon copied={link_copied} />
+                <CopyIcon />
               </button>
               <div className="mt-6 flex items-center gap-2">
                 <Spinner class_name="w-4 h-4 text-txt-muted" />
@@ -1028,9 +991,9 @@ function SidebarNavButton({
       >
         {icon}
       </span>
-      <span className="flex-1 text-left">{label}</span>
+      <span className="flex-1 text-start">{label}</span>
       {badge != null && badge > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#ef4444]/15 text-[#ef4444] font-mono font-medium min-w-[18px] text-center">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-aster-danger/15 text-aster-danger font-mono font-medium min-w-[18px] text-center">
           {badge}
         </span>
       )}
@@ -1091,11 +1054,11 @@ function Sidebar({
           onClick={() => set_show_menu(!show_menu)}
         >
           <div className="w-9 h-9 flex-shrink-0">
-            <img alt="Aster Bridge" className="w-full h-full select-none rounded-lg" decoding="async" draggable={false} src="/mail_logo.webp" />
+            <img alt="" className="w-full h-full select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
           </div>
           <div className="flex flex-col items-start min-w-0 flex-1">
-            <span className="text-[15px] font-semibold text-txt-primary">Aster Bridge</span>
-            <span className="text-[11px] truncate w-full text-left text-txt-muted">
+            <span className="text-[15px] font-semibold text-txt-primary">{t("app_name")}</span>
+            <span className="text-[11px] truncate w-full text-start text-txt-muted">
               {display_name || email || t("not_connected")}
             </span>
           </div>
@@ -1113,16 +1076,11 @@ function Sidebar({
         {show_menu && (
           <div
             ref={menu_ref}
-            className="absolute left-3 right-3 mt-2 rounded-2xl overflow-hidden z-50 animate-dropdown-in"
-            style={{
-              backgroundColor: "var(--dropdown-bg)",
-              border: "1px solid var(--border-secondary)",
-              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)",
-            }}
+            className="aster_floating absolute inset-x-3 mt-2 overflow-hidden z-50 animate-dropdown-in"
           >
             <div className="p-1.5 pb-0">
               <button
-                className="w-full px-2.5 py-2 rounded-lg text-left flex items-center gap-2.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                className="w-full px-2.5 py-2 rounded-[var(--aster-radius-item)] text-start flex items-center gap-2.5 transition-colors hover:bg-[var(--aster-floating-hover)]"
                 onClick={() => {
                   if (email) {
                     navigator.clipboard.writeText(email).catch(() => {});
@@ -1140,7 +1098,7 @@ function Sidebar({
                   />
                   {bridge_running && (
                     <div
-                      className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2"
+                      className="absolute -bottom-0.5 -end-0.5 w-2.5 h-2.5 rounded-full border-2"
                       style={{
                         backgroundColor: "var(--color-success)",
                         borderColor: "var(--dropdown-bg)",
@@ -1163,7 +1121,7 @@ function Sidebar({
               </button>
             </div>
 
-            <div className="h-px my-1.5 mx-1.5" style={{ backgroundColor: "var(--border-secondary)" }} />
+            <div className="h-px my-1.5 mx-1.5" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
 
             <div className="p-1.5 pt-0 space-y-1">
               <Button
@@ -1184,7 +1142,7 @@ function Sidebar({
 
       <nav className="flex-1 px-2.5 pt-0.5 pb-2 relative">
         <div
-          className="sidebar-indicator absolute left-2.5 right-2.5 rounded-[12px] pointer-events-none"
+          className="sidebar-indicator absolute inset-x-2.5 rounded-[12px] pointer-events-none"
           style={{
             height: 32,
             backgroundColor: "var(--indicator-bg)",
@@ -1228,9 +1186,7 @@ function Sidebar({
 
       <Modal open={show_sign_out_modal} on_close={() => set_show_sign_out_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("sign_out_title")}</p>
-        <ModalBody>
-          <span>{t("sign_out_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("sign_out_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_show_sign_out_modal(false)}>{t("cancel")}</Button>
           <Button variant="destructive" size="md" onClick={() => { set_show_sign_out_modal(false); on_sign_out(); }}>{t("sign_out")}</Button>
@@ -1340,12 +1296,12 @@ function ConfigPanel({
   const email_value = email || "-";
 
   const avatar_letter = (display_name || email || "?")[0].toUpperCase();
-  const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : "#6366f1";
+  const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : DEFAULT_PROFILE_COLOR;
 
   return (
     <div className="p-6">
       <div className="flex items-center gap-3 mb-5">
-        <div className="w-10 h-10 rounded-xl flex-shrink-0 overflow-hidden">
+        <div className="w-10 h-10 rounded-[var(--aster-radius-item)] flex-shrink-0 overflow-hidden">
           {profile_picture ? (
             <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
           ) : (
@@ -1361,7 +1317,7 @@ function ConfigPanel({
       </div>
 
       <div
-        className="flex items-center justify-between gap-4 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+        className="aster_island flex items-center justify-between gap-4 px-5 py-4 mb-5"
         title={bridge_running
           ? (connected_since
               ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
@@ -1398,7 +1354,7 @@ function ConfigPanel({
       )}
 
       {bridge_running && sync_progress && (
-        <div className="mb-4">
+        <div className="aster_island px-4 py-3 mb-4">
           <div className="flex items-end justify-between mb-1.5 gap-3">
             <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
               <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
@@ -1413,7 +1369,7 @@ function ConfigPanel({
                 : `${sync_progress.done.toLocaleString()} / ${sync_progress.total.toLocaleString()}`}
             </span>
           </div>
-          <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-secondary)" }}>
+          <div className="h-1.5 rounded-full overflow-hidden bg-[var(--aster-field-bg)]">
             <div
               className="h-full rounded-full bg-brand transition-all duration-500 ease-out"
               style={{ width: `${sync_bar_fraction(sync_progress) * 100}%` }}
@@ -1500,23 +1456,25 @@ function TlsInfoBlock({
     api.get_tls_info().then((info) => { if (!cancelled) set_tls_info(info); }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
-  const fingerprint = tls_info?.fingerprint_sha256 || "(unavailable)";
-  const cert_path = tls_info?.cert_path || "(unavailable)";
+  const fingerprint = tls_info?.fingerprint_sha256 || t("tls_unavailable");
+  const cert_path = tls_info?.cert_path || t("tls_unavailable");
   return (
     <ServerCard title={t("section_tls")} icon={<LockClosedIcon />} hint={t("tls_hint")}>
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
-      <InfoRow label={t("tls_cert_sha256")} value={fingerprint} />
-      <div className="flex items-center justify-between gap-4 py-2">
+      <InfoRow label={t("tls_cert_sha256")} value={fingerprint} copy={!!tls_info?.fingerprint_sha256} mono={!!tls_info?.fingerprint_sha256} />
+      <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
         <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
         <span className="inline-flex items-center justify-end gap-2 min-w-0">
-          <span className="text-[13px] text-txt-primary font-mono truncate max-w-[140px]" title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
-          <button
-            type="button"
-            className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0"
-            onClick={() => api.open_tls_cert().catch(() => {})}
-          >
-            {t("tls_open_cert_folder")}
-          </button>
+          <span className={`text-[13px] text-txt-primary truncate max-w-[140px] ${tls_info?.cert_path ? "font-mono" : ""}`} title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
+          {tls_info?.cert_path && (
+            <button
+              type="button"
+              className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0 rounded-[4px] focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary"
+              onClick={() => api.open_tls_cert().catch(() => {})}
+            >
+              {t("tls_open_cert_folder")}
+            </button>
+          )}
         </span>
       </div>
       <InfoRow label={t("tls_jmap_scheme")} value={jmap_https_enabled ? "https://" : "http://"} copy={false} />
@@ -1538,7 +1496,6 @@ function PasswordsPanel({
   const [new_password_label, set_new_password_label] = useState("");
   const [generated_password, set_generated_password] = useState<string | null>(null);
   const [generating, set_generating] = useState(false);
-  const [banner_copied, set_banner_copied] = useState(false);
   const [delete_target, set_delete_target] = useState<{ id: string; label: string } | null>(null);
   const delete_display = use_frozen(delete_target);
   const [deleting, set_deleting] = useState(false);
@@ -1565,7 +1522,7 @@ function PasswordsPanel({
 
   const handle_generate = async () => {
     set_generating(true);
-    const label = new_password_label.trim() || "App Password";
+    const label = new_password_label.trim() || t("app_password_default_label");
     const password = await on_generate_password(label);
     if (password) { set_generated_password(password); set_new_password_label(""); }
     set_generating(false);
@@ -1587,39 +1544,38 @@ function PasswordsPanel({
       </p>
 
       {generated_password && (
-        <div className="mb-4 rounded-lg p-4" style={{ backgroundColor: "var(--accent-color)" }}>
+        <div className="aster_island aster_island_tone_accent mb-4 p-4">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium text-white">{t("password_created_banner")}</span>
-            <button className="p-1 rounded-lg transition-all duration-150 hover:opacity-70" onClick={() => set_generated_password(null)}>
-              <svg className="w-4 h-4 text-white/70" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <span className="text-sm font-medium text-txt-primary">{t("password_created_banner")}</span>
+            <button type="button" className="h-7 w-7 flex items-center justify-center rounded-full text-txt-muted transition-colors duration-150 hover:bg-[var(--aster-field-hover)] hover:text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("dismiss")} onClick={() => set_generated_password(null)}>
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                 <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <code className="flex-1 text-sm font-mono text-white px-3 py-2 rounded-md select-all" style={{ backgroundColor: "rgba(255, 255, 255, 0.15)" }}>
+            <code className="bridge_field flex-1 text-sm font-mono text-txt-primary px-3 py-2 select-all">
               {generated_password}
             </code>
-            <button className="p-2 rounded-md transition-all duration-150 hover:opacity-70" style={{ backgroundColor: "rgba(255, 255, 255, 0.2)" }} onClick={async () => { await handle_copy(generated_password); set_banner_copied(true); setTimeout(() => set_banner_copied(false), 1500); }}>
-              <CopyIcon copied={banner_copied} />
+            <button type="button" className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("copy")} onClick={() => void handle_copy(generated_password)}>
+              <CopyIcon />
             </button>
           </div>
-          <p className="mt-2 text-xs" style={{ color: "rgba(255, 255, 255, 0.7)" }}>{t("password_copy_hint")}</p>
+          <p className="mt-2 text-xs text-txt-muted">{t("password_copy_hint")}</p>
         </div>
       )}
 
       <div className="flex gap-2 mb-2 items-stretch">
         <input
-          className="flex-1 h-9 rounded-lg border px-3 text-sm text-txt-primary placeholder-txt-muted focus:outline-none transition-colors"
-          style={{ backgroundColor: "var(--bg-tertiary)", borderColor: "var(--border-secondary)" }}
+          className="bridge_field flex-1 h-9 px-3 text-sm text-txt-primary placeholder-txt-muted focus:outline-none"
           placeholder={t("password_label_placeholder")}
           type="text"
           value={new_password_label}
           onChange={(e) => set_new_password_label(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") handle_generate(); }}
         />
-        <Button disabled={generating} variant="depth" size="lg" onClick={handle_generate}>
-          {generating ? t("generating") : t("generate")}
+        <Button is_loading={generating} variant="depth" size="lg" onClick={handle_generate}>
+          {t("generate")}
         </Button>
       </div>
       <div className="flex flex-wrap items-center gap-1.5 mb-4">
@@ -1628,8 +1584,8 @@ function PasswordsPanel({
           <button
             key={s}
             type="button"
-            className="text-[11px] px-2 py-0.5 rounded-full border transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-            style={{ borderColor: "var(--border-secondary)", color: "var(--text-secondary)" }}
+            className="text-[11px] px-2 py-0.5 rounded-full bg-[var(--aster-field-bg)] transition-colors hover:bg-[var(--aster-field-hover)]"
+            style={{ color: "var(--text-secondary)" }}
             onClick={() => set_new_password_label(s)}
           >
             {s}
@@ -1650,8 +1606,8 @@ function PasswordsPanel({
                 : t("last_used", { time: format_relative_time(pw.last_used_at) })
               : t("never_used");
             return (
-              <div key={pw.id} className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-secondary)" }}>
-                <div className="min-w-0 pr-3">
+              <div key={pw.id} className="aster_island flex items-center justify-between p-3">
+                <div className="min-w-0 pe-3">
                   <p className="text-sm font-medium text-txt-primary truncate">{pw.label}</p>
                   <p className="text-[11px] text-txt-muted mt-0.5">{t("created_date", { date: format_date(pw.created_at) })}</p>
                   <p className="text-[11px] text-txt-muted mt-0.5 truncate" title={last_used_label}>{last_used_label}</p>
@@ -1665,12 +1621,10 @@ function PasswordsPanel({
 
       <Modal open={!!delete_target} on_close={() => set_delete_target(null)}>
         <p className="text-base font-semibold text-txt-primary">{t("delete_password_title")}</p>
-        <ModalBody>
-          <span>{t("delete_password_confirm", { label: delete_display?.label ?? "" })}</span>
-        </ModalBody>
+        <ModalBody>{t("delete_password_confirm", { label: delete_display?.label ?? "" })}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_delete_target(null)}>{t("cancel")}</Button>
-          <Button disabled={deleting} variant="destructive" size="md" onClick={handle_delete}>{deleting ? t("deleting") : t("delete")}</Button>
+          <Button is_loading={deleting} variant="destructive" size="md" onClick={handle_delete}>{t("delete")}</Button>
         </ModalActions>
       </Modal>
     </div>
@@ -1750,11 +1704,12 @@ function IdentitiesGroup() {
   };
 
   return (
-    <section className="mb-5">
-      <div className="flex items-center justify-between gap-2 px-1 mb-2">
-        <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-txt-tertiary">
+    <section className="mb-6">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
+          <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full"><AtSymbolIcon /></span>
           {t("section_send_addresses")}
-          {identities !== null && <span className="ml-1.5 text-txt-muted normal-case tracking-normal">({enabled.length})</span>}
+          {identities !== null && <span className="text-[13px] font-normal text-txt-muted">({enabled.length})</span>}
         </h3>
         {enabled.length > 3 && (
           <button type="button" onClick={copy_all} className="text-[11px] font-medium text-txt-muted hover:text-txt-primary">
@@ -1769,7 +1724,7 @@ function IdentitiesGroup() {
           value={query}
           onChange={(e) => set_query(e.target.value)}
           placeholder={t("search_addresses")}
-          className="w-full mb-2 h-8 rounded-lg border border-edge-secondary bg-surf-tertiary px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
+          className="bridge_field w-full mb-2 h-8 px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
         />
       )}
 
@@ -1801,7 +1756,7 @@ function IdentitiesGroup() {
           })
         )}
       </div>
-      <p className="text-[11px] text-txt-muted px-1 mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
+      <p className="text-[12px] text-txt-muted mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
     </section>
   );
 }
@@ -2109,8 +2064,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={imap_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_imap_port(v); set_ports_dirty(true); }}
-            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
           />
         </SettingRow>
         <SettingRow label={t("smtp_port")}>
@@ -2120,14 +2074,13 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={smtp_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_smtp_port(v); set_ports_dirty(true); }}
-            className="w-20 h-8 px-2.5 text-sm rounded-lg text-txt-primary text-center font-mono"
-            style={{ backgroundColor: "var(--input-bg)", border: "1px solid var(--input-border)" }}
+            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
           />
         </SettingRow>
         {ports_dirty && (
           <div className="flex justify-end py-2.5">
-            <Button variant="depth" size="sm" disabled={saving_ports} onClick={handle_save_ports}>
-              {saving_ports ? t("saving") : t("save")}
+            <Button variant="depth" size="sm" is_loading={saving_ports} onClick={handle_save_ports}>
+              {t("save")}
             </Button>
           </div>
         )}
@@ -2156,11 +2109,12 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
               <Button
                 variant="outline"
                 size="sm"
-                disabled={!bridge_running || outbox_retrying_id === item.id || item.status === "sending"}
+                disabled={!bridge_running || item.status === "sending"}
+                is_loading={outbox_retrying_id === item.id}
                 title={!bridge_running ? t("start_bridge_to_retry") : undefined}
                 onClick={() => handle_outbox_retry(item.id)}
               >
-                {outbox_retrying_id === item.id ? t("retrying") : t("retry_now")}
+                {t("retry_now")}
               </Button>
             </div>
           ))}
@@ -2174,26 +2128,26 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         <SettingRow label={t("diagnostics_bundle_label")} sublabel={t("diagnostics_bundle_sub")}>
-          <Button variant="secondary" size="sm" disabled={copying_bundle} onClick={handle_copy_bundle}>
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+          <Button variant="secondary" size="sm" is_loading={copying_bundle} onClick={handle_copy_bundle}>
+            <svg className={`w-3.5 h-3.5 ${copying_bundle ? "opacity-0" : ""}`} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <rect height="13" rx="2" width="13" x="9" y="9" />
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            {copying_bundle ? t("building") : t("copy")}
+            {t("copy")}
           </Button>
         </SettingRow>
         {logs_open && (
           <div className="py-3">
             <div className="flex items-center justify-between mb-2">
               <span className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("show_recent_logs")}</span>
-              <Button variant="ghost" size="sm" disabled={logs_loading} onClick={handle_refresh_logs}>
-                {logs_loading ? t("loading") : t("refresh")}
+              <Button variant="ghost" size="sm" is_loading={logs_loading} onClick={handle_refresh_logs}>
+                {t("refresh")}
               </Button>
             </div>
             <div
               ref={log_container_ref}
-              className="rounded-lg p-3 text-[11px] font-mono whitespace-pre overflow-auto border border-edge-secondary"
-              style={{ backgroundColor: "var(--bg-secondary)", maxHeight: "240px", color: "var(--text-secondary)" }}
+              className="rounded-[var(--aster-radius-panel)] p-3 text-[11px] font-mono whitespace-pre overflow-auto bg-[var(--aster-field-bg)]"
+              style={{ maxHeight: "240px", color: "var(--text-secondary)" }}
             >
               {logs_loading && log_lines.length === 0 ? t("loading") : null}
               {!logs_loading && log_lines.length === 0 ? t("no_log_entries") : null}
@@ -2212,14 +2166,14 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             {update_info.notes && (
               <p className="text-[12px] text-txt-muted mb-2.5 line-clamp-3 leading-snug">{update_info.notes}</p>
             )}
-            <Button variant="depth" size="sm" disabled={update_installing} onClick={handle_install_update}>
-              {update_installing ? t("update_installing") : t("update_install")}
+            <Button variant="depth" size="sm" is_loading={update_installing} onClick={handle_install_update}>
+              {t("update_install")}
             </Button>
           </div>
         )}
         <SettingRow label={t("updates_app_row")} sublabel={app_version ? `${t("app_version")} ${app_version}` : undefined}>
-          <Button variant="outline" size="sm" disabled={update_checking || update_installing} onClick={handle_check_updates}>
-            {update_checking ? t("update_checking") : t("update_check_now")}
+          <Button variant="outline" size="sm" disabled={update_installing} is_loading={update_checking} onClick={handle_check_updates}>
+            {t("update_check_now")}
           </Button>
         </SettingRow>
       </SettingsGroup>
@@ -2246,8 +2200,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             </svg>
           }
         >
-          <Button variant="secondary" size="sm" disabled={repairing} onClick={() => set_show_repair_modal(true)}>
-            {repairing ? t("rebuilding_cache") : t("repair")}
+          <Button variant="secondary" size="sm" is_loading={repairing} onClick={() => set_show_repair_modal(true)}>
+            {t("repair")}
           </Button>
         </SettingRow>
         <SettingRow
@@ -2268,128 +2222,122 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
       <Modal open={show_repair_modal} on_close={() => !repairing && set_show_repair_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("repair_cache_title")}</p>
-        <ModalBody>
-          <span>{t("repair_cache_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("repair_cache_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" disabled={repairing} onClick={() => set_show_repair_modal(false)}>{t("cancel")}</Button>
-          <Button disabled={repairing} variant="destructive" size="md" onClick={handle_repair}>{repairing ? t("rebuilding") : t("repair")}</Button>
+          <Button is_loading={repairing} variant="destructive" size="md" onClick={handle_repair}>{t("repair")}</Button>
         </ModalActions>
       </Modal>
 
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>
-        <ModalBody>
-          <span>{t("reset_bridge_body")}</span>
-        </ModalBody>
+        <ModalBody>{t("reset_bridge_body")}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_show_reset_modal(false)}>{t("cancel")}</Button>
-          <Button disabled={resetting} variant="destructive" size="md" onClick={handle_reset}>{resetting ? t("resetting") : t("reset")}</Button>
+          <Button is_loading={resetting} variant="destructive" size="md" onClick={handle_reset}>{t("reset")}</Button>
         </ModalActions>
       </Modal>
 
       <Modal open={!!setup_client} on_close={() => set_setup_client(null)} size="lg">
         <p className="text-base font-semibold text-txt-primary">{t("setup_with_client", { client: setup_display ?? "" })}</p>
-        <ModalBody>
-          <div className="space-y-5">
-            {setup_display === "Thunderbird" && (
-              <>
-                <SetupStep n={1} title={t("tb_step1_title")}>
-                  <SetupNote>{t("tb_step1_desc")}</SetupNote>
-                  <SetupBox>
-                    <SetupRow label={t("tb_field_full_name")} hint={t("tb_field_full_name_hint")} />
-                    <SetupRow label={t("field_email_address")} value={email || "-"} />
-                    <SetupRow label={t("tb_field_password")} hint={t("tb_field_password_hint")} />
-                  </SetupBox>
-                  <SetupNote>{t("tb_step1_note")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("tb_step2_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("field_protocol")} value="IMAP" />
-                    <SetupRow label={t("field_hostname")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
-                    <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
-                    <SetupRow label={t("field_username")} value={email || "-"} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={3} title={t("tb_step3_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("field_hostname")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                    <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
-                    <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
-                    <SetupRow label={t("field_username")} value={email || "-"} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={4} title={t("tb_step4_title")}>
-                  <SetupNote>{t("tb_step4_desc")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            {setup_display === "Outlook" && (
-              <>
-                <SetupStep n={1} title={t("ol_step1_title")}>
-                  <SetupNote>{t("ol_step1_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("ol_step2_title")}>
-                  <SetupNote>{t("ol_step2_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={3} title={t("ol_step3_title")}>
-                  <SetupBox>
-                    <SetupGroupLabel>{t("ol_incoming_mail")}</SetupGroupLabel>
-                    <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--border-secondary)" }} />
-                    <SetupGroupLabel>{t("ol_outgoing_mail")}</SetupGroupLabel>
-                    <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                    <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
-                  </SetupBox>
-                </SetupStep>
-                <SetupStep n={4} title={t("ol_step4_title")}>
-                  <SetupNote>{t("ol_step4_desc")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            {setup_display === "Apple Mail" && (
-              <>
-                <SetupStep n={1} title={t("am_step1_title")}>
-                  <SetupNote>{t("am_step1_desc")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={2} title={t("am_step2_title")}>
-                  <SetupBox>
-                    <SetupRow label={t("am_field_name")} hint={t("am_field_name_hint")} />
-                    <SetupRow label={t("field_email_address")} value={email || "-"} />
-                    <SetupRow label={t("field_password")} hint={t("am_field_password_hint")} />
-                  </SetupBox>
-                  <SetupNote>{t("am_step2_note")}</SetupNote>
-                </SetupStep>
-                <SetupStep n={3} title={t("am_step3_title")}>
-                  <SetupNote>{t("am_step3_desc")}</SetupNote>
-                  <SetupBox>
-                    <SetupGroupLabel>{t("am_incoming_server")}</SetupGroupLabel>
-                    <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
-                    <div className="h-px my-1" style={{ backgroundColor: "var(--border-secondary)" }} />
-                    <SetupGroupLabel>{t("am_outgoing_server")}</SetupGroupLabel>
-                    <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
-                    <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
-                  </SetupBox>
-                  <SetupNote>{t("am_step3_note")}</SetupNote>
-                </SetupStep>
-              </>
-            )}
-            <div className="flex gap-3 items-start rounded-xl border border-edge-secondary bg-surf-tertiary px-3.5 py-3">
-              <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
-                <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              <p className="text-[13px] leading-relaxed text-txt-tertiary">{t("setup_guide_no_encryption_note")}</p>
-            </div>
+        <div className="aster_modal_body space-y-5">
+          {setup_display === "Thunderbird" && (
+            <>
+              <SetupStep n={1} title={t("tb_step1_title")}>
+                <SetupNote>{t("tb_step1_desc")}</SetupNote>
+                <SetupBox>
+                  <SetupRow label={t("tb_field_full_name")} hint={t("tb_field_full_name_hint")} />
+                  <SetupRow label={t("field_email_address")} value={email || "-"} />
+                  <SetupRow label={t("tb_field_password")} hint={t("tb_field_password_hint")} />
+                </SetupBox>
+                <SetupNote>{t("tb_step1_note")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("tb_step2_title")}>
+                <SetupBox>
+                  <SetupRow label={t("field_protocol")} value="IMAP" />
+                  <SetupRow label={t("field_hostname")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
+                  <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
+                  <SetupRow label={t("field_username")} value={email || "-"} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={3} title={t("tb_step3_title")}>
+                <SetupBox>
+                  <SetupRow label={t("field_hostname")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                  <SetupRow label={t("field_connection_security")} value={t("field_none")} mono={false} />
+                  <SetupRow label={t("field_auth_method")} value={t("field_normal_password")} mono={false} />
+                  <SetupRow label={t("field_username")} value={email || "-"} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={4} title={t("tb_step4_title")}>
+                <SetupNote>{t("tb_step4_desc")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          {setup_display === "Outlook" && (
+            <>
+              <SetupStep n={1} title={t("ol_step1_title")}>
+                <SetupNote>{t("ol_step1_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("ol_step2_title")}>
+                <SetupNote>{t("ol_step2_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={3} title={t("ol_step3_title")}>
+                <SetupBox>
+                  <SetupGroupLabel>{t("ol_incoming_mail")}</SetupGroupLabel>
+                  <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
+                  <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
+                  <SetupGroupLabel>{t("ol_outgoing_mail")}</SetupGroupLabel>
+                  <SetupRow label={t("ol_field_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                  <SetupRow label={t("ol_field_encryption")} value={t("field_none")} mono={false} />
+                </SetupBox>
+              </SetupStep>
+              <SetupStep n={4} title={t("ol_step4_title")}>
+                <SetupNote>{t("ol_step4_desc")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          {setup_display === "Apple Mail" && (
+            <>
+              <SetupStep n={1} title={t("am_step1_title")}>
+                <SetupNote>{t("am_step1_desc")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={2} title={t("am_step2_title")}>
+                <SetupBox>
+                  <SetupRow label={t("am_field_name")} hint={t("am_field_name_hint")} />
+                  <SetupRow label={t("field_email_address")} value={email || "-"} />
+                  <SetupRow label={t("field_password")} hint={t("am_field_password_hint")} />
+                </SetupBox>
+                <SetupNote>{t("am_step2_note")}</SetupNote>
+              </SetupStep>
+              <SetupStep n={3} title={t("am_step3_title")}>
+                <SetupNote>{t("am_step3_desc")}</SetupNote>
+                <SetupBox>
+                  <SetupGroupLabel>{t("am_incoming_server")}</SetupGroupLabel>
+                  <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.imap_port || 1143)} />
+                  <div className="h-px my-1" style={{ backgroundColor: "var(--aster-floating-divider)" }} />
+                  <SetupGroupLabel>{t("am_outgoing_server")}</SetupGroupLabel>
+                  <SetupRow label={t("am_field_mail_server")} value="127.0.0.1" />
+                  <SetupRow label={t("field_port")} value={String(conn_info?.smtp_port || 1025)} />
+                </SetupBox>
+                <SetupNote>{t("am_step3_note")}</SetupNote>
+              </SetupStep>
+            </>
+          )}
+          <div className="aster_island flex gap-3 items-start px-3.5 py-3">
+            <svg className="w-[18px] h-[18px] text-txt-muted flex-shrink-0 mt-px" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
+              <path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.249-8.25-3.285Z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <p className="text-[13px] leading-relaxed text-txt-tertiary">{t("setup_guide_no_encryption_note")}</p>
           </div>
-        </ModalBody>
+        </div>
         <ModalActions>
           <Button variant="depth" size="md" onClick={() => set_setup_client(null)}>{t("done")}</Button>
         </ModalActions>
@@ -2506,16 +2454,16 @@ function DashboardView({
       />
       <div className="flex-1 p-2 min-h-0 min-w-0 flex flex-col overflow-hidden">
         {!is_online && (
-          <div className="flex items-center gap-2 px-3 py-1.5 mb-1.5 rounded-lg text-[12px] font-medium" style={{ backgroundColor: "color-mix(in srgb, var(--color-warning, #f59e0b) 12%, transparent)", color: "var(--color-warning, #f59e0b)", border: "1px solid color-mix(in srgb, var(--color-warning, #f59e0b) 25%, transparent)" }}>
-            <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+          <div className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium text-txt-primary">
+            <svg className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "var(--color-warning)" }} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
             {t("offline_banner")}
           </div>
         )}
         <div
-          className="flex-1 w-full rounded-xl border overflow-hidden transition-colors duration-200"
-          style={{ backgroundColor: "var(--bg-primary)", borderColor: "var(--border-primary)" }}
+          className="flex-1 w-full rounded-[var(--aster-island-radius)] overflow-hidden transition-colors duration-200"
+          style={{ backgroundColor: "var(--bg-primary)" }}
         >
           <div className="h-full overflow-y-auto">
             <div className="mx-auto w-full max-w-5xl">
@@ -2850,10 +2798,10 @@ export function BridgeApp() {
         const url = new URL(payload);
         if (url.protocol !== "aster-mail:") return;
         if (url.hostname !== "provision" && url.pathname !== "//provision" && url.pathname !== "/provision") return;
-        const raw_label = url.searchParams.get("label") || "Auto-provisioned";
+        const raw_label = url.searchParams.get("label") || i18next.t("provision_default_label");
         // Deep links arrive from arbitrary local apps; the label is untrusted.
         // Strip control chars and cap length before it is shown in the confirm modal.
-        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || "Auto-provisioned";
+        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || i18next.t("provision_default_label");
         set_provision_label(label);
       } catch {
         /* ignore malformed deep link */
@@ -2926,9 +2874,7 @@ export function BridgeApp() {
       />
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>
-        <ModalBody>
-          <span>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</span>
-        </ModalBody>
+        <ModalBody>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</ModalBody>
         <ModalActions>
           <Button variant="ghost" size="md" onClick={() => set_provision_label(null)}>{i18next.t("cancel")}</Button>
           <Button variant="depth" size="md" onClick={handle_provision_confirm}>{i18next.t("provision_allow")}</Button>
