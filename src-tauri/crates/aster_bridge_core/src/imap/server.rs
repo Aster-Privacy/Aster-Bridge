@@ -319,6 +319,62 @@ fn header_search_matches(msg: &CachedMessage, field: &str, pattern: &str) -> boo
     }
 }
 
+/// Whether a command line is `SEARCH` or `UID SEARCH`, the commands whose
+/// string arguments may arrive as literals.
+fn is_search_command(line: &str) -> bool {
+    let mut words = line.split_whitespace().skip(1);
+    match words.next().map(|w| w.to_ascii_uppercase()) {
+        Some(cmd) if cmd == "SEARCH" => true,
+        Some(cmd) if cmd == "UID" => words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("SEARCH")),
+        _ => false,
+    }
+}
+
+/// A line ending in a literal marker, `{n}` or `{n+}`: the text before it,
+/// the literal's length, and whether it is non-synchronizing.
+fn trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
+    let inner = line.strip_suffix('}')?;
+    let open = inner.rfind('{')?;
+    let spec = &inner[open + 1..];
+    let non_sync = spec.ends_with('+');
+    let len = spec.trim_end_matches('+').parse::<usize>().ok()?;
+    Some((&line[..open], len, non_sync))
+}
+
+fn quote_search_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Drop a leading `CHARSET <name>` (RFC 3501 §6.4.4). Search strings reach
+/// the matcher as UTF-8 text, so US-ASCII and UTF-8 are accepted; any other
+/// charset is refused so the client can report it.
+fn strip_search_charset(criteria_upper: &str) -> std::result::Result<&str, ()> {
+    let trimmed = criteria_upper.trim_start();
+    let Some(after) = trimmed.strip_prefix("CHARSET ") else {
+        return Ok(trimmed);
+    };
+    let after = after.trim_start();
+    let (charset, rest) = match after.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"').ok_or(())?,
+        None => after.split_once(' ').unwrap_or((after, "")),
+    };
+    match charset {
+        "UTF-8" | "US-ASCII" => Ok(rest.trim_start()),
+        _ => Err(()),
+    }
+}
+
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
@@ -756,7 +812,55 @@ where
             continue;
         }
 
-        let trimmed = line.trim_end().to_string();
+        let mut trimmed = line.trim_end().to_string();
+        // SEARCH strings may arrive as literals (RFC 3501 §4.3): clients send
+        // non-ASCII terms that way. Read each one and splice it back into the
+        // line as a quoted string, so the criteria parse as usual.
+        if is_search_command(&trimmed) {
+            // (message, whether the connection can go on)
+            let mut literal_error: Option<(&str, bool)> = None;
+            while let Some((head, len, non_sync)) = trailing_literal(&trimmed) {
+                if head.len() + len > MAX_LINE_LENGTH {
+                    // A synchronizing literal has not been sent yet, so the
+                    // client can carry on; a non-synchronizing one is already
+                    // on its way and cannot be told apart from commands.
+                    literal_error = Some(("SEARCH literal too large", !non_sync));
+                    break;
+                }
+                if !non_sync {
+                    writer.write_all(b"+ Ready for literal data\r\n").await?;
+                    writer.flush().await?;
+                }
+                let mut buf = vec![0u8; len];
+                if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf).await.is_err() {
+                    literal_error = Some(("SEARCH read failed", false));
+                    break;
+                }
+                let head = head.to_string();
+                match read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        literal_error = Some(("Line too long", false));
+                        break;
+                    }
+                    Err(e) => return Err(crate::error::BridgeError::Io(e)),
+                }
+                trimmed = format!(
+                    "{}{}{}",
+                    head,
+                    quote_search_string(&String::from_utf8_lossy(&buf)),
+                    line.trim_end()
+                );
+            }
+            if let Some((msg, recoverable)) = literal_error {
+                let tag = trimmed.split(' ').next().unwrap_or("*").to_string();
+                write_bad(&mut writer, &tag, msg).await?;
+                if recoverable {
+                    continue;
+                }
+                break;
+            }
+        }
         let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
         if parts.len() < 2 {
             writer.write_all(b"* BAD Invalid command\r\n").await?;
@@ -1013,8 +1117,12 @@ where
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
                         let messages = db.list_cached_messages(folder).unwrap_or_default();
                         let criteria_upper = subargs.trim().to_ascii_uppercase();
+                        let Ok(criteria) = strip_search_charset(&criteria_upper) else {
+                            write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
+                            continue;
+                        };
                         let uids: Vec<String> = messages.iter()
-                            .filter(|m| search_matches(m, &criteria_upper))
+                            .filter(|m| search_matches(m, criteria))
                             .map(|m| m.imap_uid.to_string())
                             .collect();
                         writer
@@ -1127,8 +1235,12 @@ where
                 let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
                 let messages = db.list_cached_messages(folder).unwrap_or_default();
                 let criteria_upper = args.trim().to_ascii_uppercase();
+                let Ok(criteria) = strip_search_charset(&criteria_upper) else {
+                    write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
+                    continue;
+                };
                 let matched: Vec<String> = messages.iter().enumerate()
-                    .filter(|(_, m)| search_matches(m, &criteria_upper))
+                    .filter(|(_, m)| search_matches(m, criteria))
                     .map(|(i, _)| (i + 1).to_string())
                     .collect();
                 writer
@@ -5324,6 +5436,135 @@ mod tests {
         assert!(search_matches(m, "SUBJECT \"ALPHA STATUS\""));
         assert!(!search_matches(m, "SUBJECT \"ALPHA OMEGA\""));
         assert!(search_matches(m, "FROM \"ALICE@EXAMPLE.COM\" SUBJECT \"PROJECT ALPHA\""));
+    }
+
+    #[test]
+    fn strip_search_charset_accepts_utf8_and_ascii_only() {
+        assert_eq!(strip_search_charset("CHARSET UTF-8 SUBJECT X"), Ok("SUBJECT X"));
+        assert_eq!(strip_search_charset("CHARSET \"UTF-8\" ALL"), Ok("ALL"));
+        assert_eq!(strip_search_charset("CHARSET US-ASCII FROM A"), Ok("FROM A"));
+        assert_eq!(strip_search_charset("SUBJECT CHARSET"), Ok("SUBJECT CHARSET"));
+        assert_eq!(strip_search_charset("CHARSET ISO-8859-1 ALL"), Err(()));
+    }
+
+    #[test]
+    fn trailing_literal_reads_the_marker() {
+        assert_eq!(
+            trailing_literal("s1 UID SEARCH SUBJECT {7}"),
+            Some(("s1 UID SEARCH SUBJECT ", 7, false))
+        );
+        assert_eq!(
+            trailing_literal("s1 SEARCH TEXT {12+}"),
+            Some(("s1 SEARCH TEXT ", 12, true))
+        );
+        assert_eq!(trailing_literal("s1 SEARCH SUBJECT \"{7}x\""), None);
+        assert_eq!(trailing_literal("s1 SEARCH ALL"), None);
+    }
+
+    #[test]
+    fn search_command_detection() {
+        assert!(is_search_command("s1 SEARCH ALL"));
+        assert!(is_search_command("s1 uid search SUBJECT {3}"));
+        assert!(!is_search_command("s1 APPEND INBOX {3}"));
+        assert!(!is_search_command("s1 UID FETCH 1:* FLAGS"));
+    }
+
+    #[test]
+    fn quoted_literal_keeps_quotes_and_backslashes() {
+        assert_eq!(quote_search_string(r#"say "hi" \ bye"#), r#""say \"hi\" \\ bye""#);
+        assert_eq!(
+            tokenize_search_criteria(&format!("SUBJECT {}", quote_search_string(r#"a "b" c"#))),
+            vec!["SUBJECT", r#"a "b" c"#]
+        );
+    }
+
+    async fn search_with_literal(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        head: &str,
+        literal: &str,
+        rest: &str,
+    ) -> String {
+        writer
+            .write_all(format!("{} {}{{{}}}\r\n", tag, head, literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with('+'), "expected continuation, got {:?}", cont);
+        writer
+            .write_all(format!("{}{}\r\n", literal, rest).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        read_until_tag(reader, tag).await.join("\n")
+    }
+
+    fn search_hits(resp: &str) -> Vec<String> {
+        resp.lines()
+            .find(|l| l.starts_with("* SEARCH"))
+            .map(|l| {
+                l.trim_start_matches("* SEARCH")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn search_accepts_a_charset_prefix() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "cs-1", "inbox", "project alpha status");
+        seed(&db, "cs-2", "inbox", "something else");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "UID SEARCH CHARSET UTF-8 SUBJECT alpha").await;
+        assert!(resp.contains("c1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "SEARCH CHARSET US-ASCII ALL").await;
+        assert_eq!(search_hits(&resp), vec!["1", "2"], "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c3", "UID SEARCH CHARSET KOI8-R ALL").await;
+        assert!(resp.contains("c3 NO [BADCHARSET"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_reads_literal_strings() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "lit-1", "inbox", "Mudança de morada");
+        seed(&db, "lit-2", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = search_with_literal(&mut reader, &mut writer, "l1", "UID SEARCH CHARSET UTF-8 SUBJECT ", "mudança", "").await;
+        assert!(resp.contains("l1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        // Criteria can follow the literal on the same line.
+        let resp = search_with_literal(&mut reader, &mut writer, "l2", "SEARCH SUBJECT ", "alpha", " UNDELETED").await;
+        assert_eq!(search_hits(&resp), vec!["2"], "{}", resp);
+
+        let resp = search_with_literal(&mut reader, &mut writer, "l3", "SEARCH SUBJECT ", "nowhere", "").await;
+        assert!(resp.contains("l3 OK"), "{}", resp);
+        assert!(search_hits(&resp).is_empty(), "{}", resp);
+
+        // The connection is still in step afterwards.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l4", "NOOP").await;
+        assert!(resp.contains("l4 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_refuses_an_oversized_literal_and_carries_on() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "o1", "SEARCH SUBJECT {999999}").await;
+        assert!(resp.contains("o1 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "o2", "NOOP").await;
+        assert!(resp.contains("o2 OK"), "{}", resp);
     }
 
     #[test]
