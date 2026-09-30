@@ -2,6 +2,16 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.37 - 2026-09-30
+
+### What's new
+- Tags and keywords that you add to a message in your mail app now stay on the message, and you can search for messages by tag.
+- Searches that your mail app runs on the server now return results when the app specifies a character set or when you search for accented or non-Latin words.
+
+### Fixed
+- When your mail app changes labels on a message, the message keeps its read and starred status instead of becoming unread.
+- Aster Bridge checks search requests more strictly and no longer writes the text that you search for to its log.
+
 ## 0.4.36 - 2026-09-28
 
 ### What's new
