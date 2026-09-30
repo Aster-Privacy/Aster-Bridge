@@ -127,6 +127,8 @@ fn gmail_labels_for_message(msg: &CachedMessage) -> Vec<String> {
 
 const MAX_LINE_LENGTH: usize = 8192;
 const MAX_FAILED_AUTH: u32 = 5;
+const MAX_SEARCH_LITERALS: usize = 16;
+const SEARCH_LITERAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 async fn read_line_bounded<R>(
     reader: &mut R,
@@ -338,8 +340,14 @@ fn trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
     let inner = line.strip_suffix('}')?;
     let open = inner.rfind('{')?;
     let spec = &inner[open + 1..];
-    let non_sync = spec.ends_with('+');
-    let len = spec.trim_end_matches('+').parse::<usize>().ok()?;
+    let (digits, non_sync) = match spec.strip_suffix('+') {
+        Some(digits) => (digits, true),
+        None => (spec, false),
+    };
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let len = digits.parse::<usize>().ok()?;
     Some((&line[..open], len, non_sync))
 }
 
@@ -355,6 +363,27 @@ fn quote_search_string(raw: &str) -> String {
     out.push('"');
     out
 }
+
+/// What to log for a criterion the matcher does not know. Search strings are
+/// mail content, so only sequence sets and criterion-shaped atoms are logged
+/// as written; anything else is reported by its length.
+fn loggable_criterion(token: &str) -> String {
+    let is_sequence_set = !token.is_empty()
+        && token.bytes().all(|b| b.is_ascii_digit() || matches!(b, b':' | b',' | b'*'));
+    let is_criterion_name = (1..=24).contains(&token.len())
+        && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'-')
+        && (token.starts_with("X-") || KNOWN_UNSUPPORTED_CRITERIA.contains(&token));
+    if is_sequence_set || is_criterion_name {
+        token.to_string()
+    } else {
+        format!("<{} byte token>", token.len())
+    }
+}
+
+const KNOWN_UNSUPPORTED_CRITERIA: &[&str] = &[
+    "MODSEQ", "OLDER", "YOUNGER", "SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED",
+    "FUZZY", "EMAILID", "THREADID", "ANNOTATION", "FILTER",
+];
 
 /// Drop a leading `CHARSET <name>` (RFC 3501 §6.4.4). Search strings reach
 /// the matcher as UTF-8 text, so US-ASCII and UTF-8 are accepted; any other
@@ -375,25 +404,44 @@ fn strip_search_charset(criteria_upper: &str) -> std::result::Result<&str, ()> {
     }
 }
 
+#[cfg(test)]
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
+    search_matches_noting(msg, &[], criteria_upper, &mut None)
+}
+
+/// Like `search_matches`, against the message's stored keywords, and records
+/// the first criterion it does not support, so the command can log it once
+/// rather than once per message.
+fn search_matches_noting(
+    msg: &CachedMessage,
+    keywords: &[String],
+    criteria_upper: &str,
+    unsupported: &mut Option<String>,
+) -> bool {
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
     while idx < parts.len() {
-        if !search_eval(msg, &parts, &mut idx) {
+        if !search_eval(msg, keywords, &parts, &mut idx, unsupported) {
             return false;
         }
     }
     true
 }
 
-fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
+fn search_eval(
+    msg: &CachedMessage,
+    keywords: &[String],
+    parts: &[String],
+    idx: &mut usize,
+    unsupported: &mut Option<String>,
+) -> bool {
     if *idx >= parts.len() { return true; }
     match parts[*idx].as_str() {
         "(" => {
             *idx += 1;
             let mut result = true;
             while *idx < parts.len() && parts[*idx] != ")" {
-                if !search_eval(msg, parts, idx) {
+                if !search_eval(msg, keywords, parts, idx, unsupported) {
                     result = false;
                 }
             }
@@ -416,13 +464,13 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
         "UNDRAFT" => { *idx += 1; (msg.flags & 16) == 0 }
         "NOT" => {
             *idx += 1;
-            let v = search_eval(msg, parts, idx);
+            let v = search_eval(msg, keywords, parts, idx, unsupported);
             !v
         }
         "OR" => {
             *idx += 1;
-            let a = search_eval(msg, parts, idx);
-            let b = search_eval(msg, parts, idx);
+            let a = search_eval(msg, keywords, parts, idx, unsupported);
+            let b = search_eval(msg, keywords, parts, idx, unsupported);
             a || b
         }
         "FROM" => {
@@ -498,13 +546,13 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
         }
         "KEYWORD" => {
             *idx += 1;
-            if *idx < parts.len() { *idx += 1; }
-            false
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            has_keyword(keywords, pat)
         }
         "UNKEYWORD" => {
             *idx += 1;
-            if *idx < parts.len() { *idx += 1; }
-            true
+            let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
+            !has_keyword(keywords, pat)
         }
         "HEADER" => {
             *idx += 1;
@@ -525,7 +573,9 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
         "RECENT" | "NEW" => { *idx += 1; false }
         "OLD" => { *idx += 1; true }
         unknown => {
-            tracing::warn!("unsupported SEARCH criterion {}", unknown);
+            if unsupported.is_none() {
+                *unsupported = Some(loggable_criterion(unknown));
+            }
             *idx += 1;
             false
         }
@@ -545,6 +595,56 @@ fn uid_validity(db: &Database) -> u64 {
         .unwrap_or(1);
     let _ = db.set_sync_state("uid_validity", &now.to_string());
     now
+}
+
+/// Whether a STORE item is `FLAGS`, `+FLAGS` or `-FLAGS` (with or without
+/// `.SILENT`), the only items `parse_store_flags` understands. Anything else
+/// would be read as "replace the flags with none".
+fn is_store_flags_item(op_and_flags: &str) -> bool {
+    let item = op_and_flags
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        item.trim_end_matches(".SILENT"),
+        "FLAGS" | "+FLAGS" | "-FLAGS"
+    )
+}
+
+/// Gmail labels have no Aster equivalent: a label STORE changes nothing and
+/// is answered with the labels the message already has.
+async fn ack_gm_labels_store(
+    writer: &mut (impl AsyncWrite + Unpin),
+    m: &CachedMessage,
+    seq: usize,
+    uid: Option<u32>,
+    upper_store: &str,
+    store_args: &str,
+) -> std::io::Result<()> {
+    tracing::info!(
+        target: "imap::gm_labels",
+        "gm-labels store not propagated to backend: aster_id={} op={} args={}",
+        m.aster_id,
+        if upper_store.contains("+X-GM-LABELS") { "add" }
+        else if upper_store.contains("-X-GM-LABELS") { "remove" }
+        else { "replace" },
+        store_args
+    );
+    if upper_store.contains(".SILENT") {
+        return Ok(());
+    }
+    let rendered: Vec<String> = gmail_labels_for_message(m)
+        .iter()
+        .map(|l| quote_or_atom_label(l))
+        .collect();
+    let uid_item = uid.map(|u| format!("UID {} ", u)).unwrap_or_default();
+    writer
+        .write_all(
+            format!("* {} FETCH ({}X-GM-LABELS ({}))\r\n", seq, uid_item, rendered.join(" "))
+                .as_bytes(),
+        )
+        .await
 }
 
 fn parse_store_flags(op_and_flags: &str) -> (i8, u32, bool) {
@@ -582,14 +682,100 @@ fn apply_flags(current: u32, op: i8, mask: u32) -> u32 {
     }
 }
 
-fn flags_to_str(flags: u32) -> String {
+fn flags_to_str(flags: u32, keywords: &[String]) -> String {
     let mut list: Vec<&str> = Vec::new();
     if flags & 1 != 0 { list.push("\\Seen"); }
     if flags & 2 != 0 { list.push("\\Answered"); }
     if flags & 4 != 0 { list.push("\\Flagged"); }
     if flags & 8 != 0 { list.push("\\Deleted"); }
     if flags & 16 != 0 { list.push("\\Draft"); }
+    list.extend(keywords.iter().map(String::as_str));
     list.join(" ")
+}
+
+/*
+ * Keywords are user-defined flags: Thunderbird's tags are `$label1`..`$label5`
+ * or any name the user types, and other clients set `$Forwarded`, `$Junk`,
+ * `NonJunk`. SELECT advertises them with `\*` in PERMANENTFLAGS, so a client
+ * trusts the bridge to keep them; they are stored per message in the bridge
+ * database and returned wherever FLAGS are.
+ */
+const MAX_KEYWORDS_PER_MESSAGE: usize = 64;
+const MAX_KEYWORD_LEN: usize = 128;
+
+fn is_keyword(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_KEYWORD_LEN
+        && token
+            .bytes()
+            .all(|b| b > 0x20 && b < 0x7f && !b"(){%*\"\\]".contains(&b))
+}
+
+fn has_keyword(keywords: &[String], wanted: &str) -> bool {
+    keywords.iter().any(|k| k.eq_ignore_ascii_case(wanted))
+}
+
+/// The keywords named in a `STORE ... FLAGS (...)` list (the system flags,
+/// which start with a backslash, are handled by `parse_store_flags`). None
+/// when the command stores something other than FLAGS.
+fn parse_store_keywords(op_and_flags: &str) -> Option<Vec<String>> {
+    let upper = op_and_flags.to_ascii_uppercase();
+    if !upper.contains("FLAGS") || upper.contains("X-GM-LABELS") {
+        return None;
+    }
+    let flag_start = op_and_flags.find('(').map(|p| p + 1).unwrap_or(0);
+    let flag_end = op_and_flags.rfind(')').unwrap_or(op_and_flags.len());
+    let flag_str = if flag_start <= flag_end { &op_and_flags[flag_start..flag_end] } else { "" };
+    let list: &str = if flag_start == 0 {
+        // Unparenthesised form: `+FLAGS $label1`.
+        flag_str.split_once(char::is_whitespace).map(|(_, rest)| rest).unwrap_or("")
+    } else {
+        flag_str
+    };
+    Some(
+        list.split_whitespace()
+            .filter(|t| !t.starts_with('\\') && is_keyword(t))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn apply_keywords(current: &[String], op: i8, given: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = if op == 0 { Vec::new() } else { current.to_vec() };
+    if op == -1 {
+        out.retain(|k| !has_keyword(given, k));
+        return out;
+    }
+    for keyword in given {
+        if !has_keyword(&out, keyword) && out.len() < MAX_KEYWORDS_PER_MESSAGE {
+            out.push(keyword.clone());
+        }
+    }
+    out
+}
+
+/// Store the keywords a STORE asks for and return the message's keywords
+/// afterwards, for the FETCH response.
+fn store_message_keywords(
+    db: &Database,
+    aster_id: &str,
+    current: &[String],
+    op: i8,
+    given: Option<&[String]>,
+) -> Vec<String> {
+    let Some(given) = given else { return current.to_vec() };
+    // `+FLAGS (\Seen)` leaves keywords alone; `FLAGS (\Seen)` replaces them.
+    if op != 0 && given.is_empty() {
+        return current.to_vec();
+    }
+    let updated = apply_keywords(current, op, given);
+    if updated != current {
+        if let Err(e) = db.set_message_keywords(aster_id, &updated) {
+            tracing::warn!("keyword store failed for {}: {}", aster_id, e);
+            return current.to_vec();
+        }
+    }
+    updated
 }
 
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
@@ -816,11 +1002,13 @@ where
         // SEARCH strings may arrive as literals (RFC 3501 §4.3): clients send
         // non-ASCII terms that way. Read each one and splice it back into the
         // line as a quoted string, so the criteria parse as usual.
-        if is_search_command(&trimmed) {
+        if !matches!(conn.state, ImapState::NotAuthenticated) && is_search_command(&trimmed) {
             // (message, whether the connection can go on)
             let mut literal_error: Option<(&str, bool)> = None;
+            let mut literals = 0usize;
             while let Some((head, len, non_sync)) = trailing_literal(&trimmed) {
-                if head.len() + len > MAX_LINE_LENGTH {
+                literals += 1;
+                if literals > MAX_SEARCH_LITERALS || len > MAX_LINE_LENGTH.saturating_sub(head.len()) {
                     // A synchronizing literal has not been sent yet, so the
                     // client can carry on; a non-synchronizing one is already
                     // on its way and cannot be told apart from commands.
@@ -832,18 +1020,32 @@ where
                     writer.flush().await?;
                 }
                 let mut buf = vec![0u8; len];
-                if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf).await.is_err() {
+                let read = tokio::time::timeout(
+                    SEARCH_LITERAL_TIMEOUT,
+                    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf),
+                )
+                .await;
+                if !matches!(read, Ok(Ok(_))) {
                     literal_error = Some(("SEARCH read failed", false));
                     break;
                 }
                 let head = head.to_string();
-                match read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let rest = tokio::time::timeout(
+                    SEARCH_LITERAL_TIMEOUT,
+                    read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH),
+                )
+                .await;
+                match rest {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
                         literal_error = Some(("Line too long", false));
                         break;
                     }
-                    Err(e) => return Err(crate::error::BridgeError::Io(e)),
+                    Ok(Err(e)) => return Err(crate::error::BridgeError::Io(e)),
+                    Err(_) => {
+                        literal_error = Some(("SEARCH read failed", false));
+                        break;
+                    }
                 }
                 trimmed = format!(
                     "{}{}{}",
@@ -1121,10 +1323,20 @@ where
                             write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                             continue;
                         };
+                        let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
+                        let mut unsupported = None;
                         let uids: Vec<String> = messages.iter()
-                            .filter(|m| search_matches(m, criteria))
+                            .filter(|m| search_matches_noting(
+                                m,
+                                folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                criteria,
+                                &mut unsupported,
+                            ))
                             .map(|m| m.imap_uid.to_string())
                             .collect();
+                        if let Some(criterion) = unsupported {
+                            tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                        }
                         writer
                             .write_all(format!("* SEARCH {}\r\n", uids.join(" ")).as_bytes())
                             .await?;
@@ -1146,7 +1358,27 @@ where
                         let messages = db.list_cached_messages(&folder).unwrap_or_default();
                         let max_uid = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
                         let uids = parse_set(uid_set_spec, max_uid);
+                        // Routed like STORE: an X-GM-LABELS item fell through
+                        // to the flag code, which cleared every flag of the
+                        // message and pushed "unread" to the server.
+                        let upper_store = op_and_flags.to_ascii_uppercase();
+                        if upper_store.contains("X-GM-LABELS") {
+                            for uid in &uids {
+                                if let Some((seq_idx, m)) = messages.iter().enumerate().find(|(_, m)| m.imap_uid == *uid) {
+                                    ack_gm_labels_store(&mut writer, m, seq_idx + 1, Some(*uid), &upper_store, subargs)
+                                        .await?;
+                                }
+                            }
+                            write_ok(&mut writer, &tag, "UID STORE completed").await?;
+                            continue;
+                        }
+                        if !is_store_flags_item(op_and_flags) {
+                            write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                            continue;
+                        }
                         let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
+                        let store_keywords = parse_store_keywords(op_and_flags);
+                        let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
                         for uid in &uids {
                             if let Some((seq_idx, m)) = messages.iter().enumerate().find(|(_, m)| m.imap_uid == *uid) {
@@ -1154,13 +1386,20 @@ where
                                 let old_flags = m.flags as u32;
                                 let new_flags = apply_flags(old_flags, op, flag_mask);
                                 let _ = db.update_message_flags(m.imap_uid as i64, &folder, new_flags as i64);
+                                let keywords = store_message_keywords(
+                                    &db,
+                                    &m.aster_id,
+                                    folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                    op,
+                                    store_keywords.as_deref(),
+                                );
                                 if (old_flags & 1) != (new_flags & 1) {
                                     seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                                 }
                                 if !silent {
                                     writer
                                         .write_all(
-                                            format!("* {} FETCH (UID {} FLAGS ({}))\r\n", seq, uid, flags_to_str(new_flags))
+                                            format!("* {} FETCH (UID {} FLAGS ({}))\r\n", seq, uid, flags_to_str(new_flags, &keywords))
                                             .as_bytes(),
                                         )
                                         .await?;
@@ -1239,10 +1478,20 @@ where
                     write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                     continue;
                 };
+                let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
+                let mut unsupported = None;
                 let matched: Vec<String> = messages.iter().enumerate()
-                    .filter(|(_, m)| search_matches(m, criteria))
+                    .filter(|(_, m)| search_matches_noting(
+                        m,
+                        folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                        criteria,
+                        &mut unsupported,
+                    ))
                     .map(|(i, _)| (i + 1).to_string())
                     .collect();
+                if let Some(criterion) = unsupported {
+                    tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                }
                 writer
                     .write_all(format!("* SEARCH {}\r\n", matched.join(" ")).as_bytes())
                     .await?;
@@ -1264,46 +1513,39 @@ where
                 let folder = conn.selected_folder.clone().unwrap_or_default();
                 let messages = db.list_cached_messages(&folder).unwrap_or_default();
                 if is_gm_labels {
-                    let silent = upper_store.contains(".SILENT");
                     for s in &seqs {
                         if let Some(m) = messages.get((*s as usize).saturating_sub(1)) {
-                            tracing::info!(
-                                target: "imap::gm_labels",
-                                "gm-labels store not propagated to backend: aster_id={} op={} args={}",
-                                m.aster_id,
-                                if upper_store.contains("+X-GM-LABELS") { "add" }
-                                else if upper_store.contains("-X-GM-LABELS") { "remove" }
-                                else { "replace" },
-                                store_args
-                            );
-                            if !silent {
-                                let labels = gmail_labels_for_message(m);
-                                let rendered: Vec<String> =
-                                    labels.iter().map(|l| quote_or_atom_label(l)).collect();
-                                writer
-                                    .write_all(
-                                        format!("* {} FETCH (X-GM-LABELS ({}))\r\n", s, rendered.join(" "))
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                            }
+                            ack_gm_labels_store(&mut writer, m, *s as usize, None, &upper_store, store_args)
+                                .await?;
                         }
                     }
+                } else if !is_store_flags_item(op_and_flags) {
+                    write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                    continue;
                 } else {
                     let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
+                    let store_keywords = parse_store_keywords(op_and_flags);
+                    let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                     let mut seen_changes: Vec<(String, bool)> = Vec::new();
                     for s in &seqs {
                         if let Some(m) = messages.get((*s as usize).saturating_sub(1)) {
                             let old_flags = m.flags as u32;
                             let new_flags = apply_flags(old_flags, op, flag_mask);
                             let _ = db.update_message_flags(m.imap_uid as i64, &folder, new_flags as i64);
+                            let keywords = store_message_keywords(
+                                &db,
+                                &m.aster_id,
+                                folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                op,
+                                store_keywords.as_deref(),
+                            );
                             if (old_flags & 1) != (new_flags & 1) {
                                 seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                             }
                             if !silent {
                                 writer
                                     .write_all(
-                                        format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(new_flags))
+                                        format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(new_flags, &keywords))
                                         .as_bytes(),
                                     )
                                     .await?;
@@ -1429,10 +1671,21 @@ where
                                         Some(f) => f.to_string(),
                                         None => continue,
                                     };
-                                    let current: Vec<(u32, i64)> = db
-                                        .list_cached_message_meta(&folder)
+                                    let current_meta = db.list_cached_message_meta(&folder).ok();
+                                    let current: Vec<(u32, i64)> = current_meta
+                                        .as_ref()
                                         .map(|v| v.iter().map(|m| (m.imap_uid, m.flags)).collect())
-                                        .unwrap_or_else(|_| idle_msgs.clone());
+                                        .unwrap_or_else(|| idle_msgs.clone());
+                                    // A FLAGS response without the keywords would
+                                    // make the client drop them.
+                                    let keywords_by_uid: std::collections::HashMap<u32, Vec<String>> = {
+                                        let by_id = db.folder_keywords(&folder).unwrap_or_default();
+                                        current_meta
+                                            .iter()
+                                            .flatten()
+                                            .filter_map(|m| by_id.get(&m.aster_id).map(|k| (m.imap_uid, k.clone())))
+                                            .collect()
+                                    };
                                     let current_set: std::collections::HashSet<u32> =
                                         current.iter().map(|(u, _)| *u).collect();
                                     let old_flags: std::collections::HashMap<u32, i64> =
@@ -1462,7 +1715,10 @@ where
                                                             "* {} FETCH (UID {} FLAGS ({}))\r\n",
                                                             i + 1,
                                                             uid,
-                                                            flags_to_str(*flags as u32)
+                                                            flags_to_str(
+                                                                *flags as u32,
+                                                                keywords_by_uid.get(uid).map(Vec::as_slice).unwrap_or(&[]),
+                                                            )
                                                         )
                                                         .as_bytes(),
                                                     )
@@ -3190,10 +3446,12 @@ fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mark_fetched_seen(
     db: &Arc<Database>,
     folder: &str,
     msg: &CachedMessage,
+    keywords: &[String],
     seq_num: usize,
     out: &mut Vec<u8>,
     pushes: &mut Vec<String>,
@@ -3209,7 +3467,7 @@ fn mark_fetched_seen(
         let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
         pushes.push(msg.aster_id.clone());
         out.extend_from_slice(
-            format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags)).as_bytes(),
+            format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags, keywords)).as_bytes(),
         );
     }
 }
@@ -3277,6 +3535,7 @@ async fn handle_fetch(
         db.list_cached_message_meta(folder)
     }
     .unwrap_or_default();
+    let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
     let folder_attachment_meta = if !needs_body && wants_size {
         db.list_attachment_meta_for_folder(folder).unwrap_or_default()
     } else {
@@ -3301,6 +3560,7 @@ async fn handle_fetch(
             }
         };
         let uid = msg.imap_uid;
+        let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
         let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
             if msg.attachments_state == crate::db::ATTACHMENTS_STORED {
                 db.get_message_attachments(&msg.aster_id).unwrap_or_default()
@@ -3324,6 +3584,7 @@ async fn handle_fetch(
             if msg.flags & 4 != 0 { flag_list.push("\\Flagged"); }
             if msg.flags & 8 != 0 { flag_list.push("\\Deleted"); }
             if msg.flags & 16 != 0 { flag_list.push("\\Draft"); }
+            flag_list.extend(keywords.iter().map(String::as_str));
             items.push(format!("FLAGS ({})", flag_list.join(" ")));
         }
 
@@ -3412,14 +3673,14 @@ async fn handle_fetch(
 
         if wants_body_text {
             if !body_text_is_peek {
-                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             items.push(literal("BODY[TEXT]", rendered.body()));
         }
 
         for req in &section_requests {
             if !req.peek {
-                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             let key_base = if req.mime {
                 format!("BODY[{}.MIME]", req.section)
@@ -3454,7 +3715,7 @@ async fn handle_fetch(
 
         if wants_body {
             if !body_is_peek {
-                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
                 let (suffix, slice) = apply_partial(&rendered.text, Some((off, len_opt)));
@@ -3466,7 +3727,7 @@ async fn handle_fetch(
 
         if wants_rfc822_text {
             if !body_is_peek {
-                mark_fetched_seen(db, folder, msg, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             items.push(literal("RFC822.TEXT", rendered.body()));
         }
@@ -5568,6 +5829,108 @@ mod tests {
     }
 
     #[test]
+    fn trailing_literal_takes_plain_digits_only() {
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {+5}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {5++}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {+}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {-1}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {18446744073709551615}"), None);
+        assert_eq!(trailing_literal("s1 SEARCH TEXT {9999999999}"), Some(("s1 SEARCH TEXT ", 9_999_999_999, false)));
+    }
+
+    #[test]
+    fn loggable_criterion_hides_search_text() {
+        assert_eq!(loggable_criterion("1:5"), "1:5");
+        assert_eq!(loggable_criterion("1,3:*"), "1,3:*");
+        assert_eq!(loggable_criterion("X-GM-RAW"), "X-GM-RAW");
+        assert_eq!(loggable_criterion("MODSEQ"), "MODSEQ");
+        assert_eq!(loggable_criterion("PASSWORD"), "<8 byte token>");
+        assert_eq!(loggable_criterion("a\r\nforged line"), "<14 byte token>");
+    }
+
+    #[tokio::test]
+    async fn search_with_a_huge_literal_length_is_refused_without_crashing() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, marker) in [
+            ("h1", "{18446744073709551615}"),
+            ("h2", "{18446744073709551600}"),
+            ("h3", "{9999999999}"),
+            ("h4", "{4294967296}"),
+        ] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, &format!("SEARCH SUBJECT {}", marker)).await;
+            assert!(!resp.contains("+ Ready"), "{}", resp);
+            assert!(resp.contains(&format!("{} ", tag)), "{}", resp);
+        }
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "h5", "NOOP").await;
+        assert!(resp.contains("h5 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_literals_are_not_read_before_login() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "SEARCH SUBJECT {18446744073709551615}").await;
+        assert!(!resp.contains("+ Ready"), "{}", resp);
+        assert!(resp.contains("p1 NO") || resp.contains("p1 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p2", "UID SEARCH TEXT {5}").await;
+        assert!(!resp.contains("+ Ready"), "{}", resp);
+        assert!(resp.contains("p2 NO") || resp.contains("p2 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p3", "NOOP").await;
+        assert!(resp.contains("p3 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_caps_the_number_of_literals() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"n1 SEARCH TEXT {1}\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut continuations = 0;
+        loop {
+            let mut reply = String::new();
+            reader.read_line(&mut reply).await.unwrap();
+            if reply.starts_with("+ ") {
+                continuations += 1;
+                writer.write_all(b"a OR TEXT {1}\r\n").await.unwrap();
+                writer.flush().await.unwrap();
+                continue;
+            }
+            assert!(reply.starts_with("n1 BAD"), "{}", reply);
+            break;
+        }
+        assert_eq!(continuations, MAX_SEARCH_LITERALS);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "NOOP").await;
+        assert!(resp.contains("n2 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn oversized_non_sync_search_literal_closes_the_connection() {
+        let (addr, _db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer
+            .write_all(b"z1 SEARCH TEXT {999999+}\r\nz2 LOGOUT\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.unwrap();
+        assert!(reply.starts_with("z1 BAD"), "{}", reply);
+        let mut rest = String::new();
+        let closed = matches!(reader.read_line(&mut rest).await, Ok(0) | Err(_));
+        assert!(closed, "connection stayed open: {}", rest);
+    }
+
+    #[test]
     fn search_header_message_id_matches_only_that_message() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
@@ -5627,6 +5990,115 @@ mod tests {
     }
 
     #[test]
+    fn store_items_other_than_flags_are_recognised() {
+        assert!(is_store_flags_item("+FLAGS (\\Seen)"));
+        assert!(is_store_flags_item("-flags.silent (\\Deleted)"));
+        assert!(is_store_flags_item("FLAGS(\\Seen)"));
+        assert!(is_store_flags_item("FLAGS.SILENT \\Seen"));
+        assert!(!is_store_flags_item("+X-GM-LABELS (Work)"));
+        assert!(!is_store_flags_item("+BOGUS (x)"));
+        assert!(!is_store_flags_item(""));
+    }
+
+    #[test]
+    fn unsupported_search_criterion_is_noted_not_logged_per_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "un-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let mut unsupported = None;
+        assert!(!search_matches_noting(m, &[], "1:5 UNDELETED", &mut unsupported));
+        assert_eq!(unsupported.as_deref(), Some("1:5"));
+        let mut unsupported = None;
+        assert!(search_matches_noting(m, &[], "UNDELETED SUBJECT ONE", &mut unsupported));
+        assert_eq!(unsupported, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_search_criterion_is_logged_once_per_command() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for i in 0..20 {
+            seed(&db, &format!("lg-{}", i), "inbox", "one");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH 1:5 UNDELETED").await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH X-UNKNOWN").await;
+        assert!(resp.contains("s2 OK"), "{}", resp);
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("unsupported SEARCH criterion").count(),
+            2,
+            "expected one warning per command: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_store_of_gm_labels_leaves_flags_alone() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "gl-1", "inbox", "one");
+        db.set_message_flags_by_id("gl-1", 5).unwrap(); // \Seen \Flagged
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "UID STORE 1 +X-GM-LABELS (Work)").await;
+        assert!(resp.contains("g1 OK"), "{}", resp);
+        assert!(resp.contains("* 1 FETCH (UID 1 X-GM-LABELS ("), "{}", resp);
+        assert!(!resp.contains("FLAGS ()"), "flags must not be touched: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "UID STORE 1 -X-GM-LABELS.SILENT (Work)").await;
+        assert!(!resp.contains("* 1 FETCH"), "silent store must not answer: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "FETCH 1 (FLAGS)").await;
+        assert!(resp.contains("\\Seen") && resp.contains("\\Flagged"), "flags lost: {}", resp);
+
+        // Other unknown items are refused instead of clearing the flags.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g4", "UID STORE 1 +BOGUS (x)").await;
+        assert!(resp.contains("g4 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g5", "STORE 1 BOGUS (x)").await;
+        assert!(resp.contains("g5 BAD"), "{}", resp);
+        assert_eq!(db.get_message_flags_by_id("gl-1").unwrap(), 5);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let captured = calls.lock().await.clone();
+        assert!(
+            !captured.iter().any(|(m, _)| m == "PATCH"),
+            "no read-status change may reach the server: {:?}",
+            captured
+        );
+    }
+
+    #[test]
     fn search_keyword_does_not_match_everything() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
@@ -5635,6 +6107,87 @@ mod tests {
         let m = &msgs[0];
         assert!(!search_matches(m, "KEYWORD $LABEL1"));
         assert!(search_matches(m, "UNKEYWORD $LABEL1"));
+    }
+
+    #[test]
+    fn store_keywords_are_parsed_from_flag_lists() {
+        assert_eq!(
+            parse_store_keywords("+FLAGS ($label1 \\Seen NonJunk)"),
+            Some(vec!["$label1".to_string(), "NonJunk".to_string()])
+        );
+        assert_eq!(parse_store_keywords("-FLAGS.SILENT ($label2)"), Some(vec!["$label2".to_string()]));
+        assert_eq!(parse_store_keywords("+FLAGS $label3"), Some(vec!["$label3".to_string()]));
+        assert_eq!(parse_store_keywords("FLAGS (\\Seen)"), Some(vec![]));
+        assert_eq!(parse_store_keywords("+X-GM-LABELS (Work)"), None);
+        // Not atoms: dropped rather than stored.
+        assert_eq!(parse_store_keywords("+FLAGS (bad]name *)"), Some(vec![]));
+    }
+
+    #[test]
+    fn keywords_add_remove_and_replace_case_insensitively() {
+        let current = vec!["$label1".to_string(), "Work".to_string()];
+        let given = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            apply_keywords(&current, 1, &given(&["$LABEL1", "$label2"])),
+            given(&["$label1", "Work", "$label2"])
+        );
+        assert_eq!(apply_keywords(&current, -1, &given(&["work"])), given(&["$label1"]));
+        assert_eq!(apply_keywords(&current, 0, &given(&["$label5"])), given(&["$label5"]));
+        assert_eq!(apply_keywords(&current, 0, &[]), Vec::<String>::new());
+        assert_eq!(flags_to_str(1, &current), "\\Seen $label1 Work");
+    }
+
+    #[test]
+    fn search_keyword_matches_stored_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "kw-2", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let keywords = vec!["$label1".to_string()];
+        assert!(search_matches_noting(m, &keywords, "KEYWORD $LABEL1", &mut None));
+        assert!(!search_matches_noting(m, &keywords, "UNKEYWORD $LABEL1", &mut None));
+        assert!(!search_matches_noting(m, &keywords, "KEYWORD $LABEL2", &mut None));
+        assert!(search_matches_noting(m, &keywords, "UNKEYWORD $LABEL2", &mut None));
+    }
+
+    #[tokio::test]
+    async fn thunderbird_tags_survive_selecting_another_message() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "tag-1", "inbox", "first");
+        seed(&db, "tag-2", "inbox", "second");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        // Thunderbird tags a message...
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "UID STORE 1 +FLAGS ($label1)").await;
+        assert!(resp.contains("t1 OK"), "{}", resp);
+        assert!(resp.contains("$label1"), "STORE response must carry the tag: {}", resp);
+
+        // ...and reads flags back when the selection changes.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "UID FETCH 1:* (FLAGS)").await;
+        let first = resp.lines().find(|l| l.contains("UID 1") || l.starts_with("* 1 FETCH")).unwrap_or("");
+        assert!(first.contains("$label1"), "tag lost on FETCH: {}", resp);
+        let second = resp.lines().find(|l| l.starts_with("* 2 FETCH")).unwrap_or("");
+        assert!(!second.contains("$label1"), "tag leaked to another message: {}", resp);
+
+        // Setting \Seen with +FLAGS keeps the tag; searching finds it.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "STORE 1 +FLAGS (\\Seen)").await;
+        assert!(resp.contains("\\Seen") && resp.contains("$label1"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t4", "UID SEARCH KEYWORD $label1").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1"), "{}", resp);
+
+        // A new connection sees it too.
+        let (mut reader2, mut writer2) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n1", "FETCH 1 (FLAGS)").await;
+        assert!(resp.contains("$label1"), "{}", resp);
+
+        // Removing the tag, and FLAGS replacing the whole set.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t5", "UID STORE 1 -FLAGS ($label1)").await;
+        assert!(!resp.contains("$label1"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "t6", "STORE 2 +FLAGS ($label2 Work)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t7", "STORE 2 FLAGS (\\Seen)").await;
+        assert!(!resp.contains("$label2") && !resp.contains("Work"), "{}", resp);
+        assert_eq!(db.message_keywords("tag-2").unwrap(), Vec::<String>::new());
     }
 
     #[test]
