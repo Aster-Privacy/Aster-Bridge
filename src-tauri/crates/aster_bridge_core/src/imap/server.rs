@@ -319,25 +319,41 @@ fn header_search_matches(msg: &CachedMessage, field: &str, pattern: &str) -> boo
     }
 }
 
+#[cfg(test)]
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
+    search_matches_noting(msg, criteria_upper, &mut None)
+}
+
+/// Like `search_matches`, and records the first criterion it does not
+/// support, so the command can log it once rather than once per message.
+fn search_matches_noting(
+    msg: &CachedMessage,
+    criteria_upper: &str,
+    unsupported: &mut Option<String>,
+) -> bool {
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
     while idx < parts.len() {
-        if !search_eval(msg, &parts, &mut idx) {
+        if !search_eval(msg, &parts, &mut idx, unsupported) {
             return false;
         }
     }
     true
 }
 
-fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
+fn search_eval(
+    msg: &CachedMessage,
+    parts: &[String],
+    idx: &mut usize,
+    unsupported: &mut Option<String>,
+) -> bool {
     if *idx >= parts.len() { return true; }
     match parts[*idx].as_str() {
         "(" => {
             *idx += 1;
             let mut result = true;
             while *idx < parts.len() && parts[*idx] != ")" {
-                if !search_eval(msg, parts, idx) {
+                if !search_eval(msg, parts, idx, unsupported) {
                     result = false;
                 }
             }
@@ -360,13 +376,13 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
         "UNDRAFT" => { *idx += 1; (msg.flags & 16) == 0 }
         "NOT" => {
             *idx += 1;
-            let v = search_eval(msg, parts, idx);
+            let v = search_eval(msg, parts, idx, unsupported);
             !v
         }
         "OR" => {
             *idx += 1;
-            let a = search_eval(msg, parts, idx);
-            let b = search_eval(msg, parts, idx);
+            let a = search_eval(msg, parts, idx, unsupported);
+            let b = search_eval(msg, parts, idx, unsupported);
             a || b
         }
         "FROM" => {
@@ -469,7 +485,9 @@ fn search_eval(msg: &CachedMessage, parts: &[String], idx: &mut usize) -> bool {
         "RECENT" | "NEW" => { *idx += 1; false }
         "OLD" => { *idx += 1; true }
         unknown => {
-            tracing::warn!("unsupported SEARCH criterion {}", unknown);
+            if unsupported.is_none() {
+                *unsupported = Some(unknown.to_string());
+            }
             *idx += 1;
             false
         }
@@ -489,6 +507,56 @@ fn uid_validity(db: &Database) -> u64 {
         .unwrap_or(1);
     let _ = db.set_sync_state("uid_validity", &now.to_string());
     now
+}
+
+/// Whether a STORE item is `FLAGS`, `+FLAGS` or `-FLAGS` (with or without
+/// `.SILENT`), the only items `parse_store_flags` understands. Anything else
+/// would be read as "replace the flags with none".
+fn is_store_flags_item(op_and_flags: &str) -> bool {
+    let item = op_and_flags
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        item.trim_end_matches(".SILENT"),
+        "FLAGS" | "+FLAGS" | "-FLAGS"
+    )
+}
+
+/// Gmail labels have no Aster equivalent: a label STORE changes nothing and
+/// is answered with the labels the message already has.
+async fn ack_gm_labels_store(
+    writer: &mut (impl AsyncWrite + Unpin),
+    m: &CachedMessage,
+    seq: usize,
+    uid: Option<u32>,
+    upper_store: &str,
+    store_args: &str,
+) -> std::io::Result<()> {
+    tracing::info!(
+        target: "imap::gm_labels",
+        "gm-labels store not propagated to backend: aster_id={} op={} args={}",
+        m.aster_id,
+        if upper_store.contains("+X-GM-LABELS") { "add" }
+        else if upper_store.contains("-X-GM-LABELS") { "remove" }
+        else { "replace" },
+        store_args
+    );
+    if upper_store.contains(".SILENT") {
+        return Ok(());
+    }
+    let rendered: Vec<String> = gmail_labels_for_message(m)
+        .iter()
+        .map(|l| quote_or_atom_label(l))
+        .collect();
+    let uid_item = uid.map(|u| format!("UID {} ", u)).unwrap_or_default();
+    writer
+        .write_all(
+            format!("* {} FETCH ({}X-GM-LABELS ({}))\r\n", seq, uid_item, rendered.join(" "))
+                .as_bytes(),
+        )
+        .await
 }
 
 fn parse_store_flags(op_and_flags: &str) -> (i8, u32, bool) {
@@ -1013,10 +1081,14 @@ where
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
                         let messages = db.list_cached_messages(folder).unwrap_or_default();
                         let criteria_upper = subargs.trim().to_ascii_uppercase();
+                        let mut unsupported = None;
                         let uids: Vec<String> = messages.iter()
-                            .filter(|m| search_matches(m, &criteria_upper))
+                            .filter(|m| search_matches_noting(m, &criteria_upper, &mut unsupported))
                             .map(|m| m.imap_uid.to_string())
                             .collect();
+                        if let Some(criterion) = unsupported {
+                            tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                        }
                         writer
                             .write_all(format!("* SEARCH {}\r\n", uids.join(" ")).as_bytes())
                             .await?;
@@ -1038,6 +1110,24 @@ where
                         let messages = db.list_cached_messages(&folder).unwrap_or_default();
                         let max_uid = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
                         let uids = parse_set(uid_set_spec, max_uid);
+                        // Routed like STORE: an X-GM-LABELS item fell through
+                        // to the flag code, which cleared every flag of the
+                        // message and pushed "unread" to the server.
+                        let upper_store = op_and_flags.to_ascii_uppercase();
+                        if upper_store.contains("X-GM-LABELS") {
+                            for uid in &uids {
+                                if let Some((seq_idx, m)) = messages.iter().enumerate().find(|(_, m)| m.imap_uid == *uid) {
+                                    ack_gm_labels_store(&mut writer, m, seq_idx + 1, Some(*uid), &upper_store, subargs)
+                                        .await?;
+                                }
+                            }
+                            write_ok(&mut writer, &tag, "UID STORE completed").await?;
+                            continue;
+                        }
+                        if !is_store_flags_item(op_and_flags) {
+                            write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                            continue;
+                        }
                         let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
                         for uid in &uids {
@@ -1127,10 +1217,14 @@ where
                 let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
                 let messages = db.list_cached_messages(folder).unwrap_or_default();
                 let criteria_upper = args.trim().to_ascii_uppercase();
+                let mut unsupported = None;
                 let matched: Vec<String> = messages.iter().enumerate()
-                    .filter(|(_, m)| search_matches(m, &criteria_upper))
+                    .filter(|(_, m)| search_matches_noting(m, &criteria_upper, &mut unsupported))
                     .map(|(i, _)| (i + 1).to_string())
                     .collect();
+                if let Some(criterion) = unsupported {
+                    tracing::warn!("unsupported SEARCH criterion {}", criterion);
+                }
                 writer
                     .write_all(format!("* SEARCH {}\r\n", matched.join(" ")).as_bytes())
                     .await?;
@@ -1152,31 +1246,15 @@ where
                 let folder = conn.selected_folder.clone().unwrap_or_default();
                 let messages = db.list_cached_messages(&folder).unwrap_or_default();
                 if is_gm_labels {
-                    let silent = upper_store.contains(".SILENT");
                     for s in &seqs {
                         if let Some(m) = messages.get((*s as usize).saturating_sub(1)) {
-                            tracing::info!(
-                                target: "imap::gm_labels",
-                                "gm-labels store not propagated to backend: aster_id={} op={} args={}",
-                                m.aster_id,
-                                if upper_store.contains("+X-GM-LABELS") { "add" }
-                                else if upper_store.contains("-X-GM-LABELS") { "remove" }
-                                else { "replace" },
-                                store_args
-                            );
-                            if !silent {
-                                let labels = gmail_labels_for_message(m);
-                                let rendered: Vec<String> =
-                                    labels.iter().map(|l| quote_or_atom_label(l)).collect();
-                                writer
-                                    .write_all(
-                                        format!("* {} FETCH (X-GM-LABELS ({}))\r\n", s, rendered.join(" "))
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                            }
+                            ack_gm_labels_store(&mut writer, m, *s as usize, None, &upper_store, store_args)
+                                .await?;
                         }
                     }
+                } else if !is_store_flags_item(op_and_flags) {
+                    write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
+                    continue;
                 } else {
                     let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
                     let mut seen_changes: Vec<(String, bool)> = Vec::new();
@@ -5383,6 +5461,115 @@ mod tests {
         assert!(!search_matches(m, "RECENT"));
         assert!(search_matches(m, "OLD"));
         assert!(search_matches(m, "ALL"));
+    }
+
+    #[test]
+    fn store_items_other_than_flags_are_recognised() {
+        assert!(is_store_flags_item("+FLAGS (\\Seen)"));
+        assert!(is_store_flags_item("-flags.silent (\\Deleted)"));
+        assert!(is_store_flags_item("FLAGS(\\Seen)"));
+        assert!(is_store_flags_item("FLAGS.SILENT \\Seen"));
+        assert!(!is_store_flags_item("+X-GM-LABELS (Work)"));
+        assert!(!is_store_flags_item("+BOGUS (x)"));
+        assert!(!is_store_flags_item(""));
+    }
+
+    #[test]
+    fn unsupported_search_criterion_is_noted_not_logged_per_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "un-1", "inbox", "one");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let mut unsupported = None;
+        assert!(!search_matches_noting(m, "1:5 UNDELETED", &mut unsupported));
+        assert_eq!(unsupported.as_deref(), Some("1:5"));
+        let mut unsupported = None;
+        assert!(search_matches_noting(m, "UNDELETED SUBJECT ONE", &mut unsupported));
+        assert_eq!(unsupported, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_search_criterion_is_logged_once_per_command() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for i in 0..20 {
+            seed(&db, &format!("lg-{}", i), "inbox", "one");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH 1:5 UNDELETED").await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH X-UNKNOWN").await;
+        assert!(resp.contains("s2 OK"), "{}", resp);
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("unsupported SEARCH criterion").count(),
+            2,
+            "expected one warning per command: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn uid_store_of_gm_labels_leaves_flags_alone() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "gl-1", "inbox", "one");
+        db.set_message_flags_by_id("gl-1", 5).unwrap(); // \Seen \Flagged
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "UID STORE 1 +X-GM-LABELS (Work)").await;
+        assert!(resp.contains("g1 OK"), "{}", resp);
+        assert!(resp.contains("* 1 FETCH (UID 1 X-GM-LABELS ("), "{}", resp);
+        assert!(!resp.contains("FLAGS ()"), "flags must not be touched: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "UID STORE 1 -X-GM-LABELS.SILENT (Work)").await;
+        assert!(!resp.contains("* 1 FETCH"), "silent store must not answer: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "FETCH 1 (FLAGS)").await;
+        assert!(resp.contains("\\Seen") && resp.contains("\\Flagged"), "flags lost: {}", resp);
+
+        // Other unknown items are refused instead of clearing the flags.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g4", "UID STORE 1 +BOGUS (x)").await;
+        assert!(resp.contains("g4 BAD"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g5", "STORE 1 BOGUS (x)").await;
+        assert!(resp.contains("g5 BAD"), "{}", resp);
+        assert_eq!(db.get_message_flags_by_id("gl-1").unwrap(), 5);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let captured = calls.lock().await.clone();
+        assert!(
+            !captured.iter().any(|(m, _)| m == "PATCH"),
+            "no read-status change may reach the server: {:?}",
+            captured
+        );
     }
 
     #[test]
