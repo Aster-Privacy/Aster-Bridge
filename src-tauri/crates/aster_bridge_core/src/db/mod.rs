@@ -517,6 +517,12 @@ impl Database {
                 PRIMARY KEY (aster_id, folder)
             );
 
+            CREATE TABLE IF NOT EXISTS message_keywords (
+                aster_id TEXT NOT NULL,
+                keyword TEXT NOT NULL COLLATE NOCASE,
+                PRIMARY KEY (aster_id, keyword)
+            );
+
             CREATE TABLE IF NOT EXISTS message_cache (
                 aster_id TEXT PRIMARY KEY,
                 folder TEXT NOT NULL,
@@ -1063,6 +1069,57 @@ impl Database {
                 rusqlite::params![new_flags, aster_id],
             )?;
             Ok(())
+        })
+    }
+
+    /// IMAP keywords (user-defined flags such as Thunderbird's `$label1`
+    /// tags) of one message. They live only in the bridge: the Aster API has
+    /// no place for them. Keyed by message, so they survive moves and cache
+    /// repairs.
+    pub fn message_keywords(&self, aster_id: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT keyword FROM message_keywords WHERE aster_id = ?1 ORDER BY keyword",
+            )?;
+            let rows = stmt
+                .query_map([aster_id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Keywords of every message in a folder that has any, by message id.
+    pub fn folder_keywords(&self, folder: &str) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT k.aster_id, k.keyword FROM message_keywords k
+                 JOIN message_cache m ON m.aster_id = k.aster_id
+                 WHERE m.folder = ?1
+                 ORDER BY k.keyword",
+            )?;
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            let rows = stmt.query_map([folder], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, keyword) = row?;
+                out.entry(id).or_default().push(keyword);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_message_keywords(&self, aster_id: &str, keywords: &[String]) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM message_keywords WHERE aster_id = ?1", [aster_id])?;
+            for keyword in keywords {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_keywords (aster_id, keyword) VALUES (?1, ?2)",
+                    rusqlite::params![aster_id, keyword],
+                )?;
+            }
+            tx.commit()
         })
     }
 
@@ -1629,6 +1686,7 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
+                 DELETE FROM message_keywords;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -2122,6 +2180,7 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
+                 DELETE FROM message_keywords;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -2971,6 +3030,30 @@ mod db_tests {
         assert_eq!(messages, 1);
         assert_eq!(passwords, 0);
         assert_eq!(last_sync.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn message_keywords_roundtrip_and_survive_sync_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        db.upsert_cached_message("kw-a", "inbox", Some("s"), None, None, None, 1, None, None).unwrap();
+        db.upsert_cached_message("kw-b", "archive", Some("s"), None, None, None, 1, None, None).unwrap();
+        db.set_message_keywords("kw-a", &["Work".to_string(), "$label1".to_string(), "WORK".to_string()])
+            .unwrap();
+        db.set_message_keywords("kw-b", &["$label2".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("kw-a").unwrap(), vec!["$label1", "Work"]);
+
+        // A sync refresh of the message leaves them in place.
+        db.upsert_cached_message("kw-a", "inbox", Some("s2"), None, None, None, 2, None, None).unwrap();
+        let inbox = db.folder_keywords("inbox").unwrap();
+        assert_eq!(inbox.get("kw-a").unwrap(), &vec!["$label1".to_string(), "Work".to_string()]);
+        assert!(!inbox.contains_key("kw-b"));
+
+        db.set_message_keywords("kw-a", &[]).unwrap();
+        assert!(db.message_keywords("kw-a").unwrap().is_empty());
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.message_keywords("kw-b").unwrap().is_empty());
     }
 
     #[test]
