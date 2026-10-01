@@ -35,7 +35,7 @@ use crate::auth::session::Session;
 use crate::db::Database;
 
 pub const IMPORT_SOURCE: &str = "eml";
-const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_ENVELOPE_CHARS: usize = 10 * 1024 * 1024;
 const SYNC_LOOKUP_LIMIT: i64 = 200;
 const SCOPED_LOOKUP_LIMIT: i64 = 25;
@@ -321,7 +321,14 @@ pub fn build_imported_message(
         (None, None) => (now, false),
     };
 
-    let html_body = parsed.body_html(0).map(|s| s.to_string());
+    // mail-parser also returns a text/plain body as HTML, converted. Storing
+    // that made a plain text message come back over IMAP as text/html, so
+    // only a real HTML part is stored. The dedupe hash keeps the converted
+    // value, so messages appended by earlier versions are still recognised.
+    let hashed_html = parsed.body_html(0).map(|s| s.to_string());
+    let html_body = hashed_html
+        .clone()
+        .filter(|_| parsed.html_part(0).is_some_and(|part| part.is_text_html()));
     let text_body = parsed.body_text(0).map(|s| s.to_string());
 
     let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_ATTACHMENT_BYTES);
@@ -339,7 +346,7 @@ pub fn build_imported_message(
         &subject,
         if date_known { Some(&date_iso) } else { None },
         text_body.as_deref().unwrap_or(""),
-        html_body.as_deref().unwrap_or(""),
+        hashed_html.as_deref().unwrap_or(""),
     );
 
     let mut preserved_headers: Vec<serde_json::Value> = Vec::new();
@@ -817,6 +824,42 @@ pub async fn append_imported_message(
     flags: &AppendFlags,
     internal_date: Option<DateTime<Utc>>,
 ) -> std::result::Result<AppendOutcome, String> {
+    import_message(db, client, session, folder, raw_message, flags, internal_date, false).await
+}
+
+/// Stores a second copy of a message, for IMAP COPY. The import endpoint
+/// keeps only the first of two messages with the same dedupe hashes, and a
+/// copy always has its source's, so the copy is stored under hashes of its
+/// own. Its headers, Message-ID included, stay as they are.
+pub async fn store_copy(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    raw_message: &[u8],
+    flags: &AppendFlags,
+    internal_date: Option<DateTime<Utc>>,
+) -> std::result::Result<AppendOutcome, String> {
+    import_message(db, client, session, folder, raw_message, flags, internal_date, true).await
+}
+
+fn rekey_as_copy(message: &mut ImportedMessage) {
+    let salt = uuid::Uuid::new_v4();
+    message.message_id_hash = base64_sha256(&format!("{}\n{}", message.message_id_hash, salt));
+    message.content_hash = base64_sha256(&format!("{}\n{}", message.content_hash, salt));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_message(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    raw_message: &[u8],
+    flags: &AppendFlags,
+    internal_date: Option<DateTime<Utc>>,
+    as_copy: bool,
+) -> std::result::Result<AppendOutcome, String> {
     let (token, identity_key, passphrase, inbound_keys) = {
         let s = session.read().await;
         (
@@ -835,8 +878,11 @@ pub async fn append_imported_message(
         let build_key = identity_key.clone();
         let now = Utc::now();
         tokio::task::spawn_blocking(move || {
-            let message = build_imported_message(&raw, &build_folder, internal_date, now)
+            let mut message = build_imported_message(&raw, &build_folder, internal_date, now)
                 .ok_or_else(|| "could not parse the appended message".to_string())?;
+            if as_copy {
+                rekey_as_copy(&mut message);
+            }
             let (encrypted_envelope, envelope_nonce) =
                 crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
                     &message.envelope_json,
@@ -1381,6 +1427,47 @@ mod tests {
         assert_eq!(msg.attachments[0].data, b"hello pdf");
         let envelope: serde_json::Value = serde_json::from_str(&msg.envelope_json).unwrap();
         assert_eq!(envelope["attachment_count"], 1);
+    }
+
+    #[test]
+    fn plain_text_message_is_not_stored_as_html() {
+        let raw = sample_eml();
+        let msg = build_imported_message(raw, "inbox", None, ts("2026-08-11T00:00:00Z")).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&msg.envelope_json).unwrap();
+        assert_eq!(envelope["body_text"], "Here is the report.\r\n");
+        assert!(envelope["body_html"].is_null(), "{}", envelope["body_html"]);
+        assert!(envelope["html_body"].is_null(), "{}", envelope["html_body"]);
+
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let converted = parsed.body_html(0).unwrap();
+        assert_eq!(
+            msg.content_hash,
+            compute_content_hash(
+                "Alice Example <alice@old.example>",
+                &["mark@astermail.org".to_string()],
+                "Quarterly report",
+                Some("2024-07-12T13:04:05.000Z"),
+                "Here is the report.\r\n",
+                &converted,
+            ),
+            "the dedupe hash of an appended message must not change"
+        );
+    }
+
+    #[test]
+    fn a_copy_gets_dedupe_hashes_of_its_own_and_keeps_its_headers() {
+        let now = ts("2026-08-11T00:00:00Z");
+        let original = build_imported_message(sample_eml(), "inbox", None, now).unwrap();
+        let mut first = original.clone();
+        let mut second = original.clone();
+        rekey_as_copy(&mut first);
+        rekey_as_copy(&mut second);
+        assert_ne!(first.message_id_hash, original.message_id_hash);
+        assert_ne!(first.content_hash, original.content_hash);
+        assert_ne!(first.message_id_hash, second.message_id_hash);
+        assert_ne!(first.content_hash, second.content_hash);
+        assert_eq!(first.message_id, original.message_id);
+        assert_eq!(first.envelope_json, original.envelope_json);
     }
 
     #[test]

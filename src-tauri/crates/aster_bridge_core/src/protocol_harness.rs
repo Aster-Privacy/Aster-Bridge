@@ -522,11 +522,13 @@ async fn protocol_feature_matrix() {
             reselect.contains("READ-WRITE") && reselect.contains("rw1 OK"),
             "read-write restored",
         );
+        // COPY stores the message again through the same import path as
+        // APPEND, so without an identity key it fails and the source stays.
         let copy = imap_cmd(&mut reader, &mut w, "cp1", "UID COPY 1 Archive").await;
         cl.check(
-            "IMAP UID COPY to Archive (COPYUID)",
-            copy.contains("COPYUID") && copy.contains("cp1 OK"),
-            "archived",
+            "IMAP UID COPY reaches the import path, source kept",
+            copy.contains("cp1 NO") && !copy.contains("EXPUNGE") && !copy.contains("CANNOT"),
+            copy.trim().to_string(),
         );
         let movecmd = imap_cmd(&mut reader, &mut w, "mv1", "UID MOVE 2 Trash").await;
         cl.check(
