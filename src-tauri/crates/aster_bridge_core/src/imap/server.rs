@@ -1456,6 +1456,7 @@ where
                             &db,
                             &client,
                             &session,
+                            &broadcaster,
                             &mut conn,
                             &tag,
                             subargs,
@@ -1595,6 +1596,7 @@ where
                     &db,
                     &client,
                     &session,
+                    &broadcaster,
                     &mut conn,
                     &tag,
                     &args,
@@ -2886,6 +2888,7 @@ async fn handle_copy_move(
     db: &Arc<Database>,
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
     conn: &mut ImapConnection,
     tag: &str,
     args: &str,
@@ -2907,6 +2910,22 @@ async fn handle_copy_move(
         Some(entry) => entry.label,
         None => return write_no(writer, tag, "[TRYCREATE] mailbox does not exist").await,
     };
+    if !is_move {
+        return handle_copy(
+            writer,
+            db,
+            client,
+            session,
+            broadcaster,
+            conn,
+            tag,
+            set_str,
+            is_uid,
+            &source_folder,
+            &target_internal,
+        )
+        .await;
+    }
     let target_token = crate::folders::token_of_label(&target_internal).map(str::to_string);
     let source_token = crate::folders::token_of_label(&source_folder).map(str::to_string);
     let flags = match (&target_token, source_folder.as_str()) {
@@ -2978,7 +2997,6 @@ async fn handle_copy_move(
                 );
                 let draft_removed = is_missing_item
                     && source_folder == "drafts"
-                    && is_move
                     && client.delete_draft(&token, &m.aster_id).await.is_ok();
                 if !draft_removed {
                     tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
@@ -3022,11 +3040,9 @@ async fn handle_copy_move(
     let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
     let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
 
-    if is_move {
-        writer
-            .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
-            .await?;
-    }
+    writer
+        .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
+        .await?;
     moved_seqs.sort_unstable();
     let mut adjustment = 0usize;
     for seq in &moved_seqs {
@@ -3037,19 +3053,189 @@ async fn handle_copy_move(
         conn.message_count = conn.message_count.saturating_sub(1);
         adjustment += 1;
     }
-    if is_move {
-        write_ok(writer, tag, "MOVE completed").await
-    } else {
-        writer
-            .write_all(
-                format!(
-                    "{} OK [COPYUID {} {} {}] COPY completed\r\n",
-                    tag, validity, src_set, tgt_set
-                )
-                .as_bytes(),
+    write_ok(writer, tag, "MOVE completed").await
+}
+
+/// Why a message cannot be copied without losing its attachments: BODY[]
+/// shows a note in place of attachments that are not downloaded, and the
+/// import drops any attachment over its size limit.
+fn copy_refusal(db: &Database, messages: &[CachedMessage]) -> Option<String> {
+    for m in messages {
+        if crate::message_render::attachment_status_note(m).is_some() {
+            return Some(if m.attachments_state == crate::db::ATTACHMENTS_PENDING {
+                format!("[UNAVAILABLE] the attachments of UID {} are still downloading", m.imap_uid)
+            } else {
+                format!("[CANNOT] the attachments of UID {} could not be downloaded", m.imap_uid)
+            });
+        }
+        let too_big = m.attachments_state == crate::db::ATTACHMENTS_STORED
+            && db
+                .get_message_attachment_meta(&m.aster_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|a| a.size.max(0) as usize > crate::imap::append::MAX_ATTACHMENT_BYTES);
+        if too_big {
+            return Some(format!("[TOOBIG] UID {} has an attachment too large to copy", m.imap_uid));
+        }
+    }
+    None
+}
+
+/// COPY leaves the source alone (RFC 3501 §6.4.7). An Aster message lives in
+/// one folder, so each copy is a new message, stored through the same path
+/// as APPEND. If one cannot be stored, the copies already made are deleted.
+#[allow(clippy::too_many_arguments)]
+async fn handle_copy(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    set_str: &str,
+    is_uid: bool,
+    source_folder: &str,
+    target: &str,
+) -> std::io::Result<()> {
+    use crate::imap::append::{AppendFlags, AppendOutcome};
+
+    let messages = {
+        let db = Arc::clone(db);
+        let folder = source_folder.to_string();
+        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let selected: Vec<CachedMessage> = messages
+        .into_iter()
+        .enumerate()
+        .filter(|(i, m)| {
+            let n = if is_uid { m.imap_uid } else { (i + 1) as u32 };
+            uid_set_contains(set_str, n)
+        })
+        .map(|(_, m)| m)
+        .collect();
+    if selected.is_empty() {
+        return write_ok(writer, tag, "COPY completed").await;
+    }
+    if let Some(reason) = copy_refusal(db, &selected) {
+        return write_no(writer, tag, &reason).await;
+    }
+
+    // (source UID, new UID, new Aster id, keywords)
+    let mut copies: Vec<(u32, u32, String, Vec<String>)> = Vec::new();
+    let mut failure: Option<String> = None;
+    for m in &selected {
+        let (raw, keywords) = {
+            let db = Arc::clone(db);
+            let m = m.clone();
+            tokio::task::spawn_blocking(move || {
+                let attachments = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                    db.get_message_attachments(&m.aster_id).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let keywords = db.message_keywords(&m.aster_id).unwrap_or_default();
+                (crate::message_render::render_text(&m, &attachments), keywords)
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let stored = if target == "drafts" {
+            append_draft(db, client, session, raw.as_bytes()).await.map(Some)
+        } else {
+            let flags = AppendFlags {
+                seen: m.flags & 1 != 0,
+                answered: m.flags & 2 != 0,
+                flagged: m.flags & 4 != 0,
+                deleted: m.flags & 8 != 0,
+                draft: m.flags & 16 != 0,
+            };
+            let internal_date = m
+                .date
+                .as_deref()
+                .and_then(parse_datetime_lenient)
+                .map(|d| d.with_timezone(&chrono::Utc));
+            crate::imap::append::store_copy(
+                db,
+                client,
+                session,
+                target,
+                raw.as_bytes(),
+                &flags,
+                internal_date,
             )
             .await
+            .map(|outcome| match outcome {
+                AppendOutcome::Stored { uid, aster_id } => Some((uid, aster_id)),
+                AppendOutcome::Duplicate { .. } => None,
+            })
+        };
+        match stored {
+            Ok(Some((uid, aster_id))) => copies.push((m.imap_uid, uid, aster_id, keywords)),
+            Ok(None) => {
+                failure = Some(format!(
+                    "[CANNOT] Aster would not store a second copy of UID {}",
+                    m.imap_uid
+                ));
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("COPY of {} into {} failed: {}", m.aster_id, target, e);
+                failure = Some(format!(
+                    "[{}] could not copy UID {}: {}",
+                    crate::imap::append::no_response_code(&e),
+                    m.imap_uid,
+                    e
+                ));
+                break;
+            }
+        }
     }
+
+    if let Some(mut reason) = failure {
+        let mut kept = 0usize;
+        for (_, _, aster_id, _) in &copies {
+            if delete_on_server(db, client, session, target, aster_id).await {
+                let _ = db.delete_message_by_aster_id(aster_id);
+            } else {
+                kept += 1;
+            }
+        }
+        if kept > 0 {
+            tracing::warn!("COPY into {} could not remove {} of its copies", target, kept);
+            reason = format!(
+                "{}; {} copies made before the failure could not be removed",
+                reason, kept
+            );
+        }
+        return write_no(writer, tag, &reason).await;
+    }
+
+    for (_, _, aster_id, keywords) in &copies {
+        if !keywords.is_empty() {
+            let _ = db.set_message_keywords(aster_id, keywords);
+        }
+    }
+    let new_ids: Vec<&str> = copies.iter().map(|(_, _, id, _)| id.as_str()).collect();
+    let _ = db.jmap_record_sync_batch("Email", &new_ids);
+    let _ = db.jmap_state_bump("Mailbox");
+    let _ = db.jmap_state_bump("Thread");
+    announce_mailbox_change(db, broadcaster);
+    if conn.selected_folder.as_deref() == Some(target) {
+        let count = db.count_cached_messages(target).unwrap_or(0);
+        writer.write_all(format!("* {} EXISTS\r\n", count).as_bytes()).await?;
+        conn.message_count = count;
+    }
+    let src_set = copies.iter().map(|(s, ..)| s.to_string()).collect::<Vec<_>>().join(",");
+    let dst_set = copies.iter().map(|(_, d, ..)| d.to_string()).collect::<Vec<_>>().join(",");
+    write_ok(
+        writer,
+        tag,
+        &format!("[COPYUID {} {} {}] COPY completed", uid_validity(db), src_set, dst_set),
+    )
+    .await
 }
 
 async fn handle_select(
@@ -3724,6 +3910,7 @@ mod tests {
         bulk_metadata: bool,
         gateway_blip_job_create: bool,
         slow_metadata_ms: u64,
+        fail_store_after: Option<usize>,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -3734,6 +3921,7 @@ mod tests {
             bulk_metadata,
             gateway_blip_job_create,
             slow_metadata_ms,
+            fail_store_after,
         } = opts;
         let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3953,6 +4141,12 @@ mod tests {
                         if fail {
                             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
                                 .into_response();
+                        }
+                        if let Some(limit) = fail_store_after {
+                            if stored.lock().await.len() >= limit {
+                                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                                    .into_response();
+                            }
                         }
                         let is_new = hashes.lock().await.insert(hash);
                         if !is_new {
@@ -5580,6 +5774,396 @@ mod tests {
             .any(|(m, v)| m == "IMPORT_FOLDER_TOKEN" && v == "tok_r"));
         let cached = db.get_cached_message("imported-1").unwrap().unwrap();
         assert_eq!(cached.folder, "folder:tok_r");
+    }
+
+    /// A message as the sync caches it: an RFC 3339 date and metadata with
+    /// the Message-ID and Cc.
+    fn seed_copy_source(
+        db: &Database,
+        id: &str,
+        subject: &str,
+        attachments: &[crate::db::CachedAttachment],
+    ) {
+        db.upsert_cached_message(
+            id,
+            "inbox",
+            Some(subject),
+            Some("Alice Example <alice@example.com>"),
+            Some("tester@aster.test"),
+            Some("2026-05-21T10:00:00+00:00"),
+            0,
+            Some("Hello,\r\n\r\nthe figures are attached.\r\nOl\u{e1}, at\u{e9} j\u{e1}.\r\n"),
+            Some(
+                &serde_json::json!({
+                    "is_html": false,
+                    "message_id": format!("{}@example.com", id),
+                    "cc": "carol@example.com",
+                    "attachment_count": attachments.len(),
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        db.assign_uid_if_missing("inbox", id).unwrap();
+        if !attachments.is_empty() {
+            db.replace_message_attachments(id, attachments).unwrap();
+        }
+    }
+
+    /// The source and destination UID lists of a COPYUID response code.
+    fn copyuid(resp: &str) -> (Vec<u32>, Vec<u32>) {
+        let start = resp.find("[COPYUID ").unwrap_or_else(|| panic!("no COPYUID in {}", resp));
+        let code = &resp[start + "[COPYUID ".len()..];
+        let code = &code[..code.find(']').unwrap()];
+        let fields: Vec<&str> = code.split(' ').collect();
+        let uids = |list: &str| -> Vec<u32> {
+            list.split(',').map(|u| u.parse().unwrap()).collect()
+        };
+        (uids(fields[1]), uids(fields[2]))
+    }
+
+    async fn fetch_body(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        uid: u32,
+    ) -> String {
+        writer
+            .write_all(format!("{} UID FETCH {} (BODY.PEEK[])\r\n", tag, uid).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let head = loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if !line.starts_with("* OK still working") {
+                break line;
+            }
+        };
+        let open = head.rfind('{').unwrap_or_else(|| panic!("no literal in {}", head));
+        let len: usize = head[open + 1..].trim_end().trim_end_matches('}').parse().unwrap();
+        let mut body = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body).await.unwrap();
+        let rest = read_until_tag(reader, tag).await.join("\n");
+        assert!(rest.contains(&format!("{} OK", tag)), "{}", rest);
+        String::from_utf8(body).unwrap()
+    }
+
+    /// The MIME boundary is derived from the Aster id, which a copy does not
+    /// share with its source.
+    fn without_boundary(message: &str) -> String {
+        let marker = "boundary=\"";
+        let Some(at) = message.find(marker) else {
+            return message.to_string();
+        };
+        let start = at + marker.len();
+        let boundary = &message[start..start + message[start..].find('"').unwrap()];
+        message.replace(boundary, "BOUNDARY")
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_the_source_and_answers_with_the_new_uid() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-copy-src", "keep me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "COPY 1 Archive").await;
+        assert!(resp.contains("c1 OK [COPYUID "), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "COPY expunged the source: {}", resp);
+
+        let source = db.get_cached_message("msg-copy-src").unwrap().unwrap();
+        assert_eq!(source.folder, "inbox");
+        let archived = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_ne!(archived[0].aster_id, "msg-copy-src", "the source was moved, not copied");
+        assert_eq!(copyuid(&resp), (vec![source.imap_uid], vec![archived[0].imap_uid]));
+
+        let log = calls.lock().await.clone();
+        assert_eq!(
+            log.iter().filter(|(m, _)| m == "POST_IMPORT_EMAILS").count(),
+            1,
+            "the copy was not stored as a new message: {:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(_, v)| v.contains("msg-copy-src")),
+            "COPY changed the source on the server: {:?}",
+            log
+        );
+
+        let search = imap_cmd_lines(&mut reader, &mut writer, "c2", "UID SEARCH ALL").await;
+        assert!(search.contains(&format!("* SEARCH {}", source.imap_uid)), "{}", search);
+    }
+
+    #[tokio::test]
+    async fn uid_copy_keeps_flags_and_keywords_without_touching_the_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-unread", "unread", &[]);
+        seed_copy_source(&db, "msg-marked", "marked", &[]);
+        db.set_message_flags_by_id("msg-marked", 1 | 2 | 4).unwrap();
+        db.set_message_keywords("msg-marked", &["$label1".to_string()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u1", "UID COPY 1:2 Archive").await;
+        assert!(resp.contains("u1 OK [COPYUID "), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        let (from, to) = copyuid(&resp);
+        assert_eq!(from, vec![1, 2]);
+        assert_eq!(to.len(), 2);
+
+        assert_eq!(db.get_cached_message("msg-unread").unwrap().unwrap().flags, 0);
+        assert_eq!(db.get_cached_message("msg-marked").unwrap().unwrap().flags, 1 | 2 | 4);
+        assert_eq!(db.message_keywords("msg-marked").unwrap(), vec!["$label1".to_string()]);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u2", "UID FETCH 1:2 (FLAGS)").await;
+        assert!(resp.contains("* 1 FETCH (FLAGS () UID 1)"), "{}", resp);
+        assert!(
+            resp.contains("* 2 FETCH (FLAGS (\\Seen \\Answered \\Flagged $label1) UID 2)"),
+            "{}",
+            resp
+        );
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "u3", "SELECT Archive").await;
+        assert!(resp.contains("* 2 EXISTS"), "{}", resp);
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "u4",
+            &format!("UID FETCH {}:{} (FLAGS)", to[0], to[1]),
+        )
+        .await;
+        assert!(resp.contains(&format!("FLAGS () UID {})", to[0])), "{}", resp);
+        assert!(
+            resp.contains(&format!("FLAGS (\\Seen \\Answered \\Flagged $label1) UID {})", to[1])),
+            "the copy lost its flags: {}",
+            resp
+        );
+        assert!(
+            !calls.lock().await.iter().any(|(_, v)| v.starts_with("msg-")),
+            "COPY pushed a change to a source message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_has_the_same_content_and_attachments_as_its_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let figures: Vec<u8> = (0..1_048_576u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let attachments = vec![
+            crate::db::CachedAttachment {
+                seq: 0,
+                name: "figures.bin".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                content_id: None,
+                is_inline: false,
+                size: figures.len() as i64,
+                data: figures,
+            },
+            crate::db::CachedAttachment {
+                seq: 1,
+                name: "notas-\u{e7}\u{e3}o.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                content_id: None,
+                is_inline: false,
+                size: 9,
+                data: b"linha 1\r\n".to_vec(),
+            },
+        ];
+        seed_copy_source(&db, "msg-with-files", "Relat\u{f3}rio", &attachments);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let original = fetch_body(&mut reader, &mut writer, "b1", 1).await;
+        assert!(original.contains("figures.bin"), "fixture did not render its attachments");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b2", "UID COPY 1 Archive").await;
+        assert!(resp.contains("b2 OK [COPYUID "), "{}", resp);
+        let copy_uid = copyuid(&resp).1[0];
+        let source = db.get_cached_message("msg-with-files").unwrap().unwrap();
+        assert_eq!(source.folder, "inbox");
+        assert_eq!(source.flags, 0, "COPY marked the source as read");
+        let copy_id = db.list_cached_messages("archive").unwrap()[0].aster_id.clone();
+        assert_ne!(copy_id, "msg-with-files", "the source was moved, not copied");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b3", "SELECT Archive").await;
+        assert!(resp.contains("b3 OK"), "{}", resp);
+        let copied = fetch_body(&mut reader, &mut writer, "b4", copy_uid).await;
+        assert_eq!(
+            without_boundary(&copied),
+            without_boundary(&original),
+            "the copy differs from its source"
+        );
+        assert_eq!(db.get_message_attachments(&copy_id).unwrap(), attachments);
+        let uploads = calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(m, id)| m == "POST_ATTACHMENT" && *id == copy_id)
+            .count();
+        assert_eq!(uploads, 2, "the attachments were not uploaded with the copy");
+    }
+
+    #[tokio::test]
+    async fn copy_into_the_selected_mailbox_adds_a_new_message_each_time() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-twin", "twice", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "UID COPY 1 INBOX").await;
+        assert!(resp.contains("t1 OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 2 EXISTS"), "the client was not told about the copy: {}", resp);
+        assert_eq!(copyuid(&resp), (vec![1], vec![2]));
+
+        // The second copy shares the Message-ID of the first, which the
+        // import endpoint would otherwise report as a duplicate.
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t2", "UID COPY 1 INBOX").await;
+        assert!(resp.contains("t2 OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 3 EXISTS"), "{}", resp);
+        assert_eq!(copyuid(&resp), (vec![1], vec![3]));
+
+        let inbox = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(inbox.len(), 3);
+        assert!(inbox.iter().any(|m| m.aster_id == "msg-twin"));
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "UID SEARCH ALL").await;
+        assert!(resp.contains("* SEARCH 1 2 3"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn copy_into_a_custom_folder_stores_a_copy_and_leaves_the_labels_alone() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        seed_copy_source(&db, "msg-file-me", "file a copy", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "w1", "UID COPY 1 Work").await;
+        assert!(resp.contains("w1 OK [COPYUID "), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-file-me").unwrap().unwrap().folder, "inbox");
+        let filed = db.list_cached_messages("folder:tok_w").unwrap();
+        assert_eq!(filed.len(), 1);
+        assert_ne!(filed[0].aster_id, "msg-file-me");
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, v)| m == "IMPORT_FOLDER_TOKEN" && v == "tok_w"),
+            "{:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(m, _)| m == "ADD_LABEL" || m == "REMOVE_LABEL"),
+            "COPY relabelled the source: {:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_into_drafts_saves_a_new_draft_and_keeps_the_original() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-reuse", "reuse me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d1", "UID COPY 1 Drafts").await;
+        assert!(resp.contains("d1 OK [COPYUID "), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-reuse").unwrap().unwrap().folder, "inbox");
+        let draft = db.get_cached_message("draft-created-1").unwrap().unwrap();
+        assert_eq!(draft.folder, "drafts");
+        assert_eq!(draft.subject.as_deref(), Some("reuse me"));
+        assert_eq!(copyuid(&resp).1, vec![draft.imap_uid]);
+        assert!(calls.lock().await.iter().any(|(m, _)| m == "POST_DRAFT"));
+    }
+
+    #[tokio::test]
+    async fn copy_to_a_missing_mailbox_asks_the_client_to_create_it() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-nowhere", "nowhere", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "n1", "COPY 1 \"No Such Folder\"").await;
+        assert!(resp.contains("n1 NO [TRYCREATE]"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-nowhere").unwrap().unwrap().folder, "inbox");
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_a_message_whose_attachments_are_not_downloaded() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-pending", "files on the way", &[]);
+        db.set_cached_raw_headers(
+            "msg-pending",
+            &serde_json::json!({"is_html": false, "attachment_count": 1}).to_string(),
+        )
+        .unwrap();
+        db.set_attachments_state("msg-pending", crate::db::ATTACHMENTS_PENDING).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "COPY 1 Archive").await;
+        assert!(resp.contains("p1 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-pending").unwrap().unwrap().folder, "inbox");
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+        assert!(
+            !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
+            "a copy without its attachments was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_fails_part_way_removes_the_copies_it_made() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_store_after: Some(1),
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        seed_copy_source(&db, "msg-first", "first", &[]);
+        seed_copy_source(&db, "msg-second", "second", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "COPY 1:2 Archive").await;
+        assert!(resp.contains("f1 NO"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty(), "a copy was left behind");
+        assert!(db.get_cached_message("imported-1").unwrap().is_none());
+        assert_eq!(db.list_cached_messages("inbox").unwrap().len(), 2);
+
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, id)| m == "DELETE" && id == "imported-1"),
+            "the copy already made was not removed on the server: {:?}",
+            log
+        );
+        assert!(
+            !log.iter().any(|(m, id)| m == "DELETE" && id.starts_with("msg-")),
+            "a source message was deleted: {:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn move_still_moves_the_message_and_expunges_it() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-moving", "moving", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(resp.contains("* OK [COPYUID "), "{}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(resp.contains("m1 OK MOVE completed"), "{}", resp);
+        assert_eq!(db.get_cached_message("msg-moving").unwrap().unwrap().folder, "archive");
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        assert!(
+            !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
+            "MOVE stored a new message"
+        );
     }
 
     #[tokio::test]
