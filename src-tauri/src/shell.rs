@@ -216,7 +216,7 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<tauri::tray::TrayIcon> {
     let icon_bytes: &[u8] = include_bytes!("../icons/128x128.png");
     let icon = tauri::image::Image::from_bytes(icon_bytes)?;
 
-    let builder = TrayIconBuilder::new()
+    let builder = TrayIconBuilder::with_id("aster-bridge")
         .icon(icon)
         .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
