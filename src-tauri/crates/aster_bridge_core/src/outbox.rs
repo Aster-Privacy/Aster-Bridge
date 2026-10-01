@@ -98,6 +98,16 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
     let Ok(sent) = db.list_cached_message_meta("sent") else {
         return false;
     };
+    let message_id = parsed
+        .message_id()
+        .map(crate::imap::server::normalize_message_id)
+        .filter(|s| !s.is_empty());
+    if let Some(message_id) = message_id {
+        return sent.iter().any(|m| {
+            crate::imap::server::stored_message_id(m)
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(&message_id))
+        });
+    }
     sent.iter().any(|m| {
         let subject_matches = m.subject.as_deref().map(|s| s.trim()) == Some(subject.as_str());
         if !subject_matches {
@@ -474,6 +484,34 @@ mod tests {
         seed_sent(&db, "sc-3", "hello", "carol@example.com", "2026-08-01T10:00:30+00:00");
         let row = outbox_row_for("hello", "bob@example.com", queued);
         assert!(!sent_copy_exists(&db, &row));
+    }
+
+    #[test]
+    fn sent_copy_exists_needs_the_same_message_id_when_the_message_has_one() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        seed_sent(&db, "sc-4", "weekly summary", "bob@example.com", "2026-08-01T10:00:30+00:00");
+        let mut row = outbox_row_for("weekly summary", "bob@example.com", queued);
+        row.raw_mime = b"Message-ID: <queued@client.example>\r\nFrom: me@aster.test\r\nTo: bob@example.com\r\nSubject: weekly summary\r\n\r\nbody".to_vec();
+        assert!(
+            !sent_copy_exists(&db, &row),
+            "another message with the same subject must not cancel the retry"
+        );
+        db.upsert_cached_message(
+            "sc-5",
+            "sent",
+            Some("weekly summary"),
+            Some("me@aster.test"),
+            Some("bob@example.com"),
+            Some("2026-08-01T10:00:40+00:00"),
+            10,
+            Some("body"),
+            Some(r#"{"message_id":"<queued@client.example>"}"#),
+        )
+        .unwrap();
+        assert!(sent_copy_exists(&db, &row));
     }
 
     #[tokio::test]
