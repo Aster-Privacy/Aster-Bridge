@@ -389,6 +389,33 @@ pub fn attach_sent_copy(
     passphrase: &[u8],
     seal_to_identity: bool,
 ) {
+    attach_sent_copy_with_message_id(
+        payload,
+        from_email,
+        plain_text,
+        identity_key,
+        passphrase,
+        seal_to_identity,
+        None,
+    )
+}
+
+pub fn stores_sent_copy(payload: &Value) -> bool {
+    payload
+        .get("encrypted_envelope")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+}
+
+pub fn attach_sent_copy_with_message_id(
+    payload: &mut Value,
+    from_email: &str,
+    plain_text: Option<&str>,
+    identity_key: Option<&str>,
+    passphrase: &[u8],
+    seal_to_identity: bool,
+    message_id: Option<&str>,
+) {
     let Some(identity_key) = identity_key.filter(|k| !k.is_empty()) else {
         tracing::warn!("session has no identity key; sent copy skipped");
         return;
@@ -403,7 +430,11 @@ pub fn attach_sent_copy(
         .filter(|s| !s.is_empty())
         .unwrap_or(from_email)
         .to_string();
-    let envelope = sent_envelope(payload, &sender, plain_text).to_string();
+    let mut envelope = sent_envelope(payload, &sender, plain_text);
+    if let Some(message_id) = message_id.map(str::trim).filter(|s| !s.is_empty()) {
+        envelope["message_id"] = json!(message_id);
+    }
+    let envelope = envelope.to_string();
     if seal_to_identity {
         if let Some(sealed) =
             crate::crypto::sent_copy::seal_sent_envelope(&envelope, identity_key, passphrase)
@@ -643,6 +674,32 @@ mod tests {
         let env: Value = serde_json::from_str(&opened).unwrap();
         assert_eq!(env["body_text"], "hello");
         assert_eq!(env["from"]["email"], "alias@aster.test");
+    }
+
+    #[test]
+    fn attach_sent_copy_records_the_message_id_the_client_chose() {
+        let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
+        assert!(!stores_sent_copy(&payload));
+        attach_sent_copy_with_message_id(
+            &mut payload,
+            "me@aster.test",
+            None,
+            Some("ik"),
+            b"vault-pass",
+            false,
+            Some("<chosen@client.example>"),
+        );
+        assert!(stores_sent_copy(&payload));
+        let opened = crate::crypto::envelope::decrypt_envelope(
+            payload["encrypted_envelope"].as_str().unwrap(),
+            payload["envelope_nonce"].as_str(),
+            b"vault-pass",
+            Some("ik"),
+            &[],
+        )
+        .unwrap();
+        let env: Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(env["message_id"], "<chosen@client.example>");
     }
 
     #[test]

@@ -482,7 +482,8 @@ async fn protocol_feature_matrix() {
             appresp.trim().to_string(),
         );
 
-        let sent_literal = b"Subject: harness append\r\n\r\nhi";
+        let sent_literal =
+            b"Message-ID: <harness-append@bridge.test>\r\nSubject: harness append\r\n\r\nhi";
         crate::imap::append::note_outgoing_message(sent_literal);
         w.write_all(
             format!("a9 APPEND Sent {{{}}}\r\n", sent_literal.len()).as_bytes(),

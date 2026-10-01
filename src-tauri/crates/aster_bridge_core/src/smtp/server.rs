@@ -309,11 +309,13 @@ where
                     continue;
                 }
 
-                crate::imap::append::note_outgoing_message(&raw_message);
                 match send_via_api(&session, &client, &db, &smtp.mail_from, &smtp.rcpt_to, &raw_message)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(stores_sent_copy) => {
+                        if stores_sent_copy {
+                            crate::imap::append::note_outgoing_message(&raw_message);
+                        }
                         writer
                             .write_all(b"250 OK Message accepted\r\n")
                             .await?;
@@ -332,6 +334,9 @@ where
                                         id,
                                         e
                                     );
+                                    if session_stores_sent_copy(&session).await {
+                                        crate::imap::append::note_outgoing_message(&raw_message);
+                                    }
                                     writer
                                         .write_all(b"250 OK queued\r\n")
                                         .await?;
@@ -860,16 +865,23 @@ pub async fn build_send_payload_blocking(
             &passphrase,
             own_key,
         )?;
-        let plain_text = mail_parser::MessageParser::default()
-            .parse(&raw_message)
+        let parsed = mail_parser::MessageParser::default().parse(&raw_message);
+        let plain_text = parsed
+            .as_ref()
             .and_then(|m| m.body_text(0).map(|s| s.to_string()));
-        crate::smtp::reply_thread::attach_sent_copy(
+        let message_id = parsed
+            .as_ref()
+            .and_then(|m| m.message_id())
+            .map(|id| format!("<{}>", id.trim().trim_matches(&['<', '>'][..]).trim()))
+            .filter(|id| id.len() > 2);
+        crate::smtp::reply_thread::attach_sent_copy_with_message_id(
             &mut payload,
             &session_email,
             plain_text.as_deref(),
             identity_key.as_deref().map(|k| k.as_str()),
             &passphrase,
             seal_to_identity,
+            message_id.as_deref(),
         );
         Ok(payload)
     })
@@ -929,7 +941,7 @@ async fn send_via_api(
     from: &Option<String>,
     recipients: &[String],
     raw_message: &[u8],
-) -> std::result::Result<(), crate::error::BridgeError> {
+) -> std::result::Result<bool, crate::error::BridgeError> {
     let (payload, access_token) = build_threaded_send_payload(
         raw_message,
         from.clone(),
@@ -939,7 +951,14 @@ async fn send_via_api(
         db,
     )
     .await?;
-    client.send_mail(&access_token, &payload).await
+    let stores_sent_copy = crate::smtp::reply_thread::stores_sent_copy(&payload);
+    client.send_mail(&access_token, &payload).await?;
+    Ok(stores_sent_copy)
+}
+
+async fn session_stores_sent_copy(session: &Arc<RwLock<Session>>) -> bool {
+    let s = session.read().await;
+    s.identity_key.as_deref().is_some_and(|k| !k.is_empty()) && !s.vault_passphrase.is_empty()
 }
 
 #[cfg(test)]

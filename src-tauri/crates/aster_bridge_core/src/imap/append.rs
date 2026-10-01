@@ -403,50 +403,71 @@ pub fn build_imported_message(
     })
 }
 
-static RECENT_SENDS: OnceLock<std::sync::Mutex<Vec<(String, std::time::Instant)>>> = OnceLock::new();
+struct RecentSend {
+    message_id: Option<String>,
+    fingerprint: Option<String>,
+    at: std::time::Instant,
+}
+
+static RECENT_SENDS: OnceLock<std::sync::Mutex<Vec<RecentSend>>> = OnceLock::new();
 
 const RECENT_SEND_TTL_SECS: u64 = 3600;
 const RECENT_SEND_CAP: usize = 500;
 
-fn recent_sends() -> &'static std::sync::Mutex<Vec<(String, std::time::Instant)>> {
+fn recent_sends() -> &'static std::sync::Mutex<Vec<RecentSend>> {
     RECENT_SENDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-fn recent_send_keys(raw_message: &[u8]) -> Vec<String> {
+fn outgoing_identity(raw_message: &[u8]) -> Option<(Option<String>, Option<String>)> {
     use mail_parser::MessageParser;
 
-    let Some(parsed) = MessageParser::default().parse(raw_message) else {
-        return Vec::new();
-    };
-    let mut keys = Vec::new();
-    if let Some(id) = parsed
+    let parsed = MessageParser::default().parse(raw_message)?;
+    let message_id = parsed
         .message_id()
-        .map(|s| s.trim_matches(&['<', '>'][..]).to_string())
-        .filter(|s| !s.is_empty())
-    {
-        keys.push(format!("mid:{}", id));
+        .map(|s| s.trim().trim_matches(&['<', '>'][..]).trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let subject = parsed
+        .subject()
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let fingerprint = parsed
+        .date()
+        .map(|d| format!("{}\n{}", d.to_timestamp(), subject));
+    if message_id.is_none() && fingerprint.is_none() {
+        return None;
     }
-    if let Some(subject) = parsed.subject().map(|s| s.trim().to_lowercase()) {
-        if !subject.is_empty() {
-            keys.push(format!("subj:{}", subject));
-        }
+    Some((message_id, fingerprint))
+}
+
+fn same_outgoing_message(
+    sent: &RecentSend,
+    message_id: Option<&str>,
+    fingerprint: Option<&str>,
+) -> bool {
+    match (sent.message_id.as_deref(), message_id) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => match (sent.fingerprint.as_deref(), fingerprint) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        },
+        _ => false,
     }
-    keys
 }
 
 pub fn note_outgoing_message(raw_message: &[u8]) {
-    let keys = recent_send_keys(raw_message);
-    if keys.is_empty() {
+    let Some((message_id, fingerprint)) = outgoing_identity(raw_message) else {
         return;
-    }
+    };
     let Ok(mut guard) = recent_sends().lock() else {
         return;
     };
     let now = std::time::Instant::now();
-    guard.retain(|(_, at)| now.duration_since(*at).as_secs() < RECENT_SEND_TTL_SECS);
-    for key in keys {
-        guard.push((key, now));
-    }
+    guard.retain(|sent| now.duration_since(sent.at).as_secs() < RECENT_SEND_TTL_SECS);
+    guard.push(RecentSend {
+        message_id,
+        fingerprint,
+        at: now,
+    });
     let overflow = guard.len().saturating_sub(RECENT_SEND_CAP);
     if overflow > 0 {
         guard.drain(..overflow);
@@ -454,16 +475,16 @@ pub fn note_outgoing_message(raw_message: &[u8]) {
 }
 
 pub fn was_recently_sent(raw_message: &[u8]) -> bool {
-    let keys = recent_send_keys(raw_message);
-    if keys.is_empty() {
+    let Some((message_id, fingerprint)) = outgoing_identity(raw_message) else {
         return false;
-    }
+    };
     let Ok(guard) = recent_sends().lock() else {
         return false;
     };
     let now = std::time::Instant::now();
-    guard.iter().any(|(key, at)| {
-        now.duration_since(*at).as_secs() < RECENT_SEND_TTL_SECS && keys.iter().any(|k| k == key)
+    guard.iter().any(|sent| {
+        now.duration_since(sent.at).as_secs() < RECENT_SEND_TTL_SECS
+            && same_outgoing_message(sent, message_id.as_deref(), fingerprint.as_deref())
     })
 }
 
