@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use serde_json::json;
 
@@ -16,13 +16,9 @@ use super::auth::AuthedAccount;
 use super::server::AppState;
 use super::state::{compose_session_state, snapshot_all_states, JmapContext};
 
-pub async fn well_known(State(state): State<AppState>) -> Response {
-    let scheme = if state.use_https { "https" } else { "http" };
-    let body = json!({
-        "@type": "Session",
-        "redirectUrl": format!("{}://127.0.0.1:{}/jmap/session", scheme, state.bind_port)
-    });
-    (axum::http::StatusCode::OK, Json(body)).into_response()
+// RFC 8620 §2.2: the well-known URL redirects to the session resource.
+pub async fn well_known() -> Response {
+    Redirect::temporary("/jmap/session").into_response()
 }
 
 pub async fn session_resource(

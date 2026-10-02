@@ -289,15 +289,18 @@ mod e2e_tests {
     }
 
     #[tokio::test]
-    async fn well_known_open() {
+    async fn well_known_redirects_to_the_session() {
         let (base, _auth, _dir) = start_server().await;
-        let r = reqwest::get(format!("{}/.well-known/jmap", base))
+        let r = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{}/.well-known/jmap", base))
+            .send()
             .await
             .unwrap();
-        assert_eq!(r.status(), 200);
-        let v: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(v["@type"], "Session");
-        assert!(v["redirectUrl"].as_str().unwrap().contains("/jmap/session"));
+        assert_eq!(r.status(), 307);
+        assert_eq!(r.headers()["location"], "/jmap/session");
     }
 
     #[tokio::test]
@@ -993,9 +996,14 @@ mod e2e_tests {
     #[tokio::test]
     async fn well_known_no_auth_required() {
         let (base, _auth, _dir) = start_server().await;
-        let r = reqwest::get(format!("{}/.well-known/jmap", base))
+        let r = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{}/.well-known/jmap", base))
+            .send()
             .await
             .unwrap();
-        assert_eq!(r.status(), 200);
+        assert!(r.status().is_redirection(), "{}", r.status());
     }
 }
