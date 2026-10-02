@@ -150,7 +150,7 @@ async fn process_one(
             return;
         }
     }
-    if row.attempts > 0 && sent_copy_exists(db, row) {
+    if sent_copy_exists(db, row) {
         tracing::info!(
             "outbox id={} already delivered (sent copy found), skipping resend",
             row.id
@@ -512,6 +512,41 @@ mod tests {
         )
         .unwrap();
         assert!(sent_copy_exists(&db, &row));
+    }
+
+    fn stub_session() -> Arc<RwLock<Session>> {
+        Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "me@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: b"pass".to_vec(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn first_outbox_attempt_skips_resend_when_sent_copy_exists() {
+        let (_dir, db) = test_db();
+        let raw = b"From: me@aster.test\r\nTo: bob@example.com\r\nSubject: invoice\r\n\r\nbody";
+        let id = db.outbox_insert(raw, "me@aster.test", "bob@example.com").unwrap();
+        seed_sent(&db, "sc-first", "invoice", "bob@example.com", &chrono::Utc::now().to_rfc3339());
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.attempts, 0);
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        process_one(&row, &stub_session(), &client, &db).await;
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.status, "sent");
+        assert_eq!(row.attempts, 0);
     }
 
     #[tokio::test]
