@@ -1224,6 +1224,15 @@ impl Database {
         })
     }
 
+    pub fn uid_next(&self, folder: &str) -> Result<u32, String> {
+        let stored = self
+            .get_sync_state(&format!("uidnext:{}", folder))?
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let max = self.max_uid(folder)?;
+        Ok(stored.max(max.saturating_add(1)).max(1))
+    }
+
     pub fn max_uid(&self, folder: &str) -> Result<u32, String> {
         self.with_conn(|conn| {
             let n: i64 = conn.query_row(
@@ -2791,6 +2800,22 @@ mod db_tests {
     fn delete_message_by_uid_unknown_is_noop() {
         let (_d, db) = open_db();
         db.delete_message_by_uid(123, "inbox").unwrap();
+    }
+
+    #[test]
+    fn uid_next_does_not_move_backwards_after_expunge() {
+        let (_d, db) = open_db();
+        assert_eq!(db.uid_next("inbox").unwrap(), 1);
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let top = db.assign_uid_if_missing("inbox", "a2").unwrap();
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        db.delete_message_by_uid(top as i64, "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), top - 1);
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        insert(&db, "a3", "inbox");
+        assert_eq!(db.assign_uid_if_missing("inbox", "a3").unwrap(), top + 1);
     }
 
     #[test]

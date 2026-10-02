@@ -1836,7 +1836,7 @@ where
                 };
                 let aster_folder = entry.label.as_str();
                 let count = db.count_cached_messages(aster_folder).unwrap_or(0);
-                let max_uid = db.max_uid(aster_folder).unwrap_or(0);
+                let uid_next = db.uid_next(aster_folder).unwrap_or(1);
                 let unseen = db.count_unread_messages(aster_folder).unwrap_or(0);
                 writer
                     .write_all(
@@ -1846,7 +1846,7 @@ where
                             count,
                             unseen,
                             uid_validity(&db),
-                            max_uid + 1
+                            uid_next
                         )
                         .as_bytes(),
                     )
@@ -3324,9 +3324,9 @@ async fn handle_select(
     writer
         .write_all(format!("* OK [UIDVALIDITY {}]\r\n", uid_validity(db)).as_bytes())
         .await?;
-    let max_uid = db.max_uid(aster_folder).unwrap_or(0);
+    let uid_next = db.uid_next(aster_folder).unwrap_or(1);
     writer
-        .write_all(format!("* OK [UIDNEXT {}]\r\n", max_uid + 1).as_bytes())
+        .write_all(format!("* OK [UIDNEXT {}]\r\n", uid_next).as_bytes())
         .await?;
     writer
         .write_all(b"* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n")
