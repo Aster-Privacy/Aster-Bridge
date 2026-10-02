@@ -559,6 +559,11 @@ where
                         .await?;
                     continue;
                 }
+                // RFC 5321 §4.1.1.2: MAIL inside an open transaction is out of sequence.
+                if matches!(smtp.state, SmtpState::MailFrom | SmtpState::RcptTo) {
+                    writer.write_all(b"503 5.5.1 Nested MAIL command\r\n").await?;
+                    continue;
+                }
 
                 if let Some(start) = find_ci_prefix(&args, "FROM:") {
                     let from_addr = extract_addr(&args[start + 5..]);
@@ -595,6 +600,8 @@ where
                         continue;
                     }
                     smtp.mail_from = Some(session_email);
+                    smtp.rcpt_to.clear();
+                    smtp.data_buffer.clear();
                     smtp.state = SmtpState::MailFrom;
                     writer.write_all(b"250 OK\r\n").await?;
                 } else {
