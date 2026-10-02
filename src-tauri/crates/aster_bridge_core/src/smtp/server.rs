@@ -741,9 +741,13 @@ pub fn build_send_payload_with_own_key(
         .map(|a| a.iter().filter_map(|x| x.address().map(|s| s.to_string())).collect())
         .unwrap_or_default();
 
-    let to_list = header_to.clone();
-    let cc_list = header_cc.clone();
-    let mut bcc_list = header_bcc.clone();
+    let envelope: std::collections::HashSet<String> =
+        recipients.iter().map(|s| s.to_lowercase()).collect();
+    let in_envelope = |addr: &&String| envelope.contains(&addr.to_lowercase());
+
+    let to_list: Vec<String> = header_to.iter().filter(in_envelope).cloned().collect();
+    let cc_list: Vec<String> = header_cc.iter().filter(in_envelope).cloned().collect();
+    let mut bcc_list: Vec<String> = header_bcc.iter().filter(in_envelope).cloned().collect();
 
     let known: std::collections::HashSet<String> = to_list
         .iter()
@@ -1369,6 +1373,26 @@ mod tests {
         let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
         let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["bcc"][0], "hidden@example.com");
+    }
+
+    #[test]
+    fn build_send_payload_drops_header_recipients_not_in_envelope() {
+        let raw = b"From: sender@aster.test\r\nTo: Kept@Example.com, header-only@example.com\r\nCc: cc-only@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["kept@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["Kept@Example.com"]));
+        assert!(payload["cc"].is_null());
+        assert!(payload["bcc"].is_null());
+    }
+
+    #[test]
+    fn build_send_payload_keeps_header_cc_that_is_in_envelope() {
+        let raw = b"From: sender@aster.test\r\nTo: to@example.com, stale@example.com\r\nCc: cc@example.com, old-cc@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["to@example.com".to_string(), "CC@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["to@example.com"]));
+        assert_eq!(payload["cc"], serde_json::json!(["cc@example.com"]));
+        assert!(payload["bcc"].is_null());
     }
 
     #[test]
