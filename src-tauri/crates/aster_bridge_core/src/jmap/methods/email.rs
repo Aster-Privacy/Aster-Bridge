@@ -468,11 +468,11 @@ fn build_condition(
         params.push(rusqlite::types::Value::Integer(max));
     }
     if let Some(before) = obj.get("before").and_then(|v| v.as_str()) {
-        parts.push(format!("m.date < ?{}", params.len() + 1));
+        parts.push(format!("julianday(m.date) < julianday(?{})", params.len() + 1));
         params.push(rusqlite::types::Value::Text(before.to_string()));
     }
     if let Some(after) = obj.get("after").and_then(|v| v.as_str()) {
-        parts.push(format!("m.date >= ?{}", params.len() + 1));
+        parts.push(format!("julianday(m.date) >= julianday(?{})", params.len() + 1));
         params.push(rusqlite::types::Value::Text(after.to_string()));
     }
 
@@ -531,7 +531,7 @@ fn sanitize_fts_term(input: &str) -> String {
 }
 
 fn build_sort(sort: Option<&Value>) -> String {
-    let default = " ORDER BY m.date DESC".to_string();
+    let default = " ORDER BY julianday(m.date) DESC".to_string();
     let Some(arr) = sort.and_then(|v| v.as_array()) else {
         return default;
     };
@@ -543,7 +543,7 @@ fn build_sort(sort: Option<&Value>) -> String {
         let prop = item.get("property").and_then(|v| v.as_str()).unwrap_or("");
         let ascending = item.get("isAscending").and_then(|v| v.as_bool()).unwrap_or(true);
         let col = match prop {
-            "receivedAt" | "sentAt" => "m.date",
+            "receivedAt" | "sentAt" => "julianday(m.date)",
             "from" => "m.sender",
             "subject" => "m.subject",
             "size" => "m.size",
@@ -1325,11 +1325,33 @@ mod tests {
 
     #[test]
     fn build_sort_default_and_custom() {
-        assert_eq!(build_sort(None), " ORDER BY m.date DESC");
+        assert_eq!(build_sort(None), " ORDER BY julianday(m.date) DESC");
         let asc = build_sort(Some(&json!([{"property": "subject", "isAscending": true}])));
         assert_eq!(asc, " ORDER BY m.subject ASC");
         let unknown = build_sort(Some(&json!([{"property": "bogus"}])));
-        assert_eq!(unknown, " ORDER BY m.date DESC");
+        assert_eq!(unknown, " ORDER BY julianday(m.date) DESC");
+    }
+
+    #[tokio::test]
+    async fn query_dates_compare_instants_across_offsets() {
+        let (ctx, _d) = test_ctx();
+        let mut early = cached("early", "inbox");
+        early.date = Some("2026-05-21T11:00:00+02:00".to_string());
+        let mut late = cached("late", "inbox");
+        late.date = Some("2026-05-21T09:30:00Z".to_string());
+        insert_msg(&ctx, &early);
+        insert_msg(&ctx, &late);
+
+        let res = ok(query(&ctx, json!({"filter": {"after": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["late"]));
+        let res = ok(query(&ctx, json!({"filter": {"before": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["early"]));
+        let res = ok(query(
+            &ctx,
+            json!({"sort": [{"property": "receivedAt", "isAscending": false}]}),
+        )
+        .await);
+        assert_eq!(res["ids"], json!(["late", "early"]));
     }
 
     #[test]
