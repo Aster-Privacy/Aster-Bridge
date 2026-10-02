@@ -2,6 +2,15 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 0.4.38 - 2026-10-02
+
+### Fixed
+- Every message that your mail app saves to the Sent folder now appears there. Previously, a sent message could go missing when another recent message had the same subject, which happened most often with templated or repeated mail.
+- When you copy a message to another folder, the original now stays where it was, and the copy keeps its flags, tags, and date.
+- Moving or searching for the last message in a folder now acts on that message only, instead of on every message in the folder.
+- Searches that your mail app runs over a range of messages, such as all unread messages, now return results.
+- If you hide the Aster Bridge icon in the system tray, it now stays hidden after Aster Bridge restarts.
+
 ## 0.4.37 - 2026-09-30
 
 ### What's new
