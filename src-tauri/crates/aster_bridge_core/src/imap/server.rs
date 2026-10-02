@@ -217,25 +217,49 @@ fn parse_message_date_ymd(date_str: &str) -> Option<(i32, u32, u32)> {
     Some((nd.year(), nd.month(), nd.day()))
 }
 
-fn uid_set_contains(set: &str, uid: u32) -> bool {
+fn sequence_set_contains(set: &str, n: u32, largest: u32) -> bool {
+    let bound = |v: &str| if v == "*" { Some(largest) } else { v.parse::<u32>().ok() };
     for part in set.split(',') {
         let part = part.trim();
         if let Some((a, b)) = part.split_once(':') {
-            let lo: u32 = if a == "*" { u32::MAX } else { a.parse().unwrap_or(0) };
-            let hi: u32 = if b == "*" { u32::MAX } else { b.parse().unwrap_or(0) };
+            let (Some(lo), Some(hi)) = (bound(a), bound(b)) else { continue };
             let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-            if uid >= lo && uid <= hi {
+            if n >= lo && n <= hi {
                 return true;
             }
-        } else if part == "*" {
+        } else if bound(part) == Some(n) {
             return true;
-        } else if let Ok(n) = part.parse::<u32>() {
-            if n == uid {
-                return true;
-            }
         }
     }
     false
+}
+
+fn is_sequence_set(token: &str) -> bool {
+    let is_number = |v: &str| {
+        v == "*" || (v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u32>().is_ok_and(|n| n > 0))
+    };
+    !token.is_empty()
+        && token.split(',').all(|part| match part.split_once(':') {
+            Some((a, b)) => is_number(a) && is_number(b),
+            None => is_number(part),
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchPosition {
+    seq: u32,
+    last_seq: u32,
+    last_uid: u32,
+}
+
+impl SearchPosition {
+    fn in_folder(index: usize, messages: &[CachedMessage]) -> Self {
+        Self {
+            seq: (index + 1) as u32,
+            last_seq: messages.len() as u32,
+            last_uid: messages.iter().map(|m| m.imap_uid).max().unwrap_or(0),
+        }
+    }
 }
 
 fn tokenize_search_criteria(raw: &str) -> Vec<String> {
@@ -406,7 +430,8 @@ fn strip_search_charset(criteria_upper: &str) -> std::result::Result<&str, ()> {
 
 #[cfg(test)]
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
-    search_matches_noting(msg, &[], criteria_upper, &mut None)
+    let position = SearchPosition { seq: 1, last_seq: 1, last_uid: msg.imap_uid };
+    search_matches_noting(msg, position, &[], criteria_upper, &mut None)
 }
 
 /// Like `search_matches`, against the message's stored keywords, and records
@@ -414,6 +439,7 @@ fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
 /// rather than once per message.
 fn search_matches_noting(
     msg: &CachedMessage,
+    position: SearchPosition,
     keywords: &[String],
     criteria_upper: &str,
     unsupported: &mut Option<String>,
@@ -421,7 +447,7 @@ fn search_matches_noting(
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
     while idx < parts.len() {
-        if !search_eval(msg, keywords, &parts, &mut idx, unsupported) {
+        if !search_eval(msg, position, keywords, &parts, &mut idx, unsupported) {
             return false;
         }
     }
@@ -430,6 +456,7 @@ fn search_matches_noting(
 
 fn search_eval(
     msg: &CachedMessage,
+    position: SearchPosition,
     keywords: &[String],
     parts: &[String],
     idx: &mut usize,
@@ -441,7 +468,7 @@ fn search_eval(
             *idx += 1;
             let mut result = true;
             while *idx < parts.len() && parts[*idx] != ")" {
-                if !search_eval(msg, keywords, parts, idx, unsupported) {
+                if !search_eval(msg, position, keywords, parts, idx, unsupported) {
                     result = false;
                 }
             }
@@ -464,13 +491,13 @@ fn search_eval(
         "UNDRAFT" => { *idx += 1; (msg.flags & 16) == 0 }
         "NOT" => {
             *idx += 1;
-            let v = search_eval(msg, keywords, parts, idx, unsupported);
+            let v = search_eval(msg, position, keywords, parts, idx, unsupported);
             !v
         }
         "OR" => {
             *idx += 1;
-            let a = search_eval(msg, keywords, parts, idx, unsupported);
-            let b = search_eval(msg, keywords, parts, idx, unsupported);
+            let a = search_eval(msg, position, keywords, parts, idx, unsupported);
+            let b = search_eval(msg, position, keywords, parts, idx, unsupported);
             a || b
         }
         "FROM" => {
@@ -565,13 +592,17 @@ fn search_eval(
             if *idx < parts.len() {
                 let uid_set = &parts[*idx];
                 *idx += 1;
-                uid_set_contains(uid_set, msg.imap_uid)
+                sequence_set_contains(uid_set, msg.imap_uid, position.last_uid)
             } else {
                 false
             }
         }
         "RECENT" | "NEW" => { *idx += 1; false }
         "OLD" => { *idx += 1; true }
+        set if is_sequence_set(set) => {
+            *idx += 1;
+            sequence_set_contains(set, position.seq, position.last_seq)
+        }
         unknown => {
             if unsupported.is_none() {
                 *unsupported = Some(loggable_criterion(unknown));
@@ -1325,14 +1356,15 @@ where
                         };
                         let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                         let mut unsupported = None;
-                        let uids: Vec<String> = messages.iter()
-                            .filter(|m| search_matches_noting(
+                        let uids: Vec<String> = messages.iter().enumerate()
+                            .filter(|(i, m)| search_matches_noting(
                                 m,
+                                SearchPosition::in_folder(*i, &messages),
                                 folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                                 criteria,
                                 &mut unsupported,
                             ))
-                            .map(|m| m.imap_uid.to_string())
+                            .map(|(_, m)| m.imap_uid.to_string())
                             .collect();
                         if let Some(criterion) = unsupported {
                             tracing::warn!("unsupported SEARCH criterion {}", criterion);
@@ -1438,9 +1470,10 @@ where
                         let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
                         let uid_set_spec = subargs.trim();
                         let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                        let max_uid = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
                         let targets: Vec<(usize, u32, String)> = messages.iter().enumerate()
                             .filter(|(_, m)| m.flags & 8 != 0)
-                            .filter(|(_, m)| uid_set_spec.is_empty() || uid_set_contains(uid_set_spec, m.imap_uid))
+                            .filter(|(_, m)| uid_set_spec.is_empty() || sequence_set_contains(uid_set_spec, m.imap_uid, max_uid))
                             .map(|(i, m)| (i + 1, m.imap_uid, m.aster_id.clone()))
                             .collect();
                         expunge_targets(&mut writer, &db, &client, &session, &mut conn, &folder, targets).await?;
@@ -1482,8 +1515,9 @@ where
                 let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                 let mut unsupported = None;
                 let matched: Vec<String> = messages.iter().enumerate()
-                    .filter(|(_, m)| search_matches_noting(
+                    .filter(|(i, m)| search_matches_noting(
                         m,
+                        SearchPosition::in_folder(*i, &messages),
                         folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                         criteria,
                         &mut unsupported,
@@ -2948,13 +2982,15 @@ async fn handle_copy_move(
             .await
             .unwrap_or_default()
     };
+    let max_uid = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
+    let max_seq = messages.len() as u32;
     let mut selected: Vec<(usize, CachedMessage)> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let seq = (i + 1) as u32;
         let hit = if is_uid {
-            uid_set_contains(set_str, m.imap_uid)
+            sequence_set_contains(set_str, m.imap_uid, max_uid)
         } else {
-            uid_set_contains(set_str, seq)
+            sequence_set_contains(set_str, seq, max_seq)
         };
         if hit {
             selected.push((i + 1, m.clone()));
@@ -3107,12 +3143,17 @@ async fn handle_copy(
             .await
             .unwrap_or_default()
     };
+    let max_uid = messages.iter().map(|m| m.imap_uid).max().unwrap_or(0);
+    let max_seq = messages.len() as u32;
     let selected: Vec<CachedMessage> = messages
         .into_iter()
         .enumerate()
         .filter(|(i, m)| {
-            let n = if is_uid { m.imap_uid } else { (i + 1) as u32 };
-            uid_set_contains(set_str, n)
+            if is_uid {
+                sequence_set_contains(set_str, m.imap_uid, max_uid)
+            } else {
+                sequence_set_contains(set_str, (i + 1) as u32, max_seq)
+            }
         })
         .map(|(_, m)| m)
         .collect();
@@ -6580,12 +6621,87 @@ mod tests {
         seed(&db, "un-1", "inbox", "one");
         let msgs = db.list_cached_messages("inbox").unwrap();
         let m = &msgs[0];
+        let position = SearchPosition::in_folder(0, &msgs);
         let mut unsupported = None;
-        assert!(!search_matches_noting(m, &[], "1:5 UNDELETED", &mut unsupported));
-        assert_eq!(unsupported.as_deref(), Some("1:5"));
+        assert!(!search_matches_noting(m, position, &[], "OLDER 60 UNDELETED", &mut unsupported));
+        assert_eq!(unsupported.as_deref(), Some("OLDER"));
         let mut unsupported = None;
-        assert!(search_matches_noting(m, &[], "UNDELETED SUBJECT ONE", &mut unsupported));
+        assert!(search_matches_noting(m, position, &[], "UNDELETED SUBJECT ONE", &mut unsupported));
         assert_eq!(unsupported, None);
+        let mut unsupported = None;
+        assert!(search_matches_noting(m, position, &[], "1:5 UNDELETED", &mut unsupported));
+        assert_eq!(unsupported, None);
+    }
+
+    #[test]
+    fn sequence_set_star_is_the_largest_number_in_use() {
+        assert!(sequence_set_contains("*", 7, 7));
+        assert!(!sequence_set_contains("*", 3, 7));
+        assert!(sequence_set_contains("5:*", 6, 7));
+        assert!(!sequence_set_contains("5:*", 4, 7));
+        assert!(sequence_set_contains("*:5", 6, 7));
+        assert!(sequence_set_contains("9:*", 7, 7));
+        assert!(!sequence_set_contains("9:*", 6, 7));
+        assert!(sequence_set_contains("1,3:4", 4, 7));
+        assert!(!sequence_set_contains("1,3:4", 2, 7));
+        assert!(!sequence_set_contains("x:4", 2, 7));
+    }
+
+    #[test]
+    fn is_sequence_set_accepts_only_well_formed_sets() {
+        for set in ["1", "*", "1:*", "2,4:6,9", "*:3"] {
+            assert!(is_sequence_set(set), "{}", set);
+        }
+        for token in ["", "0", "1:", ":2", "1,,2", "ALL", "1:5X", "-1"] {
+            assert!(!is_sequence_set(token), "{}", token);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_accepts_a_bare_sequence_set() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=4 {
+            seed(&db, &format!("sq-{}", n), "inbox", &format!("note {}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH 1:* UNSEEN").await;
+        assert_eq!(search_hits(&resp), vec!["1", "2", "3", "4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "SEARCH 2:3").await;
+        assert_eq!(search_hits(&resp), vec!["2", "3"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "SEARCH *").await;
+        assert_eq!(search_hits(&resp), vec!["4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s4", "UID SEARCH UID *").await;
+        assert_eq!(search_hits(&resp), vec!["4"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s5", "UID SEARCH 1,3 SUBJECT note").await;
+        assert_eq!(search_hits(&resp), vec!["1", "3"], "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_star_moves_only_the_last_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        for n in 1..=3 {
+            seed(&db, &format!("mv-star-{}", n), "inbox", &format!("m{}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "MOVE * Archive").await;
+        assert!(resp.contains("m1 OK"), "move failed: {}", resp);
+        let inbox: Vec<String> = db
+            .list_cached_messages("inbox")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.aster_id)
+            .collect();
+        assert_eq!(inbox, vec!["mv-star-1", "mv-star-2"]);
+        let archive: Vec<String> = db
+            .list_cached_messages("archive")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.aster_id)
+            .collect();
+        assert_eq!(archive, vec!["mv-star-3"]);
     }
 
     #[derive(Clone, Default)]
@@ -6623,7 +6739,7 @@ mod tests {
             seed(&db, &format!("lg-{}", i), "inbox", "one");
         }
         let (mut reader, mut writer) = login_and_select(addr).await;
-        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH 1:5 UNDELETED").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH OLDER 60 UNDELETED").await;
         assert!(resp.contains("s1 OK"), "{}", resp);
         let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH X-UNKNOWN").await;
         assert!(resp.contains("s2 OK"), "{}", resp);
@@ -6718,10 +6834,11 @@ mod tests {
         let msgs = db.list_cached_messages("inbox").unwrap();
         let m = &msgs[0];
         let keywords = vec!["$label1".to_string()];
-        assert!(search_matches_noting(m, &keywords, "KEYWORD $LABEL1", &mut None));
-        assert!(!search_matches_noting(m, &keywords, "UNKEYWORD $LABEL1", &mut None));
-        assert!(!search_matches_noting(m, &keywords, "KEYWORD $LABEL2", &mut None));
-        assert!(search_matches_noting(m, &keywords, "UNKEYWORD $LABEL2", &mut None));
+        let position = SearchPosition::in_folder(0, &msgs);
+        assert!(search_matches_noting(m, position, &keywords, "KEYWORD $LABEL1", &mut None));
+        assert!(!search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL1", &mut None));
+        assert!(!search_matches_noting(m, position, &keywords, "KEYWORD $LABEL2", &mut None));
+        assert!(search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL2", &mut None));
     }
 
     #[tokio::test]
