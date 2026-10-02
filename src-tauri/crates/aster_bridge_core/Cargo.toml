@@ -42,7 +42,7 @@ rcgen = "0.13"
 rustls = { workspace = true }
 rustls-pemfile = "2"
 webpki-roots = "1"
-x509-parser = "0.16"
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 subtle = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 time = "0.3"
