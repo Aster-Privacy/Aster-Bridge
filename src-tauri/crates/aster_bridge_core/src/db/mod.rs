@@ -825,6 +825,7 @@ impl Database {
         let sender = sender.map(strip_c0_controls);
         let recipients = recipients.map(strip_c0_controls);
         let body_text = body_text.map(strip_c0_controls);
+        let size = body_text.as_ref().map_or(size, |b| b.len() as i64);
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
@@ -2624,6 +2625,23 @@ mod db_tests {
         let msg = db.get_cached_message("a1").unwrap().unwrap();
         assert_eq!(msg.subject.as_deref(), Some("s2"));
         assert_eq!(msg.size, 6);
+    }
+
+    #[test]
+    fn upsert_size_matches_stored_body_after_control_stripping() {
+        let (_d, db) = open_db();
+        let raw = "hi\u{1}\u{7}\r\nthere\u{1b}";
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, raw.len() as i64, Some(raw), None)
+            .unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.body_text.as_deref(), Some("hi\r\nthere"));
+        assert_eq!(msg.size, "hi\r\nthere".len() as i64);
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        let full = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(
+            crate::message_render::rendered_size(&meta[0], &[]),
+            crate::message_render::render_text(&full[0], &[]).len()
+        );
     }
 
     #[test]
