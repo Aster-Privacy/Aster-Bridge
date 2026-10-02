@@ -3443,17 +3443,21 @@ fn parse_header_fields_request(fetch_parts: &str) -> Option<(String, Vec<String>
 }
 
 fn parse_body_partial(upper_parts: &str) -> Option<(usize, Option<usize>)> {
-    let idx = upper_parts
-        .find("BODY[]<")
-        .map(|i| i + "BODY[]<".len())
-        .or_else(|| upper_parts.find("BODY.PEEK[]<").map(|i| i + "BODY.PEEK[]<".len()))?;
-    let rest = &upper_parts[idx..];
-    let end = rest.find('>')?;
-    let spec = &rest[..end];
-    let mut it = spec.split('.');
-    let off: usize = it.next()?.parse().ok()?;
-    let len = it.next().and_then(|s| s.parse::<usize>().ok());
-    Some((off, len))
+    parse_section_partial(upper_parts, "")
+}
+
+fn parse_section_partial(upper_parts: &str, section: &str) -> Option<(usize, Option<usize>)> {
+    ["BODY[", "BODY.PEEK["].iter().find_map(|prefix| {
+        let marker = format!("{}{}]<", prefix, section);
+        let idx = upper_parts.find(&marker)? + marker.len();
+        let rest = &upper_parts[idx..];
+        let end = rest.find('>')?;
+        let spec = &rest[..end];
+        let mut it = spec.split('.');
+        let off: usize = it.next()?.parse().ok()?;
+        let len = it.next().and_then(|s| s.parse::<usize>().ok());
+        Some((off, len))
+    })
 }
 
 fn filter_header_fields(header: &str, fields: &[String]) -> String {
@@ -3681,12 +3685,11 @@ async fn handle_fetch(
     let wants_size = upper_parts.contains("RFC822.SIZE") || is_all || is_fast || is_full;
     let wants_uid = uid_command || upper_parts.contains("UID");
     let wants_rfc822_text = contains_word(&upper_parts, "RFC822.TEXT");
-    let wants_body = upper_parts.contains("BODY[]")
-        || upper_parts.contains("BODY.PEEK[]")
-        || (contains_word(&upper_parts, "RFC822") && !wants_rfc822_text && !upper_parts.contains("RFC822.HEADER") && !upper_parts.contains("RFC822.SIZE"));
+    let wants_rfc822 = contains_word(&upper_parts, "RFC822");
+    let wants_rfc822_header = contains_word(&upper_parts, "RFC822.HEADER");
+    let wants_body = upper_parts.contains("BODY[]") || upper_parts.contains("BODY.PEEK[]");
     let wants_body_header = upper_parts.contains("BODY[HEADER]")
-        || upper_parts.contains("BODY.PEEK[HEADER]")
-        || upper_parts.contains("RFC822.HEADER");
+        || upper_parts.contains("BODY.PEEK[HEADER]");
     let wants_body_text = upper_parts.contains("BODY[TEXT]") || upper_parts.contains("BODY.PEEK[TEXT]");
     let body_text_is_peek = upper_parts.contains("BODY.PEEK[TEXT]");
     let header_fields = parse_header_fields_request(fetch_parts);
@@ -3697,10 +3700,11 @@ async fn handle_fetch(
     let section_requests = parse_section_requests(fetch_parts);
     let wants_internaldate = upper_parts.contains("INTERNALDATE")
         || is_all || is_fast || is_full;
-    let body_is_peek = upper_parts.contains("BODY.PEEK[]")
-        || upper_parts.contains("RFC822.HEADER");
+    let body_is_peek = upper_parts.contains("BODY.PEEK[]");
 
     let needs_body = wants_body
+        || wants_rfc822
+        || wants_rfc822_header
         || wants_body_header
         || wants_body_text
         || !section_requests.is_empty()
@@ -3853,7 +3857,8 @@ async fn handle_fetch(
             if !body_text_is_peek {
                 mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
-            items.push(literal("BODY[TEXT]", rendered.body()));
+            let (suffix, slice) = apply_partial(rendered.body(), parse_section_partial(&upper_parts, "TEXT"));
+            items.push(literal(&format!("BODY[TEXT]{}", suffix), &slice));
         }
 
         for req in &section_requests {
@@ -3888,7 +3893,12 @@ async fn handle_fetch(
         }
 
         if wants_body_header {
-            items.push(literal("BODY[HEADER]", rendered.header()));
+            let (suffix, slice) = apply_partial(rendered.header(), parse_section_partial(&upper_parts, "HEADER"));
+            items.push(literal(&format!("BODY[HEADER]{}", suffix), &slice));
+        }
+
+        if wants_rfc822_header {
+            items.push(literal("RFC822.HEADER", rendered.header()));
         }
 
         if wants_body {
@@ -3903,10 +3913,13 @@ async fn handle_fetch(
             }
         }
 
+        if wants_rfc822 {
+            mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
+            items.push(literal("RFC822", &rendered.text));
+        }
+
         if wants_rfc822_text {
-            if !body_is_peek {
-                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
-            }
+            mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             items.push(literal("RFC822.TEXT", rendered.body()));
         }
 
@@ -7117,6 +7130,39 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pushed, "non-peek fetch must push read status to backend");
+    }
+
+    #[tokio::test]
+    async fn fetch_answers_rfc822_items_under_their_own_names() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "rn-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r1", "FETCH 1 (RFC822.HEADER)").await;
+        assert!(resp.contains("RFC822.HEADER {"), "{}", resp);
+        assert!(resp.contains("Subject: one"), "{}", resp);
+        assert!(!resp.contains("BODY[HEADER]"), "{}", resp);
+        assert_eq!(db.get_cached_message("rn-1").unwrap().unwrap().flags & 1, 0);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "r2", "FETCH 1 (RFC822.SIZE RFC822)").await;
+        assert!(resp.contains("RFC822.SIZE "), "{}", resp);
+        assert!(resp.contains("RFC822 {"), "{}", resp);
+        assert!(resp.contains("hello body"), "{}", resp);
+        assert!(!resp.contains("BODY[]"), "{}", resp);
+        assert_eq!(db.get_cached_message("rn-1").unwrap().unwrap().flags & 1, 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_applies_partials_to_text_and_header_sections() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "pt-1", "inbox", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p1", "FETCH 1 (BODY.PEEK[TEXT]<0.5>)").await;
+        assert!(resp.contains("BODY[TEXT]<0> {5}\nhello)"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "p2", "FETCH 1 (BODY.PEEK[HEADER]<0.4>)").await;
+        assert!(resp.contains("BODY[HEADER]<0> {4}\nDate)"), "{}", resp);
     }
 
     #[tokio::test]
