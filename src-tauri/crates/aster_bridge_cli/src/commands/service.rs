@@ -18,6 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -282,10 +283,11 @@ async fn status(ctx: &Context) -> CliResult<i32> {
 }
 
 #[allow(dead_code)]
-fn run_tool(program: &str, args: &[&str]) -> CliResult<String> {
+fn run_tool(program: impl AsRef<OsStr>, args: &[&str]) -> CliResult<String> {
+    let program = program.as_ref();
     let output = tool_command(program, args)
         .output()
-        .map_err(|e| CliError::coded(CODE_SERVICE_COMMAND, format!("Couldn't run {}: {}", program, e)))?;
+        .map_err(|e| CliError::coded(CODE_SERVICE_COMMAND, format!("Couldn't run {}: {}", program.to_string_lossy(), e)))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
@@ -296,7 +298,7 @@ fn run_tool(program: &str, args: &[&str]) -> CliResult<String> {
         CODE_SERVICE_COMMAND,
         format!(
             "{} {} failed: {}",
-            program,
+            program.to_string_lossy(),
             args.first().copied().unwrap_or_default(),
             detail
         ),
@@ -304,7 +306,7 @@ fn run_tool(program: &str, args: &[&str]) -> CliResult<String> {
 }
 
 #[allow(dead_code)]
-fn probe_tool(program: &str, args: &[&str]) -> Option<(bool, String)> {
+fn probe_tool(program: impl AsRef<OsStr>, args: &[&str]) -> Option<(bool, String)> {
     let output = tool_command(program, args).output().ok()?;
     Some((
         output.status.success(),
@@ -312,7 +314,7 @@ fn probe_tool(program: &str, args: &[&str]) -> Option<(bool, String)> {
     ))
 }
 
-fn tool_command(program: &str, args: &[&str]) -> Command {
+fn tool_command(program: impl AsRef<OsStr>, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -620,6 +622,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use aster_bridge_core::system_tools::reg_path;
 
     pub const MANAGER: &str = "Windows sign-in startup";
     const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -643,7 +646,7 @@ mod platform {
     }
 
     pub fn exists(data_dir: &Path) -> bool {
-        probe_tool("reg", &["query", RUN_KEY, "/v", &value_name(data_dir)]).is_some_and(|(ok, _)| ok)
+        probe_tool(reg_path(), &["query", RUN_KEY, "/v", &value_name(data_dir)]).is_some_and(|(ok, _)| ok)
     }
 
     fn quote_arg(value: &str) -> String {
@@ -674,7 +677,7 @@ mod platform {
     pub fn install(spec: &Spec) -> CliResult<()> {
         let line = command_line(spec)?;
         run_tool(
-            "reg",
+            reg_path(),
             &["add", RUN_KEY, "/v", &value_name(&spec.data_dir), "/t", "REG_SZ", "/d", &line, "/f"],
         )?;
         use std::os::windows::process::CommandExt;
@@ -693,7 +696,7 @@ mod platform {
     pub fn before_uninstall(_data_dir: &Path) {}
 
     pub fn uninstall(data_dir: &Path) -> CliResult<()> {
-        run_tool("reg", &["delete", RUN_KEY, "/v", &value_name(data_dir), "/f"])?;
+        run_tool(reg_path(), &["delete", RUN_KEY, "/v", &value_name(data_dir), "/f"])?;
         Ok(())
     }
 

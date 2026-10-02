@@ -30,9 +30,17 @@ pub fn system_tool_path(system_root: Option<&Path>, tool: &str) -> PathBuf {
     root.join("System32").join(tool)
 }
 
-pub fn icacls_path() -> PathBuf {
+pub fn system32_tool(tool: &str) -> PathBuf {
     let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
-    system_tool_path(system_root.as_deref(), "icacls.exe")
+    system_tool_path(system_root.as_deref(), tool)
+}
+
+pub fn icacls_path() -> PathBuf {
+    system32_tool("icacls.exe")
+}
+
+pub fn reg_path() -> PathBuf {
+    system32_tool("reg.exe")
 }
 
 pub fn icacls_command() -> std::process::Command {
@@ -66,6 +74,14 @@ mod tests {
     #[test]
     fn resolves_to_the_real_icacls() {
         let path = icacls_path();
+        assert!(path.is_absolute());
+        assert!(path.is_file(), "{}", path.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_to_the_real_reg() {
+        let path = reg_path();
         assert!(path.is_absolute());
         assert!(path.is_file(), "{}", path.display());
     }
