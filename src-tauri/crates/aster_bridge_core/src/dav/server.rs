@@ -35,7 +35,10 @@ use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
 use crate::jmap::auth::{AuthedAccount, JmapAuth};
 
-use super::store::{collection_ctag, is_safe_uid, ContactEntry, ContactsStore};
+use super::store::{
+    collection_ctag, is_safe_uid, ContactEntry, ContactsStore, DeleteOutcome, Preconditions,
+    PutOutcome,
+};
 use super::xml::{escape_xml, parse_propfind, parse_report, PropRequest, ReportRequest};
 
 const ROOT_PATH: &str = "/";
@@ -683,6 +686,13 @@ fn if_match_values(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
     )
 }
 
+fn preconditions(headers: &HeaderMap) -> Preconditions {
+    Preconditions {
+        if_match: if_match_values(headers, "if-match"),
+        if_none_match: if_match_values(headers, "if-none-match"),
+    }
+}
+
 async fn card_handler(
     _account: AuthedAccount,
     State(state): State<DavState>,
@@ -751,32 +761,15 @@ async fn card_handler(
             Err(response) => return response,
         };
 
-        let existing = match state.store.get(&uid).await {
-            Ok(existing) => existing,
-            Err(e) => return store_error(e),
-        };
-
-        if let Some(values) = if_match_values(&headers, "if-none-match") {
-            if values.iter().any(|v| v == "*") && existing.is_some() {
-                return (StatusCode::PRECONDITION_FAILED, "already exists").into_response();
-            }
-        }
-        if let Some(values) = if_match_values(&headers, "if-match") {
-            let matches = match &existing {
-                Some(entry) => values.iter().any(|v| v == "*" || v == &entry.etag),
-                None => false,
-            };
-            if !matches {
-                return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
-            }
-        }
-
         if !body.contains("BEGIN:VCARD") {
             return (StatusCode::BAD_REQUEST, "not a vcard").into_response();
         }
 
-        return match state.store.put(&uid, &body).await {
-            Ok((entry, created)) => {
+        return match state.store.put(&uid, &body, &preconditions(&headers)).await {
+            Ok(PutOutcome::PreconditionFailed) => {
+                (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
+            }
+            Ok(PutOutcome::Stored(entry, created)) => {
                 let status = if created {
                     StatusCode::CREATED
                 } else {
@@ -798,21 +791,12 @@ async fn card_handler(
     }
 
     if method == Method::DELETE {
-        let headers = req.headers().clone();
-        if let Some(values) = if_match_values(&headers, "if-match") {
-            match state.store.get(&uid).await {
-                Ok(Some(entry)) => {
-                    if !values.iter().any(|v| v == "*" || v == &entry.etag) {
-                        return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
-                    }
-                }
-                Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
-                Err(e) => return store_error(e),
+        return match state.store.delete(&uid, &preconditions(req.headers())).await {
+            Ok(DeleteOutcome::Deleted) => (StatusCode::NO_CONTENT, "").into_response(),
+            Ok(DeleteOutcome::NotFound) => (StatusCode::NOT_FOUND, "not found").into_response(),
+            Ok(DeleteOutcome::PreconditionFailed) => {
+                (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response()
             }
-        }
-        return match state.store.delete(&uid).await {
-            Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
-            Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
             Err(e) => store_error(e),
         };
     }
@@ -1415,6 +1399,43 @@ mod e2e_tests {
             .await
             .unwrap();
         assert_eq!(fresh.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn conditional_writes_see_changes_made_elsewhere() {
+        let (base, auth, rows, _dir) = start_dav().await;
+        let card_url = format!("{}/addressbooks/user/contacts/ada-1.vcf", base);
+
+        let created = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        let etag = created.headers()["etag"].to_str().unwrap().to_string();
+
+        // Another client edits the card; the bridge's listing cache still holds the old etag.
+        for row in rows.lock().unwrap().values_mut() {
+            row["updated_at"] = Value::from("2026-08-22T00:00:00Z");
+        }
+
+        let stale_put = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .header("if-match", &etag)
+            .body(CARD.replace("Ada Lovelace", "Ada B Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_put.status(), 412);
+
+        let stale_delete = dav_request("DELETE", &card_url, &auth)
+            .header("if-match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_delete.status(), 412);
+        assert_eq!(rows.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

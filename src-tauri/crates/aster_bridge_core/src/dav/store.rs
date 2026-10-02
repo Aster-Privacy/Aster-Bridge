@@ -57,6 +57,37 @@ pub struct ContactsStore {
     write_lock: Mutex<()>,
 }
 
+/// If-Match / If-None-Match values for a write. They are checked under the
+/// write lock against a fresh listing so two clients can't both win.
+#[derive(Default)]
+pub struct Preconditions {
+    pub if_match: Option<Vec<String>>,
+    pub if_none_match: Option<Vec<String>>,
+}
+
+impl Preconditions {
+    fn hold_for(&self, current: Option<&ContactEntry>) -> bool {
+        let matches = |tags: &[String]| {
+            current.is_some_and(|e| tags.iter().any(|t| t == "*" || t == &e.etag))
+        };
+        if self.if_match.as_deref().is_some_and(|tags| !matches(tags)) {
+            return false;
+        }
+        !self.if_none_match.as_deref().is_some_and(matches)
+    }
+}
+
+pub enum PutOutcome {
+    Stored(ContactEntry, bool),
+    PreconditionFailed,
+}
+
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    PreconditionFailed,
+}
+
 pub fn entry_etag(vcard: &str) -> String {
     let digest = Sha256::digest(vcard.as_bytes());
     format!("\"{}\"", hex_prefix(&digest, 16))
@@ -213,7 +244,12 @@ impl ContactsStore {
         Ok(self.list().await?.into_iter().find(|e| e.uid == uid))
     }
 
-    pub async fn put(&self, uid: &str, vcard: &str) -> Result<(ContactEntry, bool)> {
+    pub async fn put(
+        &self,
+        uid: &str,
+        vcard: &str,
+        preconditions: &Preconditions,
+    ) -> Result<PutOutcome> {
         if vcard.len() > MAX_VCARD_BYTES {
             return Err(BridgeError::Api("vcard too large".to_string()));
         }
@@ -222,6 +258,12 @@ impl ContactsStore {
         }
 
         let _guard = self.write_lock.lock().await;
+
+        self.invalidate().await;
+        let existing = self.list().await?.into_iter().find(|e| e.uid == uid);
+        if !preconditions.hold_for(existing.as_ref()) {
+            return Ok(PutOutcome::PreconditionFailed);
+        }
 
         if let Some(body_uid) = super::vcard::extract_uid(vcard) {
             if body_uid != uid {
@@ -234,7 +276,6 @@ impl ContactsStore {
 
         let keys = self.keys().await?;
         let token = self.access_token().await;
-        let existing = self.list().await?.into_iter().find(|e| e.uid == uid);
 
         let sealed = keys.encrypt_data(&Value::Object(payload.clone()))?;
         let tokens = search_tokens(&keys, &payload);
@@ -286,21 +327,25 @@ impl ContactsStore {
             .find(|e| e.uid == uid)
             .ok_or_else(|| BridgeError::Api("contact was not stored".to_string()))?;
 
-        Ok((entry, created))
+        Ok(PutOutcome::Stored(entry, created))
     }
 
-    pub async fn delete(&self, uid: &str) -> Result<bool> {
+    pub async fn delete(&self, uid: &str, preconditions: &Preconditions) -> Result<DeleteOutcome> {
         let _guard = self.write_lock.lock().await;
 
+        self.invalidate().await;
         let Some(entry) = self.list().await?.into_iter().find(|e| e.uid == uid) else {
-            return Ok(false);
+            return Ok(DeleteOutcome::NotFound);
         };
+        if !preconditions.hold_for(Some(&entry)) {
+            return Ok(DeleteOutcome::PreconditionFailed);
+        }
 
         let token = self.access_token().await;
         self.client.delete_contact(&token, &entry.contact_id).await?;
         self.invalidate().await;
 
-        Ok(true)
+        Ok(DeleteOutcome::Deleted)
     }
 }
 
