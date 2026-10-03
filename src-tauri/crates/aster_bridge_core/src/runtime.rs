@@ -225,6 +225,16 @@ pub fn token_refresh_wait(tuning: &RuntimeTuning, consecutive_failures: u32) -> 
         .min(tuning.token_refresh_interval.max(tuning.token_retry_interval))
 }
 
+const EARLY_REFRESH_MIN_GAP: Duration = Duration::from_secs(60);
+
+fn should_refresh_early(
+    consecutive_failures: u32,
+    last_attempt: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    consecutive_failures == 0 && now.duration_since(last_attempt) >= EARLY_REFRESH_MIN_GAP
+}
+
 pub fn is_definitive_device_failure(error: &BridgeError) -> bool {
     match error {
         BridgeError::Api(msg) => msg.starts_with("401") || msg.starts_with("404"),
@@ -687,9 +697,20 @@ impl BridgeRuntime {
                 Service::TokenRefresh,
                 tokio::spawn(async move {
                     let mut consecutive_failures: u32 = 0;
+                    let mut last_attempt = tokio::time::Instant::now();
+                    let mut due = last_attempt + token_refresh_wait(&tuning, consecutive_failures);
                     loop {
-                        let wait = token_refresh_wait(&tuning, consecutive_failures);
-                        tokio::time::sleep(wait).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(due) => {}
+                            _ = crate::auth::session::token_refresh_requested() => {
+                                let now = tokio::time::Instant::now();
+                                if !should_refresh_early(consecutive_failures, last_attempt, now) {
+                                    continue;
+                                }
+                                tracing::info!("refreshing the access token early");
+                            }
+                        }
+                        last_attempt = tokio::time::Instant::now();
                         match crate::auth::session::refresh_access_token(
                             &s,
                             device_id,
@@ -723,6 +744,8 @@ impl BridgeRuntime {
                                 }
                             }
                         }
+                        due = tokio::time::Instant::now()
+                            + token_refresh_wait(&tuning, consecutive_failures);
                     }
                 }),
             ));
@@ -778,5 +801,14 @@ mod token_refresh_wait_tests {
             .collect();
 
         assert_eq!(waits, vec![3000, 60, 120, 240, 480, 960, 1920, 3000, 3000, 3000]);
+    }
+
+    #[test]
+    fn an_early_refresh_waits_out_failures_and_recent_attempts() {
+        let start = tokio::time::Instant::now();
+        let later = start + Duration::from_secs(120);
+        assert!(should_refresh_early(0, start, later));
+        assert!(!should_refresh_early(0, start, start + Duration::from_secs(5)));
+        assert!(!should_refresh_early(2, start, later));
     }
 }
