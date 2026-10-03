@@ -3853,7 +3853,7 @@ async fn handle_fetch(
 
         if wants_body_text {
             let (suffix, slice) = apply_partial(rendered.body(), parse_section_partial(&upper_parts, "TEXT"));
-            items.push(literal(&format!("BODY[TEXT]{}", suffix), &slice));
+            items.push(literal(&format!("BODY[TEXT]{}", suffix), slice));
         }
 
         for req in &section_requests {
@@ -3886,7 +3886,7 @@ async fn handle_fetch(
 
         if wants_body_header {
             let (suffix, slice) = apply_partial(rendered.header(), parse_section_partial(&upper_parts, "HEADER"));
-            items.push(literal(&format!("BODY[HEADER]{}", suffix), &slice));
+            items.push(literal(&format!("BODY[HEADER]{}", suffix), slice));
         }
 
         if wants_rfc822_header {
