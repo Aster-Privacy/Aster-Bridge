@@ -677,22 +677,46 @@ impl Database {
                 recipients,
                 body_text,
                 tokenize = 'unicode61 remove_diacritics 2'
-            );
+            );",
+        ).map_err(|e| e.to_string())?;
 
-            CREATE TRIGGER IF NOT EXISTS message_cache_ai AFTER INSERT ON message_cache BEGIN
-                INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+        let update_trigger: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if update_trigger.is_some_and(|sql| !sql.contains("UPDATE OF")) {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS message_cache_ai;
+                 DROP TRIGGER IF EXISTS message_cache_ad;
+                 DROP TRIGGER IF EXISTS message_cache_au;
+                 DELETE FROM message_fts;",
+            ).map_err(|e| format!("FTS migration failed: {}", e))?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS message_cache_ai AFTER INSERT ON message_cache BEGIN
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
                         COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
             END;
 
             CREATE TRIGGER IF NOT EXISTS message_cache_ad AFTER DELETE ON message_cache BEGIN
-                DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS message_cache_au AFTER UPDATE ON message_cache BEGIN
-                DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
-                INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+            CREATE TRIGGER IF NOT EXISTS message_cache_au
+            AFTER UPDATE OF subject, sender, recipients, body_text ON message_cache
+            WHEN OLD.subject IS NOT NEW.subject OR OLD.sender IS NOT NEW.sender
+              OR OLD.recipients IS NOT NEW.recipients OR OLD.body_text IS NOT NEW.body_text
+            BEGIN
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
                         COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
             END;",
         ).map_err(|e| e.to_string())?;
@@ -705,8 +729,8 @@ impl Database {
             .unwrap_or(0);
         if fts_count == 0 && cache_count > 0 {
             conn.execute_batch(
-                "INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                 SELECT aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                "INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid, aster_id, COALESCE(subject,''), COALESCE(sender,''),
                         COALESCE(recipients,''), COALESCE(body_text,'')
                  FROM message_cache;",
             ).map_err(|e| format!("FTS backfill failed: {}", e))?;
@@ -2616,6 +2640,7 @@ mod encryption_tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     fn open_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
@@ -3070,6 +3095,147 @@ mod db_tests {
         let snip = db.fts_snippet("a1", "quick").unwrap();
         assert!(snip.is_some());
         assert!(db.fts_snippet("a1", "").unwrap().is_none());
+    }
+
+    fn fts_subject(db: &Database, aster_id: &str) -> Option<String> {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subject FROM message_fts WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .unwrap()
+    }
+
+    fn mark_fts_row(db: &Database, aster_id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_fts SET subject = 'untouched' WHERE aster_id = ?1",
+                [aster_id],
+            )
+        })
+        .unwrap();
+    }
+
+    fn fts_rowids_match_cache(db: &Database) -> bool {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM message_fts) = (SELECT COUNT(*) FROM message_cache)
+                    AND (SELECT COUNT(*) FROM message_fts f
+                         JOIN message_cache c ON c.rowid = f.rowid AND c.aster_id = f.aster_id)
+                        = (SELECT COUNT(*) FROM message_cache)",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fts_untouched_by_non_text_updates() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        mark_fts_row(&db, "a1");
+
+        db.set_message_flags_by_id("a1", 3).unwrap();
+        db.set_folder_if_changed("a1", "archive").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = 2, attachment_attempts = 1 WHERE aster_id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        db.upsert_cached_message("a1", "archive", Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-02"), 11, Some("body"), Some("headers"))
+            .unwrap();
+
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+    }
+
+    #[test]
+    fn fts_follows_text_updates_and_deletes() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a1", "inbox", Some("quarterly report"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, None, None)
+            .unwrap();
+        assert_eq!(db.fts_search("quarterly", 10).unwrap(), vec!["a1".to_string()]);
+        db.update_cached_body("a2", "lighthouse keeper", None).unwrap();
+        assert_eq!(db.fts_search("lighthouse", 10).unwrap(), vec!["a2".to_string()]);
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("quarterly report"));
+
+        db.delete_message_by_aster_id("a1").unwrap();
+        assert!(fts_subject(&db, "a1").is_none());
+        assert!(db.fts_search("quarterly", 10).unwrap().is_empty());
+        assert!(fts_rowids_match_cache(&db));
+    }
+
+    #[test]
+    fn legacy_fts_triggers_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a3", "inbox", Some("harbour lights"), None, None, Some("2026-01-03"), 0, None, None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "DROP TRIGGER message_cache_ai;
+                 DROP TRIGGER message_cache_ad;
+                 DROP TRIGGER message_cache_au;
+                 DELETE FROM message_fts;
+                 INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid + 100, aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                        COALESCE(recipients,''), COALESCE(body_text,'')
+                 FROM message_cache;
+                 CREATE TRIGGER message_cache_ai AFTER INSERT ON message_cache BEGIN
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;
+                 CREATE TRIGGER message_cache_ad AFTER DELETE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                 END;
+                 CREATE TRIGGER message_cache_au AFTER UPDATE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;",
+            )
+        })
+        .unwrap();
+        assert!(!fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert!(fts_rowids_match_cache(&db));
+        let au: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(au.contains("UPDATE OF"));
+        assert_eq!(db.fts_search("harbour", 10).unwrap(), vec!["a3".to_string()]);
+
+        mark_fts_row(&db, "a1");
+        db.set_message_flags_by_id("a1", 1).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+        db.delete_message_by_aster_id("a3").unwrap();
+        assert!(db.fts_search("harbour", 10).unwrap().is_empty());
+        insert(&db, "a4", "inbox");
+        assert!(fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"), "a migrated index is not rebuilt again");
     }
 
     #[test]
