@@ -727,8 +727,6 @@ async fn backfill_pending_attachments(
                 updated.push(aster_id);
             }
             Err(AttachmentFetchError::Transport(e)) => {
-                // Moves the message behind the rest of the backlog, so one
-                // download that keeps failing does not hold up the others.
                 let _ = db.bump_attachment_attempts(&aster_id);
                 tracing::debug!("attachment download for {} deferred: {}", aster_id, e);
                 break;
