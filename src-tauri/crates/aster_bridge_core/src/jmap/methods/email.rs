@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
@@ -277,12 +278,12 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
     let account_id = ctx.require_account(&args).await?;
     let id_to_label = store::mailbox_id_to_label_map(&ctx.db);
 
-    let position = args.get("position").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(50)
-        .clamp(0, 500);
+    let requested_position = args.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
+    let limit = match args.get("limit").and_then(|v| v.as_i64()) {
+        Some(n) if n < 0 => return Err(MethodError::invalid_args("limit must not be negative")),
+        Some(n) => n.min(500),
+        None => 50,
+    };
 
     if let Some(filter) = args.get("filter") {
         if let Some(bad) = unsupported_filter_field(filter) {
@@ -294,7 +295,43 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
     }
 
     let (where_sql, params) = build_filter(args.get("filter"), &id_to_label);
-    let sort_sql = build_sort(args.get("sort"));
+    let sort_sql = format!("{}, m.aster_id", build_sort(args.get("sort")));
+
+    let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
+    let total: i64 = ctx
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                &count_sql,
+                rusqlite::params_from_iter(params.iter()),
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0);
+    let position = match args.get("anchor").and_then(|v| v.as_str()) {
+        Some(anchor) => {
+            let offset = args.get("anchorOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let index_sql = format!(
+                "SELECT rn FROM (SELECT m.aster_id, ROW_NUMBER() OVER ({}) - 1 AS rn FROM message_cache m WHERE 1=1 {}) WHERE aster_id = ?{}",
+                sort_sql.trim_start(),
+                where_sql,
+                params.len() + 1
+            );
+            let mut bound = params.clone();
+            bound.push(rusqlite::types::Value::Text(anchor.to_string()));
+            let index: Option<i64> = ctx
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(&index_sql, rusqlite::params_from_iter(bound.iter()), |r| r.get(0))
+                        .optional()
+                })
+                .map_err(|e| MethodError::new("serverError", e))?;
+            let index = index.ok_or_else(|| MethodError::new("anchorNotFound", "anchor is not in the results"))?;
+            index.saturating_add(offset).max(0)
+        }
+        None if requested_position < 0 => total.saturating_add(requested_position).max(0),
+        None => requested_position,
+    };
 
     let sql = format!(
         "SELECT m.aster_id FROM message_cache m WHERE 1=1 {} {} LIMIT ?{} OFFSET ?{}",
@@ -319,18 +356,6 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
             Ok(rows)
         })
         .map_err(|e| MethodError::new("serverError", e))?;
-
-    let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
-    let total: i64 = ctx
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                &count_sql,
-                rusqlite::params_from_iter(params.iter()),
-                |r| r.get(0),
-            )
-        })
-        .unwrap_or(0);
 
     let state = ctx.db.jmap_state_get("Email").unwrap_or(0);
     Ok(json!({
@@ -1302,6 +1327,46 @@ mod tests {
         insert_msg(&ctx, &big);
         let res = ok(query(&ctx, json!({"filter": {"minSize": 500}})).await);
         assert_eq!(res["ids"], json!(["big"]));
+    }
+
+    #[tokio::test]
+    async fn query_negative_position_counts_from_the_end() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("p1", "01"), ("p2", "02"), ("p3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"position": -2})).await);
+        assert_eq!(res["position"], json!(1));
+        assert_eq!(res["ids"], json!(["p2", "p1"]));
+        let res = ok(query(&ctx, json!({"position": -10})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_anchor_overrides_position() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("a1", "01"), ("a2", "02"), ("a3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": -1, "position": 2})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"], json!(["a3", "a2", "a1"]));
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": 1})).await);
+        assert_eq!(res["ids"], json!(["a1"]));
+        let err = err_kind(query(&ctx, json!({"anchor": "missing"})).await);
+        assert_eq!(err, "anchorNotFound");
+    }
+
+    #[tokio::test]
+    async fn query_negative_limit_is_invalid() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(query(&ctx, json!({"limit": -1})).await);
+        assert_eq!(err, "invalidArguments");
     }
 
     #[test]
