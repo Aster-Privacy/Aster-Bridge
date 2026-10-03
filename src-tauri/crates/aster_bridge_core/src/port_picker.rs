@@ -149,7 +149,7 @@ pub const ALTERNATE_IMAP_PORT: u16 = 2143;
 pub const ALTERNATE_SMTP_PORT: u16 = 2025;
 const MAX_ALTERNATE_ROUNDS: u32 = 10;
 
-fn pick_free_port_avoiding(host: &str, preferred: u16, avoid: &[u16]) -> Result<u16, String> {
+pub fn pick_free_port_avoiding(host: &str, preferred: u16, avoid: &[u16]) -> Result<u16, String> {
     let mut start = preferred;
     for _ in 0..MAX_ALTERNATE_ROUNDS {
         let candidate = pick_available_port(host, start)?;
