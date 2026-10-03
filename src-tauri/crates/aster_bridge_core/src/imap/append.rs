@@ -985,8 +985,6 @@ async fn import_message(
         if let Err(e) =
             upload_attachments(client, &token, &passphrase, &aster_id, &message.attachments).await
         {
-            // The message is stored without its attachments; remove it so
-            // the client sees a failed APPEND and a retry is not a duplicate.
             if let Err(cleanup) = client.delete_mail_item_permanent(&token, &aster_id).await {
                 tracing::warn!(
                     "could not remove {} after a failed attachment upload: {}",

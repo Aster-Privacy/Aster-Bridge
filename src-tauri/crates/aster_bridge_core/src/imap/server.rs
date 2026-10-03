@@ -4309,9 +4309,6 @@ mod tests {
             )
             .route(
                 "/mail/v1/attachments/by-mail/:mail_id",
-                // Read the whole upload before answering. Replying early and
-                // dropping the connection mid-request resets it on Windows,
-                // which the client reports as a failed upload.
                 post(move |AxumPath(mail_id): AxumPath<String>, _body: axum::body::Bytes| {
                     let calls = c6.clone();
                     async move {
