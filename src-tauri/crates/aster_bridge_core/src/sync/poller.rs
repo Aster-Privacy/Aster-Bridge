@@ -1420,10 +1420,6 @@ fn parse_cached_date(date: Option<&str>) -> Option<chrono::DateTime<chrono::Fixe
     chrono::DateTime::parse_from_rfc3339(date?).ok()
 }
 
-/// Local messages that a capped folder listing should have returned if they
-/// still existed: unseen, and no older than the oldest message of the most
-/// recent capped listing. Drafts are left alone, since web drafts are not
-/// mail items and cannot be checked one by one.
 fn capped_prune_candidates(
     local: &[(String, String, Option<String>)],
     seen: &HashSet<String>,
@@ -1451,8 +1447,6 @@ fn capped_prune_candidates(
         .collect()
 }
 
-/// Of the candidates, the ones the server reports as gone. Stops at the
-/// first answer that is neither the message nor a 404/410.
 async fn confirm_gone_on_server(
     client: &ApiClient,
     access_token: &str,
@@ -2010,9 +2004,6 @@ async fn run_sync_pass(
             }
         }
     } else if deep && last_err.is_none() && capped_only && !capped_listings.is_empty() {
-        // Some folders hold more than the sync fetches, so an unseen message
-        // may only be older than the listing. Prune unseen messages within
-        // the listed range, and only once the server confirms they are gone.
         if let Ok(local) = db.list_all_cached_id_folder_dates() {
             let candidates = capped_prune_candidates(&local, &seen_ids, &capped_listings);
             for id in confirm_gone_on_server(client, &access_token, &candidates).await {
