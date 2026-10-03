@@ -1643,7 +1643,11 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
-    pub async fn get_contact(&self, access_token: &str, contact_id: &str) -> Result<ContactRecord> {
+    pub async fn get_contact(
+        &self,
+        access_token: &str,
+        contact_id: &str,
+    ) -> Result<Option<ContactRecord>> {
         let resp = self
             .client
             .get(format!(
@@ -1655,11 +1659,14 @@ impl ApiClient {
             .send()
             .await?;
 
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             return Err(map_response_error(resp).await);
         }
 
-        resp.json().await.map_err(BridgeError::from)
+        resp.json().await.map(Some).map_err(BridgeError::from)
     }
 
     pub async fn create_contact(

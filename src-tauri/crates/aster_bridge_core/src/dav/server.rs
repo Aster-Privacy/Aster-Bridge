@@ -35,7 +35,10 @@ use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
 use crate::jmap::auth::{AuthedAccount, JmapAuth};
 
-use super::store::{collection_ctag, is_safe_uid, ContactEntry, ContactsStore};
+use super::store::{
+    collection_ctag, is_safe_uid, ContactEntry, ContactsStore, DeleteOutcome, Preconditions,
+    PutOutcome,
+};
 use super::xml::{escape_xml, parse_propfind, parse_report, PropRequest, ReportRequest};
 
 const ROOT_PATH: &str = "/";
@@ -683,6 +686,13 @@ fn if_match_values(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
     )
 }
 
+fn preconditions(headers: &HeaderMap) -> Preconditions {
+    Preconditions {
+        if_match: if_match_values(headers, "if-match"),
+        if_none_match: if_match_values(headers, "if-none-match"),
+    }
+}
+
 async fn card_handler(
     _account: AuthedAccount,
     State(state): State<DavState>,
@@ -751,32 +761,15 @@ async fn card_handler(
             Err(response) => return response,
         };
 
-        let existing = match state.store.get(&uid).await {
-            Ok(existing) => existing,
-            Err(e) => return store_error(e),
-        };
-
-        if let Some(values) = if_match_values(&headers, "if-none-match") {
-            if values.iter().any(|v| v == "*") && existing.is_some() {
-                return (StatusCode::PRECONDITION_FAILED, "already exists").into_response();
-            }
-        }
-        if let Some(values) = if_match_values(&headers, "if-match") {
-            let matches = match &existing {
-                Some(entry) => values.iter().any(|v| v == "*" || v == &entry.etag),
-                None => false,
-            };
-            if !matches {
-                return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
-            }
-        }
-
         if !body.contains("BEGIN:VCARD") {
             return (StatusCode::BAD_REQUEST, "not a vcard").into_response();
         }
 
-        return match state.store.put(&uid, &body).await {
-            Ok((entry, created)) => {
+        return match state.store.put(&uid, &body, &preconditions(&headers)).await {
+            Ok(PutOutcome::PreconditionFailed) => {
+                (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
+            }
+            Ok(PutOutcome::Stored(entry, created)) => {
                 let status = if created {
                     StatusCode::CREATED
                 } else {
@@ -798,21 +791,12 @@ async fn card_handler(
     }
 
     if method == Method::DELETE {
-        let headers = req.headers().clone();
-        if let Some(values) = if_match_values(&headers, "if-match") {
-            match state.store.get(&uid).await {
-                Ok(Some(entry)) => {
-                    if !values.iter().any(|v| v == "*" || v == &entry.etag) {
-                        return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
-                    }
-                }
-                Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
-                Err(e) => return store_error(e),
+        return match state.store.delete(&uid, &preconditions(req.headers())).await {
+            Ok(DeleteOutcome::Deleted) => (StatusCode::NO_CONTENT, "").into_response(),
+            Ok(DeleteOutcome::NotFound) => (StatusCode::NOT_FOUND, "not found").into_response(),
+            Ok(DeleteOutcome::PreconditionFailed) => {
+                (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response()
             }
-        }
-        return match state.store.delete(&uid).await {
-            Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
-            Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
             Err(e) => store_error(e),
         };
     }
@@ -970,16 +954,20 @@ mod e2e_tests {
     use base64::Engine as _;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use uuid::Uuid;
 
     type Rows = Arc<StdMutex<HashMap<String, Value>>>;
 
-    async fn stub_backend() -> (String, Rows) {
+    async fn stub_backend() -> (String, Rows, Arc<AtomicUsize>) {
         let rows: Rows = Arc::new(StdMutex::new(HashMap::new()));
+        let list_calls = Arc::new(AtomicUsize::new(0));
 
         let list_rows = rows.clone();
+        let list_counter = list_calls.clone();
+        let get_rows = rows.clone();
         let create_rows = rows.clone();
         let update_rows = rows.clone();
         let delete_rows = rows.clone();
@@ -989,6 +977,7 @@ mod e2e_tests {
                 "/contacts/v1",
                 axum::routing::get(move || {
                     let rows = list_rows.clone();
+                    list_counter.fetch_add(1, Ordering::SeqCst);
                     async move {
                         let items: Vec<Value> =
                             rows.lock().unwrap().values().cloned().collect();
@@ -1015,7 +1004,16 @@ mod e2e_tests {
             )
             .route(
                 "/contacts/v1/:id",
-                axum::routing::put(
+                axum::routing::get(move |Path(id): Path<String>| {
+                    let rows = get_rows.clone();
+                    async move {
+                        match rows.lock().unwrap().get(&id) {
+                            Some(row) => axum::Json(row.clone()).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                })
+                .put(
                     move |Path(id): Path<String>, axum::Json(body): axum::Json<Value>| {
                         let rows = update_rows.clone();
                         async move {
@@ -1049,11 +1047,16 @@ mod e2e_tests {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (base, rows)
+        (base, rows, list_calls)
     }
 
     async fn start_dav() -> (String, String, Rows, tempfile::TempDir) {
-        let (api_base, rows) = stub_backend().await;
+        let (base, auth, rows, _list_calls, dir) = start_dav_counting().await;
+        (base, auth, rows, dir)
+    }
+
+    async fn start_dav_counting() -> (String, String, Rows, Arc<AtomicUsize>, tempfile::TempDir) {
+        let (api_base, rows, list_calls) = stub_backend().await;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::db::Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
@@ -1098,7 +1101,7 @@ mod e2e_tests {
                 .await
                 .is_ok()
             {
-                return (base, auth, rows, dir);
+                return (base, auth, rows, list_calls, dir);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1415,6 +1418,166 @@ mod e2e_tests {
             .await
             .unwrap();
         assert_eq!(fresh.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn conditional_writes_see_changes_made_elsewhere() {
+        let (base, auth, rows, _dir) = start_dav().await;
+        let card_url = format!("{}/addressbooks/user/contacts/ada-1.vcf", base);
+
+        let created = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        let etag = created.headers()["etag"].to_str().unwrap().to_string();
+
+        for row in rows.lock().unwrap().values_mut() {
+            row["updated_at"] = Value::from("2026-08-22T00:00:00Z");
+        }
+
+        let stale_put = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .header("if-match", &etag)
+            .body(CARD.replace("Ada Lovelace", "Ada B Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_put.status(), 412);
+
+        let stale_delete = dav_request("DELETE", &card_url, &auth)
+            .header("if-match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_delete.status(), 412);
+        assert_eq!(rows.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_conditional_writes_let_only_one_through() {
+        let (base, auth, _rows, _dir) = start_dav().await;
+        let card_url = format!("{}/addressbooks/user/contacts/ada-1.vcf", base);
+
+        let created = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD)
+            .send()
+            .await
+            .unwrap();
+        let etag = created.headers()["etag"].to_str().unwrap().to_string();
+
+        let send = |email: &str| {
+            dav_request("PUT", &card_url, &auth)
+                .header("content-type", "text/vcard")
+                .header("if-match", &etag)
+                .body(CARD.replace("ada@example.com", email))
+                .send()
+        };
+        let (first, second) = tokio::join!(send("first@example.com"), send("second@example.com"));
+        let mut statuses = vec![first.unwrap().status(), second.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, vec![StatusCode::NO_CONTENT, StatusCode::PRECONDITION_FAILED]);
+
+        let (first, second) = tokio::join!(
+            dav_request("PUT", &format!("{}/addressbooks/user/contacts/new-1.vcf", base), &auth)
+                .header("content-type", "text/vcard")
+                .header("if-none-match", "*")
+                .body(CARD.replace("ada-1", "new-1"))
+                .send(),
+            dav_request("PUT", &format!("{}/addressbooks/user/contacts/new-1.vcf", base), &auth)
+                .header("content-type", "text/vcard")
+                .header("if-none-match", "*")
+                .body(CARD.replace("ada-1", "new-1"))
+                .send()
+        );
+        let mut statuses = vec![first.unwrap().status(), second.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, vec![StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]);
+    }
+
+    #[tokio::test]
+    async fn if_none_match_refuses_a_matching_etag() {
+        let (base, auth, _rows, _dir) = start_dav().await;
+        let card_url = format!("{}/addressbooks/user/contacts/ada-1.vcf", base);
+
+        let created = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD)
+            .send()
+            .await
+            .unwrap();
+        let etag = created.headers()["etag"].to_str().unwrap().to_string();
+
+        let refused = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .header("if-none-match", &etag)
+            .body(CARD.replace("Ada Lovelace", "Ada B Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 412);
+
+        let accepted = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .header("if-none-match", "\"other\"")
+            .body(CARD.replace("Ada Lovelace", "Ada B Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn writes_do_not_reload_the_contact_list() {
+        let (base, auth, _rows, list_calls, _dir) = start_dav_counting().await;
+        let card_url = format!("{}/addressbooks/user/contacts/ada-1.vcf", base);
+
+        let created = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+
+        let updated = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD.replace("Ada Lovelace", "Ada B Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), 204);
+        let etag = updated.headers()["etag"].to_str().unwrap().to_string();
+
+        let conditional = dav_request("PUT", &card_url, &auth)
+            .header("content-type", "text/vcard")
+            .header("if-match", &etag)
+            .body(CARD.replace("Ada Lovelace", "Ada C Lovelace"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conditional.status(), 204);
+
+        let other_url = format!("{}/addressbooks/user/contacts/bob-1.vcf", base);
+        let other = dav_request("PUT", &other_url, &auth)
+            .header("content-type", "text/vcard")
+            .body(CARD.replace("ada-1", "bob-1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 201);
+
+        let deleted = dav_request("DELETE", &other_url, &auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), 204);
+        let calls = list_calls.load(Ordering::SeqCst);
+        assert!(calls < 5, "five writes reloaded the listing {} times", calls);
     }
 
     #[tokio::test]
