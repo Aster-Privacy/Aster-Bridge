@@ -58,6 +58,9 @@ fn urlencoding_path(segment: &str) -> String {
 async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        crate::auth::session::request_token_refresh();
+    }
     if status == reqwest::StatusCode::FORBIDDEN {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
             if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
@@ -2020,6 +2023,29 @@ mod tests {
         let body = seen.lock().await.clone().unwrap();
         assert_eq!(body["is_archived"], true);
         assert_eq!(body["is_trashed"], false);
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_response_requests_a_token_refresh() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async { (StatusCode::UNAUTHORIZED, "expired").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        use futures_util::FutureExt;
+        let _ = crate::auth::session::token_refresh_requested().now_or_never();
+        let err = client
+            .send_mail("tok", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Api(ref m) if m.starts_with("401")));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::auth::session::token_refresh_requested(),
+        )
+        .await
+        .expect("a 401 must ask the refresh task to run");
     }
 
     #[tokio::test]

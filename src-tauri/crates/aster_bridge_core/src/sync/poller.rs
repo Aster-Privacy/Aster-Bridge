@@ -2170,6 +2170,7 @@ pub async fn run_poll_loop_tuned(
                 last_tick = now;
                 if elapsed > interval_dur * 3 {
                     tracing::info!("sync: detected sleep/wake gap ({:.0}s); running immediate sync pass", elapsed.as_secs_f64());
+                    crate::auth::session::request_token_refresh();
                 }
                 sync_count += 1;
                 if sync_count.is_multiple_of(plan_check_every)
