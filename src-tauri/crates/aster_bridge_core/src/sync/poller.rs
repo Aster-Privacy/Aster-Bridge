@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
@@ -424,7 +424,6 @@ fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachmen
 }
 
 const ADDRESS_META_VERSION_KEY: &str = "addresses_v";
-const ADDRESS_META_KEYS: [&str; 3] = ["cc", "bcc", "reply_to"];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct EnvelopeAddresses {
@@ -516,41 +515,7 @@ fn backfill_cached_addresses(
     true
 }
 
-fn carry_address_meta(
-    db: &Database,
-    aster_id: &str,
-    meta: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    let Some(existing) = cached_meta_map(db, aster_id) else {
-        return;
-    };
-    for key in ADDRESS_META_KEYS.iter().chain(std::iter::once(&ADDRESS_META_VERSION_KEY)) {
-        if let Some(v) = existing.get(*key) {
-            meta.insert(key.to_string(), v.clone());
-        }
-    }
-}
 
-fn carry_attachment_meta(
-    db: &Database,
-    aster_id: &str,
-    meta: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    let Ok(Some(existing)) = db.get_cached_message(aster_id) else {
-        return;
-    };
-    let Some(raw) = existing.raw_headers.as_deref() else {
-        return;
-    };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return;
-    };
-    for key in ["attachment_count", "attachments"] {
-        if let Some(v) = parsed.get(key) {
-            meta.insert(key.to_string(), v.clone());
-        }
-    }
-}
 
 async fn fetch_and_decrypt_attachments(
     client: &ApiClient,
@@ -891,6 +856,9 @@ enum Prepared {
     Ready(PreparedMessage),
 }
 
+const RATCHET_PLACEHOLDER: &str = "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
+     Open it in the Aster web or mobile app to decrypt.]";
+
 fn prepare_mail_item(
     db: &Database,
     folder: &str,
@@ -989,11 +957,7 @@ fn prepare_mail_item(
     let mut is_html = body_html.is_some();
     let mut body_text = body_html.or(body_plain);
     if is_ratchet_envelope {
-        body_text = Some(
-            "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
-             Open it in the Aster web or mobile app to decrypt.]"
-                .to_string(),
-        );
+        body_text = Some(RATCHET_PLACEHOLDER.to_string());
         is_html = false;
     }
     let attachments = parse_envelope_attachments(&parsed);
@@ -1268,63 +1232,375 @@ fn looks_like_html(s: &str) -> bool {
     trimmed.starts_with('<') || (s.contains('<') && s.contains("</"))
 }
 
-async fn try_decrypt_internal_mail(
-    item: &MailItem,
-    our_email: &str,
-    passphrase: &[u8],
-    identity_key: Option<&str>,
-    previous_keys: &[String],
-    ratchet_keys: &[crate::crypto::ratchet::RatchetReceiverKeys],
-    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
-    sync_key: Option<&[u8; 32]>,
-    client: &ApiClient,
-    access_token: &str,
+struct InternalDecryptContext<'a> {
+    our_email: &'a str,
+    passphrase: &'a [u8],
+    identity_key: Option<&'a str>,
+    previous_keys: &'a [String],
+    ratchet_keys: &'a [crate::crypto::ratchet::RatchetReceiverKeys],
+    inbound_keys: &'a [crate::crypto::inbound::InboundKeyCandidate],
+    recovery: &'a crate::crypto::ratchet_recovery::RecoveryMaterial,
+    sync_keys: &'a [Zeroizing<[u8; 32]>],
+    escrow_keys: &'a [Zeroizing<[u8; 32]>],
+    client: &'a ApiClient,
+    access_token: &'a str,
+}
+
+fn envelope_sender_address(parsed: &serde_json::Value) -> String {
+    let from = parsed.get("from");
+    let raw = match from {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(v) => v.get("email").and_then(|e| e.as_str()).unwrap_or(""),
+        None => "",
+    };
+    match (raw.rfind('<'), raw.rfind('>')) {
+        (Some(open), Some(close)) if open < close => raw[open + 1..close].trim().to_string(),
+        _ => raw.trim().to_string(),
+    }
+}
+
+async fn fetch_pq_secrets(
+    ctx: &InternalDecryptContext<'_>,
+    key_id: i32,
+) -> Vec<Zeroizing<Vec<u8>>> {
+    if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
+        let mut secrets: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+        let inbound = ctx.inbound_keys.iter().filter_map(|c| c.pq_decap_key.as_ref());
+        let lane = ctx.recovery.lane_candidates.iter().filter_map(|c| c.pq_decap_key.as_ref());
+        for secret in inbound.chain(lane) {
+            if !secrets.iter().any(|s| s.as_slice() == secret.as_slice()) {
+                secrets.push(Zeroizing::new(secret.clone()));
+            }
+        }
+        return secrets;
+    }
+    let Ok(key_id) = u32::try_from(key_id) else {
+        return Vec::new();
+    };
+    if ctx.sync_keys.is_empty() {
+        return Vec::new();
+    }
+    let resp = match ctx.client.get_pq_secret(ctx.access_token, key_id).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::debug!("ratchet pq secret {} unavailable: {}", key_id, e);
+            return Vec::new();
+        }
+    };
+    for sync_key in ctx.sync_keys {
+        if let Ok(secret) = crate::crypto::ratchet::decrypt_pq_secret(
+            sync_key.as_slice(),
+            &resp.encrypted_secret,
+            &resp.secret_nonce,
+        ) {
+            return vec![Zeroizing::new(secret)];
+        }
+    }
+    tracing::debug!("ratchet pq secret {} did not open with any storage key", key_id);
+    Vec::new()
+}
+
+async fn try_bootstrap(
+    ctx: &InternalDecryptContext<'_>,
+    ratchet_obj: &serde_json::Value,
+    address: &str,
 ) -> Option<String> {
-    if ratchet_keys.is_empty() {
+    if ctx.ratchet_keys.is_empty() {
         return None;
     }
+    let mut msg = crate::crypto::ratchet::parse_recipient_message(ratchet_obj, address)?;
+    let Some(key_id) = msg.pq_key_id else {
+        return crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
+    };
+    for secret in fetch_pq_secrets(ctx, key_id).await {
+        msg.pq_secret = Some(secret.to_vec());
+        let opened = crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
+        if let Some(mut s) = msg.pq_secret.take() {
+            s.zeroize();
+        }
+        if opened.is_some() {
+            return opened;
+        }
+    }
+    None
+}
 
+async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
+    if ctx.escrow_keys.is_empty() {
+        return None;
+    }
+    let entry = match ctx.client.get_escrow_plaintext(ctx.access_token, dedupe_key).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!("ratchet escrow lookup failed: {}", e);
+            return None;
+        }
+    };
+    if entry.message_id != dedupe_key {
+        tracing::warn!("ratchet escrow returned an entry for a different message; ignored");
+        return None;
+    }
+    crate::crypto::ratchet_recovery::decrypt_escrow_entry(
+        ctx.escrow_keys,
+        dedupe_key,
+        &entry.encrypted_plaintext,
+        &entry.plaintext_nonce,
+    )
+}
+
+async fn try_decrypt_internal_mail(
+    item: &MailItem,
+    ctx: &InternalDecryptContext<'_>,
+) -> Option<crate::crypto::ratchet_recovery::SubjectBundle> {
     let plaintext_env = decrypt_envelope_with_previous_keys(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
-        passphrase,
-        identity_key,
-        previous_keys,
-        inbound_keys,
+        ctx.passphrase,
+        ctx.identity_key,
+        ctx.previous_keys,
+        ctx.inbound_keys,
     )
     .ok()?;
 
     let parsed: serde_json::Value = serde_json::from_str(&plaintext_env).ok()?;
     let ratchet_obj = crate::crypto::ratchet::find_ratchet_object(&parsed)?;
-    let mut msg = crate::crypto::ratchet::parse_recipient_message(&ratchet_obj, our_email)?;
+    let sender_email = envelope_sender_address(&parsed);
+    let sender_identity = ratchet_obj
+        .get("sender_identity_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-    if let Some(key_id) = msg.pq_key_id {
-        if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
-            for candidate in inbound_keys {
-                let Some(pq_identity_secret) = candidate.pq_decap_key.as_ref() else {
-                    continue;
-                };
-                msg.pq_secret = Some(pq_identity_secret.clone());
-                if let Some(plaintext) =
-                    crate::crypto::ratchet::decrypt_with_key_sets(ratchet_keys, &msg)
-                {
-                    return Some(plaintext);
-                }
+    let attempts =
+        crate::crypto::ratchet_recovery::recipient_attempts(&ratchet_obj, ctx.our_email, &sender_email);
+    let mut opened: Option<String> = None;
+    let mut failed_steps: Vec<&str> = Vec::new();
+    for attempt in &attempts {
+        if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
+            opened = try_bootstrap(ctx, &ratchet_obj, &attempt.address).await;
+            if opened.is_some() {
+                break;
             }
-            return None;
+            failed_steps.push("bootstrap");
         }
-        let sk = sync_key?;
-        let resp = client
-            .get_pq_secret(access_token, u32::try_from(key_id).ok()?)
-            .await
-            .ok()?;
-        let secret =
-            crate::crypto::ratchet::decrypt_pq_secret(sk, &resp.encrypted_secret, &resp.secret_nonce)
-                .ok()?;
-        msg.pq_secret = Some(secret);
+        if !sender_identity.is_empty() && attempt.data.get("recovery").is_some() {
+            let conversation =
+                crate::crypto::ratchet_recovery::conversation_id(&attempt.address, &sender_email);
+            opened = crate::crypto::ratchet_recovery::decrypt_via_recovery_lane(
+                attempt.data,
+                &conversation,
+                sender_identity,
+                &ctx.recovery.lane_candidates,
+            );
+            if opened.is_some() {
+                break;
+            }
+            failed_steps.push("recovery_lane");
+        }
+        if let Some(dedupe_key) = crate::crypto::ratchet_recovery::escrow_dedupe_key(&item.id, attempt.data) {
+            opened = try_escrow(ctx, &dedupe_key).await;
+            if opened.is_some() {
+                break;
+            }
+            failed_steps.push("escrow");
+        }
     }
+    if opened.is_none() && attempts.is_empty() {
+        opened = try_escrow(ctx, &item.id).await;
+        failed_steps.push("no_recipient_entry");
+    }
+    match opened {
+        Some(plaintext) => Some(crate::crypto::ratchet_recovery::extract_subject_bundle(&plaintext)),
+        None => {
+            tracing::debug!(
+                "ratchet message {} still sealed after: {}",
+                item.id,
+                failed_steps.join(", ")
+            );
+            None
+        }
+    }
+}
 
-    crate::crypto::ratchet::decrypt_with_key_sets(ratchet_keys, &msg)
+const SEALED_RETRY_BATCH: usize = 40;
+const SEALED_RETRY_SCAN_LIMIT: usize = 2000;
+const SEALED_RETRY_BASE_SECS: u64 = 300;
+const SEALED_RETRY_MAX_SECS: u64 = 6 * 60 * 60;
+const SEALED_RETRY_TRACKED_CAP: usize = 10_000;
+
+static SEALED_RETRY: OnceLock<StdMutex<HashMap<String, (u32, std::time::Instant)>>> = OnceLock::new();
+
+fn sealed_retry_state() -> &'static StdMutex<HashMap<String, (u32, std::time::Instant)>> {
+    SEALED_RETRY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn sealed_retry_delay(attempts: u32) -> std::time::Duration {
+    let factor = 1u64.checked_shl(attempts.saturating_sub(1).min(16)).unwrap_or(u64::MAX);
+    std::time::Duration::from_secs(SEALED_RETRY_BASE_SECS.saturating_mul(factor).min(SEALED_RETRY_MAX_SECS))
+}
+
+fn sealed_retry_due(aster_id: &str, now: std::time::Instant) -> bool {
+    let Ok(state) = sealed_retry_state().lock() else {
+        return false;
+    };
+    state.get(aster_id).is_none_or(|(_, next)| now >= *next)
+}
+
+fn note_sealed_retry(aster_id: &str, now: std::time::Instant) {
+    let Ok(mut state) = sealed_retry_state().lock() else {
+        return;
+    };
+    if state.len() >= SEALED_RETRY_TRACKED_CAP && !state.contains_key(aster_id) {
+        state.retain(|_, (_, next)| *next > now);
+        if state.len() >= SEALED_RETRY_TRACKED_CAP {
+            return;
+        }
+    }
+    let entry = state.entry(aster_id.to_string()).or_insert((0, now));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now + sealed_retry_delay(entry.0);
+}
+
+fn clear_sealed_retry(aster_id: &str) {
+    if let Ok(mut state) = sealed_retry_state().lock() {
+        state.remove(aster_id);
+    }
+}
+
+fn db_body_is_placeholder(db: &Database, aster_id: &str) -> bool {
+    matches!(
+        db.get_cached_message(aster_id),
+        Ok(Some(ref m)) if m.body_text.as_deref() == Some(RATCHET_PLACEHOLDER)
+    )
+}
+
+fn store_unsealed_message(
+    db: &Database,
+    aster_id: &str,
+    bundle: &crate::crypto::ratchet_recovery::SubjectBundle,
+) -> bool {
+    let mut meta_map = cached_meta_map(db, aster_id).unwrap_or_default();
+    meta_map.insert(
+        "is_html".to_string(),
+        serde_json::json!(looks_like_html(&bundle.body)),
+    );
+    meta_map
+        .entry("message_id".to_string())
+        .or_insert(serde_json::Value::Null);
+    let meta = serde_json::Value::Object(meta_map).to_string();
+    if let Err(e) = db.update_cached_body(aster_id, &bundle.body, Some(&meta)) {
+        tracing::warn!("storing decrypted ratchet body for {} failed: {}", aster_id, e);
+        return false;
+    }
+    if let Some(subject) = bundle.subject.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Err(e) = db.update_cached_subject(aster_id, subject) {
+            tracing::warn!("storing decrypted ratchet subject for {} failed: {}", aster_id, e);
+        }
+    }
+    clear_sealed_retry(aster_id);
+    true
+}
+
+const BUNDLE_REPAIR_BATCH: usize = 200;
+
+static BUNDLE_REPAIR_SKIPPED: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn repair_cached_bundles(db: &Database) -> Vec<String> {
+    let marker = crate::crypto::ratchet_recovery::SUBJECT_BUNDLE_MARKER;
+    let skipped = BUNDLE_REPAIR_SKIPPED.get_or_init(|| StdMutex::new(HashSet::new()));
+    let skip_count = skipped.lock().map(|s| s.len()).unwrap_or(0);
+    let rows = match db.list_bodies_starting_with(marker, BUNDLE_REPAIR_BATCH + skip_count) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("listing cached subject bundles failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut repaired = Vec::new();
+    for (aster_id, body) in rows {
+        if skipped.lock().map(|s| s.contains(&aster_id)).unwrap_or(true) {
+            continue;
+        }
+        let Ok(Some(cached)) = db.get_cached_message(&aster_id) else {
+            continue;
+        };
+        let bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&body);
+        let sealed_subject = cached.subject.as_deref().is_none_or(|s| s.trim().is_empty());
+        if bundle.subject.is_none() || !sealed_subject {
+            if let Ok(mut s) = skipped.lock() {
+                s.insert(aster_id);
+            }
+            continue;
+        }
+        if !store_unsealed_message(db, &aster_id, &bundle) {
+            continue;
+        }
+        if cached.imap_uid > 0 {
+            let _ = db.remove_uid_mapping(cached.imap_uid as i64, &cached.folder);
+        }
+        let _ = db.assign_uid_if_missing(&cached.folder, &aster_id);
+        repaired.push(aster_id);
+        if repaired.len() >= BUNDLE_REPAIR_BATCH {
+            break;
+        }
+    }
+    if !repaired.is_empty() {
+        tracing::info!("unwrapped {} cached message(s) stored by an older version", repaired.len());
+    }
+    repaired
+}
+
+async fn retry_sealed_messages(
+    db: &Database,
+    ctx: &InternalDecryptContext<'_>,
+) -> Vec<String> {
+    let mut unsealed = repair_cached_bundles(db);
+    let now = std::time::Instant::now();
+    let ids = match db.list_ids_with_body(RATCHET_PLACEHOLDER, SEALED_RETRY_SCAN_LIMIT) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!("listing sealed ratchet messages failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let due: Vec<String> = ids
+        .into_iter()
+        .filter(|id| is_valid_item_id(id) && sealed_retry_due(id, now))
+        .take(SEALED_RETRY_BATCH)
+        .collect();
+    for aster_id in due {
+        let item = match ctx.client.fetch_mail_item(ctx.access_token, &aster_id).await {
+            Ok(item) => item,
+            Err(e) => {
+                tracing::debug!("sealed message {} refetch failed: {}", aster_id, e);
+                note_sealed_retry(&aster_id, now);
+                continue;
+            }
+        };
+        if item.id != aster_id {
+            note_sealed_retry(&aster_id, now);
+            continue;
+        }
+        let Some(bundle) = try_decrypt_internal_mail(&item, ctx).await else {
+            note_sealed_retry(&aster_id, now);
+            continue;
+        };
+        let Ok(Some(cached)) = db.get_cached_message(&aster_id) else {
+            continue;
+        };
+        if !store_unsealed_message(db, &aster_id, &bundle) {
+            continue;
+        }
+        if cached.imap_uid > 0 {
+            let _ = db.remove_uid_mapping(cached.imap_uid as i64, &cached.folder);
+        }
+        let _ = db.assign_uid_if_missing(&cached.folder, &aster_id);
+        unsealed.push(aster_id);
+    }
+    if !unsealed.is_empty() {
+        tracing::info!("decrypted {} previously sealed message(s)", unsealed.len());
+    }
+    unsealed
 }
 
 const INBOUND_HEAL_COOLDOWN_SECS: u64 = 300;
@@ -1560,7 +1836,7 @@ async fn run_sync_pass(
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
 
-    let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys) = {
+    let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
         (
             s.access_token.clone(),
@@ -1570,11 +1846,28 @@ async fn run_sync_pass(
             s.email.clone(),
             s.ratchet_keys.clone(),
             s.inbound_keys.clone(),
+            s.ratchet_recovery.clone(),
         )
     };
-    let sync_key = crate::crypto::ratchet::derive_sync_key(&passphrase).ok();
+    let sync_keys = recovery.sync_keys();
+    let escrow_keys = recovery.escrow_keys();
+    let ratchet_ctx = InternalDecryptContext {
+        our_email: &our_email,
+        passphrase: &passphrase,
+        identity_key: identity_key.as_deref(),
+        previous_keys: &previous_keys,
+        ratchet_keys: &ratchet_keys,
+        inbound_keys: &inbound_keys,
+        recovery: &recovery,
+        sync_keys: &sync_keys,
+        escrow_keys: &escrow_keys,
+        client,
+        access_token: &access_token,
+    };
 
     backfill_missing_message_ids(db);
+
+    updated_ids.extend(retry_sealed_messages(db, &ratchet_ctx).await);
 
     match sync_custom_folders(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
         Ok(changed) => mailboxes_changed = changed,
@@ -1739,31 +2032,14 @@ async fn run_sync_pass(
                         }
                         if outcome.was_new {
                             new_ids.push(item.id.clone());
-                            if let Some(plaintext) = try_decrypt_internal_mail(
-                                item,
-                                &our_email,
-                                &passphrase,
-                                identity_key.as_deref(),
-                                &previous_keys,
-                                &ratchet_keys,
-                                &inbound_keys,
-                                sync_key.as_ref(),
-                                client,
-                                &access_token,
-                            )
-                            .await
-                            {
-                                let mut meta_map = serde_json::Map::new();
-                                meta_map.insert(
-                                    "is_html".to_string(),
-                                    serde_json::json!(looks_like_html(&plaintext)),
-                                );
-                                meta_map
-                                    .insert("message_id".to_string(), serde_json::Value::Null);
-                                carry_attachment_meta(db, &item.id, &mut meta_map);
-                                carry_address_meta(db, &item.id, &mut meta_map);
-                                let meta = serde_json::Value::Object(meta_map).to_string();
-                                let _ = db.update_cached_body(&item.id, &plaintext, Some(&meta));
+                            if db_body_is_placeholder(db, &item.id) {
+                                if let Some(bundle) =
+                                    try_decrypt_internal_mail(item, &ratchet_ctx).await
+                                {
+                                    store_unsealed_message(db, &item.id, &bundle);
+                                } else {
+                                    note_sealed_retry(&item.id, std::time::Instant::now());
+                                }
                             }
                         }
                     }
@@ -1849,6 +2125,9 @@ async fn run_sync_pass(
     )
     .await;
     updated_ids.extend(backfilled);
+
+    let unsealed = retry_sealed_messages(db, &ratchet_ctx).await;
+    updated_ids.extend(unsealed);
 
     let account_keys = session.read().await.account_keys.clone();
     match identity_key.as_deref() {
@@ -3025,6 +3304,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }))
     }
 
@@ -3131,6 +3411,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }))
     }
 
@@ -4190,4 +4471,172 @@ mod tests {
         assert_eq!(db.list_attachment_backlog(10).unwrap().len(), 1);
     }
 
+}
+
+#[cfg(test)]
+mod sealed_retry_tests {
+    use super::*;
+    use crate::crypto::ratchet_recovery::SubjectBundle;
+    use std::time::{Duration, Instant};
+
+    fn temp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        (dir, db)
+    }
+
+    fn cache_sealed(db: &Database, id: &str) {
+        db.upsert_cached_message(
+            id,
+            "INBOX",
+            Some(""),
+            Some("alice@astermail.org"),
+            Some("hello@astermail.org"),
+            None,
+            1,
+            Some(RATCHET_PLACEHOLDER),
+            Some("{\"is_html\":false,\"message_id\":\"<m@x>\"}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_sender_address_handles_every_shape() {
+        let cases = [
+            (serde_json::json!({ "from": "alice@astermail.org" }), "alice@astermail.org"),
+            (serde_json::json!({ "from": "Alice <Alice@AsterMail.org>" }), "Alice@AsterMail.org"),
+            (serde_json::json!({ "from": { "email": " bob@astermail.org ", "name": "Bob" } }), "bob@astermail.org"),
+            (serde_json::json!({ "from": { "name": "No address" } }), ""),
+            (serde_json::json!({ "from": "broken > <order" }), "broken > <order"),
+            (serde_json::json!({}), ""),
+        ];
+        for (parsed, expected) in cases {
+            assert_eq!(envelope_sender_address(&parsed), expected, "{}", parsed);
+        }
+    }
+
+    #[test]
+    fn sealed_retry_backoff_doubles_and_caps() {
+        assert_eq!(sealed_retry_delay(1), Duration::from_secs(SEALED_RETRY_BASE_SECS));
+        assert_eq!(sealed_retry_delay(2), Duration::from_secs(SEALED_RETRY_BASE_SECS * 2));
+        assert_eq!(sealed_retry_delay(3), Duration::from_secs(SEALED_RETRY_BASE_SECS * 4));
+        assert_eq!(sealed_retry_delay(50), Duration::from_secs(SEALED_RETRY_MAX_SECS));
+        assert_eq!(sealed_retry_delay(u32::MAX), Duration::from_secs(SEALED_RETRY_MAX_SECS));
+    }
+
+    #[test]
+    fn sealed_retry_schedule_tracks_each_message() {
+        let id = "sealed-retry-schedule-test";
+        let now = Instant::now();
+        clear_sealed_retry(id);
+        assert!(sealed_retry_due(id, now));
+        note_sealed_retry(id, now);
+        assert!(!sealed_retry_due(id, now));
+        assert!(!sealed_retry_due(id, now + Duration::from_secs(SEALED_RETRY_BASE_SECS - 1)));
+        assert!(sealed_retry_due(id, now + Duration::from_secs(SEALED_RETRY_BASE_SECS)));
+        note_sealed_retry(id, now);
+        assert!(!sealed_retry_due(id, now + Duration::from_secs(SEALED_RETRY_BASE_SECS)));
+        assert!(sealed_retry_due(id, now + Duration::from_secs(SEALED_RETRY_BASE_SECS * 2)));
+        clear_sealed_retry(id);
+        assert!(sealed_retry_due(id, now));
+    }
+
+    fn cache_body(db: &Database, id: &str, subject: &str, body: &str) {
+        db.upsert_cached_message(
+            id,
+            "INBOX",
+            Some(subject),
+            Some("alice@astermail.org"),
+            Some("hello@astermail.org"),
+            None,
+            1,
+            Some(body),
+            Some("{\"is_html\":false,\"message_id\":\"<m@x>\"}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn repair_unwraps_bundles_cached_by_older_versions() {
+        let (_dir, db) = temp_db();
+        cache_body(
+            &db,
+            "old-ratchet",
+            "",
+            "\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":\"Aliases \",\"b\":\"<div><p>Hello</p></div>\"}",
+        );
+        cache_body(&db, "old-no-subject", "", "ASTER_BUNDLE_V2{\"b\":\"Hallo\nTeam\"}");
+        cache_body(
+            &db,
+            "planted",
+            "Real subject",
+            "ASTER_BUNDLE_V2{\"s\":\"Your bank\",\"b\":\"pay here\"}",
+        );
+        cache_body(&db, "quoted", "", "Hi, see ASTER_BUNDLE_V2{\"s\":\"x\",\"b\":\"y\"}");
+        cache_body(&db, "plain", "", "nothing to see");
+        for id in ["old-ratchet", "old-no-subject", "planted", "quoted", "plain"] {
+            db.assign_uid_if_missing("INBOX", id).unwrap();
+        }
+        let before_uid = db.get_cached_message("old-ratchet").unwrap().unwrap().imap_uid;
+
+        let mut repaired = repair_cached_bundles(&db);
+        repaired.sort();
+        assert_eq!(repaired, vec!["old-no-subject".to_string(), "old-ratchet".to_string()]);
+
+        let fixed = db.get_cached_message("old-ratchet").unwrap().unwrap();
+        assert_eq!(fixed.subject.as_deref(), Some("Aliases"));
+        assert_eq!(fixed.body_text.as_deref(), Some("<div><p>Hello</p></div>"));
+        assert!(fixed.imap_uid > before_uid);
+        let meta: serde_json::Value = serde_json::from_str(fixed.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["is_html"], true);
+        assert_eq!(meta["message_id"], "<m@x>");
+
+        let no_subject = db.get_cached_message("old-no-subject").unwrap().unwrap();
+        assert_eq!(no_subject.body_text.as_deref(), Some("Hallo\nTeam"));
+
+        let planted = db.get_cached_message("planted").unwrap().unwrap();
+        assert_eq!(planted.subject.as_deref(), Some("Real subject"));
+        assert!(planted.body_text.unwrap().starts_with("ASTER_BUNDLE_V2"));
+
+        let quoted = db.get_cached_message("quoted").unwrap().unwrap();
+        assert!(quoted.body_text.unwrap().starts_with("Hi, see"));
+
+        assert!(repair_cached_bundles(&db).is_empty());
+    }
+
+    #[test]
+    fn unsealing_replaces_body_subject_and_keeps_meta() {
+        let (_dir, db) = temp_db();
+        cache_sealed(&db, "sealed-1");
+        cache_sealed(&db, "sealed-2");
+        db.upsert_cached_message("plain-1", "INBOX", Some("s"), None, None, None, 1, Some("hello"), None)
+            .unwrap();
+        assert!(db_body_is_placeholder(&db, "sealed-1"));
+        assert!(!db_body_is_placeholder(&db, "plain-1"));
+        assert!(!db_body_is_placeholder(&db, "missing"));
+        let mut listed = db.list_ids_with_body(RATCHET_PLACEHOLDER, 10).unwrap();
+        listed.sort();
+        assert_eq!(listed, vec!["sealed-1".to_string(), "sealed-2".to_string()]);
+        assert_eq!(db.list_ids_with_body(RATCHET_PLACEHOLDER, 1).unwrap().len(), 1);
+
+        let bundle = SubjectBundle {
+            subject: Some("Refund\r\nBcc: injected\tplease".to_string()),
+            body: "<p>Hi there</p>".to_string(),
+        };
+        assert!(store_unsealed_message(&db, "sealed-1", &bundle));
+        let cached = db.get_cached_message("sealed-1").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("<p>Hi there</p>"));
+        assert_eq!(cached.subject.as_deref(), Some("Refund  Bcc: injected please"));
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["is_html"], true);
+        assert_eq!(meta["message_id"], "<m@x>");
+        assert!(!db_body_is_placeholder(&db, "sealed-1"));
+        assert_eq!(db.list_ids_with_body(RATCHET_PLACEHOLDER, 10).unwrap(), vec!["sealed-2".to_string()]);
+
+        let no_subject = SubjectBundle { subject: Some("   ".to_string()), body: "text".to_string() };
+        assert!(store_unsealed_message(&db, "sealed-2", &no_subject));
+        let kept = db.get_cached_message("sealed-2").unwrap().unwrap();
+        assert_eq!(kept.subject.as_deref(), Some(""));
+        assert_eq!(kept.body_text.as_deref(), Some("text"));
+    }
 }

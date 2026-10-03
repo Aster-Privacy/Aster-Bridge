@@ -1076,6 +1076,7 @@ mod e2e_tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }));
 
         let client = Arc::new(ApiClient::new_with_base_url(&api_base));

@@ -50,7 +50,7 @@ pub struct InboundKeyCandidate {
     pub pq_decap_key: Option<Vec<u8>>,
 }
 
-fn decode_pq_decap_key(expanded_b64: Option<&str>, seed_b64: Option<&str>) -> Option<Vec<u8>> {
+pub(crate) fn decode_pq_decap_key(expanded_b64: Option<&str>, seed_b64: Option<&str>) -> Option<Vec<u8>> {
     if let Some(expanded) = expanded_b64 {
         if let Ok(bytes) = STANDARD.decode(expanded.trim()) {
             if bytes.len() == ML_KEM_768_DK_LEN {

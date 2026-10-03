@@ -76,7 +76,7 @@ pub(crate) fn ecdh_p256(secret_d: &[u8], public_sec1: &[u8]) -> Result<[u8; 32],
     Ok(out)
 }
 
-fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Result<Vec<u8>, String> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut okm = vec![0u8; out_len];
     hk.expand(info, &mut okm).map_err(|e| format!("hkdf expand: {}", e))?;
@@ -97,7 +97,7 @@ pub(crate) fn ml_kem768_decapsulate(ct_bytes: &[u8], sk_bytes: &[u8]) -> Result<
     Ok(out)
 }
 
-fn serialize_header_ad(version: u8, dh_public: &[u8], previous_chain_length: u32, message_number: u32) -> Vec<u8> {
+pub(crate) fn serialize_header_ad(version: u8, dh_public: &[u8], previous_chain_length: u32, message_number: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(RATCHET_HEADER_AD_PREFIX.len() + 1 + dh_public.len() + 8);
     out.extend_from_slice(RATCHET_HEADER_AD_PREFIX);
     out.push(version);
@@ -177,7 +177,7 @@ pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Re
     Err("ratchet message decryption failed".to_string())
 }
 
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     STANDARD.decode(s.trim()).map_err(|e| format!("base64 decode: {}", e))
 }
 

@@ -217,6 +217,7 @@ fn stub_session() -> Arc<RwLock<Session>> {
         default_sender_id: None,
         account_keys: Vec::new(),
         previous_keys: Default::default(),
+        ratchet_recovery: Default::default(),
     }))
 }
 
@@ -1144,6 +1145,7 @@ async fn decrypt_real_internal() {
         default_sender_id: None,
         account_keys: Vec::new(),
         previous_keys: Default::default(),
+        ratchet_recovery: Default::default(),
     };
     println!("logged in as {}", session.email);
     println!("ratchet key sets available: {}", session.ratchet_keys.len());

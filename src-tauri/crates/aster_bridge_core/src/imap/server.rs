@@ -4409,6 +4409,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
         let (tx, _rx) = broadcast::channel(16);
@@ -4461,6 +4462,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }));
         let client = Arc::new(ApiClient::new());
         let (tx, _rx) = broadcast::channel(16);
@@ -4747,6 +4749,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 
@@ -4846,6 +4849,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }));
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 

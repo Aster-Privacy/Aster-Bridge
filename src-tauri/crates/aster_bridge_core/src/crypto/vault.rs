@@ -39,6 +39,74 @@ pub struct RatchetKeySet {
     pub ratchet_signed_prekey_public: Option<String>,
     pub ratchet_pq_identity_key: Option<String>,
     pub ratchet_pq_identity_seed: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub ratchet_pq_identity_public: Option<String>,
+}
+
+fn lenient_string<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    }))
+}
+
+#[derive(Zeroize, Clone)]
+pub struct LegacyKek {
+    pub k: String,
+}
+
+fn lenient_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n <= u32::MAX as f64)
+        .map(|n| n as u32))
+}
+
+fn lenient_string_list<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }))
+}
+
+fn lenient_legacy_keks<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<LegacyKek>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::Array(items) => Some(
+            items
+                .into_iter()
+                .filter_map(|item| {
+                    item.get("k")
+                        .and_then(|k| k.as_str())
+                        .map(|k| LegacyKek { k: k.to_string() })
+                })
+                .collect(),
+        ),
+        _ => None,
+    }))
 }
 
 #[derive(Deserialize, ZeroizeOnDrop)]
@@ -57,6 +125,16 @@ pub struct VaultContents {
     pub ratchet_pq_identity_seed: Option<String>,
     pub ratchet_previous_keys: Option<Vec<RatchetKeySet>>,
     pub previous_keys: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub ratchet_pq_identity_public: Option<String>,
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub vault_format: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub kdf_version: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_legacy_keks")]
+    pub legacy_keks: Option<Vec<LegacyKek>>,
+    #[serde(default, deserialize_with = "lenient_string_list")]
+    pub legacy_identity_keys: Option<Vec<String>>,
 }
 
 pub fn decrypt_vault(

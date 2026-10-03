@@ -148,6 +148,13 @@ pub struct ApiClient {
     base_url: String,
 }
 
+#[derive(Deserialize)]
+pub struct EscrowPlaintextResponse {
+    pub message_id: String,
+    pub encrypted_plaintext: String,
+    pub plaintext_nonce: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PqSecretResponse {
     pub key_id: i32,
@@ -1195,6 +1202,31 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_escrow_plaintext(
+        &self,
+        access_token: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<EscrowPlaintextResponse>> {
+        let resp = self.client
+            .get(format!(
+                "{}/crypto/v1/ratchet/plaintext/{}",
+                self.base_url,
+                urlencoding_path(dedupe_key)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
     }
 
     pub async fn list_mail(

@@ -79,6 +79,7 @@ pub struct Session {
     pub default_sender_id: Option<String>,
     pub account_keys: Vec<crate::crypto::account_key::AccountKey>,
     pub previous_keys: Zeroizing<Vec<String>>,
+    pub ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial,
 }
 
 impl Session {
@@ -322,6 +323,7 @@ pub struct VaultKeyMaterial {
     pub ratchet_keys: Vec<crate::crypto::ratchet::RatchetReceiverKeys>,
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
     pub previous_keys: Zeroizing<Vec<String>>,
+    pub ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial,
 }
 
 pub fn decrypt_vault_key_material(
@@ -337,6 +339,7 @@ pub fn decrypt_vault_key_material(
         ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
         previous_keys: Zeroizing::new(v.previous_keys.clone().unwrap_or_default()),
+        ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault(&v, passphrase),
     })
 }
 
@@ -366,6 +369,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
     session.previous_keys = material.previous_keys;
+    session.ratchet_recovery = material.ratchet_recovery;
 }
 
 pub async fn restore_or_login(
@@ -406,7 +410,7 @@ pub async fn login_with_passphrase(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
-    let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys) =
+    let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys, ratchet_recovery) =
         match decrypt_vault_key_material(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
@@ -419,13 +423,14 @@ pub async fn login_with_passphrase(
                 m.ratchet_keys,
                 m.inbound_keys,
                 m.previous_keys,
+                m.ratchet_recovery,
             ),
             Err(e) => {
                 tracing::error!(
                     "vault decrypt failed during sign-in: {}; encrypted mail cannot be decrypted until you sign in again",
                     e
                 );
-                (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()))
+                (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()), Default::default())
             }
         };
 
@@ -469,6 +474,7 @@ pub async fn login_with_passphrase(
         default_sender_id,
         account_keys,
         previous_keys,
+        ratchet_recovery,
     })
 }
 
@@ -646,7 +652,7 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
-                let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys) =
+                let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys, ratchet_recovery) =
                     match decrypt_vault_key_material(
                         &login_resp.encrypted_vault,
                         &login_resp.vault_nonce,
@@ -659,13 +665,14 @@ pub async fn first_time_setup(
                             m.ratchet_keys,
                             m.inbound_keys,
                             m.previous_keys,
+                            m.ratchet_recovery,
                         ),
                         Err(e) => {
                             tracing::error!(
                                 "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
                                 e
                             );
-                            (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()))
+                            (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()), Default::default())
                         }
                     };
 
@@ -709,6 +716,7 @@ pub async fn first_time_setup(
                     default_sender_id,
                     account_keys,
                     previous_keys,
+                    ratchet_recovery,
                 });
             }
             "expired" => {
@@ -740,6 +748,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         }
     }
 
@@ -777,6 +786,7 @@ mod tests {
             default_sender_id: None,
             account_keys: Vec::new(),
             previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
         };
         drop(s);
     }

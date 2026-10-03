@@ -1,0 +1,13 @@
+{
+  "passphrase": "correct horse battery staple",
+  "v2_iterations": 1000,
+  "storage_v1": "y2YWtl4a3k/a7KF3UBAzSvmkvnvOBmbsiz12XfAaFP0=",
+  "storage_v2": "qGmKUJ+ywHtxGd7xk4+Xgn7bWnGdlrtTrpSGHynZVQs=",
+  "sync_from_v1": "yiGQWOiRHOdWpjbA4IRi8/brK5ahJubwF61Gt9+AxiI=",
+  "escrow_from_v2": "zIsM+LqyO6XR7xnptiOeBOCYUWaguIkcSzwWLYSR6fo=",
+  "escrow_nonce": "AQIDBAUGBwgJCgsM",
+  "escrow_dedupe_key": "mail-123:BAbc==:4",
+  "escrow_no_aad": "itrZk6uhdafadbduxwKg9IfnN/xEIUgbNnmf8pFhpndPDxXRbSJiec8=",
+  "escrow_v2_aad": "itrZk6uhdafadbduxwKg9IfneOhRZXaYP1en0onrI5WdF9GKuec=",
+  "conversation_id_hello_alice": "HsGgU1Zra0szu6zzZp5XFwX2CES9UFEqSPP6wvCRHsQ="
+}

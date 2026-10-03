@@ -906,6 +906,57 @@ impl Database {
         })
     }
 
+    pub fn update_cached_subject(&self, aster_id: &str, subject: &str) -> Result<(), String> {
+        let single_line: String = subject
+            .chars()
+            .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+            .collect();
+        let subject = strip_c0_controls(single_line.trim());
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET subject=?2 WHERE aster_id=?1",
+                rusqlite::params![aster_id, subject],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_ids_with_body(&self, body_text: &str, limit: usize) -> Result<Vec<String>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id FROM message_cache WHERE body_cached=1 AND body_text=?1 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![body_text, limit], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_bodies_starting_with(
+        &self,
+        marker: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, body_text FROM message_cache WHERE body_cached=1 AND instr(substr(body_text, 1, 64), ?1) > 0 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![marker, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_cached_messages(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
