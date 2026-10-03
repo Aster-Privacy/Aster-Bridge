@@ -317,6 +317,16 @@ pub fn attachment_status_note(msg: &CachedMessage) -> Option<String> {
     })
 }
 
+pub const SENDER_UNVERIFIED_NOTE: &str = "[Aster Bridge could not confirm that this message comes from the sender shown. Before you act on it, check with the sender another way.]";
+
+pub fn sender_unverified(meta: &serde_json::Value) -> bool {
+    meta.get("sender_unverified").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+pub fn sender_unverified_suffix(meta: &serde_json::Value, is_html: bool) -> String {
+    note_suffix(sender_unverified(meta).then_some(SENDER_UNVERIFIED_NOTE), is_html)
+}
+
 pub fn strip_legacy_note(body: &str) -> Option<String> {
     let pos = body.rfind(LEGACY_NOTE_PREFIX)?;
     let mut cut = pos;
@@ -634,7 +644,11 @@ pub fn render(
             body_present
         },
         body_len_hint: msg.size.max(0) as usize,
-        suffix: note_suffix(note.as_deref(), is_html),
+        suffix: format!(
+            "{}{}",
+            sender_unverified_suffix(&meta, is_html),
+            note_suffix(note.as_deref(), is_html)
+        ),
         is_html,
     };
 
@@ -760,6 +774,26 @@ mod tests {
             size: data.len() as i64,
             data: data.to_vec(),
         }
+    }
+
+    #[test]
+    fn unverified_sender_shows_a_note_in_text_and_html() {
+        let plain = msg(Some("hello"), Some("{\"is_html\":false,\"sender_unverified\":true}"), 0);
+        let r = render(&plain, &[], true);
+        assert!(r.text.ends_with(&format!("hello
+
+{}", SENDER_UNVERIFIED_NOTE)));
+        assert_eq!(rendered_size(&plain, &[]), r.text.len());
+
+        let html = msg(Some("<p>hi</p>"), Some("{\"is_html\":true,\"sender_unverified\":true}"), 0);
+        let r = render(&html, &[], true);
+        assert!(r.text.contains("<p>hi</p>
+<p>[Aster Bridge could not confirm"));
+
+        let verified = msg(Some("hello"), Some("{\"is_html\":false}"), 0);
+        assert!(!render(&verified, &[], true).text.contains("could not confirm"));
+        let flagged_false = msg(Some("hello"), Some("{\"sender_unverified\":false}"), 0);
+        assert!(!render(&flagged_false, &[], true).text.contains("could not confirm"));
     }
 
     #[test]

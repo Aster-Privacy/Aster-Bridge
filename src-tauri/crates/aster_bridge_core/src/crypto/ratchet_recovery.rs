@@ -648,6 +648,7 @@ fn unwrap_subject_bundle_layer(text: &str) -> Option<(Option<String>, String)> {
 pub struct SubjectBundle {
     pub subject: Option<String>,
     pub body: String,
+    pub sender_unverified: bool,
 }
 
 pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
@@ -665,11 +666,12 @@ pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
         unwrapped = true;
     }
     if !unwrapped {
-        return SubjectBundle { subject: None, body };
+        return SubjectBundle { subject: None, body, sender_unverified: false };
     }
     SubjectBundle {
         subject: Some(subject.unwrap_or_default()),
         body,
+        sender_unverified: false,
     }
 }
 

@@ -1374,6 +1374,7 @@ async fn try_decrypt_internal_mail(
     let attempts =
         crate::crypto::ratchet_recovery::recipient_attempts(&ratchet_obj, ctx.our_email, &sender_email);
     let mut opened: Option<String> = None;
+    let mut via_recovery_lane = false;
     let mut failed_steps: Vec<&str> = Vec::new();
     for attempt in &attempts {
         if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
@@ -1393,6 +1394,7 @@ async fn try_decrypt_internal_mail(
                 &ctx.recovery.lane_candidates,
             );
             if opened.is_some() {
+                via_recovery_lane = true;
                 break;
             }
             failed_steps.push("recovery_lane");
@@ -1410,7 +1412,11 @@ async fn try_decrypt_internal_mail(
         failed_steps.push("no_recipient_entry");
     }
     match opened {
-        Some(plaintext) => Some(crate::crypto::ratchet_recovery::extract_subject_bundle(&plaintext)),
+        Some(plaintext) => {
+            let mut bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&plaintext);
+            bundle.sender_unverified = via_recovery_lane;
+            Some(bundle)
+        }
         None => {
             tracing::debug!(
                 "ratchet message {} still sealed after: {}",
@@ -1487,6 +1493,9 @@ fn store_unsealed_message(
     meta_map
         .entry("message_id".to_string())
         .or_insert(serde_json::Value::Null);
+    if bundle.sender_unverified {
+        meta_map.insert("sender_unverified".to_string(), serde_json::json!(true));
+    }
     let meta = serde_json::Value::Object(meta_map).to_string();
     if let Err(e) = db.update_cached_body(aster_id, &bundle.body, Some(&meta)) {
         tracing::warn!("storing decrypted ratchet body for {} failed: {}", aster_id, e);
@@ -4622,6 +4631,7 @@ mod sealed_retry_tests {
         let bundle = SubjectBundle {
             subject: Some("Refund\r\nBcc: injected\tplease".to_string()),
             body: "<p>Hi there</p>".to_string(),
+            sender_unverified: false,
         };
         assert!(store_unsealed_message(&db, "sealed-1", &bundle));
         let cached = db.get_cached_message("sealed-1").unwrap().unwrap();
@@ -4630,13 +4640,20 @@ mod sealed_retry_tests {
         let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(meta["is_html"], true);
         assert_eq!(meta["message_id"], "<m@x>");
+        assert!(meta.get("sender_unverified").is_none());
         assert!(!db_body_is_placeholder(&db, "sealed-1"));
         assert_eq!(db.list_ids_with_body(RATCHET_PLACEHOLDER, 10).unwrap(), vec!["sealed-2".to_string()]);
 
-        let no_subject = SubjectBundle { subject: Some("   ".to_string()), body: "text".to_string() };
+        let no_subject = SubjectBundle {
+            subject: Some("   ".to_string()),
+            body: "text".to_string(),
+            sender_unverified: true,
+        };
         assert!(store_unsealed_message(&db, "sealed-2", &no_subject));
         let kept = db.get_cached_message("sealed-2").unwrap().unwrap();
         assert_eq!(kept.subject.as_deref(), Some(""));
         assert_eq!(kept.body_text.as_deref(), Some("text"));
+        let kept_meta: serde_json::Value = serde_json::from_str(kept.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(kept_meta["sender_unverified"], true);
     }
 }
