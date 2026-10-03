@@ -2028,6 +2028,8 @@ mod tests {
         );
         let base = spawn(app).await;
         let client = ApiClient::new_with_base_url(&base);
+        use futures_util::FutureExt;
+        let _ = crate::auth::session::token_refresh_requested().now_or_never();
         let err = client
             .send_mail("tok", &serde_json::json!({}))
             .await
