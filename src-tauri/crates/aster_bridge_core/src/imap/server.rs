@@ -7268,6 +7268,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rfc822_fetch_reports_seen_in_the_same_response() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "rs-1", "inbox", "one");
+        seed(&db, "rs-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, seq, item) in [("s1", 1, "RFC822"), ("s2", 2, "RFC822.TEXT")] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, &format!("FETCH {} ({})", seq, item)).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{}", resp);
+            let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with(&format!("* {} FETCH", seq))).collect();
+            assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+            assert!(fetches[0].contains("FLAGS (\\Seen)"), "{} did not report \\Seen: {}", item, resp);
+        }
+        assert_eq!(db.get_cached_message("rs-1").unwrap().unwrap().flags & 1, 1);
+        assert_eq!(db.get_cached_message("rs-2").unwrap().unwrap().flags & 1, 1);
+    }
+
+    #[tokio::test]
+    async fn rfc822_fetch_from_examine_does_not_set_seen() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "re-1", "inbox", "one");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let _ = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "a1",
+            "LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"",
+        )
+        .await;
+        let sel = imap_cmd_lines(&mut reader, &mut writer, "a2", "EXAMINE INBOX").await;
+        assert!(sel.contains("READ-ONLY"), "{}", sel);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e1", "FETCH 1 (RFC822.SIZE RFC822)").await;
+        assert!(resp.contains("RFC822 {"), "{}", resp);
+        assert!(!resp.contains("\\Seen"), "{}", resp);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(db.get_cached_message("re-1").unwrap().unwrap().flags & 1, 0);
+        assert!(calls.lock().await.is_empty(), "EXAMINE fetch must not push read status");
+    }
+
+    #[tokio::test]
     async fn peek_fetch_does_not_push_read_status() {
         let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
         seed(&db, "fs-2", "inbox", "one");
