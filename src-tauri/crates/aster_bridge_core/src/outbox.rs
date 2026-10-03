@@ -51,6 +51,10 @@ fn ready_to_retry(row: &OutboxRow) -> bool {
     now_secs() >= last + wait
 }
 
+fn due_for_automatic_send(row: &OutboxRow) -> bool {
+    row.status != "failed" && row.attempts < MAX_ATTEMPTS && ready_to_retry(row)
+}
+
 pub async fn try_send_row(
     row: &OutboxRow,
     session: &Arc<RwLock<Session>>,
@@ -213,10 +217,7 @@ pub async fn run_outbox_loop(
                     Err(e) => { tracing::warn!("outbox list failed: {}", e); continue; }
                 };
                 for row in rows {
-                    if row.attempts >= MAX_ATTEMPTS {
-                        continue;
-                    }
-                    if !ready_to_retry(&row) {
+                    if !due_for_automatic_send(&row) {
                         continue;
                     }
                     process_one(&row, &session, &client, &db).await;
@@ -324,6 +325,33 @@ mod tests {
         assert!(ready_to_retry(&row));
         let recent = row_with(50, Some(now_secs()), now_secs());
         assert!(!ready_to_retry(&recent));
+    }
+
+    #[test]
+    fn failed_rows_are_not_sent_automatically() {
+        let mut row = row_with(0, None, now_secs() - 3600);
+        assert!(due_for_automatic_send(&row));
+        row.status = "failed".to_string();
+        assert!(!due_for_automatic_send(&row));
+        row.attempts = MAX_ATTEMPTS - 1;
+        assert!(!due_for_automatic_send(&row));
+    }
+
+    #[test]
+    fn exhausted_rows_are_not_sent_automatically() {
+        let row = row_with(MAX_ATTEMPTS, None, now_secs() - 86400);
+        assert!(!due_for_automatic_send(&row));
+    }
+
+    #[test]
+    fn failed_row_can_still_be_claimed_for_manual_retry() {
+        let (_dir, db) = test_db();
+        let id = db.outbox_insert(b"m", "a@x", "b@x").unwrap();
+        db.outbox_mark_failed(id, "permanent 400").unwrap();
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(!due_for_automatic_send(&row));
+        assert_eq!(db.outbox_mark_sending(id).unwrap(), 1);
     }
 
     #[test]
