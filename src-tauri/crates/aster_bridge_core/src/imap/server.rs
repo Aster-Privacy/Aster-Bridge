@@ -3620,32 +3620,6 @@ fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn mark_fetched_seen(
-    db: &Arc<Database>,
-    folder: &str,
-    msg: &CachedMessage,
-    keywords: &[String],
-    seq_num: usize,
-    out: &mut Vec<u8>,
-    pushes: &mut Vec<String>,
-    already: &mut bool,
-) {
-    if *already {
-        return;
-    }
-    *already = true;
-    let current_flags = msg.flags as u32;
-    if current_flags & 1 == 0 {
-        let new_flags = current_flags | 1;
-        let _ = db.update_message_flags(msg.imap_uid as i64, folder, new_flags as i64);
-        pushes.push(msg.aster_id.clone());
-        out.extend_from_slice(
-            format!("* {} FETCH (FLAGS ({}))\r\n", seq_num, flags_to_str(new_flags, keywords)).as_bytes(),
-        );
-    }
-}
-
 fn literal(key: &str, data: &str) -> String {
     format!("{} {{{}}}\r\n{}", key, data.len(), data)
 }
@@ -3695,6 +3669,9 @@ async fn handle_fetch(
         || is_all || is_fast || is_full;
     let body_is_peek = upper_parts.contains("BODY.PEEK[]")
         || upper_parts.contains("RFC822.HEADER");
+    let marks_seen = (wants_body_text && !body_text_is_peek)
+        || section_requests.iter().any(|req| !req.peek)
+        || ((wants_body || wants_rfc822_text) && !body_is_peek);
 
     let needs_body = wants_body
         || wants_body_header
@@ -3748,18 +3725,16 @@ async fn handle_fetch(
                 .unwrap_or_default()
         };
         let rendered = crate::message_render::render(msg, &attachments, needs_body);
-        let mut seen_marked = false;
         let mut items: Vec<String> = Vec::new();
 
-        if wants_flags {
-            let mut flag_list: Vec<&str> = Vec::new();
-            if msg.flags & 1 != 0 { flag_list.push("\\Seen"); }
-            if msg.flags & 2 != 0 { flag_list.push("\\Answered"); }
-            if msg.flags & 4 != 0 { flag_list.push("\\Flagged"); }
-            if msg.flags & 8 != 0 { flag_list.push("\\Deleted"); }
-            if msg.flags & 16 != 0 { flag_list.push("\\Draft"); }
-            flag_list.extend(keywords.iter().map(String::as_str));
-            items.push(format!("FLAGS ({})", flag_list.join(" ")));
+        let mut flags = msg.flags as u32;
+        if marks_seen && flags & 1 == 0 {
+            flags |= 1;
+            let _ = db.update_message_flags(msg.imap_uid as i64, folder, flags as i64);
+            fetch_seen_pushes.push(msg.aster_id.clone());
+        }
+        if wants_flags || flags != msg.flags as u32 {
+            items.push(format!("FLAGS ({})", flags_to_str(flags, keywords)));
         }
 
         if wants_uid {
@@ -3846,16 +3821,10 @@ async fn handle_fetch(
         }
 
         if wants_body_text {
-            if !body_text_is_peek {
-                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
-            }
             items.push(literal("BODY[TEXT]", rendered.body()));
         }
 
         for req in &section_requests {
-            if !req.peek {
-                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
-            }
             let key_base = if req.mime {
                 format!("BODY[{}.MIME]", req.section)
             } else {
@@ -3888,9 +3857,6 @@ async fn handle_fetch(
         }
 
         if wants_body {
-            if !body_is_peek {
-                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
-            }
             if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
                 let (suffix, slice) = apply_partial(&rendered.text, Some((off, len_opt)));
                 items.push(literal(&format!("BODY[]{}", suffix), &slice));
@@ -3900,9 +3866,6 @@ async fn handle_fetch(
         }
 
         if wants_rfc822_text {
-            if !body_is_peek {
-                mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
-            }
             items.push(literal("RFC822.TEXT", rendered.body()));
         }
 
@@ -7099,6 +7062,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pushed, "non-peek fetch must push read status to backend");
+    }
+
+    #[tokio::test]
+    async fn nonpeek_fetch_reports_the_new_flags_once() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "sf-1", "inbox", "one");
+        seed(&db, "sf-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1 (FLAGS BODY[])").await;
+        assert!(resp.contains("f1 OK"), "{}", resp);
+        let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with("* 1 FETCH")).collect();
+        assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+        assert!(fetches[0].contains("FLAGS (\\Seen)"), "stale FLAGS: {}", resp);
+
+        let uid = db.get_cached_message("sf-2").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f2", &format!("UID FETCH {} (BODY[])", uid)).await;
+        let fetches: Vec<&str> = resp.lines().filter(|l| l.starts_with("* 2 FETCH")).collect();
+        assert_eq!(fetches.len(), 1, "one FETCH response expected: {}", resp);
+        assert!(fetches[0].contains("FLAGS (\\Seen)"), "implicit \\Seen not reported: {}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f3", "FETCH 1:2 (FLAGS)").await;
+        assert_eq!(resp.matches("FLAGS (\\Seen)").count(), 2, "{}", resp);
     }
 
     #[tokio::test]
