@@ -1063,6 +1063,82 @@ impl Database {
         })
     }
 
+    pub fn cached_sync_states(
+        &self,
+        aster_ids: &[&str],
+    ) -> Result<HashMap<String, CachedSyncState>, String> {
+        let mut out: HashMap<String, CachedSyncState> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, body_cached, folder, flags, raw_headers
+                     FROM message_cache WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        CachedSyncState {
+                            body_cached: r.get::<_, i64>(1)? == 1,
+                            folder: r.get(2)?,
+                            flags: r.get(3)?,
+                            raw_headers: r.get(4)?,
+                            uid_folders: Vec::new(),
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (id, state) = row?;
+                    out.insert(id, state);
+                }
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, folder FROM uid_map WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, folder) = row?;
+                    if let Some(state) = out.get_mut(&id) {
+                        state.uid_folders.push(folder);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn set_message_flags_if_unchanged(
+        &self,
+        updates: &[(String, i64, i64)],
+    ) -> Result<Vec<String>, String> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stale = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2 AND flags = ?3",
+                )?;
+                for (aster_id, expected, flags) in updates {
+                    if stmt.execute(rusqlite::params![flags, aster_id, expected])? == 0 {
+                        stale.push(aster_id.clone());
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(stale)
+        })
+    }
+
     pub fn set_message_flags_by_id(&self, aster_id: &str, new_flags: i64) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
@@ -2250,6 +2326,15 @@ pub struct CachedAttachment {
     pub is_inline: bool,
     pub size: i64,
     pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedSyncState {
+    pub body_cached: bool,
+    pub folder: String,
+    pub flags: i64,
+    pub raw_headers: Option<String>,
+    pub uid_folders: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
