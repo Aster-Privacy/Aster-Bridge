@@ -1720,6 +1720,62 @@ mod tests {
     }
 
     #[test]
+    fn build_send_payload_keeps_three_blind_recipients_out_of_to_and_cc() {
+        let raw = b"From: sender@aster.test\r\nTo: undisclosed-recipients:;\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec![
+            "alice@example.com".to_string(),
+            "bob@example.com".to_string(),
+            "carol@example.com".to_string(),
+        ];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert!(payload["cc"].is_null());
+        assert_eq!(
+            payload["bcc"],
+            serde_json::json!(["alice@example.com", "bob@example.com", "carol@example.com"])
+        );
+    }
+
+    #[test]
+    fn build_send_payload_keeps_blind_recipients_out_of_to_when_only_cc_is_set() {
+        let raw = b"From: sender@aster.test\r\nCc: cc@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["cc@example.com".to_string(), "hidden@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["cc"], serde_json::json!(["cc@example.com"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["hidden@example.com"]));
+    }
+
+    #[test]
+    fn build_send_payload_never_lists_a_blind_recipient_as_visible() {
+        let headers: [&[u8]; 5] = [
+            b"",
+            b"To: undisclosed-recipients:;\r\n",
+            b"To: visible@example.com\r\n",
+            b"Cc: visible@example.com\r\n",
+            b"To: visible@example.com\r\nBcc: hidden@example.com\r\n",
+        ];
+        for header in headers {
+            let mut raw = b"From: sender@aster.test\r\n".to_vec();
+            raw.extend_from_slice(header);
+            raw.extend_from_slice(b"Subject: hi\r\n\r\nbody\r\n");
+            let recipients = vec!["visible@example.com".to_string(), "hidden@example.com".to_string()];
+            let payload = build_send_payload(&raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+            for field in ["to", "cc"] {
+                let visible = payload[field].as_array().cloned().unwrap_or_default();
+                assert!(
+                    !visible.iter().any(|a| a == "hidden@example.com"),
+                    "{} lists the blind recipient for headers {:?}",
+                    field,
+                    String::from_utf8_lossy(header)
+                );
+            }
+            let blind = payload["bcc"].as_array().cloned().unwrap_or_default();
+            assert!(blind.iter().any(|a| a == "hidden@example.com"));
+        }
+    }
+
+    #[test]
     fn build_send_payload_keeps_header_cc_that_is_in_envelope() {
         let raw = b"From: sender@aster.test\r\nTo: to@example.com, stale@example.com\r\nCc: cc@example.com, old-cc@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["to@example.com".to_string(), "CC@example.com".to_string()];
