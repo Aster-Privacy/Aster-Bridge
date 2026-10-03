@@ -300,7 +300,9 @@ fn attachment_display_name(a: &EnvelopeAttachment) -> String {
 }
 
 const ATTACHMENT_INLINE_DOWNLOADS_PER_PASS: usize = 25;
-const ATTACHMENT_BACKLOG_PER_PASS: i64 = 25;
+const ATTACHMENT_BACKLOG_BATCH: usize = 25;
+const ATTACHMENT_BACKLOG_CONCURRENCY: usize = 4;
+const ATTACHMENT_BACKLOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 const ATTACHMENT_MAX_ATTEMPTS: i64 = 5;
 
 enum AttachmentFetchError {
@@ -637,6 +639,81 @@ async fn refresh_attachment_keys(
     Ok(parse_envelope_attachments(&parsed))
 }
 
+struct BacklogDownload {
+    aster_id: String,
+    folder: String,
+    msg: CachedMessage,
+    meta_json: Option<String>,
+    result: std::result::Result<Vec<CachedAttachment>, AttachmentFetchError>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_backlog_item(
+    client: &ApiClient,
+    access_token: &str,
+    aster_id: String,
+    folder: String,
+    msg: CachedMessage,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> BacklogDownload {
+    let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
+    let mut meta_json = msg.raw_headers.clone();
+    if entries.iter().all(|e| e.key.is_none()) {
+        match refresh_attachment_keys(
+            client,
+            access_token,
+            &aster_id,
+            passphrase,
+            identity_key,
+            previous_keys,
+            inbound_keys,
+        )
+        .await
+        {
+            Ok(fresh) if !fresh.is_empty() => {
+                meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh));
+                entries = fresh;
+            }
+            Ok(_) => {}
+            Err(AttachmentFetchError::Transport(e)) => {
+                tracing::debug!("attachment key refresh for {} deferred: {}", aster_id, e);
+                return BacklogDownload {
+                    aster_id,
+                    folder,
+                    msg,
+                    meta_json,
+                    result: Err(AttachmentFetchError::Transport(e)),
+                };
+            }
+            Err(AttachmentFetchError::Permanent(e)) | Err(AttachmentFetchError::Content(e)) => {
+                tracing::debug!("attachment key refresh for {} skipped: {}", aster_id, e);
+            }
+        }
+    }
+    let result = fetch_and_decrypt_attachments(
+        client,
+        access_token,
+        &aster_id,
+        &entries,
+        passphrase,
+        identity_key,
+        previous_keys,
+        Some(crate::api_client::ATTACHMENT_TRANSFER_TIMEOUT),
+    )
+    .await;
+    BacklogDownload {
+        aster_id,
+        folder,
+        msg,
+        meta_json,
+        result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn backfill_pending_attachments(
     db: &Database,
     client: &ApiClient,
@@ -647,110 +724,129 @@ async fn backfill_pending_attachments(
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
     skip: &HashSet<String>,
 ) -> Vec<String> {
+    use futures_util::StreamExt;
+
     let mut updated: Vec<String> = Vec::new();
     let mut unavailable: usize = 0;
-    let backlog = match db.list_attachment_backlog(ATTACHMENT_BACKLOG_PER_PASS) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("attachment backlog query failed: {}", e);
-            return updated;
-        }
-    };
-    for (aster_id, folder) in backlog {
-        if skip.contains(&aster_id) {
-            continue;
-        }
-        let Ok(Some(msg)) = db.get_cached_message(&aster_id) else {
-            continue;
-        };
-        let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
-        let mut meta_json = msg.raw_headers.clone();
-        if entries.iter().all(|e| e.key.is_none()) {
-            match refresh_attachment_keys(
-                client,
-                access_token,
-                &aster_id,
-                passphrase,
-                identity_key,
-                previous_keys,
-                inbound_keys,
-            )
-            .await
-            {
-                Ok(fresh) if !fresh.is_empty() => {
-                    meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh));
-                    entries = fresh;
-                }
-                Ok(_) => {}
-                Err(AttachmentFetchError::Transport(e)) => {
-                    let _ = db.bump_attachment_attempts(&aster_id);
-                    tracing::debug!("attachment key refresh for {} deferred: {}", aster_id, e);
-                    break;
-                }
-                Err(AttachmentFetchError::Permanent(e)) | Err(AttachmentFetchError::Content(e)) => {
-                    tracing::debug!("attachment key refresh for {} skipped: {}", aster_id, e);
-                }
-            }
-        }
-        match fetch_and_decrypt_attachments(
-            client,
-            access_token,
-            &aster_id,
-            &entries,
-            passphrase,
-            identity_key,
-            previous_keys,
-            Some(crate::api_client::ATTACHMENT_TRANSFER_TIMEOUT),
-        )
-        .await
-        {
-            Ok(list) => {
-                if let Err(e) = db.replace_message_attachments(&aster_id, &list) {
-                    tracing::warn!("attachment store for {} failed: {}", aster_id, e);
-                    continue;
-                }
-                let body = msg.body_text.clone().unwrap_or_default();
-                let cleaned = crate::message_render::strip_legacy_note(&body);
-                if cleaned.is_some() || meta_json != msg.raw_headers {
-                    let new_body = cleaned.unwrap_or(body);
-                    let _ = db.update_cached_body(&aster_id, &new_body, meta_json.as_deref());
-                }
-                if msg.imap_uid > 0 {
-                    let _ = db.remove_uid_mapping(msg.imap_uid as i64, &folder);
-                }
-                let _ = db.assign_uid_if_missing(&folder, &aster_id);
-                tracing::info!(
-                    "attachments for {} stored ({} part(s))",
-                    aster_id,
-                    list.len()
-                );
-                updated.push(aster_id);
-            }
-            Err(AttachmentFetchError::Transport(e)) => {
-                let _ = db.bump_attachment_attempts(&aster_id);
-                tracing::debug!("attachment download for {} deferred: {}", aster_id, e);
+    let deadline = std::time::Instant::now() + ATTACHMENT_BACKLOG_BUDGET;
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut stop = false;
+
+    while !stop && std::time::Instant::now() < deadline {
+        let limit = (skip.len() + tried.len() + ATTACHMENT_BACKLOG_BATCH) as i64;
+        let backlog = match db.list_attachment_backlog(limit) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("attachment backlog query failed: {}", e);
                 break;
             }
-            Err(AttachmentFetchError::Permanent(e)) => {
-                let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
-                tracing::debug!("attachment download for {} unavailable: {}", aster_id, e);
-                unavailable += 1;
-                updated.push(aster_id);
+        };
+        let mut batch: Vec<(String, String, CachedMessage)> = Vec::new();
+        for (aster_id, folder) in backlog {
+            if batch.len() >= ATTACHMENT_BACKLOG_BATCH {
+                break;
             }
-            Err(AttachmentFetchError::Content(e)) => {
-                let attempts = db.bump_attachment_attempts(&aster_id).unwrap_or(0);
-                tracing::debug!(
-                    "attachment download for {} failed (attempt {}): {}",
+            if skip.contains(&aster_id) || !tried.insert(aster_id.clone()) {
+                continue;
+            }
+            let Ok(Some(msg)) = db.get_cached_message(&aster_id) else {
+                continue;
+            };
+            batch.push((aster_id, folder, msg));
+        }
+        if batch.is_empty() {
+            break;
+        }
+
+        let halted = std::sync::atomic::AtomicBool::new(false);
+        let mut downloads = futures_util::stream::iter(batch)
+            .take_while(|_| {
+                let go_on = !halted.load(std::sync::atomic::Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline;
+                std::future::ready(go_on)
+            })
+            .enumerate()
+            .map(|(position, (aster_id, folder, msg))| async move {
+                let download = download_backlog_item(
+                    client,
+                    access_token,
                     aster_id,
-                    attempts,
-                    e
-                );
-                if attempts >= ATTACHMENT_MAX_ATTEMPTS {
+                    folder,
+                    msg,
+                    passphrase,
+                    identity_key,
+                    previous_keys,
+                    inbound_keys,
+                )
+                .await;
+                (position, download)
+            })
+            .buffer_unordered(ATTACHMENT_BACKLOG_CONCURRENCY);
+
+        let mut deferred: Option<(usize, String)> = None;
+        while let Some((position, download)) = downloads.next().await {
+            let BacklogDownload {
+                aster_id,
+                folder,
+                msg,
+                meta_json,
+                result,
+            } = download;
+            match result {
+                Ok(list) => {
+                    if let Err(e) = db.replace_message_attachments(&aster_id, &list) {
+                        tracing::warn!("attachment store for {} failed: {}", aster_id, e);
+                        continue;
+                    }
+                    let body = msg.body_text.clone().unwrap_or_default();
+                    let cleaned = crate::message_render::strip_legacy_note(&body);
+                    if cleaned.is_some() || meta_json != msg.raw_headers {
+                        let new_body = cleaned.unwrap_or(body);
+                        let _ = db.update_cached_body(&aster_id, &new_body, meta_json.as_deref());
+                    }
+                    if msg.imap_uid > 0 {
+                        let _ = db.remove_uid_mapping(msg.imap_uid as i64, &folder);
+                    }
+                    let _ = db.assign_uid_if_missing(&folder, &aster_id);
+                    tracing::info!(
+                        "attachments for {} stored ({} part(s))",
+                        aster_id,
+                        list.len()
+                    );
+                    updated.push(aster_id);
+                }
+                Err(AttachmentFetchError::Transport(e)) => {
+                    tracing::debug!("attachment download for {} deferred: {}", aster_id, e);
+                    if !matches!(&deferred, Some((first, _)) if *first <= position) {
+                        deferred = Some((position, aster_id));
+                    }
+                    halted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    stop = true;
+                }
+                Err(AttachmentFetchError::Permanent(e)) => {
                     let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
+                    tracing::debug!("attachment download for {} unavailable: {}", aster_id, e);
                     unavailable += 1;
                     updated.push(aster_id);
                 }
+                Err(AttachmentFetchError::Content(e)) => {
+                    let attempts = db.bump_attachment_attempts(&aster_id).unwrap_or(0);
+                    tracing::debug!(
+                        "attachment download for {} failed (attempt {}): {}",
+                        aster_id,
+                        attempts,
+                        e
+                    );
+                    if attempts >= ATTACHMENT_MAX_ATTEMPTS {
+                        let _ = db.set_attachments_state(&aster_id, ATTACHMENTS_FAILED);
+                        unavailable += 1;
+                        updated.push(aster_id);
+                    }
+                }
             }
+        }
+        if let Some((_, aster_id)) = deferred {
+            let _ = db.bump_attachment_attempts(&aster_id);
         }
     }
     if unavailable > 0 {
@@ -4388,6 +4484,138 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         let change = rx.try_recv().expect("backfill must broadcast a state change");
         assert!(change.changed.contains_key("Email"));
+    }
+
+    fn seed_backlog_with_keys(db: &Database, count: usize, key: &[u8; 32]) -> Vec<String> {
+        let meta = serde_json::json!({
+            "attachment_count": 1,
+            "attachments": [{
+                "seq": 0,
+                "name": "a.txt",
+                "type": "text/plain",
+                "size": 7,
+                "key": STANDARD.encode(key)
+            }]
+        })
+        .to_string();
+        (0..count)
+            .map(|i| {
+                let id = format!("mail-backlog-{:03}", i);
+                db.upsert_cached_message(
+                    &id,
+                    "inbox",
+                    Some("subject"),
+                    None,
+                    None,
+                    None,
+                    4,
+                    Some("body"),
+                    Some(&meta),
+                )
+                .unwrap();
+                db.set_attachments_state(&id, ATTACHMENTS_PENDING).unwrap();
+                id
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_backlog_pass_keeps_going_past_one_batch_while_downloads_are_quick() {
+        let (_dir, db) = temp_db();
+        let key = [11u8; 32];
+        let ids = seed_backlog_with_keys(&db, 60, &key);
+        let row = sealed_attachment_row(0, &key, b"payload", "a.txt", "text/plain");
+        let (base, hits) =
+            spawn_mock_attachment_server(vec![], serde_json::json!({}), vec![row]).await;
+        let client = ApiClient::new_with_base_url(&base);
+
+        let updated = backfill_pending_attachments(
+            &db,
+            &client,
+            "tok",
+            b"pass",
+            None,
+            &[],
+            &[],
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(updated.len(), ids.len());
+        assert!(updated.len() > ATTACHMENT_BACKLOG_BATCH);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), ids.len());
+        assert!(db.list_attachment_backlog(100).unwrap().is_empty());
+        for id in &ids {
+            let cached = db.get_cached_message(id).unwrap().unwrap();
+            assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
+            assert!(cached.imap_uid > 0);
+            let stored = db.get_message_attachments(id).unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].data, b"payload".to_vec());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backlog_pass_stops_at_the_first_transport_error() {
+        let (_dir, db) = temp_db();
+        let key = [12u8; 32];
+        let ids = seed_backlog_with_keys(&db, 40, &key);
+
+        use axum::{routing::get, Router};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/mail/v1/attachments/by-mail/:id",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
+        let head = db.list_attachment_backlog(1).unwrap()[0].0.clone();
+
+        let updated = backfill_pending_attachments(
+            &db,
+            &client,
+            "tok",
+            b"pass",
+            None,
+            &[],
+            &[],
+            &HashSet::new(),
+        )
+        .await;
+
+        assert!(updated.is_empty());
+        let requests = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(requests >= 1);
+        assert!(
+            requests <= ATTACHMENT_BACKLOG_CONCURRENCY,
+            "no new download may start after a transport error, saw {}",
+            requests
+        );
+        let backlog = db.list_attachment_backlog(100).unwrap();
+        assert_eq!(backlog.len(), ids.len());
+        let bumped: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_cache WHERE attachment_attempts > 0",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(bumped, 1, "only the first transport failure bumps its attempts");
+        assert_ne!(
+            db.list_attachment_backlog(1).unwrap()[0].0,
+            head,
+            "the deferred item moved behind the rest of the backlog"
+        );
     }
 
     #[tokio::test]
