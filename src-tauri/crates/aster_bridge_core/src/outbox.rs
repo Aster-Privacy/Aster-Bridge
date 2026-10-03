@@ -108,6 +108,9 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
                 .is_some_and(|stored| stored.eq_ignore_ascii_case(&message_id))
         });
     }
+    if row.attempts == 0 {
+        return false;
+    }
     sent.iter().any(|m| {
         let subject_matches = m.subject.as_deref().map(|s| s.trim()) == Some(subject.as_str());
         if !subject_matches {
@@ -534,12 +537,51 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn first_attempt_without_message_id_is_never_matched_by_subject() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        seed_sent(&db, "sc-6", "Backup failed", "ops@example.com", "2026-08-01T10:00:30+00:00");
+        let mut row = outbox_row_for("Backup failed", "ops@example.com", queued);
+        row.attempts = 0;
+        assert!(!sent_copy_exists(&db, &row));
+        row.attempts = 1;
+        assert!(sent_copy_exists(&db, &row));
+    }
+
     #[tokio::test]
-    async fn first_outbox_attempt_skips_resend_when_sent_copy_exists() {
+    async fn first_outbox_attempt_without_message_id_still_sends() {
         let (_dir, db) = test_db();
         let raw = b"From: me@aster.test\r\nTo: bob@example.com\r\nSubject: invoice\r\n\r\nbody";
         let id = db.outbox_insert(raw, "me@aster.test", "bob@example.com").unwrap();
-        seed_sent(&db, "sc-first", "invoice", "bob@example.com", &chrono::Utc::now().to_rfc3339());
+        seed_sent(&db, "sc-earlier", "invoice", "bob@example.com", &chrono::Utc::now().to_rfc3339());
+        let row = db.outbox_get(id).unwrap().unwrap();
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        process_one(&row, &stub_session(), &client, &db).await;
+        let row = db.outbox_get(id).unwrap().unwrap();
+        assert_ne!(row.status, "sent");
+        assert!(row.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn first_outbox_attempt_skips_resend_when_sent_copy_exists() {
+        let (_dir, db) = test_db();
+        let raw = b"Message-ID: <first@client.example>\r\nFrom: me@aster.test\r\nTo: bob@example.com\r\nSubject: invoice\r\n\r\nbody";
+        let id = db.outbox_insert(raw, "me@aster.test", "bob@example.com").unwrap();
+        db.upsert_cached_message(
+            "sc-first",
+            "sent",
+            Some("invoice"),
+            Some("me@aster.test"),
+            Some("bob@example.com"),
+            Some(&chrono::Utc::now().to_rfc3339()),
+            10,
+            Some("body"),
+            Some(r#"{"message_id":"<first@client.example>"}"#),
+        )
+        .unwrap();
         let row = db.outbox_get(id).unwrap().unwrap();
         assert_eq!(row.attempts, 0);
         let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
