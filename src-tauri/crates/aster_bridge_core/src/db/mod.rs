@@ -1146,11 +1146,19 @@ impl Database {
         })
     }
 
-    pub fn list_all_cached_id_folders(&self) -> Result<Vec<(String, String)>, String> {
+    pub fn list_all_cached_id_folder_dates(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT aster_id, folder FROM message_cache")?;
+            let mut stmt = conn.prepare("SELECT aster_id, folder, date FROM message_cache")?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })

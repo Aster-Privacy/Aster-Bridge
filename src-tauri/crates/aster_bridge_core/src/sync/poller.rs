@@ -1413,6 +1413,68 @@ fn retry_failed_inbound_items(
 
 const CUSTOM_FOLDER_PAGE: i64 = 100;
 const CUSTOM_FOLDER_MAX_ITEMS: usize = 2000;
+const SYSTEM_FOLDER_MAX_ITEMS: usize = 2000;
+const CAPPED_PRUNE_CHECKS_PER_PASS: usize = 50;
+
+fn parse_cached_date(date: Option<&str>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(date?).ok()
+}
+
+/// Local messages that a capped folder listing should have returned if they
+/// still existed: unseen, and no older than the oldest message of the most
+/// recent capped listing. Drafts are left alone, since web drafts are not
+/// mail items and cannot be checked one by one.
+fn capped_prune_candidates(
+    local: &[(String, String, Option<String>)],
+    seen: &HashSet<String>,
+    capped_listings: &[Vec<String>],
+) -> Vec<String> {
+    let dates: HashMap<&str, chrono::DateTime<chrono::FixedOffset>> = local
+        .iter()
+        .filter_map(|(id, _, date)| Some((id.as_str(), parse_cached_date(date.as_deref())?)))
+        .collect();
+    let mut floor = None;
+    for listing in capped_listings {
+        let Some(oldest) = listing.iter().filter_map(|id| dates.get(id.as_str())).min() else {
+            return Vec::new();
+        };
+        floor = floor.max(Some(*oldest));
+    }
+    let Some(floor) = floor else {
+        return Vec::new();
+    };
+    local
+        .iter()
+        .filter(|(id, folder, _)| folder != "drafts" && !seen.contains(id))
+        .filter(|(id, _, _)| dates.get(id.as_str()).is_some_and(|d| *d >= floor))
+        .map(|(id, _, _)| id.clone())
+        .collect()
+}
+
+/// Of the candidates, the ones the server reports as gone. Stops at the
+/// first answer that is neither the message nor a 404/410.
+async fn confirm_gone_on_server(
+    client: &ApiClient,
+    access_token: &str,
+    candidates: &[String],
+) -> Vec<String> {
+    let mut gone = Vec::new();
+    for id in candidates.iter().take(CAPPED_PRUNE_CHECKS_PER_PASS) {
+        match client.fetch_mail_item(access_token, id).await {
+            Ok(_) => {}
+            Err(BridgeError::Api(ref msg))
+                if api_status_code(msg).is_some_and(is_permanent_status) =>
+            {
+                gone.push(id.clone())
+            }
+            Err(e) => {
+                tracing::debug!("sync: stopped checking for deleted messages: {}", e);
+                break;
+            }
+        }
+    }
+    gone
+}
 
 fn is_custom_folder_definition(def: &crate::api_client::FolderDefinition) -> bool {
     !def.is_system
@@ -1555,6 +1617,8 @@ async fn run_sync_pass(
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut updated_ids: Vec<String> = Vec::new();
     let mut all_folders_complete = true;
+    let mut capped_listings: Vec<Vec<String>> = Vec::new();
+    let mut capped_only = true;
     let mut failed_inbound: Vec<(String, MailItem)> = Vec::new();
     let mut mailboxes_changed = false;
     let mut inline_downloads = 0usize;
@@ -1602,10 +1666,11 @@ async fn run_sync_pass(
         let mut cursor: Option<String> = None;
         let mut offset: i64 = 0;
         let mut total_fetched = 0usize;
+        let mut listed_ids: Vec<String> = Vec::new();
         let max_per_folder = if custom_folder.is_some() {
             CUSTOM_FOLDER_MAX_ITEMS
         } else {
-            2000usize
+            SYSTEM_FOLDER_MAX_ITEMS
         };
         loop {
             let page: Result<FolderPage, BridgeError> = match (system_query, custom_folder) {
@@ -1652,6 +1717,7 @@ async fn run_sync_pass(
                     let mut new_ids: Vec<String> = Vec::new();
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
+                        listed_ids.push(item.id.clone());
                         let item_folder = if custom_folder.is_some() {
                             resp.label.clone()
                         } else {
@@ -1789,6 +1855,11 @@ async fn run_sync_pass(
                     if done_with_folder {
                         if !reached_end {
                             all_folders_complete = false;
+                            if capped {
+                                capped_listings.push(std::mem::take(&mut listed_ids));
+                            } else {
+                                capped_only = false;
+                            }
                         }
                         break;
                     }
@@ -1899,6 +1970,7 @@ async fn run_sync_pass(
                         if reached_end || fetched >= 1000 {
                             if !reached_end {
                                 all_folders_complete = false;
+                                capped_only = false;
                             }
                             break;
                         }
@@ -1928,13 +2000,26 @@ async fn run_sync_pass(
 
     let mut destroyed_ids: Vec<String> = Vec::new();
     if deep && all_folders_complete && last_err.is_none() {
-        if let Ok(local) = db.list_all_cached_id_folders() {
-            for (id, folder) in local {
+        if let Ok(local) = db.list_all_cached_id_folder_dates() {
+            for (id, folder, _) in local {
                 if !seen_ids.contains(&id)
                     && db.delete_message_by_aster_id(&id).is_ok() {
                         tracing::info!("sync: pruned {} from {} (gone on server)", id, folder);
                         destroyed_ids.push(id);
                     }
+            }
+        }
+    } else if deep && last_err.is_none() && capped_only && !capped_listings.is_empty() {
+        // Some folders hold more than the sync fetches, so an unseen message
+        // may only be older than the listing. Prune unseen messages within
+        // the listed range, and only once the server confirms they are gone.
+        if let Ok(local) = db.list_all_cached_id_folder_dates() {
+            let candidates = capped_prune_candidates(&local, &seen_ids, &capped_listings);
+            for id in confirm_gone_on_server(client, &access_token, &candidates).await {
+                if db.delete_message_by_aster_id(&id).is_ok() {
+                    tracing::info!("sync: pruned {} (gone on server)", id);
+                    destroyed_ids.push(id);
+                }
             }
         }
     }
@@ -3406,6 +3491,151 @@ mod tests {
             .unwrap();
 
         assert!(db.get_cached_message("web-draft-gone").unwrap().is_none());
+    }
+
+    fn local_row(id: &str, folder: &str, date: Option<&str>) -> (String, String, Option<String>) {
+        (id.to_string(), folder.to_string(), date.map(str::to_string))
+    }
+
+    #[test]
+    fn capped_prune_candidates_stay_within_the_listed_range() {
+        let local = vec![
+            local_row("listed-new", "inbox", Some("2026-06-10T00:00:00Z")),
+            local_row("listed-old", "inbox", Some("2026-06-01T00:00:00Z")),
+            local_row("gone-in-range", "inbox", Some("2026-06-05T00:00:00Z")),
+            local_row("older-than-listing", "inbox", Some("2026-05-01T00:00:00Z")),
+            local_row("undated", "inbox", None),
+            local_row("draft-in-range", "drafts", Some("2026-06-05T00:00:00Z")),
+        ];
+        let seen: HashSet<String> = ["listed-new", "listed-old"].iter().map(|s| s.to_string()).collect();
+        let listing = vec!["listed-new".to_string(), "listed-old".to_string()];
+
+        let candidates = capped_prune_candidates(&local, &seen, std::slice::from_ref(&listing));
+        assert_eq!(candidates, vec!["gone-in-range".to_string()]);
+
+        let narrower = vec!["listed-new".to_string()];
+        assert!(
+            capped_prune_candidates(&local, &seen, &[listing, narrower]).is_empty(),
+            "the most recent capped listing sets the floor"
+        );
+        assert!(capped_prune_candidates(&local, &seen, &[vec!["unknown".to_string()]]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_messages_the_server_reports_missing_are_confirmed_gone() {
+        use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+        let app = Router::new().route(
+            "/bridge/v1/messages/:id",
+            get(|Path(id): Path<String>| async move {
+                match id.as_str() {
+                    "alive" => Json(server_item_json("alive", "here")).into_response(),
+                    "flaky" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
+        let ids: Vec<String> = ["alive", "gone", "flaky", "gone-later"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let gone = confirm_gone_on_server(&client, "tok", &ids).await;
+
+        assert_eq!(gone, vec!["gone".to_string()]);
+    }
+
+    async fn spawn_capped_mock_server(fail_listing: bool) -> String {
+        use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+        let items: Vec<serde_json::Value> = (0..SYSTEM_FOLDER_MAX_ITEMS)
+            .map(|i| {
+                let mut item = server_item_json(&format!("listed-{}", i), "listed");
+                item["created_at"] = serde_json::json!("2026-06-14T00:00:00Z");
+                item
+            })
+            .collect();
+        let body = serde_json::json!({
+            "items": items,
+            "total": SYSTEM_FOLDER_MAX_ITEMS + 500,
+            "has_more": true,
+            "next_cursor": "more"
+        });
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move || {
+                    let body = body.clone();
+                    async move {
+                        if fail_listing {
+                            StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            Json(body).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id",
+                get(|Path(id): Path<String>| async move {
+                    if id == "beyond-cap" {
+                        Json(server_item_json("beyond-cap", "old")).into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn cache_dated(db: &Database, id: &str, date: &str) {
+        let item = item_with_envelope(id, &serde_json::json!({"subject": id, "body_text": "b", "date": date}));
+        assert!(cache_mail_item(db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+    }
+
+    #[tokio::test]
+    async fn deep_sync_of_a_capped_folder_prunes_only_in_range_deletions() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        cache_dated(&db, "gone-in-range", "2026-07-01T00:00:00Z");
+        cache_dated(&db, "beyond-cap", "2020-01-01T00:00:00Z");
+
+        let base = spawn_capped_mock_server(false).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("gone-in-range").unwrap().is_none());
+        assert!(
+            db.get_cached_message("beyond-cap").unwrap().is_some(),
+            "a message older than the listed range must be kept"
+        );
+        assert!(db.get_cached_message("listed-0").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_prunes_nothing() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        cache_dated(&db, "gone-in-range", "2026-07-01T00:00:00Z");
+
+        let base = spawn_capped_mock_server(true).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        assert!(run_sync_pass(&session, &client, &db, None, true).await.is_err());
+
+        assert!(db.get_cached_message("gone-in-range").unwrap().is_some());
     }
 
     #[tokio::test]
