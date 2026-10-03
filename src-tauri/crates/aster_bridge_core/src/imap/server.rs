@@ -3602,21 +3602,18 @@ fn parse_section_requests(fetch_parts: &str) -> Vec<SectionRequest> {
     out
 }
 
-fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String, String) {
+fn apply_partial(data: &str, partial: Option<(usize, Option<usize>)>) -> (String, &[u8]) {
+    let bytes = data.as_bytes();
     match partial {
         Some((off, len_opt)) => {
-            let bytes = data.as_bytes();
             let start = off.min(bytes.len());
             let end = match len_opt {
                 Some(l) => start.saturating_add(l).min(bytes.len()),
                 None => bytes.len(),
             };
-            (
-                format!("<{}>", off),
-                String::from_utf8_lossy(&bytes[start..end]).into_owned(),
-            )
+            (format!("<{}>", off), &bytes[start..end])
         }
-        None => (String::new(), data.to_string()),
+        None => (String::new(), bytes),
     }
 }
 
@@ -3646,8 +3643,11 @@ fn mark_fetched_seen(
     }
 }
 
-fn literal(key: &str, data: &str) -> String {
-    format!("{} {{{}}}\r\n{}", key, data.len(), data)
+fn literal(key: &str, data: impl AsRef<[u8]>) -> Vec<u8> {
+    let data = data.as_ref();
+    let mut out = format!("{} {{{}}}\r\n", key, data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out
 }
 
 async fn handle_fetch(
@@ -3749,7 +3749,7 @@ async fn handle_fetch(
         };
         let rendered = crate::message_render::render(msg, &attachments, needs_body);
         let mut seen_marked = false;
-        let mut items: Vec<String> = Vec::new();
+        let mut items: Vec<Vec<u8>> = Vec::new();
 
         if wants_flags {
             let mut flag_list: Vec<&str> = Vec::new();
@@ -3759,15 +3759,15 @@ async fn handle_fetch(
             if msg.flags & 8 != 0 { flag_list.push("\\Deleted"); }
             if msg.flags & 16 != 0 { flag_list.push("\\Draft"); }
             flag_list.extend(keywords.iter().map(String::as_str));
-            items.push(format!("FLAGS ({})", flag_list.join(" ")));
+            items.push(format!("FLAGS ({})", flag_list.join(" ")).into_bytes());
         }
 
         if wants_uid {
-            items.push(format!("UID {}", uid));
+            items.push(format!("UID {}", uid).into_bytes());
         }
 
         if wants_size {
-            items.push(format!("RFC822.SIZE {}", rendered.size));
+            items.push(format!("RFC822.SIZE {}", rendered.size).into_bytes());
         }
 
         if wants_envelope {
@@ -3817,32 +3817,32 @@ async fn handle_fetch(
                 bcc_list,
                 in_reply_to,
                 imap_quote(&msg_id)
-            ));
+            ).into_bytes());
         }
 
         if wants_gm_labels {
             let labels = gmail_labels_for_message(msg);
             let rendered_labels: Vec<String> = labels.iter().map(|l| quote_or_atom_label(l)).collect();
-            items.push(format!("X-GM-LABELS ({})", rendered_labels.join(" ")));
+            items.push(format!("X-GM-LABELS ({})", rendered_labels.join(" ")).into_bytes());
         }
 
         if wants_gm_thrid {
-            items.push(format!("X-GM-THRID {}", gmail_thrid_from_aster(&msg.aster_id)));
+            items.push(format!("X-GM-THRID {}", gmail_thrid_from_aster(&msg.aster_id)).into_bytes());
         }
 
         if wants_gm_msgid {
-            items.push(format!("X-GM-MSGID {}", gmail_msgid_from_aster(&msg.aster_id)));
+            items.push(format!("X-GM-MSGID {}", gmail_msgid_from_aster(&msg.aster_id)).into_bytes());
         }
 
         if wants_internaldate {
             let date_val = msg.date.as_deref()
                 .map(iso_to_imap_date)
                 .unwrap_or_else(|| "01-Jan-1970 00:00:00 +0000".to_string());
-            items.push(format!("INTERNALDATE {}", imap_quote(&date_val)));
+            items.push(format!("INTERNALDATE {}", imap_quote(&date_val)).into_bytes());
         }
 
         if wants_bodystructure {
-            items.push(format!("BODYSTRUCTURE {}", rendered.bodystructure));
+            items.push(format!("BODYSTRUCTURE {}", rendered.bodystructure).into_bytes());
         }
 
         if wants_body_text {
@@ -3869,9 +3869,9 @@ async fn handle_fetch(
             match content {
                 Some(data) => {
                     let (suffix, slice) = apply_partial(data, req.partial);
-                    items.push(literal(&format!("{}{}", key_base, suffix), &slice));
+                    items.push(literal(&format!("{}{}", key_base, suffix), slice));
                 }
-                None => items.push(format!("{} NIL", key_base)),
+                None => items.push(format!("{} NIL", key_base).into_bytes()),
             }
         }
 
@@ -3893,7 +3893,7 @@ async fn handle_fetch(
             }
             if let Some((off, len_opt)) = parse_body_partial(&upper_parts) {
                 let (suffix, slice) = apply_partial(&rendered.text, Some((off, len_opt)));
-                items.push(literal(&format!("BODY[]{}", suffix), &slice));
+                items.push(literal(&format!("BODY[]{}", suffix), slice));
             } else {
                 items.push(literal("BODY[]", &rendered.text));
             }
@@ -3906,7 +3906,9 @@ async fn handle_fetch(
             items.push(literal("RFC822.TEXT", rendered.body()));
         }
 
-        out.extend_from_slice(format!("* {} FETCH ({})\r\n", seq_num, items.join(" ")).as_bytes());
+        out.extend_from_slice(format!("* {} FETCH (", seq_num).as_bytes());
+        out.extend_from_slice(&items.join(&b' '));
+        out.extend_from_slice(b")\r\n");
         if out.len() >= 256 * 1024 {
             writer.write_all(&out).await?;
             out.clear();
@@ -7099,6 +7101,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(pushed, "non-peek fetch must push read status to backend");
+    }
+
+    #[test]
+    fn apply_partial_slices_bytes_without_reencoding() {
+        let (suffix, slice) = apply_partial("aé", Some((0, Some(2))));
+        assert_eq!(suffix, "<0>");
+        assert_eq!(slice, b"a\xc3");
+        let (_, rest) = apply_partial("aé", Some((2, None)));
+        assert_eq!(rest, b"\xa9");
+        assert_eq!(literal("BODY[]<0>", slice), b"BODY[]<0> {2}\r\na\xc3".to_vec());
+    }
+
+    async fn fetch_literal_bytes(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<u8> {
+        writer
+            .write_all(format!("{} {}\r\n", tag, cmd).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut head = String::new();
+        reader.read_line(&mut head).await.unwrap();
+        let open = head.rfind('{').unwrap_or_else(|| panic!("no literal in {}", head));
+        let len: usize = head[open + 1..].trim_end().trim_end_matches('}').parse().unwrap();
+        let mut body = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut body).await.unwrap();
+        let rest = read_until_tag(reader, tag).await.join("\n");
+        assert!(rest.starts_with(')'), "literal length was wrong: {}", rest);
+        assert!(rest.contains(&format!("{} OK", tag)), "{}", rest);
+        body
+    }
+
+    #[tokio::test]
+    async fn partial_fetch_splits_multibyte_characters_byte_exactly() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        db.upsert_cached_message(
+            "pf-1",
+            "inbox",
+            Some("partial"),
+            Some("alice@example.com"),
+            Some("tester@aster.test"),
+            Some("Wed, 21 May 2026 10:00:00 +0000"),
+            64,
+            Some("olá ünïcödé €"),
+            Some(&serde_json::json!({"is_html": false}).to_string()),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "pf-1");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = fetch_literal_bytes(&mut reader, &mut writer, "p0", "FETCH 1 (BODY.PEEK[])").await;
+        let split = full.iter().position(|b| *b >= 0x80).unwrap() + 1;
+        let cmd = format!("FETCH 1 (BODY.PEEK[]<0.{}>)", split);
+        let first = fetch_literal_bytes(&mut reader, &mut writer, "p1", &cmd).await;
+        assert_eq!(first, full[..split]);
+        let cmd = format!("FETCH 1 (BODY.PEEK[]<{}.{}>)", split, full.len());
+        let second = fetch_literal_bytes(&mut reader, &mut writer, "p2", &cmd).await;
+        assert_eq!(second, full[split..]);
     }
 
     #[tokio::test]

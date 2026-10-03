@@ -524,6 +524,25 @@ pub async fn refresh_access_token(
         }
     }
 
+    sign_in_and_reload_vault(session, device_id, signing_key, client).await
+}
+
+pub async fn reload_vault_keys(
+    session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
+    device_id: uuid::Uuid,
+    signing_key: &ed25519_dalek::SigningKey,
+    client: &ApiClient,
+) -> Result<()> {
+    let _gate = REFRESH_GATE.lock().await;
+    sign_in_and_reload_vault(session, device_id, signing_key, client).await
+}
+
+async fn sign_in_and_reload_vault(
+    session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
+    device_id: uuid::Uuid,
+    signing_key: &ed25519_dalek::SigningKey,
+    client: &ApiClient,
+) -> Result<()> {
     let challenge = client.device_challenge(device_id).await?;
     let signature = device_identity::sign_with_key(signing_key, &challenge.nonce)
         .map_err(BridgeError::Crypto)?;
@@ -818,6 +837,15 @@ mod tests {
         });
         let app = Router::new()
             .route(
+                "/core/v1/auth/refresh",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "access_token": "refreshed-token",
+                        "refresh_token": "refresh-2",
+                    }))
+                }),
+            )
+            .route(
                 "/core/v1/auth/device/challenge",
                 post(move || {
                     let challenge = challenge.clone();
@@ -871,6 +899,43 @@ mod tests {
         assert_eq!(s.access_token.as_str(), "fresh-token");
         assert_eq!(s.identity_key.as_deref(), Some("new-ik"));
         assert_eq!(s.ratchet_identity_public.as_deref(), Some("pub-b64"));
+        assert_eq!(s.inbound_keys.len(), 1);
+        assert_eq!(s.inbound_keys[0].ecdh_secret_d, sk.to_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn reload_vault_keys_loads_new_identity_even_with_a_refresh_token() {
+        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let vault_json = serde_json::json!({
+            "identity_key": "new-ik",
+            "ratchet_identity_public": "pub-b64",
+            "ratchet_identity_key": p256_jwk(&sk),
+        })
+        .to_string();
+        let (ev, vn) = encrypt_vault_for_test(vault_json.as_bytes(), b"passphrase-bytes");
+        let base = spawn_device_login_server(ev, vn).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let mut initial = sample_session();
+        initial.refresh_token = Some(Zeroizing::new("refresh-1".to_string()));
+        let session = std::sync::Arc::new(tokio::sync::RwLock::new(initial));
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+
+        refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client)
+            .await
+            .unwrap();
+        {
+            let s = session.read().await;
+            assert_eq!(s.access_token.as_str(), "refreshed-token");
+            assert!(s.inbound_keys.is_empty());
+        }
+
+        reload_vault_keys(&session, Uuid::new_v4(), &signing_key, &client)
+            .await
+            .unwrap();
+
+        let s = session.read().await;
+        assert_eq!(s.access_token.as_str(), "fresh-token");
+        assert_eq!(s.identity_key.as_deref(), Some("new-ik"));
         assert_eq!(s.inbound_keys.len(), 1);
         assert_eq!(s.inbound_keys[0].ecdh_secret_d, sk.to_bytes().to_vec());
     }
