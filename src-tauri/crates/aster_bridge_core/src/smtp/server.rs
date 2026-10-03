@@ -36,7 +36,7 @@ pub fn is_transient_send_error(err: &BridgeError) -> bool {
     match err {
         BridgeError::Network(_) | BridgeError::Io(_) => true,
         BridgeError::Api(msg) => {
-            for code in ["408", "429", "500", "502", "503", "504"] {
+            for code in ["401", "408", "429", "500", "502", "503", "504"] {
                 if msg.starts_with(code) {
                     return true;
                 }
@@ -989,9 +989,9 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_401_is_permanent() {
-        let e = BridgeError::Api("401 unauthorized".into());
-        assert!(!is_transient_send_error(&e));
+    fn unauthorized_401_is_transient() {
+        let e = BridgeError::Api("401 Unauthorized: token expired".into());
+        assert!(is_transient_send_error(&e));
     }
 
     #[test]
