@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
@@ -294,7 +295,7 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
     }
 
     let (where_sql, params) = build_filter(args.get("filter"), &id_to_label);
-    let sort_sql = build_sort(args.get("sort"));
+    let sort_sql = format!("{}, m.aster_id", build_sort(args.get("sort")));
 
     let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
     let total: i64 = ctx
@@ -307,10 +308,29 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
             )
         })
         .unwrap_or(0);
-    let position = if requested_position < 0 {
-        (total + requested_position).max(0)
-    } else {
-        requested_position
+    let position = match args.get("anchor").and_then(|v| v.as_str()) {
+        Some(anchor) => {
+            let offset = args.get("anchorOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let index_sql = format!(
+                "SELECT rn FROM (SELECT m.aster_id, ROW_NUMBER() OVER ({}) - 1 AS rn FROM message_cache m WHERE 1=1 {}) WHERE aster_id = ?{}",
+                sort_sql.trim_start(),
+                where_sql,
+                params.len() + 1
+            );
+            let mut bound = params.clone();
+            bound.push(rusqlite::types::Value::Text(anchor.to_string()));
+            let index: Option<i64> = ctx
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(&index_sql, rusqlite::params_from_iter(bound.iter()), |r| r.get(0))
+                        .optional()
+                })
+                .map_err(|e| MethodError::new("serverError", e))?;
+            let index = index.ok_or_else(|| MethodError::new("anchorNotFound", "anchor is not in the results"))?;
+            index.saturating_add(offset).max(0)
+        }
+        None if requested_position < 0 => total.saturating_add(requested_position).max(0),
+        None => requested_position,
     };
 
     let sql = format!(
@@ -1322,6 +1342,23 @@ mod tests {
         let res = ok(query(&ctx, json!({"position": -10})).await);
         assert_eq!(res["position"], json!(0));
         assert_eq!(res["ids"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_anchor_overrides_position() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("a1", "01"), ("a2", "02"), ("a3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": -1, "position": 2})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"], json!(["a3", "a2", "a1"]));
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": 1})).await);
+        assert_eq!(res["ids"], json!(["a1"]));
+        let err = err_kind(query(&ctx, json!({"anchor": "missing"})).await);
+        assert_eq!(err, "anchorNotFound");
     }
 
     #[tokio::test]
