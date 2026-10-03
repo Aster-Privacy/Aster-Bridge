@@ -806,12 +806,11 @@ fn extract_from_field(v: &serde_json::Value) -> Option<String> {
     }
     let email = from.get("email").and_then(|x| x.as_str()).unwrap_or("");
     let name = from.get("name").and_then(|x| x.as_str()).unwrap_or("");
-    if email.is_empty() && name.is_empty() {
+    let mailbox = crate::address::format_mailbox(name, email);
+    if mailbox.is_empty() {
         None
-    } else if name.is_empty() {
-        Some(email.to_string())
     } else {
-        Some(format!("{} <{}>", name, email))
+        Some(mailbox)
     }
 }
 
@@ -824,12 +823,9 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
         } else {
             let email = r.get("email").and_then(|x| x.as_str()).unwrap_or("");
             let name = r.get("name").and_then(|x| x.as_str()).unwrap_or("");
-            if !email.is_empty() {
-                if name.is_empty() {
-                    parts.push(email.to_string());
-                } else {
-                    parts.push(format!("{} <{}>", name, email));
-                }
+            let mailbox = crate::address::format_mailbox(name, email);
+            if !mailbox.is_empty() {
+                parts.push(mailbox);
             }
         }
     }
@@ -2508,6 +2504,27 @@ mod tests {
             extract_recipients(&v, "to"),
             Some("raw@example.com, Carol <carol@example.com>, dave@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn display_names_with_commas_stay_a_single_address() {
+        let v = serde_json::json!({
+            "from": {"name": "Doe, John", "email": "john@example.com"},
+            "to": [
+                {"name": "Roe, Jane", "email": "jane@example.com"},
+                {"name": "Carol", "email": "carol@example.com"}
+            ]
+        });
+        let from = extract_from_field(&v).unwrap();
+        assert_eq!(from, "\"Doe, John\" <john@example.com>");
+        assert_eq!(crate::address::split_address_list(&from).len(), 1);
+        assert_eq!(
+            crate::address::parse_mailbox(&from),
+            ("Doe, John".to_string(), "john@example.com".to_string())
+        );
+        let to = extract_recipients(&v, "to").unwrap();
+        assert_eq!(to, "\"Roe, Jane\" <jane@example.com>, Carol <carol@example.com>");
+        assert_eq!(crate::address::split_address_list(&to).len(), 2);
     }
 
     #[test]
