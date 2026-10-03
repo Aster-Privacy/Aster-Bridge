@@ -473,6 +473,15 @@ pub async fn login_with_passphrase(
 }
 
 static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static REFRESH_REQUESTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+pub fn request_token_refresh() {
+    REFRESH_REQUESTED.notify_one();
+}
+
+pub async fn token_refresh_requested() {
+    REFRESH_REQUESTED.notified().await;
+}
 
 fn is_transient_refresh_error(error: &BridgeError) -> bool {
     match error {
