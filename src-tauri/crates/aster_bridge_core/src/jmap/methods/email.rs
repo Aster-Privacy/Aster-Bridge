@@ -1296,6 +1296,7 @@ mod tests {
         let mut small = cached("small", "inbox");
         small.size = 10;
         let mut big = cached("big", "inbox");
+        big.body_text = Some("x".repeat(1000));
         big.size = 1000;
         insert_msg(&ctx, &small);
         insert_msg(&ctx, &big);
