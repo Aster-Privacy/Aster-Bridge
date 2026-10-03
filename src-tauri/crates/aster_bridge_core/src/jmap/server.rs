@@ -671,13 +671,30 @@ mod e2e_tests {
                 "{}/jmap/download/{}/{}/anything.bin",
                 base, acct, blob_id
             ))
-            .header("authorization", auth)
+            .header("authorization", auth.clone())
             .send()
             .await
             .unwrap();
         assert_eq!(r_dl.status(), 200);
         let bytes = r_dl.bytes().await.unwrap();
         assert_eq!(&bytes[..], payload);
+
+        let template = sess["downloadUrl"].as_str().unwrap();
+        let url = template
+            .replace("{accountId}", &acct)
+            .replace("{blobId}", &blob_id)
+            .replace("{name}", "notes.txt")
+            .replace("{type}", "text%2Fplain");
+        let url = format!("{}{}", base, &url[url.find("/jmap/").unwrap()..]);
+        let r_typed = client
+            .get(url)
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_typed.status(), 200);
+        assert_eq!(r_typed.headers()["content-type"], "text/plain");
+        assert_eq!(&r_typed.bytes().await.unwrap()[..], payload);
     }
 
     #[tokio::test]
