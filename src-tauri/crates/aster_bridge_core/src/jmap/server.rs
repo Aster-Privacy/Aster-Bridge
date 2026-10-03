@@ -243,12 +243,18 @@ mod e2e_tests {
     use uuid::Uuid;
 
     async fn start_server() -> (String, String, tempfile::TempDir) {
+        let (base, auth, dir, _passwords, _id) = start_server_with_passwords().await;
+        (base, auth, dir)
+    }
+
+    async fn start_server_with_passwords(
+    ) -> (String, String, tempfile::TempDir, Arc<AppPasswords>, String) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
 
         let passwords = Arc::new(AppPasswords::new(db.clone()));
-        let _id = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let pw_id = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
 
         let session = Arc::new(RwLock::new(Session {
             data_kek: None,
@@ -281,7 +287,7 @@ mod e2e_tests {
         });
         for _ in 0..200 {
             if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                return (url_base, auth, dir);
+                return (url_base, auth, dir, passwords, pw_id);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -308,6 +314,29 @@ mod e2e_tests {
             .unwrap();
         assert_eq!(r.status(), 401);
         assert!(r.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn revoked_app_password_is_rejected_on_next_request() {
+        let (base, auth, _dir, passwords, pw_id) = start_server_with_passwords().await;
+        let http = reqwest::Client::new();
+        for _ in 0..2 {
+            let r = http
+                .get(format!("{}/jmap/session", base))
+                .header("authorization", auth.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+        }
+        passwords.delete(&pw_id).unwrap();
+        let r = http
+            .get(format!("{}/jmap/session", base))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
     }
 
     #[tokio::test]

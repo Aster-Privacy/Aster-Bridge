@@ -100,7 +100,7 @@ where
             return Err(unauthorized());
         }
 
-        let password_id = match auth_state.passwords.verify_and_id_async(pass).await {
+        let password_id = match auth_state.passwords.verify_and_id_cached(user, pass).await {
             Some(id) => id,
             None => {
                 register_auth_failure().await;
@@ -116,7 +116,7 @@ where
             .map(|s| s.to_string());
         auth_state
             .passwords
-            .record_use(&password_id, user_agent.as_deref());
+            .record_use_throttled(&password_id, user_agent.as_deref());
 
         Ok(AuthedAccount {
             email: expected_email,
