@@ -475,8 +475,6 @@ pub async fn login_with_passphrase(
 static REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static REFRESH_REQUESTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// Asks the token refresh task to refresh now instead of at its next
-/// scheduled time, after a 401 or a sleep/wake gap.
 pub fn request_token_refresh() {
     REFRESH_REQUESTED.notify_one();
 }

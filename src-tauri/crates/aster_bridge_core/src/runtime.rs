@@ -735,8 +735,6 @@ impl BridgeRuntime {
                                 false
                             }
                             Err(e @ BridgeError::Network(_)) => {
-                                // Not a denial: retry at the short interval
-                                // without growing the backoff.
                                 tracing::warn!(
                                     "proactive token refresh could not reach the server: {}",
                                     e
