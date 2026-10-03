@@ -410,6 +410,14 @@ const KNOWN_UNSUPPORTED_CRITERIA: &[&str] = &[
     "FUZZY", "EMAILID", "THREADID", "ANNOTATION", "FILTER",
 ];
 
+fn search_response(hits: &[String]) -> String {
+    if hits.is_empty() {
+        "* SEARCH\r\n".to_string()
+    } else {
+        format!("* SEARCH {}\r\n", hits.join(" "))
+    }
+}
+
 /// Drop a leading `CHARSET <name>` (RFC 3501 §6.4.4). Search strings reach
 /// the matcher as UTF-8 text, so US-ASCII and UTF-8 are accepted; any other
 /// charset is refused so the client can report it.
@@ -1473,9 +1481,7 @@ where
                         if let Some(criterion) = unsupported {
                             tracing::warn!("unsupported SEARCH criterion {}", criterion);
                         }
-                        writer
-                            .write_all(format!("* SEARCH {}\r\n", uids.join(" ")).as_bytes())
-                            .await?;
+                        writer.write_all(search_response(&uids).as_bytes()).await?;
                         write_ok(&mut writer, &tag, "UID SEARCH completed").await?;
                     }
                     "STORE" => {
@@ -1631,9 +1637,7 @@ where
                 if let Some(criterion) = unsupported {
                     tracing::warn!("unsupported SEARCH criterion {}", criterion);
                 }
-                writer
-                    .write_all(format!("* SEARCH {}\r\n", matched.join(" ")).as_bytes())
-                    .await?;
+                writer.write_all(search_response(&matched).as_bytes()).await?;
                 write_ok(&mut writer, &tag, "SEARCH completed").await?;
             }
             "STORE" => {
@@ -6379,6 +6383,20 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn search_without_hits_has_no_trailing_space() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "nh-1", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "SEARCH SUBJECT nomatch").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH"), "{:?}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "UID SEARCH SUBJECT nomatch").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH"), "{:?}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", "SEARCH SUBJECT alpha").await;
+        assert!(resp.lines().any(|l| l == "* SEARCH 1"), "{:?}", resp);
     }
 
     #[tokio::test]
