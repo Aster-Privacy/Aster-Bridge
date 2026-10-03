@@ -236,6 +236,8 @@ pub fn no_response_code(message: &str) -> &'static str {
         .any(|phrase| text.contains(phrase));
     if transient {
         "UNAVAILABLE"
+    } else if text.contains("too large") {
+        "TOOBIG"
     } else {
         "SERVERBUG"
     }
@@ -331,7 +333,7 @@ pub fn build_imported_message(
         .filter(|_| parsed.html_part(0).is_some_and(|part| part.is_text_html()));
     let text_body = parsed.body_text(0).map(|s| s.to_string());
 
-    let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_ATTACHMENT_BYTES);
+    let attachments = crate::crypto::attachment::mime_attachments(&parsed, usize::MAX);
 
     let message_id = parsed
         .message_id()
@@ -772,13 +774,17 @@ async fn forget_import_job(client: &ApiClient) {
     guard.remove(client.base_url());
 }
 
+fn oversized_attachment(attachments: &[ParsedAttachment], max_bytes: usize) -> Option<&ParsedAttachment> {
+    attachments.iter().find(|a| a.data.len() > max_bytes)
+}
+
 async fn upload_attachments(
     client: &ApiClient,
     token: &str,
     passphrase: &[u8],
     mail_id: &str,
     attachments: &[ParsedAttachment],
-) {
+) -> std::result::Result<(), String> {
     for (seq, attachment) in attachments.iter().enumerate() {
         let sealed = {
             let attachment = attachment.clone();
@@ -792,12 +798,10 @@ async fn upload_attachments(
         let sealed = match sealed {
             Ok(Ok(parts)) => parts,
             Ok(Err(e)) => {
-                tracing::warn!("attachment sealing failed for {}: {}", attachment.name, e);
-                continue;
+                return Err(format!("could not encrypt the attachment {}: {}", attachment.name, e))
             }
             Err(e) => {
-                tracing::warn!("attachment sealing did not finish: {}", e);
-                continue;
+                return Err(format!("could not encrypt the attachment {}: {}", attachment.name, e))
             }
         };
 
@@ -810,9 +814,10 @@ async fn upload_attachments(
         };
 
         if let Err(e) = client.create_attachment(token, mail_id, &body).await {
-            tracing::warn!("attachment upload failed for {}: {}", attachment.name, e);
+            return Err(format!("could not upload the attachment {}: {}", attachment.name, e));
         }
     }
+    Ok(())
 }
 
 pub async fn append_imported_message(
@@ -880,6 +885,9 @@ async fn import_message(
         tokio::task::spawn_blocking(move || {
             let mut message = build_imported_message(&raw, &build_folder, internal_date, now)
                 .ok_or_else(|| "could not parse the appended message".to_string())?;
+            if let Some(a) = oversized_attachment(&message.attachments, MAX_ATTACHMENT_BYTES) {
+                return Err(format!("the attachment {} is too large to import", a.name));
+            }
             if as_copy {
                 rekey_as_copy(&mut message);
             }
@@ -974,7 +982,19 @@ async fn import_message(
     let aster_id = locate_stored_item(client, &token, &encrypted_envelope, stored_after).await?;
 
     if attachment_count > 0 {
-        upload_attachments(client, &token, &passphrase, &aster_id, &message.attachments).await;
+        if let Err(e) =
+            upload_attachments(client, &token, &passphrase, &aster_id, &message.attachments).await
+        {
+            if let Err(cleanup) = client.delete_mail_item_permanent(&token, &aster_id).await {
+                tracing::warn!(
+                    "could not remove {} after a failed attachment upload: {}",
+                    aster_id,
+                    cleanup
+                );
+                return Err(format!("{}; a copy without attachments is left on the server", e));
+            }
+            return Err(e);
+        }
     }
 
     apply_placement(client, &token, &aster_id, folder, flags).await;
@@ -1626,6 +1646,44 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://127.0.0.1:{}", port)
+    }
+
+    fn attachment(name: &str, size: usize) -> ParsedAttachment {
+        ParsedAttachment {
+            name: name.to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            content_id: None,
+            is_inline: false,
+            data: vec![7u8; size],
+        }
+    }
+
+    #[test]
+    fn an_oversized_attachment_is_reported_not_dropped() {
+        let list = vec![attachment("small.bin", 4), attachment("big.bin", 10)];
+        assert_eq!(oversized_attachment(&list, 8).map(|a| a.name.as_str()), Some("big.bin"));
+        assert!(oversized_attachment(&list, 10).is_none());
+        assert_eq!(
+            no_response_code("the attachment big.bin is too large to import"),
+            "TOOBIG"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attachment_upload_fails_the_import() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/mail/v1/attachments/by-mail/:id",
+            post(|| async { (StatusCode::BAD_REQUEST, "rejected") }),
+        );
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = upload_attachments(&client, "tok", b"pass", "mail-1", &[attachment("a.bin", 4)])
+            .await
+            .unwrap_err();
+        assert!(err.contains("a.bin"), "{}", err);
     }
 
     #[test]

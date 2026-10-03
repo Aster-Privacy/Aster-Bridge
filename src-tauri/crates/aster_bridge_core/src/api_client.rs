@@ -41,6 +41,7 @@ fn user_agent() -> String {
 const API_BASE_URL: &str = "https://app.astermail.org/api";
 const ERR_BODY_MAX: usize = 256;
 const SEND_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+pub const ATTACHMENT_TRANSFER_TIMEOUT: std::time::Duration = SEND_MAIL_TIMEOUT;
 
 #[allow(dead_code)]
 async fn err_body(resp: reqwest::Response) -> String {
@@ -1097,6 +1098,7 @@ impl ApiClient {
             ))
             .bearer_auth(access_token)
             .json(body)
+            .timeout(ATTACHMENT_TRANSFER_TIMEOUT)
             .send()
             .await?;
 
@@ -1111,16 +1113,19 @@ impl ApiClient {
         &self,
         access_token: &str,
         mail_id: &str,
+        timeout: Option<std::time::Duration>,
     ) -> Result<AttachmentListResponse> {
-        let resp = self
+        let mut req = self
             .client
             .get(format!(
                 "{}/mail/v1/attachments/by-mail/{}",
                 self.base_url, mail_id
             ))
-            .bearer_auth(access_token)
-            .send()
-            .await?;
+            .bearer_auth(access_token);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(map_response_error(resp).await);
@@ -2041,6 +2046,29 @@ mod tests {
         )
         .await
         .expect("a 401 must ask the refresh task to run");
+    }
+
+    #[tokio::test]
+    async fn attachment_listing_uses_the_timeout_it_is_given() {
+        let app = Router::new().route(
+            "/mail/v1/attachments/by-mail/:id",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Json(serde_json::json!({"attachments": [], "total": 0}))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .list_attachments_for_mail("tok", "msg-1", Some(std::time::Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Network(ref e) if e.is_timeout()));
+        let ok = client
+            .list_attachments_for_mail("tok", "msg-1", Some(ATTACHMENT_TRANSFER_TIMEOUT))
+            .await
+            .unwrap();
+        assert!(ok.attachments.is_empty());
     }
 
     #[tokio::test]
