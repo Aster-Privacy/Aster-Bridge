@@ -1372,7 +1372,7 @@ async fn heal_inbound_keys(session: &Arc<RwLock<Session>>, client: &Arc<ApiClien
     let Some(device_id) = identity.device_id else {
         return false;
     };
-    if let Err(e) = crate::auth::session::refresh_access_token(
+    if let Err(e) = crate::auth::session::reload_vault_keys(
         session,
         device_id,
         &identity.ed25519_signing_key,
@@ -1380,7 +1380,7 @@ async fn heal_inbound_keys(session: &Arc<RwLock<Session>>, client: &Arc<ApiClien
     )
     .await
     {
-        tracing::warn!("inbound key heal refresh failed: {}", e);
+        tracing::warn!("inbound key heal vault reload failed: {}", e);
         return false;
     }
     let changed = {
