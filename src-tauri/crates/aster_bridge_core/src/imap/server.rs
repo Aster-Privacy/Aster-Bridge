@@ -4336,7 +4336,7 @@ mod tests {
             )
             .route(
                 "/mail/v1/attachments/by-mail/:mail_id",
-                post(move |AxumPath(mail_id): AxumPath<String>| {
+                post(move |AxumPath(mail_id): AxumPath<String>, _body: axum::body::Bytes| {
                     let calls = c6.clone();
                     async move {
                         calls
@@ -4346,7 +4346,8 @@ mod tests {
                         Json(serde_json::json!({"id": "att-1", "success": true})).into_response()
                     }
                 }),
-            );
+            )
+            .layer(axum::extract::DefaultBodyLimit::disable());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
