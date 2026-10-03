@@ -3684,7 +3684,7 @@ async fn handle_fetch(
         || upper_parts.contains("BODY.PEEK[HEADER]")
         || upper_parts.contains("RFC822.HEADER");
     let wants_body_text = upper_parts.contains("BODY[TEXT]") || upper_parts.contains("BODY.PEEK[TEXT]");
-    let body_text_is_peek = upper_parts.contains("BODY.PEEK[TEXT]");
+    let body_text_is_peek = conn.read_only || upper_parts.contains("BODY.PEEK[TEXT]");
     let header_fields = parse_header_fields_request(fetch_parts);
     let wants_gm_labels = contains_word(&upper_parts, "X-GM-LABELS");
     let wants_gm_thrid = contains_word(&upper_parts, "X-GM-THRID");
@@ -3693,7 +3693,8 @@ async fn handle_fetch(
     let section_requests = parse_section_requests(fetch_parts);
     let wants_internaldate = upper_parts.contains("INTERNALDATE")
         || is_all || is_fast || is_full;
-    let body_is_peek = upper_parts.contains("BODY.PEEK[]")
+    let body_is_peek = conn.read_only
+        || upper_parts.contains("BODY.PEEK[]")
         || upper_parts.contains("RFC822.HEADER");
 
     let needs_body = wants_body
@@ -3853,7 +3854,7 @@ async fn handle_fetch(
         }
 
         for req in &section_requests {
-            if !req.peek {
+            if !req.peek && !conn.read_only {
                 mark_fetched_seen(db, folder, msg, keywords, seq_num, &mut out, &mut fetch_seen_pushes, &mut seen_marked);
             }
             let key_base = if req.mime {
@@ -7008,6 +7009,42 @@ mod tests {
         assert!(resp.contains("r5 NO"), "MOVE must fail read-only: {}", resp);
         assert!(db.get_cached_message("ro-1").unwrap().is_some());
         assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn examine_fetch_does_not_mark_messages_read() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "ro-f1", "inbox", "one");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        let _ = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "a1",
+            "LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"",
+        )
+        .await;
+        let sel = imap_cmd_lines(&mut reader, &mut writer, "a2", "EXAMINE INBOX").await;
+        assert!(sel.contains("READ-ONLY"), "{}", sel);
+
+        for (tag, cmd) in [
+            ("f1", "FETCH 1 (BODY[])"),
+            ("f2", "FETCH 1 (BODY[TEXT])"),
+            ("f3", "FETCH 1 (BODY[1])"),
+            ("f4", "FETCH 1 (RFC822)"),
+            ("f5", "UID FETCH 1:* (RFC822.TEXT)"),
+        ] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, tag, cmd).await;
+            assert!(resp.contains(&format!("{} OK", tag)), "{}", resp);
+            assert!(!resp.contains("\\Seen"), "{} marked the message read: {}", cmd, resp);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(db.get_cached_message("ro-f1").unwrap().unwrap().flags & 1, 0);
+        assert!(calls.lock().await.is_empty(), "EXAMINE fetch reached the backend");
     }
 
     #[tokio::test]
