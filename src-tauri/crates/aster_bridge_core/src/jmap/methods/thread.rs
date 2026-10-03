@@ -38,7 +38,7 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
                 let mut stmt = conn.prepare(
                     "SELECT aster_id FROM message_cache \
                      WHERE thread_id = ?1 OR (thread_id IS NULL AND aster_id = ?1) \
-                     ORDER BY date ASC",
+                     ORDER BY julianday(date) ASC",
                 )?;
                 let rows = stmt.query_map([tid], |r| r.get::<_, String>(0))?;
                 rows.collect::<std::result::Result<Vec<String>, _>>()
@@ -154,6 +154,15 @@ mod tests {
         let res = ok(get(&ctx, json!({"ids": ["t1"]})).await);
         assert_eq!(res["list"][0]["id"], json!("t1"));
         assert_eq!(res["list"][0]["emailIds"], json!(["m2", "m1"]));
+    }
+
+    #[tokio::test]
+    async fn get_orders_thread_members_by_instant_across_offsets() {
+        let (ctx, _d) = test_ctx();
+        add_msg(&ctx, "later", Some("t2"), "2026-01-02T09:30:00Z");
+        add_msg(&ctx, "earlier", Some("t2"), "2026-01-02T11:00:00+02:00");
+        let res = ok(get(&ctx, json!({"ids": ["t2"]})).await);
+        assert_eq!(res["list"][0]["emailIds"], json!(["earlier", "later"]));
     }
 
     #[tokio::test]

@@ -214,7 +214,14 @@ pub async fn check_bridge_access(
     Err(StartError::PlanCheckFailed(last_error))
 }
 
-pub fn token_refresh_wait(tuning: &RuntimeTuning, consecutive_failures: u32) -> Duration {
+pub fn token_refresh_wait(
+    tuning: &RuntimeTuning,
+    consecutive_failures: u32,
+    network_retry: bool,
+) -> Duration {
+    if network_retry {
+        return tuning.token_retry_interval;
+    }
     if consecutive_failures == 0 {
         return tuning.token_refresh_interval;
     }
@@ -223,6 +230,16 @@ pub fn token_refresh_wait(tuning: &RuntimeTuning, consecutive_failures: u32) -> 
         .token_retry_interval
         .saturating_mul(1u32 << exponent)
         .min(tuning.token_refresh_interval.max(tuning.token_retry_interval))
+}
+
+const EARLY_REFRESH_MIN_GAP: Duration = Duration::from_secs(60);
+
+fn should_refresh_early(
+    consecutive_failures: u32,
+    last_attempt: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    consecutive_failures == 0 && now.duration_since(last_attempt) >= EARLY_REFRESH_MIN_GAP
 }
 
 pub fn is_definitive_device_failure(error: &BridgeError) -> bool {
@@ -687,10 +704,22 @@ impl BridgeRuntime {
                 Service::TokenRefresh,
                 tokio::spawn(async move {
                     let mut consecutive_failures: u32 = 0;
+                    let mut last_attempt = tokio::time::Instant::now();
+                    let mut due =
+                        last_attempt + token_refresh_wait(&tuning, consecutive_failures, false);
                     loop {
-                        let wait = token_refresh_wait(&tuning, consecutive_failures);
-                        tokio::time::sleep(wait).await;
-                        match crate::auth::session::refresh_access_token(
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(due) => {}
+                            _ = crate::auth::session::token_refresh_requested() => {
+                                let now = tokio::time::Instant::now();
+                                if !should_refresh_early(consecutive_failures, last_attempt, now) {
+                                    continue;
+                                }
+                                tracing::info!("refreshing the access token early");
+                            }
+                        }
+                        last_attempt = tokio::time::Instant::now();
+                        let network_retry = match crate::auth::session::refresh_access_token(
                             &s,
                             device_id,
                             &signing_key,
@@ -703,6 +732,14 @@ impl BridgeRuntime {
                                     tracing::info!("access token refresh recovered");
                                 }
                                 consecutive_failures = 0;
+                                false
+                            }
+                            Err(e @ BridgeError::Network(_)) => {
+                                tracing::warn!(
+                                    "proactive token refresh could not reach the server: {}",
+                                    e
+                                );
+                                true
                             }
                             Err(e) => {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
@@ -721,8 +758,11 @@ impl BridgeRuntime {
                                 if consecutive_failures == SESSION_EXPIRED_AFTER_FAILURES {
                                     poller::emit_session_expired();
                                 }
+                                false
                             }
-                        }
+                        };
+                        due = tokio::time::Instant::now()
+                            + token_refresh_wait(&tuning, consecutive_failures, network_retry);
                     }
                 }),
             ));
@@ -774,9 +814,26 @@ mod token_refresh_wait_tests {
     fn failed_refreshes_back_off_up_to_the_normal_interval() {
         let tuning = RuntimeTuning::for_config(&BridgeConfig::default());
         let waits: Vec<u64> = (0..10)
-            .map(|failures| token_refresh_wait(&tuning, failures).as_secs())
+            .map(|failures| token_refresh_wait(&tuning, failures, false).as_secs())
             .collect();
 
         assert_eq!(waits, vec![3000, 60, 120, 240, 480, 960, 1920, 3000, 3000, 3000]);
+    }
+
+    #[test]
+    fn network_failures_retry_at_the_short_interval() {
+        let tuning = RuntimeTuning::for_config(&BridgeConfig::default());
+        for failures in [0, 1, 4, 9] {
+            assert_eq!(token_refresh_wait(&tuning, failures, true).as_secs(), 60);
+        }
+    }
+
+    #[test]
+    fn an_early_refresh_waits_out_failures_and_recent_attempts() {
+        let start = tokio::time::Instant::now();
+        let later = start + Duration::from_secs(120);
+        assert!(should_refresh_early(0, start, later));
+        assert!(!should_refresh_early(0, start, start + Duration::from_secs(5)));
+        assert!(!should_refresh_early(2, start, later));
     }
 }

@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::api_client::{ApiClient, CreateContactRequest, UpdateContactRequest};
+use crate::api_client::{ApiClient, ContactRecord, CreateContactRequest, UpdateContactRequest};
 use crate::auth::session::Session;
 use crate::crypto::contacts::{ContactsKeys, CONTACT_DATA_VERSION};
 use crate::error::{BridgeError, Result};
@@ -55,6 +55,75 @@ pub struct ContactsStore {
     session: Arc<RwLock<Session>>,
     cache: RwLock<Option<CachedListing>>,
     write_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+pub struct Preconditions {
+    pub if_match: Option<Vec<String>>,
+    pub if_none_match: Option<Vec<String>>,
+}
+
+impl Preconditions {
+    fn is_empty(&self) -> bool {
+        self.if_match.is_none() && self.if_none_match.is_none()
+    }
+
+    fn hold_for(&self, current: Option<&ContactEntry>) -> bool {
+        let matches = |tags: &[String]| {
+            current.is_some_and(|e| tags.iter().any(|t| t == "*" || t == &e.etag))
+        };
+        if self.if_match.as_deref().is_some_and(|tags| !matches(tags)) {
+            return false;
+        }
+        !self.if_none_match.as_deref().is_some_and(matches)
+    }
+}
+
+pub enum PutOutcome {
+    Stored(ContactEntry, bool),
+    PreconditionFailed,
+}
+
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    PreconditionFailed,
+}
+
+enum DecodeError {
+    Integrity,
+    Decrypt(BridgeError),
+}
+
+fn decode_record(
+    keys: &ContactsKeys,
+    record: &ContactRecord,
+) -> std::result::Result<ContactEntry, DecodeError> {
+    if let (Some(hash), Some(version)) = (record.integrity_hash.as_deref(), record.data_version) {
+        if !keys.verify_integrity_hash(&record.encrypted_data, &record.data_nonce, version, hash) {
+            return Err(DecodeError::Integrity);
+        }
+    }
+
+    let payload = keys
+        .decrypt_data(&record.encrypted_data, &record.data_nonce)
+        .map_err(DecodeError::Decrypt)?;
+
+    let uid = payload
+        .get(DAV_UID_FIELD)
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty() && is_safe_uid(v))
+        .unwrap_or(record.id.as_str())
+        .to_string();
+
+    let vcard = super::vcard::contact_to_vcard(&uid, &payload, &record.updated_at);
+    Ok(ContactEntry {
+        uid,
+        contact_id: record.id.clone(),
+        etag: entry_etag(&vcard),
+        vcard,
+    })
 }
 
 pub fn entry_etag(vcard: &str) -> String {
@@ -123,49 +192,20 @@ impl ContactsStore {
                 .await?;
 
             for record in &page.items {
-                if let (Some(hash), Some(version)) =
-                    (record.integrity_hash.as_deref(), record.data_version)
-                {
-                    if !keys.verify_integrity_hash(
-                        &record.encrypted_data,
-                        &record.data_nonce,
-                        version,
-                        hash,
-                    ) {
+                match decode_record(&keys, record) {
+                    Ok(entry) => entries.push(entry),
+                    Err(DecodeError::Integrity) => {
                         skipped_integrity += 1;
                         tracing::debug!(
                             "contact {} failed its integrity check and was skipped",
                             record.id
                         );
-                        continue;
                     }
-                }
-
-                let payload = match keys.decrypt_data(&record.encrypted_data, &record.data_nonce) {
-                    Ok(payload) => payload,
-                    Err(e) => {
+                    Err(DecodeError::Decrypt(e)) => {
                         skipped_decrypt += 1;
                         tracing::debug!("contact {} could not be decrypted: {}", record.id, e);
-                        continue;
                     }
-                };
-
-                let uid = payload
-                    .get(DAV_UID_FIELD)
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim())
-                    .filter(|v| !v.is_empty() && is_safe_uid(v))
-                    .unwrap_or(record.id.as_str())
-                    .to_string();
-
-                let vcard =
-                    super::vcard::contact_to_vcard(&uid, &payload, &record.updated_at);
-                entries.push(ContactEntry {
-                    uid,
-                    contact_id: record.id.clone(),
-                    etag: entry_etag(&vcard),
-                    vcard,
-                });
+                }
             }
 
             match page.next_cursor {
@@ -213,7 +253,63 @@ impl ContactsStore {
         Ok(self.list().await?.into_iter().find(|e| e.uid == uid))
     }
 
-    pub async fn put(&self, uid: &str, vcard: &str) -> Result<(ContactEntry, bool)> {
+    async fn fetch_entry(&self, contact_id: &str) -> Result<Option<ContactEntry>> {
+        let keys = self.keys().await?;
+        let token = self.access_token().await;
+        let Some(record) = self.client.get_contact(&token, contact_id).await? else {
+            return Ok(None);
+        };
+        match decode_record(&keys, &record) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(DecodeError::Integrity) => Err(BridgeError::Crypto(format!(
+                "contact {} failed its integrity check",
+                contact_id
+            ))),
+            Err(DecodeError::Decrypt(e)) => Err(e),
+        }
+    }
+
+    async fn remember(&self, entry: ContactEntry) {
+        if let Some(cached) = self.cache.write().await.as_mut() {
+            cached
+                .entries
+                .retain(|e| e.uid != entry.uid && e.contact_id != entry.contact_id);
+            cached.entries.push(entry);
+        }
+    }
+
+    async fn forget(&self, uid: &str) {
+        if let Some(cached) = self.cache.write().await.as_mut() {
+            cached.entries.retain(|e| e.uid != uid);
+        }
+    }
+
+    async fn current(
+        &self,
+        uid: &str,
+        preconditions: &Preconditions,
+    ) -> Result<Option<ContactEntry>> {
+        let cached = self.get(uid).await?;
+        if preconditions.is_empty() {
+            return Ok(cached);
+        }
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        let fresh = self.fetch_entry(&cached.contact_id).await?;
+        match &fresh {
+            Some(entry) => self.remember(entry.clone()).await,
+            None => self.forget(uid).await,
+        }
+        Ok(fresh.filter(|e| e.uid == uid))
+    }
+
+    pub async fn put(
+        &self,
+        uid: &str,
+        vcard: &str,
+        preconditions: &Preconditions,
+    ) -> Result<PutOutcome> {
         if vcard.len() > MAX_VCARD_BYTES {
             return Err(BridgeError::Api("vcard too large".to_string()));
         }
@@ -222,6 +318,11 @@ impl ContactsStore {
         }
 
         let _guard = self.write_lock.lock().await;
+
+        let existing = self.current(uid, preconditions).await?;
+        if !preconditions.hold_for(existing.as_ref()) {
+            return Ok(PutOutcome::PreconditionFailed);
+        }
 
         if let Some(body_uid) = super::vcard::extract_uid(vcard) {
             if body_uid != uid {
@@ -234,12 +335,11 @@ impl ContactsStore {
 
         let keys = self.keys().await?;
         let token = self.access_token().await;
-        let existing = self.list().await?.into_iter().find(|e| e.uid == uid);
 
         let sealed = keys.encrypt_data(&Value::Object(payload.clone()))?;
         let tokens = search_tokens(&keys, &payload);
 
-        let created = match &existing {
+        let (contact_id, created) = match &existing {
             Some(entry) => {
                 self.client
                     .update_contact(
@@ -255,10 +355,11 @@ impl ContactsStore {
                         },
                     )
                     .await?;
-                false
+                (entry.contact_id.clone(), false)
             }
             None => {
-                self.client
+                let response = self
+                    .client
                     .create_contact(
                         &token,
                         &CreateContactRequest {
@@ -273,34 +374,34 @@ impl ContactsStore {
                         },
                     )
                     .await?;
-                true
+                (response.id, true)
             }
         };
 
-        self.invalidate().await;
+        let Some(entry) = self.fetch_entry(&contact_id).await? else {
+            self.invalidate().await;
+            return Err(BridgeError::Api("contact was not stored".to_string()));
+        };
+        self.remember(entry.clone()).await;
 
-        let entry = self
-            .list()
-            .await?
-            .into_iter()
-            .find(|e| e.uid == uid)
-            .ok_or_else(|| BridgeError::Api("contact was not stored".to_string()))?;
-
-        Ok((entry, created))
+        Ok(PutOutcome::Stored(entry, created))
     }
 
-    pub async fn delete(&self, uid: &str) -> Result<bool> {
+    pub async fn delete(&self, uid: &str, preconditions: &Preconditions) -> Result<DeleteOutcome> {
         let _guard = self.write_lock.lock().await;
 
-        let Some(entry) = self.list().await?.into_iter().find(|e| e.uid == uid) else {
-            return Ok(false);
+        let Some(entry) = self.current(uid, preconditions).await? else {
+            return Ok(DeleteOutcome::NotFound);
         };
+        if !preconditions.hold_for(Some(&entry)) {
+            return Ok(DeleteOutcome::PreconditionFailed);
+        }
 
         let token = self.access_token().await;
         self.client.delete_contact(&token, &entry.contact_id).await?;
-        self.invalidate().await;
+        self.forget(uid).await;
 
-        Ok(true)
+        Ok(DeleteOutcome::Deleted)
     }
 }
 

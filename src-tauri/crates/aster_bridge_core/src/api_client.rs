@@ -41,6 +41,7 @@ fn user_agent() -> String {
 const API_BASE_URL: &str = "https://app.astermail.org/api";
 const ERR_BODY_MAX: usize = 256;
 const SEND_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+pub const ATTACHMENT_TRANSFER_TIMEOUT: std::time::Duration = SEND_MAIL_TIMEOUT;
 
 #[allow(dead_code)]
 async fn err_body(resp: reqwest::Response) -> String {
@@ -57,6 +58,9 @@ fn urlencoding_path(segment: &str) -> String {
 async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        crate::auth::session::request_token_refresh();
+    }
     if status == reqwest::StatusCode::FORBIDDEN {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
             if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
@@ -1102,6 +1106,7 @@ impl ApiClient {
             ))
             .bearer_auth(access_token)
             .json(body)
+            .timeout(ATTACHMENT_TRANSFER_TIMEOUT)
             .send()
             .await?;
 
@@ -1116,16 +1121,19 @@ impl ApiClient {
         &self,
         access_token: &str,
         mail_id: &str,
+        timeout: Option<std::time::Duration>,
     ) -> Result<AttachmentListResponse> {
-        let resp = self
+        let mut req = self
             .client
             .get(format!(
                 "{}/mail/v1/attachments/by-mail/{}",
                 self.base_url, mail_id
             ))
-            .bearer_auth(access_token)
-            .send()
-            .await?;
+            .bearer_auth(access_token);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(map_response_error(resp).await);
@@ -1668,7 +1676,11 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
-    pub async fn get_contact(&self, access_token: &str, contact_id: &str) -> Result<ContactRecord> {
+    pub async fn get_contact(
+        &self,
+        access_token: &str,
+        contact_id: &str,
+    ) -> Result<Option<ContactRecord>> {
         let resp = self
             .client
             .get(format!(
@@ -1680,11 +1692,14 @@ impl ApiClient {
             .send()
             .await?;
 
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             return Err(map_response_error(resp).await);
         }
 
-        resp.json().await.map_err(BridgeError::from)
+        resp.json().await.map(Some).map_err(BridgeError::from)
     }
 
     pub async fn create_contact(
@@ -2048,6 +2063,52 @@ mod tests {
         let body = seen.lock().await.clone().unwrap();
         assert_eq!(body["is_archived"], true);
         assert_eq!(body["is_trashed"], false);
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_response_requests_a_token_refresh() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async { (StatusCode::UNAUTHORIZED, "expired").into_response() }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        use futures_util::FutureExt;
+        let _ = crate::auth::session::token_refresh_requested().now_or_never();
+        let err = client
+            .send_mail("tok", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Api(ref m) if m.starts_with("401")));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::auth::session::token_refresh_requested(),
+        )
+        .await
+        .expect("a 401 must ask the refresh task to run");
+    }
+
+    #[tokio::test]
+    async fn attachment_listing_uses_the_timeout_it_is_given() {
+        let app = Router::new().route(
+            "/mail/v1/attachments/by-mail/:id",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Json(serde_json::json!({"attachments": [], "total": 0}))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .list_attachments_for_mail("tok", "msg-1", Some(std::time::Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Network(ref e) if e.is_timeout()));
+        let ok = client
+            .list_attachments_for_mail("tok", "msg-1", Some(ATTACHMENT_TRANSFER_TIMEOUT))
+            .await
+            .unwrap();
+        assert!(ok.attachments.is_empty());
     }
 
     #[tokio::test]

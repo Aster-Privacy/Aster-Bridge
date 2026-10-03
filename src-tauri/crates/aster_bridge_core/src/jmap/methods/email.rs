@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
@@ -281,12 +282,12 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
     let account_id = ctx.require_account(&args).await?;
     let id_to_label = store::mailbox_id_to_label_map(&ctx.db);
 
-    let position = args.get("position").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(50)
-        .clamp(0, 500);
+    let requested_position = args.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
+    let limit = match args.get("limit").and_then(|v| v.as_i64()) {
+        Some(n) if n < 0 => return Err(MethodError::invalid_args("limit must not be negative")),
+        Some(n) => n.min(500),
+        None => 50,
+    };
 
     if let Some(filter) = args.get("filter") {
         if let Some(bad) = unsupported_filter_field(filter) {
@@ -298,7 +299,43 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
     }
 
     let (where_sql, params) = build_filter(args.get("filter"), &id_to_label);
-    let sort_sql = build_sort(args.get("sort"));
+    let sort_sql = format!("{}, m.aster_id", build_sort(args.get("sort")));
+
+    let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
+    let total: i64 = ctx
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                &count_sql,
+                rusqlite::params_from_iter(params.iter()),
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0);
+    let position = match args.get("anchor").and_then(|v| v.as_str()) {
+        Some(anchor) => {
+            let offset = args.get("anchorOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let index_sql = format!(
+                "SELECT rn FROM (SELECT m.aster_id, ROW_NUMBER() OVER ({}) - 1 AS rn FROM message_cache m WHERE 1=1 {}) WHERE aster_id = ?{}",
+                sort_sql.trim_start(),
+                where_sql,
+                params.len() + 1
+            );
+            let mut bound = params.clone();
+            bound.push(rusqlite::types::Value::Text(anchor.to_string()));
+            let index: Option<i64> = ctx
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(&index_sql, rusqlite::params_from_iter(bound.iter()), |r| r.get(0))
+                        .optional()
+                })
+                .map_err(|e| MethodError::new("serverError", e))?;
+            let index = index.ok_or_else(|| MethodError::new("anchorNotFound", "anchor is not in the results"))?;
+            index.saturating_add(offset).max(0)
+        }
+        None if requested_position < 0 => total.saturating_add(requested_position).max(0),
+        None => requested_position,
+    };
 
     let sql = format!(
         "SELECT m.aster_id FROM message_cache m WHERE 1=1 {} {} LIMIT ?{} OFFSET ?{}",
@@ -323,18 +360,6 @@ pub async fn query(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodE
             Ok(rows)
         })
         .map_err(|e| MethodError::new("serverError", e))?;
-
-    let count_sql = format!("SELECT COUNT(*) FROM message_cache m WHERE 1=1 {}", where_sql);
-    let total: i64 = ctx
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                &count_sql,
-                rusqlite::params_from_iter(params.iter()),
-                |r| r.get(0),
-            )
-        })
-        .unwrap_or(0);
 
     let state = ctx.db.jmap_state_get("Email").unwrap_or(0);
     Ok(json!({
@@ -472,11 +497,11 @@ fn build_condition(
         params.push(rusqlite::types::Value::Integer(max));
     }
     if let Some(before) = obj.get("before").and_then(|v| v.as_str()) {
-        parts.push(format!("m.date < ?{}", params.len() + 1));
+        parts.push(format!("julianday(m.date) < julianday(?{})", params.len() + 1));
         params.push(rusqlite::types::Value::Text(before.to_string()));
     }
     if let Some(after) = obj.get("after").and_then(|v| v.as_str()) {
-        parts.push(format!("m.date >= ?{}", params.len() + 1));
+        parts.push(format!("julianday(m.date) >= julianday(?{})", params.len() + 1));
         params.push(rusqlite::types::Value::Text(after.to_string()));
     }
 
@@ -535,7 +560,7 @@ fn sanitize_fts_term(input: &str) -> String {
 }
 
 fn build_sort(sort: Option<&Value>) -> String {
-    let default = " ORDER BY m.date DESC".to_string();
+    let default = " ORDER BY julianday(m.date) DESC".to_string();
     let Some(arr) = sort.and_then(|v| v.as_array()) else {
         return default;
     };
@@ -547,7 +572,7 @@ fn build_sort(sort: Option<&Value>) -> String {
         let prop = item.get("property").and_then(|v| v.as_str()).unwrap_or("");
         let ascending = item.get("isAscending").and_then(|v| v.as_bool()).unwrap_or(true);
         let col = match prop {
-            "receivedAt" | "sentAt" => "m.date",
+            "receivedAt" | "sentAt" => "julianday(m.date)",
             "from" => "m.sender",
             "subject" => "m.subject",
             "size" => "m.size",
@@ -622,6 +647,23 @@ fn move_flags_for_label(label: &str) -> Option<Value> {
     }
 }
 
+// Patch keys are JSON pointers with an implicit leading "/" (RFC 8620 5.3),
+// so "keywords/$seen" and "/keywords/$seen" name the same path. Returns the
+// key as "keywords", "mailboxIds", "/keywords/<kw>" or "/mailboxIds/<id>".
+fn normalize_patch_key(key: &str) -> Option<String> {
+    let path = key.strip_prefix('/').unwrap_or(key);
+    let mut segments = path.split('/').map(|s| s.replace("~1", "/").replace("~0", "~"));
+    let property = segments.next()?;
+    if property != "keywords" && property != "mailboxIds" {
+        return None;
+    }
+    match (segments.next(), segments.next()) {
+        (None, _) => Some(property),
+        (Some(member), None) => Some(format!("/{}/{}", property, member)),
+        _ => None,
+    }
+}
+
 enum PatchOutcome {
     Applied,
     Rejected(Value),
@@ -641,19 +683,18 @@ async fn apply_update_patch(
         );
     };
 
-    for k in patch_obj.keys() {
-        let supported = k == "keywords"
-            || k.starts_with("/keywords/")
-            || k == "mailboxIds"
-            || k.starts_with("/mailboxIds/");
-        if !supported {
+    let mut normalized = serde_json::Map::new();
+    for (k, v) in patch_obj {
+        let Some(key) = normalize_patch_key(k) else {
             return PatchOutcome::Rejected(json!({
                 "type": "invalidProperties",
                 "properties": [k],
                 "description": "only keywords and mailboxIds updates are supported"
             }));
-        }
+        };
+        normalized.insert(key, v.clone());
     }
+    let patch_obj = &normalized;
 
     let existing = match ctx.db.get_cached_message(id) {
         Ok(Some(m)) => m,
@@ -833,6 +874,11 @@ pub async fn set(
 ) -> Result<Value, MethodError> {
     let account_id = ctx.require_account(&args).await?;
     let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    if let Some(expected) = args.get("ifInState").and_then(|v| v.as_str()) {
+        if expected != old_state.to_string() {
+            return Err(MethodError::new("stateMismatch", "email state has changed"));
+        }
+    }
 
     let creates = args.get("create").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let updates = args.get("update").and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -1292,11 +1338,52 @@ mod tests {
         let mut small = cached("small", "inbox");
         small.size = 10;
         let mut big = cached("big", "inbox");
+        big.body_text = Some("x".repeat(1000));
         big.size = 1000;
         insert_msg(&ctx, &small);
         insert_msg(&ctx, &big);
         let res = ok(query(&ctx, json!({"filter": {"minSize": 500}})).await);
         assert_eq!(res["ids"], json!(["big"]));
+    }
+
+    #[tokio::test]
+    async fn query_negative_position_counts_from_the_end() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("p1", "01"), ("p2", "02"), ("p3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"position": -2})).await);
+        assert_eq!(res["position"], json!(1));
+        assert_eq!(res["ids"], json!(["p2", "p1"]));
+        let res = ok(query(&ctx, json!({"position": -10})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_anchor_overrides_position() {
+        let (ctx, _d) = test_ctx();
+        for (id, day) in [("a1", "01"), ("a2", "02"), ("a3", "03")] {
+            let mut m = cached(id, "inbox");
+            m.date = Some(format!("2026-05-{}T10:00:00Z", day));
+            insert_msg(&ctx, &m);
+        }
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": -1, "position": 2})).await);
+        assert_eq!(res["position"], json!(0));
+        assert_eq!(res["ids"], json!(["a3", "a2", "a1"]));
+        let res = ok(query(&ctx, json!({"anchor": "a2", "anchorOffset": 1})).await);
+        assert_eq!(res["ids"], json!(["a1"]));
+        let err = err_kind(query(&ctx, json!({"anchor": "missing"})).await);
+        assert_eq!(err, "anchorNotFound");
+    }
+
+    #[tokio::test]
+    async fn query_negative_limit_is_invalid() {
+        let (ctx, _d) = test_ctx();
+        let err = err_kind(query(&ctx, json!({"limit": -1})).await);
+        assert_eq!(err, "invalidArguments");
     }
 
     #[test]
@@ -1321,11 +1408,33 @@ mod tests {
 
     #[test]
     fn build_sort_default_and_custom() {
-        assert_eq!(build_sort(None), " ORDER BY m.date DESC");
+        assert_eq!(build_sort(None), " ORDER BY julianday(m.date) DESC");
         let asc = build_sort(Some(&json!([{"property": "subject", "isAscending": true}])));
         assert_eq!(asc, " ORDER BY m.subject ASC");
         let unknown = build_sort(Some(&json!([{"property": "bogus"}])));
-        assert_eq!(unknown, " ORDER BY m.date DESC");
+        assert_eq!(unknown, " ORDER BY julianday(m.date) DESC");
+    }
+
+    #[tokio::test]
+    async fn query_dates_compare_instants_across_offsets() {
+        let (ctx, _d) = test_ctx();
+        let mut early = cached("early", "inbox");
+        early.date = Some("2026-05-21T11:00:00+02:00".to_string());
+        let mut late = cached("late", "inbox");
+        late.date = Some("2026-05-21T09:30:00Z".to_string());
+        insert_msg(&ctx, &early);
+        insert_msg(&ctx, &late);
+
+        let res = ok(query(&ctx, json!({"filter": {"after": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["late"]));
+        let res = ok(query(&ctx, json!({"filter": {"before": "2026-05-21T09:15:00Z"}})).await);
+        assert_eq!(res["ids"], json!(["early"]));
+        let res = ok(query(
+            &ctx,
+            json!({"sort": [{"property": "receivedAt", "isAscending": false}]}),
+        )
+        .await);
+        assert_eq!(res["ids"], json!(["late", "early"]));
     }
 
     #[test]
@@ -1500,6 +1609,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_patch_accepts_pointer_without_leading_slash() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("s5", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({"update": {"s5": {"keywords/$seen": true, "keywords/$flagged": true}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(
+            res["updated"].as_object().unwrap().contains_key("s5"),
+            "patch rejected: {}",
+            res["notUpdated"]
+        );
+        assert_eq!(ctx.db.get_message_flags_by_id("s5").unwrap(), 1 | 4);
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, body)| m == "PATCH" && id == "s5" && body["is_read"] == json!(true)));
+    }
+
+    #[test]
+    fn normalize_patch_key_handles_both_forms_and_escapes() {
+        assert_eq!(normalize_patch_key("keywords").as_deref(), Some("keywords"));
+        assert_eq!(normalize_patch_key("/mailboxIds").as_deref(), Some("mailboxIds"));
+        assert_eq!(normalize_patch_key("keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("/keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("mailboxIds/mbx_inbox").as_deref(), Some("/mailboxIds/mbx_inbox"));
+        assert_eq!(normalize_patch_key("keywords/a~1b~0c").as_deref(), Some("/keywords/a/b~c"));
+        assert_eq!(normalize_patch_key("keywords/~01").as_deref(), Some("/keywords/~1"));
+        assert_eq!(normalize_patch_key("subject"), None);
+        assert_eq!(normalize_patch_key("/keywordsx/$seen"), None);
+        assert_eq!(normalize_patch_key("keywords/a/b"), None);
+    }
+
+    #[tokio::test]
     async fn set_rejects_non_keyword_patch() {
         let (ctx, _d) = test_ctx();
         insert_msg(&ctx, &cached("s3", "inbox"));
@@ -1564,8 +1707,8 @@ mod tests {
         let (ctx, calls, _d) = test_ctx_with_backend(false).await;
         insert_msg(&ctx, &cached("mv2", "inbox"));
         let args = json!({"update": {"mv2": {
-            "/mailboxIds/mbx_trash": true,
-            "/mailboxIds/mbx_inbox": Value::Null
+            "mailboxIds/mbx_trash": true,
+            "mailboxIds/mbx_inbox": Value::Null
         }}});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert!(
@@ -1625,6 +1768,39 @@ mod tests {
         let args = json!({"create": {"draft1": {"subject": "x"}}});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert_eq!(res["notCreated"]["draft1"]["type"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn set_rejects_stale_if_in_state() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({
+            "ifInState": "999",
+            "update": {"st1": {"/keywords/$seen": true}},
+            "destroy": ["st1"]
+        });
+        assert_eq!(err_kind(set(&ctx, args, &mut HashMap::new()).await), "stateMismatch");
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("st1").unwrap(), 0);
+        assert!(ctx.db.get_cached_message("st1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_accepts_matching_if_in_state() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let state = ctx.db.jmap_state_get("Email").unwrap_or(0).to_string();
+        let args = json!({
+            "ifInState": state,
+            "update": {"st2": {"keywords": {"$seen": true}}}
+        });
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["oldState"], json!(state));
+        assert!(res["updated"].as_object().unwrap().contains_key("st2"));
     }
 
     #[tokio::test]

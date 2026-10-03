@@ -825,6 +825,7 @@ impl Database {
         let sender = sender.map(strip_c0_controls);
         let recipients = recipients.map(strip_c0_controls);
         let body_text = body_text.map(strip_c0_controls);
+        let size = body_text.as_ref().map_or(size, |b| b.len() as i64);
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
@@ -1197,11 +1198,19 @@ impl Database {
         })
     }
 
-    pub fn list_all_cached_id_folders(&self) -> Result<Vec<(String, String)>, String> {
+    pub fn list_all_cached_id_folder_dates(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT aster_id, folder FROM message_cache")?;
+            let mut stmt = conn.prepare("SELECT aster_id, folder, date FROM message_cache")?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -1273,6 +1282,15 @@ impl Database {
             )?;
             Ok(next as u32)
         })
+    }
+
+    pub fn uid_next(&self, folder: &str) -> Result<u32, String> {
+        let stored = self
+            .get_sync_state(&format!("uidnext:{}", folder))?
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let max = self.max_uid(folder)?;
+        Ok(stored.max(max.saturating_add(1)).max(1))
     }
 
     pub fn max_uid(&self, folder: &str) -> Result<u32, String> {
@@ -2678,6 +2696,23 @@ mod db_tests {
     }
 
     #[test]
+    fn upsert_size_matches_stored_body_after_control_stripping() {
+        let (_d, db) = open_db();
+        let raw = "hi\u{1}\u{7}\r\nthere\u{1b}";
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, raw.len() as i64, Some(raw), None)
+            .unwrap();
+        let msg = db.get_cached_message("a1").unwrap().unwrap();
+        assert_eq!(msg.body_text.as_deref(), Some("hi\r\nthere"));
+        assert_eq!(msg.size, "hi\r\nthere".len() as i64);
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        let full = db.list_cached_messages("inbox").unwrap();
+        assert_eq!(
+            crate::message_render::rendered_size(&meta[0], &[]),
+            crate::message_render::render_text(&full[0], &[]).len()
+        );
+    }
+
+    #[test]
     fn upsert_preserves_flags_on_update() {
         let (_d, db) = open_db();
         insert(&db, "a1", "inbox");
@@ -2842,6 +2877,22 @@ mod db_tests {
     fn delete_message_by_uid_unknown_is_noop() {
         let (_d, db) = open_db();
         db.delete_message_by_uid(123, "inbox").unwrap();
+    }
+
+    #[test]
+    fn uid_next_does_not_move_backwards_after_expunge() {
+        let (_d, db) = open_db();
+        assert_eq!(db.uid_next("inbox").unwrap(), 1);
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.assign_uid_if_missing("inbox", "a1").unwrap();
+        let top = db.assign_uid_if_missing("inbox", "a2").unwrap();
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        db.delete_message_by_uid(top as i64, "inbox").unwrap();
+        assert_eq!(db.max_uid("inbox").unwrap(), top - 1);
+        assert_eq!(db.uid_next("inbox").unwrap(), top + 1);
+        insert(&db, "a3", "inbox");
+        assert_eq!(db.assign_uid_if_missing("inbox", "a3").unwrap(), top + 1);
     }
 
     #[test]

@@ -663,6 +663,10 @@ async fn protocol_feature_matrix() {
             all_rcpt_ok &= smtp_read_reply(&mut reader).await.starts_with("250");
         }
         cl.check("SMTP multi-recipient (3x RCPT)", all_rcpt_ok, "all 250");
+        w.write_all(format!("MAIL FROM:<{}>\r\n", EMAIL).as_bytes()).await.unwrap();
+        w.flush().await.unwrap();
+        let nested = smtp_read_reply(&mut reader).await;
+        cl.check("SMTP nested MAIL is out of sequence", nested.starts_with("503"), nested.trim());
         w.write_all(b"RSET\r\n").await.unwrap();
         w.flush().await.unwrap();
         let rset = smtp_read_reply(&mut reader).await;
