@@ -822,7 +822,7 @@ fn apply_keywords(current: &[String], op: i8, given: &[String]) -> Vec<String> {
 }
 
 fn store_message_keywords(
-    db: &Database,
+    db: &crate::db::WriteBatch<'_>,
     aster_id: &str,
     current: &[String],
     op: i8,
@@ -915,14 +915,16 @@ async fn store_append_keywords(
     let item_ids = [aster_id.to_string()];
     let tag_store = store_tag_keywords(db, client, session, &item_ids, 1, Some(keywords)).await;
     let current = db.message_keywords(aster_id).unwrap_or_default();
-    store_message_keywords(
-        db,
-        aster_id,
-        &current,
-        1,
-        Some(keywords),
-        &tag_store.label_keywords,
-    );
+    db.write_batch(|batch| {
+        store_message_keywords(
+            batch,
+            aster_id,
+            &current,
+            1,
+            Some(keywords),
+            &tag_store.label_keywords,
+        )
+    });
     tag_store.failure
 }
 
@@ -1742,68 +1744,50 @@ where
                         let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
                         let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
-                        for uid in &uids {
-                            if let Some((seq, m)) = view.by_uid(*uid) {
-                                let old_flags = m.flags as u32;
-                                let wanted_flags = apply_flags(old_flags, op, flag_mask);
-                                let new_flags = if db
-                                    .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
-                                    .is_ok()
-                                {
-                                    wanted_flags
-                                } else {
-                                    old_flags
-                                };
-                                store_message_keywords(
-                                    &db,
-                                    &m.aster_id,
-                                    folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
-                                    op,
-                                    store_keywords.as_deref(),
-                                    &tag_store.label_keywords,
-                                );
-                                if (old_flags & 1) != (new_flags & 1) {
-                                    seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                        db.write_batch(|batch| {
+                            for uid in &uids {
+                                if let Some((seq, m)) = view.by_uid(*uid) {
+                                    let old_flags = m.flags as u32;
+                                    let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                                    let new_flags = if batch
+                                        .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                        .is_ok()
+                                    {
+                                        wanted_flags
+                                    } else {
+                                        old_flags
+                                    };
+                                    store_message_keywords(
+                                        batch,
+                                        &m.aster_id,
+                                        folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                        op,
+                                        store_keywords.as_deref(),
+                                        &tag_store.label_keywords,
+                                    );
+                                    if (old_flags & 1) != (new_flags & 1) {
+                                        seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                                    }
+                                    stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
                                 }
-                                stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
                             }
-                        }
+                        });
                         if !silent {
                             let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                            let mut untagged = String::new();
                             for (seq, uid, aster_id, new_flags) in &stored_rows {
                                 let keywords =
                                     stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
-                                writer
-                                    .write_all(
-                                        format!(
-                                            "* {} FETCH (UID {} FLAGS ({}))\r\n",
-                                            seq,
-                                            uid,
-                                            flags_to_str(*new_flags, keywords)
-                                        )
-                                        .as_bytes(),
-                                    )
-                                    .await?;
+                                untagged.push_str(&format!(
+                                    "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                    seq,
+                                    uid,
+                                    flags_to_str(*new_flags, keywords)
+                                ));
                             }
+                            writer.write_all(untagged.as_bytes()).await?;
                         }
-                        if !seen_changes.is_empty() {
-                            let client = client.clone();
-                            let session = session.clone();
-                            crate::shutdown::current().spawn(async move {
-                                let token = session.read().await.access_token.to_string();
-                                for (aster_id, is_read) in seen_changes {
-                                    if let Err(e) =
-                                        client.set_read_status(&token, &aster_id, is_read).await
-                                    {
-                                        tracing::warn!(
-                                            "read-status sync failed for {}: {}",
-                                            aster_id,
-                                            e
-                                        );
-                                    }
-                                }
-                            });
-                        }
+                        push_read_status(&client, &session, seen_changes);
                         match tag_store.failure {
                             Some(text) => write_no(&mut writer, &tag, text).await?,
                             None => write_ok(&mut writer, &tag, "UID STORE completed").await?,
@@ -1936,62 +1920,44 @@ where
                     let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                     let mut seen_changes: Vec<(String, bool)> = Vec::new();
                     let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
-                    for s in &seqs {
-                        if let Some(m) = view.by_seq(*s) {
-                            let old_flags = m.flags as u32;
-                            let wanted_flags = apply_flags(old_flags, op, flag_mask);
-                            let new_flags = if db
-                                .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
-                                .is_ok()
-                            {
-                                wanted_flags
-                            } else {
-                                old_flags
-                            };
-                            store_message_keywords(
-                                &db,
-                                &m.aster_id,
-                                folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
-                                op,
-                                store_keywords.as_deref(),
-                                &tag_store.label_keywords,
-                            );
-                            if (old_flags & 1) != (new_flags & 1) {
-                                seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                    db.write_batch(|batch| {
+                        for s in &seqs {
+                            if let Some(m) = view.by_seq(*s) {
+                                let old_flags = m.flags as u32;
+                                let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                                let new_flags = if batch
+                                    .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                    .is_ok()
+                                {
+                                    wanted_flags
+                                } else {
+                                    old_flags
+                                };
+                                store_message_keywords(
+                                    batch,
+                                    &m.aster_id,
+                                    folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
+                                    op,
+                                    store_keywords.as_deref(),
+                                    &tag_store.label_keywords,
+                                );
+                                if (old_flags & 1) != (new_flags & 1) {
+                                    seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
+                                }
+                                stored_rows.push((*s, m.aster_id.clone(), new_flags));
                             }
-                            stored_rows.push((*s, m.aster_id.clone(), new_flags));
                         }
-                    }
+                    });
                     if !silent {
                         let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                        let mut untagged = String::new();
                         for (s, aster_id, new_flags) in &stored_rows {
                             let keywords = stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
-                            writer
-                                .write_all(
-                                    format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(*new_flags, keywords))
-                                        .as_bytes(),
-                                )
-                                .await?;
+                            untagged.push_str(&format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(*new_flags, keywords)));
                         }
+                        writer.write_all(untagged.as_bytes()).await?;
                     }
-                    if !seen_changes.is_empty() {
-                        let client = client.clone();
-                        let session = session.clone();
-                        crate::shutdown::current().spawn(async move {
-                            let token = session.read().await.access_token.to_string();
-                            for (aster_id, is_read) in seen_changes {
-                                if let Err(e) =
-                                    client.set_read_status(&token, &aster_id, is_read).await
-                                {
-                                    tracing::warn!(
-                                        "read-status sync failed for {}: {}",
-                                        aster_id,
-                                        e
-                                    );
-                                }
-                            }
-                        });
-                    }
+                    push_read_status(&client, &session, seen_changes);
                 }
                 match store_failure {
                     Some(text) => write_no(&mut writer, &tag, text).await?,
@@ -2605,6 +2571,36 @@ async fn delete_on_server(
     }
 }
 
+const READ_STATUS_CONCURRENCY: usize = 8;
+
+fn push_read_status(
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+) {
+    use futures_util::StreamExt;
+
+    if changes.is_empty() {
+        return;
+    }
+    let client = client.clone();
+    let session = session.clone();
+    crate::shutdown::current().spawn(async move {
+        let token = session.read().await.access_token.to_string();
+        futures_util::stream::iter(changes)
+            .for_each_concurrent(READ_STATUS_CONCURRENCY, |(aster_id, is_read)| {
+                let client = &client;
+                let token = &token;
+                async move {
+                    if let Err(e) = client.set_read_status(token, &aster_id, is_read).await {
+                        tracing::warn!("read-status sync failed for {}: {}", aster_id, e);
+                    }
+                }
+            })
+            .await;
+    });
+}
+
 async fn expunge_targets(
     writer: &mut (impl AsyncWrite + Unpin),
     db: &Arc<Database>,
@@ -2614,12 +2610,19 @@ async fn expunge_targets(
     folder: &str,
     targets: Vec<(u32, String)>,
 ) -> std::io::Result<()> {
+    let mut deleted: Vec<u32> = Vec::new();
     for (uid, aster_id) in &targets {
-        if !delete_on_server(db, client, session, folder, aster_id).await {
-            continue;
+        if delete_on_server(db, client, session, folder, aster_id).await {
+            deleted.push(*uid);
         }
-        let _ = db.delete_message_by_uid(*uid as i64, folder);
-        if let Some(seq) = conn.expunged(*uid) {
+    }
+    db.write_batch(|batch| {
+        for uid in &deleted {
+            let _ = batch.delete_message_by_uid(*uid as i64, folder);
+        }
+    });
+    for uid in deleted {
+        if let Some(seq) = conn.expunged(uid) {
             writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
         }
     }
@@ -2633,12 +2636,17 @@ async fn expunge_targets_silent(
     folder: &str,
     targets: Vec<(u32, String)>,
 ) {
+    let mut deleted: Vec<&str> = Vec::new();
     for (_, aster_id) in &targets {
-        if !delete_on_server(db, client, session, folder, aster_id).await {
-            continue;
+        if delete_on_server(db, client, session, folder, aster_id).await {
+            deleted.push(aster_id);
         }
-        let _ = db.delete_message_by_aster_id(aster_id);
     }
+    db.write_batch(|batch| {
+        for aster_id in deleted {
+            let _ = batch.delete_message_by_aster_id(aster_id);
+        }
+    });
 }
 
 fn format_attachment_size(bytes: usize) -> String {
@@ -3493,28 +3501,30 @@ async fn handle_copy_move(
             let mut src: Vec<u32> = Vec::new();
             let mut tgt: Vec<u32> = Vec::new();
             let mut all_assigned = true;
-            for (_, m) in &entries {
-                let _ = db.upsert_cached_message(
-                    &m.aster_id,
-                    &target,
-                    m.subject.as_deref(),
-                    m.sender.as_deref(),
-                    m.recipients.as_deref(),
-                    m.date.as_deref(),
-                    m.size,
-                    m.body_text.as_deref(),
-                    m.raw_headers.as_deref(),
-                );
-                let _ = db.remove_uid_mapping(m.imap_uid as i64, &folder);
-                src.push(m.imap_uid);
-                match db.assign_uid_if_missing(&target, &m.aster_id) {
-                    Ok(uid) => tgt.push(uid),
-                    Err(e) => {
-                        tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
-                        all_assigned = false;
+            db.write_batch(|batch| {
+                for (_, m) in &entries {
+                    let _ = batch.upsert_cached_message(
+                        &m.aster_id,
+                        &target,
+                        m.subject.as_deref(),
+                        m.sender.as_deref(),
+                        m.recipients.as_deref(),
+                        m.date.as_deref(),
+                        m.size,
+                        m.body_text.as_deref(),
+                        m.raw_headers.as_deref(),
+                    );
+                    let _ = batch.remove_uid_mapping(m.imap_uid as i64, &folder);
+                    src.push(m.imap_uid);
+                    match batch.assign_uid_if_missing(&target, &m.aster_id) {
+                        Ok(uid) => tgt.push(uid),
+                        Err(e) => {
+                            tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
+                            all_assigned = false;
+                        }
                     }
                 }
-            }
+            });
             (src, tgt, all_assigned)
         })
         .await
@@ -4504,18 +4514,11 @@ async fn handle_fetch(
     if !out.is_empty() {
         writer.write_all(&out).await?;
     }
-    if !fetch_seen_pushes.is_empty() {
-        let client = client.clone();
-        let session = session.clone();
-        crate::shutdown::current().spawn(async move {
-            let token = session.read().await.access_token.to_string();
-            for aster_id in fetch_seen_pushes {
-                if let Err(e) = client.set_read_status(&token, &aster_id, true).await {
-                    tracing::warn!("read-status sync failed for {}: {}", aster_id, e);
-                }
-            }
-        });
-    }
+    push_read_status(
+        client,
+        session,
+        fetch_seen_pushes.into_iter().map(|aster_id| (aster_id, true)).collect(),
+    );
     match refusal {
         Some(reason) if skipped > 1 => {
             let others = skipped - 1;
@@ -9469,6 +9472,79 @@ mod tests {
             line(194).replacen(" RFC822.SIZE", " UID 194 RFC822.SIZE", 1)
         );
         assert_eq!(String::from_utf8_lossy(&resp), expected);
+    }
+
+    #[tokio::test]
+    async fn store_on_many_messages_saves_all_and_pushes_read_status_in_parallel() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                slow_metadata_ms: 300,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        for n in 1..=24 {
+            seed(&db, &format!("bs-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1:24 +FLAGS (\\Seen $Work)").await;
+        let expected: Vec<String> = (1..=24)
+            .map(|n| format!("* {} FETCH (FLAGS (\\Seen $Work))", n))
+            .chain(std::iter::once("s1 OK STORE completed".to_string()))
+            .collect();
+        assert_eq!(resp, expected.join("\n"));
+        for m in db.list_cached_message_meta("inbox").unwrap() {
+            assert_eq!(m.flags & 1, 1, "{}", m.aster_id);
+            assert_eq!(db.message_keywords(&m.aster_id).unwrap(), vec!["$Work".to_string()]);
+        }
+
+        let started = std::time::Instant::now();
+        loop {
+            let pushed = calls.lock().await.iter().filter(|(m, _)| m == "PATCH").count();
+            if pushed == 24 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(4), "only {} of 24 pushed", pushed);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn uid_store_reports_each_message_once_in_order() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        for n in 1..=5 {
+            seed(&db, &format!("us-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "UID STORE 2:4 FLAGS (\\Flagged)").await;
+        assert_eq!(
+            resp,
+            "* 2 FETCH (UID 2 FLAGS (\\Flagged))\n* 3 FETCH (UID 3 FLAGS (\\Flagged))\n\
+             * 4 FETCH (UID 4 FLAGS (\\Flagged))\ns1 OK UID STORE completed"
+        );
+        let flags: Vec<i64> = db.list_cached_message_meta("inbox").unwrap().iter().map(|m| m.flags).collect();
+        assert_eq!(flags, vec![0, 4, 4, 4, 0]);
+    }
+
+    #[tokio::test]
+    async fn expunge_of_many_messages_reports_shifting_sequence_numbers() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        for n in 1..=10 {
+            seed(&db, &format!("me-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        imap_cmd_lines(&mut reader, &mut writer, "e1", "UID STORE 2,4,6,8,10 +FLAGS.SILENT (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e2", "UID EXPUNGE 1:8").await;
+        assert_eq!(
+            resp,
+            "* 2 EXPUNGE\n* 3 EXPUNGE\n* 4 EXPUNGE\n* 5 EXPUNGE\ne2 OK UID EXPUNGE completed"
+        );
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "e3", "EXPUNGE").await;
+        assert_eq!(resp, "* 6 EXPUNGE\ne3 OK EXPUNGE completed");
+        let left: Vec<u32> = db.list_cached_message_meta("inbox").unwrap().iter().map(|m| m.imap_uid).collect();
+        assert_eq!(left, vec![1, 3, 5, 7, 9]);
     }
 
     #[tokio::test]

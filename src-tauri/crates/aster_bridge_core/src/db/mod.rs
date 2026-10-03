@@ -965,6 +965,223 @@ impl Database {
 const FTS_MARK_START: char = '\u{0002}';
 const FTS_MARK_END: char = '\u{0003}';
 
+pub struct WriteBatch<'c> {
+    conn: &'c Connection,
+}
+
+impl WriteBatch<'_> {
+    pub fn update_message_flags(&self, imap_uid: i64, folder: &str, new_flags: i64) -> Result<(), String> {
+        update_message_flags_on(self.conn, imap_uid, folder, new_flags).map_err(|e| e.to_string())
+    }
+
+    pub fn set_message_keywords(&self, aster_id: &str, keywords: &[String]) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT set_keywords")
+            .map_err(|e| e.to_string())?;
+        match set_message_keywords_on(self.conn, aster_id, keywords) {
+            Ok(()) => self.conn.execute_batch("RELEASE set_keywords"),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO set_keywords; RELEASE set_keywords");
+                Err(e)
+            }
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_message_by_uid(&self, uid: i64, folder: &str) -> Result<(), String> {
+        delete_message_by_uid_on(self.conn, uid, folder).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
+        delete_message_by_aster_id_on(self.conn, aster_id).map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_cached_message(
+        &self,
+        aster_id: &str,
+        folder: &str,
+        subject: Option<&str>,
+        sender: Option<&str>,
+        recipients: Option<&str>,
+        date: Option<&str>,
+        size: i64,
+        body_text: Option<&str>,
+        raw_headers: Option<&str>,
+    ) -> Result<bool, String> {
+        upsert_cached_message_on(
+            self.conn, aster_id, folder, subject, sender, recipients, date, size, body_text, raw_headers,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
+        remove_uid_mapping_on(self.conn, uid, folder).map_err(|e| e.to_string())
+    }
+
+    pub fn assign_uid_if_missing(&self, folder: &str, aster_id: &str) -> Result<u32, String> {
+        assign_uid_if_missing_on(self.conn, folder, aster_id).map_err(|e| e.to_string())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_cached_message_on(
+    conn: &Connection,
+    aster_id: &str,
+    folder: &str,
+    subject: Option<&str>,
+    sender: Option<&str>,
+    recipients: Option<&str>,
+    date: Option<&str>,
+    size: i64,
+    body_text: Option<&str>,
+    raw_headers: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let subject = subject.map(strip_c0_controls);
+    let sender = sender.map(strip_c0_controls);
+    let recipients = recipients.map(strip_c0_controls);
+    let body_text = body_text.map(strip_c0_controls);
+    let size = body_text
+        .as_ref()
+        .map_or(size, |b| crate::message_render::crlf_normalized_len(b) as i64);
+    conn.execute(
+        "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            aster_id,
+            folder,
+            subject,
+            sender,
+            recipients,
+            date,
+            size,
+            body_text.is_some() as i32,
+            body_text,
+            raw_headers,
+        ],
+    )?;
+    let was_inserted = conn.changes() > 0;
+    if !was_inserted {
+        conn.execute(
+            "UPDATE message_cache SET folder=?2, subject=?3, sender=?4, recipients=?5, date=?6, size=?7, raw_headers=?8 WHERE aster_id=?1",
+            rusqlite::params![aster_id, folder, subject, sender, recipients, date, size, raw_headers],
+        )?;
+        if body_text.is_some() {
+            conn.execute(
+                "UPDATE message_cache SET body_cached=1, body_text=?2 WHERE aster_id=?1",
+                rusqlite::params![aster_id, body_text],
+            )?;
+        }
+    }
+    Ok(was_inserted)
+}
+
+fn update_message_flags_on(conn: &Connection, imap_uid: i64, folder: &str, new_flags: i64) -> rusqlite::Result<()> {
+    let aster_id: Option<String> = conn
+        .query_row(
+            "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+            rusqlite::params![imap_uid, folder],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = aster_id {
+        conn.execute(
+            "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2",
+            rusqlite::params![new_flags, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_message_by_uid_on(conn: &Connection, uid: i64, folder: &str) -> rusqlite::Result<()> {
+    let aster_id: Option<String> = conn
+        .query_row(
+            "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+            rusqlite::params![uid, folder],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = &aster_id {
+        conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [id])?;
+        conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [id])?;
+        conn.execute(
+            "DELETE FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
+            rusqlite::params![id, folder],
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_uid_mapping_on(conn: &Connection, uid: i64, folder: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
+        rusqlite::params![uid, folder],
+    )?;
+    Ok(())
+}
+
+fn delete_message_by_aster_id_on(conn: &Connection, aster_id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM listing_member WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;
+    conn.execute("DELETE FROM history_retry WHERE aster_id = ?1", [aster_id])?;
+    Ok(())
+}
+
+fn assign_uid_if_missing_on(conn: &Connection, folder: &str, aster_id: &str) -> rusqlite::Result<u32> {
+    if let Ok(uid) = conn.query_row(
+        "SELECT imap_uid FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
+        rusqlite::params![aster_id, folder],
+        |r| r.get::<_, i64>(0),
+    ) {
+        return Ok(uid as u32);
+    }
+    let key = format!("uidnext:{}", folder);
+    let stored: i64 = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            rusqlite::params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let existing_max: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(imap_uid), 0) FROM uid_map WHERE folder = ?1",
+            rusqlite::params![folder],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let next = stored.max(existing_max + 1).max(1);
+    conn.execute(
+        "INSERT INTO uid_map (aster_id, folder, imap_uid) VALUES (?1, ?2, ?3)",
+        rusqlite::params![aster_id, folder, next],
+    )?;
+    conn.execute(
+        "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, (next + 1).to_string()],
+    )?;
+    Ok(next as u32)
+}
+
+fn set_message_keywords_on(conn: &Connection, aster_id: &str, keywords: &[String]) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM message_keywords WHERE aster_id = ?1", [aster_id])?;
+    for keyword in keywords {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_keywords (aster_id, keyword)
+             SELECT ?1, ?2 WHERE NOT EXISTS (
+                SELECT 1 FROM custom_tag WHERE keyword = ?2
+             )",
+            rusqlite::params![aster_id, keyword],
+        )?;
+    }
+    Ok(())
+}
+
 fn escape_fts_snippet(raw: Option<String>) -> Option<String> {
     raw.map(|s| {
         s.replace('&', "&amp;")
@@ -1010,6 +1227,27 @@ impl Database {
         })
     }
 
+    pub fn write_batch<R>(&self, f: impl FnOnce(&WriteBatch<'_>) -> R) -> R {
+        without_starving_the_runtime(|| {
+            let conn = match self.conn.lock() {
+                Ok(conn) => conn,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::warn!("write batch runs without a transaction: {}", e);
+                    return f(&WriteBatch { conn: &conn });
+                }
+            };
+            let out = f(&WriteBatch { conn: &tx });
+            if let Err(e) = tx.commit() {
+                tracing::warn!("write batch commit failed: {}", e);
+            }
+            out
+        })
+    }
+
     pub fn upsert_cached_message(
         &self,
         aster_id: &str,
@@ -1022,44 +1260,10 @@ impl Database {
         body_text: Option<&str>,
         raw_headers: Option<&str>,
     ) -> Result<bool, String> {
-        let subject = subject.map(strip_c0_controls);
-        let sender = sender.map(strip_c0_controls);
-        let recipients = recipients.map(strip_c0_controls);
-        let body_text = body_text.map(strip_c0_controls);
-        let size = body_text
-            .as_ref()
-            .map_or(size, |b| crate::message_render::crlf_normalized_len(b) as i64);
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    aster_id,
-                    folder,
-                    subject,
-                    sender,
-                    recipients,
-                    date,
-                    size,
-                    body_text.is_some() as i32,
-                    body_text,
-                    raw_headers,
-                ],
-            )?;
-            let was_inserted = conn.changes() > 0;
-            if !was_inserted {
-                conn.execute(
-                    "UPDATE message_cache SET folder=?2, subject=?3, sender=?4, recipients=?5, date=?6, size=?7, raw_headers=?8 WHERE aster_id=?1",
-                    rusqlite::params![aster_id, folder, subject, sender, recipients, date, size, raw_headers],
-                )?;
-                if body_text.is_some() {
-                    conn.execute(
-                        "UPDATE message_cache SET body_cached=1, body_text=?2 WHERE aster_id=?1",
-                        rusqlite::params![aster_id, body_text],
-                    )?;
-                }
-            }
-            Ok(was_inserted)
+            upsert_cached_message_on(
+                conn, aster_id, folder, subject, sender, recipients, date, size, body_text, raw_headers,
+            )
         })
     }
 
@@ -1299,24 +1503,7 @@ impl Database {
     }
 
     pub fn delete_message_by_uid(&self, uid: i64, folder: &str) -> Result<(), String> {
-        self.with_conn(|conn| {
-            let aster_id: Option<String> = conn
-                .query_row(
-                    "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
-                    rusqlite::params![uid, folder],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(id) = &aster_id {
-                conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [id])?;
-                conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [id])?;
-                conn.execute(
-                    "DELETE FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
-                    rusqlite::params![id, folder],
-                )?;
-            }
-            Ok(())
-        })
+        self.with_conn(|conn| delete_message_by_uid_on(conn, uid, folder))
     }
 
     pub fn set_folder_if_changed(&self, aster_id: &str, folder: &str) -> Result<(), String> {
@@ -1381,25 +1568,11 @@ impl Database {
     }
 
     pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "DELETE FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
-                rusqlite::params![uid, folder],
-            )?;
-            Ok(())
-        })
+        self.with_conn(|conn| remove_uid_mapping_on(conn, uid, folder))
     }
 
     pub fn delete_message_by_aster_id(&self, aster_id: &str) -> Result<(), String> {
-        self.with_conn(|conn| {
-            conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
-            conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
-            conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
-            conn.execute("DELETE FROM listing_member WHERE aster_id = ?1", [aster_id])?;
-            conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;
-            conn.execute("DELETE FROM history_retry WHERE aster_id = ?1", [aster_id])?;
-            Ok(())
-        })
+        self.with_conn(|conn| delete_message_by_aster_id_on(conn, aster_id))
     }
 
     pub fn get_message_flags_by_id(&self, aster_id: &str) -> Result<i64, String> {
@@ -1576,16 +1749,7 @@ impl Database {
     pub fn set_message_keywords(&self, aster_id: &str, keywords: &[String]) -> Result<(), String> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM message_keywords WHERE aster_id = ?1", [aster_id])?;
-            for keyword in keywords {
-                tx.execute(
-                    "INSERT OR IGNORE INTO message_keywords (aster_id, keyword)
-                     SELECT ?1, ?2 WHERE NOT EXISTS (
-                        SELECT 1 FROM custom_tag WHERE keyword = ?2
-                     )",
-                    rusqlite::params![aster_id, keyword],
-                )?;
-            }
+            set_message_keywords_on(&tx, aster_id, keywords)?;
             tx.commit()
         })
     }
@@ -1832,62 +1996,11 @@ impl Database {
     }
 
     pub fn update_message_flags(&self, imap_uid: i64, folder: &str, new_flags: i64) -> Result<(), String> {
-        self.with_conn(|conn| {
-            let aster_id: Option<String> = conn
-                .query_row(
-                    "SELECT aster_id FROM uid_map WHERE imap_uid = ?1 AND folder = ?2",
-                    rusqlite::params![imap_uid, folder],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(id) = aster_id {
-                conn.execute(
-                    "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2",
-                    rusqlite::params![new_flags, id],
-                )?;
-            }
-            Ok(())
-        })
+        self.with_conn(|conn| update_message_flags_on(conn, imap_uid, folder, new_flags))
     }
 
     pub fn assign_uid_if_missing(&self, folder: &str, aster_id: &str) -> Result<u32, String> {
-        self.with_conn(|conn| {
-            if let Ok(uid) = conn.query_row(
-                "SELECT imap_uid FROM uid_map WHERE aster_id = ?1 AND folder = ?2",
-                rusqlite::params![aster_id, folder],
-                |r| r.get::<_, i64>(0),
-            ) {
-                return Ok(uid as u32);
-            }
-            let key = format!("uidnext:{}", folder);
-            let stored: i64 = conn
-                .query_row(
-                    "SELECT value FROM sync_state WHERE key = ?1",
-                    rusqlite::params![key],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let existing_max: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(imap_uid), 0) FROM uid_map WHERE folder = ?1",
-                    rusqlite::params![folder],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let next = stored.max(existing_max + 1).max(1);
-            conn.execute(
-                "INSERT INTO uid_map (aster_id, folder, imap_uid) VALUES (?1, ?2, ?3)",
-                rusqlite::params![aster_id, folder, next],
-            )?;
-            conn.execute(
-                "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, (next + 1).to_string()],
-            )?;
-            Ok(next as u32)
-        })
+        self.with_conn(|conn| assign_uid_if_missing_on(conn, folder, aster_id))
     }
 
     pub fn uid_next(&self, folder: &str) -> Result<u32, String> {
@@ -3915,6 +4028,33 @@ mod db_tests {
         assert_eq!(meta.len(), 1);
         assert!(meta[0].body_text.is_none());
         assert_eq!(meta[0].subject.as_deref(), Some("subj"));
+    }
+
+    #[test]
+    fn write_batch_commits_every_write() {
+        let (_d, db) = open_db();
+        for id in ["b1", "b2", "b3"] {
+            insert(&db, id, "inbox");
+            db.assign_uid_if_missing("inbox", id).unwrap();
+        }
+        let moved_uid = db.write_batch(|batch| {
+            batch.update_message_flags(1, "inbox", 5).unwrap();
+            batch.set_message_keywords("b2", &["$Work".to_string()]).unwrap();
+            batch.delete_message_by_uid(3, "inbox").unwrap();
+            batch
+                .upsert_cached_message("b1", "archive", Some("subj"), None, None, None, 0, None, None)
+                .unwrap();
+            batch.remove_uid_mapping(1, "inbox").unwrap();
+            batch.assign_uid_if_missing("archive", "b1").unwrap()
+        });
+        assert_eq!(moved_uid, 1);
+        let b1 = db.get_cached_message("b1").unwrap().unwrap();
+        assert_eq!((b1.folder.as_str(), b1.flags, b1.imap_uid), ("archive", 5, 1));
+        assert!(b1.body_text.is_some(), "a move must keep the cached body");
+        assert_eq!(db.message_keywords("b2").unwrap(), vec!["$Work".to_string()]);
+        assert!(db.get_cached_message("b3").unwrap().is_none());
+        db.set_message_keywords("b2", &[]).unwrap();
+        assert!(db.message_keywords("b2").unwrap().is_empty());
     }
 
     #[test]
