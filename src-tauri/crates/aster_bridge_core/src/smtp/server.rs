@@ -769,7 +769,12 @@ pub fn build_send_payload_with_own_key(
     }
 
     let effective_to = if to_list.is_empty() {
-        recipients.to_vec()
+        let own_address = sender_identity
+            .filter(|i| i.kind != crate::auth::session::SendIdentityKind::Primary)
+            .map(|i| i.address.clone())
+            .unwrap_or_else(|| session_email.to_string());
+        bcc_list.retain(|a| !a.eq_ignore_ascii_case(&own_address));
+        vec![own_address]
     } else {
         to_list
     };
@@ -1353,7 +1358,8 @@ mod tests {
         let recipients = vec!["rcpt@example.com".to_string()];
         let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["subject"], "hi");
-        assert_eq!(payload["to"][0], "rcpt@example.com");
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["rcpt@example.com"]));
         assert_eq!(payload["client_source"], "bridge");
         assert_eq!(payload["is_e2e_encrypted"], false);
     }
@@ -1383,6 +1389,35 @@ mod tests {
         assert_eq!(payload["to"], serde_json::json!(["Kept@Example.com"]));
         assert!(payload["cc"].is_null());
         assert!(payload["bcc"].is_null());
+    }
+
+    #[test]
+    fn build_send_payload_keeps_blind_recipients_out_of_to() {
+        let raw = b"From: sender@aster.test
+To: list@example.com
+Subject: hi
+
+body
+";
+        let recipients = vec!["alice@example.com".to_string(), "bob@example.com".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert!(payload["cc"].is_null());
+        assert_eq!(payload["bcc"], serde_json::json!(["alice@example.com", "bob@example.com"]));
+    }
+
+    #[test]
+    fn build_send_payload_does_not_repeat_the_sender_in_bcc() {
+        let raw = b"From: sender@aster.test
+To: undisclosed-recipients:;
+Subject: hi
+
+body
+";
+        let recipients = vec!["alice@example.com".to_string(), "Sender@aster.test".to_string()];
+        let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["alice@example.com"]));
     }
 
     #[test]
