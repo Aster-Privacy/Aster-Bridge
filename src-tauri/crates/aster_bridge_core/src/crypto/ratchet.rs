@@ -27,6 +27,7 @@ use ml_kem::array::Array;
 use ml_kem::kem::Decapsulate;
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
 use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -39,6 +40,10 @@ type MlKemDecapKey = <MlKem768 as KemCore>::DecapsulationKey;
 const X3DH_INFO_CLASSICAL: &[u8] = b"Aster Mail_X3DH_v1";
 const X3DH_INFO_PQ: &[u8] = b"Aster Mail_PQXDH_v1";
 const X3DH_INFO_PQ_IDENTITY: &[u8] = b"Aster Mail_PQXDH_identity_v1";
+const X3DH_INFO_CLASSICAL_V2: &[u8] = b"Aster Mail_X3DH_v2";
+const X3DH_INFO_PQ_V2: &[u8] = b"Aster Mail_PQXDH_v2";
+const X3DH_INFO_PQ_IDENTITY_V2: &[u8] = b"Aster Mail_PQXDH_identity_v2";
+pub const X3DH_VERSION_TRANSCRIPT_BOUND: u8 = 2;
 const KDF_INFO_ROOT: &[u8] = b"Aster Mail_Root_KDF";
 const KDF_INFO_CHAIN: &[u8] = b"Aster Mail_Chain_KDF";
 const RATCHET_HEADER_AD_PREFIX: &[u8] = b"astermail-ratchet-header-v2";
@@ -65,6 +70,7 @@ pub struct RatchetMessage {
     pub pq_ciphertext: Option<Vec<u8>>,
     pub pq_key_id: Option<i32>,
     pub pq_secret: Option<Vec<u8>>,
+    pub x3dh_version: Option<u8>,
 }
 
 pub(crate) fn ecdh_p256(secret_d: &[u8], public_sec1: &[u8]) -> Result<[u8; 32], String> {
@@ -107,10 +113,20 @@ pub(crate) fn serialize_header_ad(version: u8, dh_public: &[u8], previous_chain_
     out
 }
 
-pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Result<String, String> {
-    if msg.nonce.len() != 12 {
-        return Err("ratchet nonce must be 12 bytes".to_string());
-    }
+fn identity_public_sec1(secret_d: &[u8]) -> Result<Vec<u8>, String> {
+    let sk = SecretKey::from_slice(secret_d).map_err(|e| format!("p256 secret: {}", e))?;
+    Ok(sk.public_key().to_encoded_point(false).as_bytes().to_vec())
+}
+
+pub(crate) fn derive_x3dh_shared_secret(
+    keys: &RatchetReceiverKeys,
+    msg: &RatchetMessage,
+) -> Result<Vec<u8>, String> {
+    let transcript_bound = match msg.x3dh_version {
+        None | Some(1) => false,
+        Some(X3DH_VERSION_TRANSCRIPT_BOUND) => true,
+        Some(other) => return Err(format!("unsupported x3dh version {}", other)),
+    };
 
     let dh1 = ecdh_p256(&keys.signed_prekey_secret_d, &msg.sender_identity_public)?;
     let dh2 = ecdh_p256(&keys.identity_secret_d, &msg.ephemeral_public)?;
@@ -121,22 +137,43 @@ pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Re
     ikm.extend_from_slice(&dh2);
     ikm.extend_from_slice(&dh3);
 
-    let info: &[u8] = match (&msg.pq_ciphertext, &msg.pq_secret) {
+    let (info, bound_ciphertext): (&[u8], Option<&[u8]>) = match (&msg.pq_ciphertext, &msg.pq_secret) {
         (Some(ct), Some(sk)) => {
             let mut pq_ss = ml_kem768_decapsulate(ct, sk)?;
             ikm.extend_from_slice(&pq_ss);
             pq_ss.zeroize();
-            if msg.pq_key_id == Some(PQ_IDENTITY_KEY_ID) {
-                X3DH_INFO_PQ_IDENTITY
-            } else {
-                X3DH_INFO_PQ
-            }
+            let from_identity = msg.pq_key_id == Some(PQ_IDENTITY_KEY_ID);
+            let info = match (from_identity, transcript_bound) {
+                (true, true) => X3DH_INFO_PQ_IDENTITY_V2,
+                (true, false) => X3DH_INFO_PQ_IDENTITY,
+                (false, true) => X3DH_INFO_PQ_V2,
+                (false, false) => X3DH_INFO_PQ,
+            };
+            (info, Some(ct.as_slice()))
         }
-        _ => X3DH_INFO_CLASSICAL,
+        _ if transcript_bound => (X3DH_INFO_CLASSICAL_V2, None),
+        _ => (X3DH_INFO_CLASSICAL, None),
     };
 
-    let mut shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32)?;
+    if transcript_bound {
+        ikm.extend_from_slice(&msg.sender_identity_public);
+        ikm.extend_from_slice(&identity_public_sec1(&keys.identity_secret_d)?);
+        if let Some(ct) = bound_ciphertext {
+            ikm.extend_from_slice(ct);
+        }
+    }
+
+    let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32);
     ikm.zeroize();
+    shared_secret
+}
+
+pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Result<String, String> {
+    if msg.nonce.len() != 12 {
+        return Err("ratchet nonce must be 12 bytes".to_string());
+    }
+
+    let mut shared_secret = derive_x3dh_shared_secret(keys, msg)?;
 
     let dh_root = ecdh_p256(&keys.signed_prekey_secret_d, &msg.header_dh_public)?;
     let mut root_out = hkdf_sha256(&dh_root, &shared_secret, KDF_INFO_ROOT, 64)?;
@@ -330,6 +367,10 @@ pub fn parse_recipient_message(ratchet: &Value, our_email: &str) -> Option<Ratch
         .and_then(|v| v.as_str())
         .and_then(|s| b64_decode(s).ok());
     let pq_key_id = rec.get("pq_key_id").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let x3dh_version = rec
+        .get("x3dh_v")
+        .and_then(|v| v.as_u64())
+        .map(|v| u8::try_from(v).unwrap_or(u8::MAX));
 
     Some(RatchetMessage {
         sender_identity_public,
@@ -343,6 +384,7 @@ pub fn parse_recipient_message(ratchet: &Value, our_email: &str) -> Option<Ratch
         pq_ciphertext,
         pq_key_id,
         pq_secret: None,
+        x3dh_version,
     })
 }
 
@@ -449,6 +491,7 @@ pub fn encrypt_bootstrap(
         pq_ciphertext,
         pq_key_id: out_key_id,
         pq_secret: None,
+        x3dh_version: None,
     })
 }
 
@@ -545,8 +588,109 @@ mod tests {
                 pq_ciphertext: pq_ct,
                 pq_key_id: if pq_secret.is_some() { Some(436178) } else { None },
                 pq_secret,
+                x3dh_version: None,
             },
         }
+    }
+
+    const VECTOR_RECEIVER_IDENTITY_D: &str = "S-TtOFuUV4kV3U_6iwvv7w_2FsCMvB2JJAP2qEHWENc";
+    const VECTOR_RECEIVER_SIGNED_PREKEY_D: &str = "_964242B7JrwBFGRDZSqeWB-34nP1X8JeFrM_kcb2h8";
+    const VECTOR_SENDER_IDENTITY: &str =
+        "BN8n2kbWCqaAzmq3WZqLmpl2H7G6DM2o8LP4z0ZA6DWEkVAiEcrDMyM/SF0M6g4KvkIGKE52GkieLoXBCXfcGbs=";
+    const VECTOR_SENDER_EPHEMERAL: &str =
+        "BDfQMwe0A3dW5WScHDZPToNk67qpP/VdQspfEd1zHZwW/IoCDYVRxpWBUF92xIgp85tfr76G3fgbq6w1F8NtXjw=";
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn vector_secret(version: Option<u8>, pq: bool, identity_lane: bool) -> Result<String, String> {
+        use ml_kem::EncapsulateDeterministic;
+
+        let seed: Vec<u8> = (0..64u32).map(|i| ((i * 13 + 5) & 0xff) as u8).collect();
+        let randomness: Vec<u8> = (0..32u32).map(|i| ((i * 17 + 9) & 0xff) as u8).collect();
+        let d = Array::try_from(&seed[..32]).unwrap();
+        let z = Array::try_from(&seed[32..]).unwrap();
+        let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+        let m = Array::try_from(&randomness[..]).unwrap();
+        let (ct, ss) = ek.encapsulate_deterministic(&m).unwrap();
+
+        assert_eq!(
+            to_hex(ss.as_slice()),
+            "5c21a072f4c2a105009f3b845108363b3768e0a0acaa9f3b8c8e2998eb77cc41"
+        );
+        assert_eq!(
+            to_hex(Sha256::digest(ct.as_slice()).as_slice()),
+            "a43360145b62962fd1e7a66fe28a609b95eb15292119638cbff121b9e1dfa341"
+        );
+
+        let keys = RatchetReceiverKeys {
+            identity_secret_d: URL_SAFE_NO_PAD.decode(VECTOR_RECEIVER_IDENTITY_D).unwrap(),
+            signed_prekey_secret_d: URL_SAFE_NO_PAD.decode(VECTOR_RECEIVER_SIGNED_PREKEY_D).unwrap(),
+            signed_prekey_public: Vec::new(),
+        };
+        let msg = RatchetMessage {
+            sender_identity_public: STANDARD.decode(VECTOR_SENDER_IDENTITY).unwrap(),
+            ephemeral_public: STANDARD.decode(VECTOR_SENDER_EPHEMERAL).unwrap(),
+            header_dh_public: Vec::new(),
+            previous_chain_length: 0,
+            message_number: 0,
+            header_version: None,
+            ciphertext: Vec::new(),
+            nonce: Vec::new(),
+            pq_ciphertext: pq.then(|| ct.as_slice().to_vec()),
+            pq_key_id: pq.then(|| if identity_lane { PQ_IDENTITY_KEY_ID } else { 7 }),
+            pq_secret: pq.then(|| dk.as_bytes().to_vec()),
+            x3dh_version: version,
+        };
+
+        derive_x3dh_shared_secret(&keys, &msg).map(|secret| to_hex(&secret))
+    }
+
+    #[test]
+    fn x3dh_secrets_match_the_cross_client_vectors() {
+        assert_eq!(
+            vector_secret(Some(1), false, false).unwrap(),
+            "8d18029bb35dde7d83b8f9228152e49d34e096819b1fb7c810ef70ac5bc600b6"
+        );
+        assert_eq!(vector_secret(None, false, false), vector_secret(Some(1), false, false));
+        assert_eq!(
+            vector_secret(Some(2), false, false).unwrap(),
+            "6bb032c615db5f87012e62cf8da751b52343c2b4c2d5ed8f140a2c1bb6014f48"
+        );
+        assert_eq!(
+            vector_secret(Some(1), true, false).unwrap(),
+            "efa41c478ff0477bfea970527a6a9cee3d8a348e3e4704e255593aa18e3b25f6"
+        );
+        assert_eq!(
+            vector_secret(Some(2), true, false).unwrap(),
+            "023e364282464ccbe2c013d61f7453907d94e2a464f0ee5025cb485eb9cc324c"
+        );
+        assert_eq!(
+            vector_secret(Some(2), true, true).unwrap(),
+            "1ffb50c01be8f1aa988305dc1152a159a7ab59ad9f845e2f3f7544bf272af88a"
+        );
+    }
+
+    #[test]
+    fn unknown_x3dh_version_is_rejected() {
+        assert!(vector_secret(Some(3), false, false).is_err());
+    }
+
+    #[test]
+    fn parses_the_x3dh_version_from_the_recipient_entry() {
+        let (case, _, _) = pq_identity_vector_parts();
+        let mut ratchet = find_ratchet_object(&case["envelope"]).unwrap();
+        let our_email = case["our_email"].as_str().unwrap();
+
+        assert_eq!(parse_recipient_message(&ratchet, our_email).unwrap().x3dh_version, None);
+
+        let recipients = ratchet["recipients"].as_object_mut().unwrap();
+        for entry in recipients.values_mut() {
+            entry["x3dh_v"] = json!(2);
+        }
+
+        assert_eq!(parse_recipient_message(&ratchet, our_email).unwrap().x3dh_version, Some(2));
     }
 
     #[test]

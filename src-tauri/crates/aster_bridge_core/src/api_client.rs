@@ -182,6 +182,7 @@ pub struct ReportEnvelopeCapability<'a> {
     pub max_envelope_marker: i16,
     pub platform: &'a str,
     pub identity_fingerprint: Option<&'a str>,
+    pub x3dh_max_version: i16,
 }
 
 #[derive(Debug, Deserialize)]

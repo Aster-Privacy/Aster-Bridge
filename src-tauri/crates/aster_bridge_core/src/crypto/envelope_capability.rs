@@ -29,9 +29,11 @@ use sha2::{Digest, Sha256};
 
 use crate::api_client::{ApiClient, ReportEnvelopeCapability};
 use crate::crypto::inbound::INBOUND_PQ_HYBRID_MARKER;
+use crate::crypto::ratchet::X3DH_VERSION_TRANSCRIPT_BOUND;
 
 pub const MAX_ENVELOPE_MARKER: i16 = INBOUND_PQ_HYBRID_MARKER as i16;
 pub const PLATFORM: &str = "bridge";
+pub const X3DH_MAX_VERSION: i16 = X3DH_VERSION_TRANSCRIPT_BOUND as i16;
 pub const REPORT_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 
 const STATE_FILE: &str = "envelope_capability.json";
@@ -146,6 +148,7 @@ pub async fn report_if_due(
         max_envelope_marker: MAX_ENVELOPE_MARKER,
         platform: PLATFORM,
         identity_fingerprint: fingerprint.as_deref(),
+        x3dh_max_version: X3DH_MAX_VERSION,
     };
 
     match client.report_envelope_capability(access_token, &body).await {
@@ -193,6 +196,20 @@ mod tests {
     fn bridge_reports_the_pq_hybrid_marker() {
         assert_eq!(MAX_ENVELOPE_MARKER, 4);
         assert_eq!(MAX_ENVELOPE_MARKER, INBOUND_PQ_HYBRID_MARKER as i16);
+    }
+
+    #[test]
+    fn bridge_reports_transcript_bound_key_agreement() {
+        let body = ReportEnvelopeCapability {
+            client_id: "client",
+            max_envelope_marker: MAX_ENVELOPE_MARKER,
+            platform: PLATFORM,
+            identity_fingerprint: None,
+            x3dh_max_version: X3DH_MAX_VERSION,
+        };
+        let value = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(value["x3dh_max_version"], 2);
     }
 
     #[test]
