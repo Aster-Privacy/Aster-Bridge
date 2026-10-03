@@ -552,6 +552,7 @@ fn carry_attachment_meta(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_decrypt_attachments(
     client: &ApiClient,
     access_token: &str,
@@ -560,9 +561,10 @@ async fn fetch_and_decrypt_attachments(
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
+    timeout: Option<std::time::Duration>,
 ) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
     let resp = client
-        .list_attachments_for_mail(access_token, mail_id)
+        .list_attachments_for_mail(access_token, mail_id, timeout)
         .await
         .map_err(classify_api_error)?;
     if resp.attachments.is_empty() {
@@ -681,6 +683,7 @@ async fn backfill_pending_attachments(
                 }
                 Ok(_) => {}
                 Err(AttachmentFetchError::Transport(e)) => {
+                    let _ = db.bump_attachment_attempts(&aster_id);
                     tracing::debug!("attachment key refresh for {} deferred: {}", aster_id, e);
                     break;
                 }
@@ -697,6 +700,7 @@ async fn backfill_pending_attachments(
             passphrase,
             identity_key,
             previous_keys,
+            Some(crate::api_client::ATTACHMENT_TRANSFER_TIMEOUT),
         )
         .await
         {
@@ -723,6 +727,9 @@ async fn backfill_pending_attachments(
                 updated.push(aster_id);
             }
             Err(AttachmentFetchError::Transport(e)) => {
+                // Moves the message behind the rest of the backlog, so one
+                // download that keeps failing does not hold up the others.
+                let _ = db.bump_attachment_attempts(&aster_id);
                 tracing::debug!("attachment download for {} deferred: {}", aster_id, e);
                 break;
             }
@@ -1684,6 +1691,7 @@ async fn run_sync_pass(
                                         &passphrase,
                                         identity_key.as_deref(),
                                         &previous_keys,
+                                        None,
                                     )
                                     .await
                                     {
@@ -2314,6 +2322,46 @@ mod tests {
         db.set_attachments_state("mail-retry", ATTACHMENTS_FAILED)
             .unwrap();
         assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_download_moves_behind_the_rest_of_the_backlog() {
+        let (_dir, db) = temp_db();
+        for id in ["mail-a", "mail-b"] {
+            db.upsert_cached_message(
+                id,
+                "inbox",
+                Some("subject"),
+                None,
+                None,
+                None,
+                4,
+                Some("body"),
+                None,
+            )
+            .unwrap();
+            db.set_attachments_state(id, ATTACHMENTS_PENDING).unwrap();
+        }
+        let base = spawn_mock_list_server(Vec::new()).await;
+        let client = ApiClient::new_with_base_url(&base);
+
+        let first = db.list_attachment_backlog(10).unwrap()[0].0.clone();
+        let updated = backfill_pending_attachments(
+            &db,
+            &client,
+            "tok",
+            b"pass",
+            None,
+            &[],
+            &[],
+            &HashSet::new(),
+        )
+        .await;
+
+        assert!(updated.is_empty());
+        let backlog = db.list_attachment_backlog(10).unwrap();
+        assert_eq!(backlog.len(), 2);
+        assert_ne!(backlog[0].0, first, "the failing message must not stay at the head");
     }
 
     #[test]
