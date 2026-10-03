@@ -499,7 +499,14 @@ impl Database {
     }
 
     fn prepare_schema(conn: &Connection) -> Result<(), String> {
-        conn.pragma_update(None, "journal_mode", "WAL")
+        let journal_mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| e.to_string())?;
+        }
+        conn.pragma_update(None, "cache_size", -65536)
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| e.to_string())?;
@@ -2359,6 +2366,30 @@ mod encryption_tests {
         let reopened = Database::open_with_key(dir.path(), &key).unwrap();
         assert!(reopened.get_cached_message("a1").unwrap().is_some());
         assert_eq!(quarantined_files(dir.path()).len(), 1, "a healthy database is not quarantined again");
+    }
+
+    #[test]
+    fn connection_pragmas_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[4u8; 32]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let get = |name: &str| -> String {
+            conn.query_row(&format!("PRAGMA {}", name), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{:?}", other),
+            })
+            .unwrap()
+        };
+        assert_eq!(get("journal_mode"), "wal");
+        assert_eq!(get("synchronous"), "1");
+        assert_eq!(get("cache_size"), "-65536");
+        assert_eq!(get("secure_delete"), "1");
+        assert_eq!(get("foreign_keys"), "1");
+        assert!(!get("cipher_version").is_empty());
     }
 
     #[test]
