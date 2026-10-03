@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.0 - 2026-10-03
+
+### What's new
+- Aster Bridge reaches version 1.0 and is no longer in beta.
+
+### Fixed
+- Aster Bridge stays signed in after your computer wakes from sleep, and it no longer sends a message twice when a send is retried.
+- Messages that you send go only to the recipients that your mail app specifies, and a send that fails permanently stops retrying.
+- If Aster Bridge can't save a message with all of its attachments, your mail app shows an error instead of saving the message without them.
+- Opening a folder in read-only mode no longer marks its messages as read.
+- Messages that you delete on another device now disappear from large folders too, and attachment downloads no longer stall the rest of the sync.
+- Aster Bridge answers requests from mail and contacts apps more accurately, so folders, searches, and message counts match what is on the server.
+- Connections to Aster stay protected if the certificate authority for Aster's servers changes.
+
 ## 0.4.38 - 2026-10-02
 
 ### Fixed
