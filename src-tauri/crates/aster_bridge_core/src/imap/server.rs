@@ -850,9 +850,6 @@ impl ImapConnection {
     }
 }
 
-/// The selected mailbox as this session numbers it: message sequence
-/// numbers follow the UIDs announced to the client, not the current
-/// listing, until EXPUNGE and EXISTS responses tell the client otherwise.
 struct MailboxView<'a> {
     messages: Vec<Option<&'a CachedMessage>>,
     seq_by_uid: std::collections::HashMap<u32, usize>,
@@ -896,9 +893,6 @@ impl<'a> MailboxView<'a> {
     }
 }
 
-/// Brings the session's numbering up to date with the mailbox. Expunges are
-/// only reported where RFC 3501 §7.4.1 allows them, so a command that takes
-/// sequence numbers keeps the messages it was addressing.
 async fn report_mailbox_changes(
     writer: &mut (impl AsyncWrite + Unpin),
     conn: &mut ImapConnection,
@@ -1821,8 +1815,6 @@ where
                             let Ok(current_meta) = db.list_cached_message_meta(&folder) else {
                                 continue;
                             };
-                            // A FLAGS response without the keywords would
-                            // make the client drop them.
                             let keywords_by_uid: std::collections::HashMap<u32, Vec<String>> = {
                                 let by_id = db.folder_keywords(&folder).unwrap_or_default();
                                 current_meta
