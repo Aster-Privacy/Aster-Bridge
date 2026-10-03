@@ -66,6 +66,67 @@ async fn with_attachments(
 const ATTACHMENTS_UNAVAILABLE: &[u8] =
     b"-ERR [SYS/TEMP] the attachments of this message could not be downloaded; try again later\r\n";
 
+fn wire_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                lines.push(&text[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                start = i;
+            }
+            b'\n' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+fn push_wire_line(out: &mut String, line: &str) {
+    if line.starts_with('.') {
+        out.push('.');
+    }
+    out.push_str(line);
+    out.push_str("\r\n");
+}
+
+fn retr_response(text: &str) -> String {
+    let lines = wire_lines(text);
+    let octets: usize = lines.iter().map(|l| l.len() + 2).sum();
+    let mut out = String::with_capacity(octets + 64);
+    out.push_str(&format!("+OK {} octets\r\n", octets));
+    for line in &lines {
+        push_wire_line(&mut out, line);
+    }
+    out.push_str(".\r\n");
+    out
+}
+
+fn top_response(text: &str, line_count: usize) -> String {
+    let lines = wire_lines(text);
+    let header_end = lines.iter().position(|l| l.is_empty()).unwrap_or(lines.len());
+    let mut out = String::from("+OK\r\n");
+    for line in &lines[..header_end] {
+        push_wire_line(&mut out, line);
+    }
+    out.push_str("\r\n");
+    for line in lines.iter().skip(header_end + 1).take(line_count) {
+        push_wire_line(&mut out, line);
+    }
+    out.push_str(".\r\n");
+    out
+}
+
 static POP3_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct Pop3SessionLock;
@@ -466,23 +527,7 @@ where
                             continue;
                         };
                         let rfc = full_message_text(&db, &full);
-                        let mut dot_stuffed = String::with_capacity(rfc.len() + 64);
-                        let lines: Vec<&str> = rfc.split("\r\n").collect();
-                        let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-                            &lines[..lines.len() - 1]
-                        } else {
-                            &lines[..]
-                        };
-                        for rline in content_lines {
-                            if rline.starts_with('.') {
-                                dot_stuffed.push('.');
-                            }
-                            dot_stuffed.push_str(rline);
-                            dot_stuffed.push_str("\r\n");
-                        }
-                        writer.write_all(format!("+OK {} octets\r\n", rfc.len()).as_bytes()).await?;
-                        writer.write_all(dot_stuffed.as_bytes()).await?;
-                        writer.write_all(b".\r\n").await?;
+                        writer.write_all(retr_response(&rfc).as_bytes()).await?;
                     } else {
                         writer.write_all(b"-ERR message body unavailable\r\n").await?;
                     }
@@ -511,35 +556,7 @@ where
                 };
                 if let Some(full) = full_top {
                     let rfc = full_message_text(&db, &full);
-                    let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
-                    let header_str = &rfc[..sep];
-                    let body = rfc.get(sep + 2..).unwrap_or("");
-                    writer.write_all(b"+OK\r\n").await?;
-                    for hline in header_str.split("\r\n") {
-                        if hline.starts_with('.') {
-                            writer.write_all(b".").await?;
-                        }
-                        writer.write_all(hline.as_bytes()).await?;
-                        writer.write_all(b"\r\n").await?;
-                    }
-                    writer.write_all(b"\r\n").await?;
-                    let body_lines: Vec<&str> = body.split("\r\n").collect();
-                    let body_content = if body_lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-                        &body_lines[..body_lines.len() - 1]
-                    } else {
-                        &body_lines[..]
-                    };
-                    for (i, bline) in body_content.iter().enumerate() {
-                        if i >= line_count {
-                            break;
-                        }
-                        if bline.starts_with('.') {
-                            writer.write_all(b".").await?;
-                        }
-                        writer.write_all(bline.as_bytes()).await?;
-                        writer.write_all(b"\r\n").await?;
-                    }
-                    writer.write_all(b".\r\n").await?;
+                    writer.write_all(top_response(&rfc, line_count).as_bytes()).await?;
                 } else {
                     writer.write_all(b"-ERR no such message\r\n").await?;
                 }
@@ -703,77 +720,315 @@ mod tests {
         assert!(rfc.contains("\r\n\r\n"));
     }
 
+    static AUTHENTICATED_SESSION_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn wait_for_maildrop_release() {
+        for _ in 0..200 {
+            if !POP3_SESSION_ACTIVE.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the maildrop lock was never released");
+    }
+
+    fn decode_multiline(wire: &str) -> (String, Vec<String>, Vec<String>) {
+        let lines = wire_lines(wire);
+        let status = lines[0].to_string();
+        let end = lines
+            .iter()
+            .skip(1)
+            .position(|l| *l == ".")
+            .map(|p| p + 1)
+            .expect("a multi-line response always carries a terminator");
+        let content = lines[1..end]
+            .iter()
+            .map(|l| l.strip_prefix('.').unwrap_or(l).to_string())
+            .collect();
+        let leftover = lines[end + 1..].iter().map(|l| l.to_string()).collect();
+        (status, content, leftover)
+    }
+
+    fn assert_strict_crlf(wire: &str) {
+        let stripped = wire.replace("\r\n", "");
+        assert!(
+            !stripped.contains('\r') && !stripped.contains('\n'),
+            "response carries a bare CR or LF: {:?}",
+            wire
+        );
+        assert!(wire.ends_with("\r\n.\r\n"));
+    }
+
     #[test]
-    fn top_split_with_separator() {
+    fn wire_lines_splits_on_every_line_ending() {
+        assert_eq!(wire_lines("a\r\nb\nc\rd"), vec!["a", "b", "c", "d"]);
+        assert_eq!(wire_lines("a\r\n"), vec!["a"]);
+        assert_eq!(wire_lines("a\n\nb"), vec!["a", "", "b"]);
+        assert_eq!(wire_lines("\r\r\n"), vec!["", ""]);
+        assert_eq!(wire_lines("\n"), vec![""]);
+        assert!(wire_lines("").is_empty());
+        assert_eq!(
+            wire_lines("h\u{e9}llo\n\u{4e16}\u{754c}"),
+            vec!["h\u{e9}llo", "\u{4e16}\u{754c}"]
+        );
+    }
+
+    #[test]
+    fn retr_keeps_crlf_messages_byte_for_byte() {
+        let rfc = "From: a@aster.test\r\nSubject: hi\r\n\r\nline one\r\n\r\nline three\r\n";
+        assert_eq!(
+            retr_response(rfc),
+            format!("+OK {} octets\r\n{}.\r\n", rfc.len(), rfc)
+        );
+    }
+
+    #[test]
+    fn retr_stuffs_leading_dots_after_crlf() {
+        let wire = retr_response(".secret\r\nnormal\r\n..double\r\n");
+        assert_eq!(wire, "+OK 27 octets\r\n..secret\r\nnormal\r\n...double\r\n.\r\n");
+    }
+
+    #[test]
+    fn retr_leaves_normal_lines_untouched() {
+        let wire = retr_response("plain line\r\nanother\r\n");
+        assert_eq!(wire, "+OK 21 octets\r\nplain line\r\nanother\r\n.\r\n");
+    }
+
+    #[test]
+    fn retr_stuffs_a_lone_dot_after_a_bare_line_feed() {
+        let wire = retr_response("Subject: x\r\n\r\nHi\n.\n+OK fake\nBye");
+        assert_eq!(
+            wire,
+            "+OK 36 octets\r\nSubject: x\r\n\r\nHi\r\n..\r\n+OK fake\r\nBye\r\n.\r\n"
+        );
+        assert_strict_crlf(&wire);
+        let (status, content, leftover) = decode_multiline(&wire);
+        assert_eq!(status, "+OK 36 octets");
+        assert_eq!(content, vec!["Subject: x", "", "Hi", ".", "+OK fake", "Bye"]);
+        assert!(leftover.is_empty(), "message text leaked past the terminator: {:?}", leftover);
+    }
+
+    #[test]
+    fn retr_stuffs_a_lone_dot_after_a_bare_carriage_return() {
+        let wire = retr_response("Subject: x\r\n\r\nHi\r.\r-ERR fake\rBye");
+        assert_strict_crlf(&wire);
+        let (_, content, leftover) = decode_multiline(&wire);
+        assert_eq!(content, vec!["Subject: x", "", "Hi", ".", "-ERR fake", "Bye"]);
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn retr_of_a_rendered_message_with_a_hostile_body_stays_framed() {
+        let mut m = sample_message("id-hostile");
+        m.body_text = Some("Hi\n.\n+OK fake\n.\r\n-ERR spoof\r.\rBye".to_string());
+        let rfc = message_render::render_text(&m, &[]);
+        let wire = retr_response(&rfc);
+        assert_strict_crlf(&wire);
+        let (status, content, leftover) = decode_multiline(&wire);
+        assert!(leftover.is_empty(), "message text leaked past the terminator: {:?}", leftover);
+        let octets: usize = content.iter().map(|l| l.len() + 2).sum();
+        assert_eq!(status, format!("+OK {} octets", octets));
+        let tail: Vec<&str> = content.iter().rev().take(7).rev().map(|s| s.as_str()).collect();
+        assert_eq!(tail, vec!["Hi", ".", "+OK fake", ".", "-ERR spoof", ".", "Bye"]);
+    }
+
+    #[test]
+    fn top_returns_headers_one_blank_line_and_the_requested_lines() {
+        let rfc = "A: 1\r\nB: 2\r\n\r\none\r\ntwo\r\nthree\r\n";
+        assert_eq!(top_response(rfc, 2), "+OK\r\nA: 1\r\nB: 2\r\n\r\none\r\ntwo\r\n.\r\n");
+        assert_eq!(top_response(rfc, 0), "+OK\r\nA: 1\r\nB: 2\r\n\r\n.\r\n");
+        assert_eq!(
+            top_response(rfc, 99),
+            "+OK\r\nA: 1\r\nB: 2\r\n\r\none\r\ntwo\r\nthree\r\n.\r\n"
+        );
+    }
+
+    #[test]
+    fn top_counts_lines_of_a_body_that_uses_bare_line_feeds() {
+        let wire = top_response("A: 1\r\n\r\none\n.\ntwo\nthree", 2);
+        assert_eq!(wire, "+OK\r\nA: 1\r\n\r\none\r\n..\r\n.\r\n");
+        assert_strict_crlf(&wire);
+        let (_, content, leftover) = decode_multiline(&wire);
+        assert_eq!(content, vec!["A: 1", "", "one", "."]);
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn top_keeps_blank_lines_inside_the_body() {
+        let wire = top_response("A: 1\r\n\r\none\r\n\r\nthree\r\n", 3);
+        assert_eq!(wire, "+OK\r\nA: 1\r\n\r\none\r\n\r\nthree\r\n.\r\n");
+    }
+
+    #[test]
+    fn top_of_a_rendered_message_splits_headers_from_body() {
         let m = sample_message("id-5");
-        let rfc = build_rfc822(&m);
-        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
-        let header_str = &rfc[..sep];
-        let body = rfc.get(sep + 2..).unwrap_or("");
-        assert!(header_str.contains("From:"));
-        assert!(body.contains("line one"));
+        let wire = top_response(&build_rfc822(&m), 1);
+        let (_, content, leftover) = decode_multiline(&wire);
+        assert!(leftover.is_empty());
+        let blank = content.iter().position(|l| l.is_empty()).unwrap();
+        assert!(content[..blank].iter().any(|l| l.starts_with("From:")));
+        assert_eq!(content[blank + 1..].to_vec(), vec!["line one".to_string()]);
     }
 
     #[test]
-    fn top_split_no_separator_does_not_panic() {
-        let rfc = "Header-Only: yes\r\nNo-Body-Here: true";
-        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
-        let header_str = &rfc[..sep];
-        let body = rfc.get(sep + 2..).unwrap_or("");
-        assert_eq!(header_str, rfc);
-        assert_eq!(body, "");
+    fn top_without_a_separator_treats_everything_as_headers() {
+        let wire = top_response("Header-Only: yes\r\nNo-Body-Here: true", 5);
+        assert_eq!(wire, "+OK\r\nHeader-Only: yes\r\nNo-Body-Here: true\r\n\r\n.\r\n");
     }
 
     #[test]
-    fn top_split_empty_string_does_not_panic() {
-        let rfc = "";
-        let sep = rfc.find("\r\n\r\n").map(|p| p + 2).unwrap_or(rfc.len());
-        let header_str = &rfc[..sep];
-        let body = rfc.get(sep + 2..).unwrap_or("");
-        assert_eq!(header_str, "");
-        assert_eq!(body, "");
+    fn empty_text_does_not_panic() {
+        assert_eq!(retr_response(""), "+OK 0 octets\r\n.\r\n");
+        assert_eq!(top_response("", 3), "+OK\r\n\r\n.\r\n");
     }
 
     #[test]
-    fn dot_stuffing_prefixes_leading_dot_lines() {
-        let rfc = ".secret\r\nnormal\r\n..double\r\n";
-        let mut dot_stuffed = String::new();
-        let lines: Vec<&str> = rfc.split("\r\n").collect();
-        let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-            &lines[..lines.len() - 1]
-        } else {
-            &lines[..]
-        };
-        for rline in content_lines {
-            if rline.starts_with('.') {
-                dot_stuffed.push('.');
+    fn no_short_text_can_end_a_response_early() {
+        const ALPHABET: [char; 5] = ['.', '\r', '\n', 'a', '+'];
+        const MAX_LEN: usize = 7;
+        let mut checked = 0usize;
+        for len in 0..=MAX_LEN {
+            let total = ALPHABET.len().pow(len as u32);
+            for index in 0..total {
+                let mut n = index;
+                let mut body = String::with_capacity(len);
+                for _ in 0..len {
+                    body.push(ALPHABET[n % ALPHABET.len()]);
+                    n /= ALPHABET.len();
+                }
+                let text = format!("H: v\r\n\r\n{}", body);
+                let expected: Vec<String> =
+                    wire_lines(&text).iter().map(|l| l.to_string()).collect();
+
+                let wire = retr_response(&text);
+                assert_strict_crlf(&wire);
+                let (status, content, leftover) = decode_multiline(&wire);
+                assert!(leftover.is_empty(), "RETR leaked for {:?}: {:?}", body, wire);
+                assert_eq!(content, expected, "RETR changed the content of {:?}", body);
+                let octets: usize = expected.iter().map(|l| l.len() + 2).sum();
+                assert_eq!(status, format!("+OK {} octets", octets));
+
+                for limit in [0usize, 1, 2, 100] {
+                    let wire = top_response(&text, limit);
+                    assert_strict_crlf(&wire);
+                    let (status, content, leftover) = decode_multiline(&wire);
+                    assert_eq!(status, "+OK");
+                    assert!(leftover.is_empty(), "TOP leaked for {:?}: {:?}", body, wire);
+                    let keep = (2 + limit).min(expected.len());
+                    assert_eq!(content, expected[..keep].to_vec(), "TOP {} of {:?}", limit, body);
+                }
+                checked += 1;
             }
-            dot_stuffed.push_str(rline);
-            dot_stuffed.push_str("\r\n");
         }
-        assert!(dot_stuffed.starts_with("..secret\r\n"));
-        assert!(dot_stuffed.contains("normal\r\n"));
-        assert!(dot_stuffed.contains("...double\r\n"));
+        assert_eq!(checked, 97656);
     }
 
-    #[test]
-    fn dot_stuffing_leaves_normal_lines_untouched() {
-        let rfc = "plain line\r\nanother\r\n";
-        let mut dot_stuffed = String::new();
-        let lines: Vec<&str> = rfc.split("\r\n").collect();
-        let content_lines = if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-            &lines[..lines.len() - 1]
-        } else {
-            &lines[..]
-        };
-        for rline in content_lines {
-            if rline.starts_with('.') {
-                dot_stuffed.push('.');
-            }
-            dot_stuffed.push_str(rline);
-            dot_stuffed.push_str("\r\n");
+    #[tokio::test]
+    async fn retr_and_top_keep_a_hostile_body_inside_the_response() {
+        let _serial = AUTHENTICATED_SESSION_TESTS.lock().await;
+        wait_for_maildrop_release().await;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[5u8; 32]).unwrap());
+        db.upsert_cached_message(
+            "pop-hostile",
+            "inbox",
+            Some("s"),
+            Some("a@b.com"),
+            Some("c@d.com"),
+            Some("2026-01-01T00:00:00Z"),
+            10,
+            Some("Hi\n.\n+OK fake\n-ERR spoofed\r.\rBye"),
+            Some("{\"is_html\":false}"),
+        )
+        .unwrap();
+        let _ = db.assign_uid_if_missing("inbox", "pop-hostile");
+
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_with_tls(listener, session, db, client, passwords, None).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"));
+
+        for cmd in ["USER tester@aster.test", "PASS abcd-efgh-ijkl-mnop"] {
+            w.write_all(format!("{}\r\n", cmd).as_bytes()).await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("+OK"), "{} failed: {}", cmd, line);
         }
-        assert_eq!(dot_stuffed, "plain line\r\nanother\r\n");
+
+        for (cmd, expected_tail) in [
+            ("RETR 1", vec!["Hi", ".", "+OK fake", "-ERR spoofed", ".", "Bye"]),
+            ("TOP 1 2", vec!["Hi", "."]),
+        ] {
+            w.write_all(format!("{}\r\n", cmd).as_bytes()).await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("+OK"), "{} failed: {}", cmd, line);
+            let mut content: Vec<String> = Vec::new();
+            loop {
+                line.clear();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .expect("the response never ended")
+                .unwrap();
+                assert!(read > 0);
+                assert!(line.ends_with("\r\n"), "{} sent a bare line feed: {:?}", cmd, line);
+                let text = line.trim_end_matches("\r\n");
+                assert!(!text.contains('\r'), "{} sent a bare carriage return: {:?}", cmd, line);
+                if text == "." {
+                    break;
+                }
+                content.push(text.strip_prefix('.').unwrap_or(text).to_string());
+            }
+            let blank = content.iter().position(|l| l.is_empty()).unwrap();
+            assert_eq!(content[blank + 1..].to_vec(), expected_tail, "{}", cmd);
+
+            w.write_all(b"NOOP\r\n").await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "+OK\r\n", "the reply after {} came from the message body", cmd);
+        }
+
+        w.write_all(b"QUIT\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"));
+        wait_for_maildrop_release().await;
+        drop(dir);
     }
 
     #[test]
@@ -1129,6 +1384,8 @@ mod tests {
 
     #[tokio::test]
     async fn dele_quit_deletes_on_server_and_locally() {
+        let _serial = AUTHENTICATED_SESSION_TESTS.lock().await;
+        wait_for_maildrop_release().await;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
 
@@ -1216,5 +1473,6 @@ mod tests {
         }
         assert!(db.get_cached_message("pop-1").unwrap().is_none());
         assert_eq!(calls.lock().await.clone(), vec!["pop-1".to_string()]);
+        wait_for_maildrop_release().await;
     }
 }
