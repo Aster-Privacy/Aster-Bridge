@@ -3719,12 +3719,7 @@ async fn handle_fetch(
         || wants_rfc822_text
         || wants_bodystructure
         || header_fields.is_some();
-    let messages = if needs_body {
-        db.list_cached_messages(folder)
-    } else {
-        db.list_cached_message_meta(folder)
-    }
-    .unwrap_or_default();
+    let messages = db.list_cached_message_meta(folder).unwrap_or_default();
     let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
     let folder_attachment_meta = if !needs_body && wants_size {
         db.list_attachment_meta_for_folder(folder).unwrap_or_default()
@@ -3742,9 +3737,21 @@ async fn handle_fetch(
         } else {
             view.by_seq(*n).map(|m| (*n as usize, m))
         };
-        let Some((seq_num, msg)) = found else {
+        let Some((seq_num, meta)) = found else {
             continue;
         };
+        let with_body = if needs_body {
+            let Ok(Some(stored)) = db.get_cached_message(&meta.aster_id) else {
+                continue;
+            };
+            Some(CachedMessage {
+                body_text: stored.body_text,
+                ..meta.clone()
+            })
+        } else {
+            None
+        };
+        let msg = with_body.as_ref().unwrap_or(meta);
         let uid = msg.imap_uid;
         let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
         let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
@@ -7523,5 +7530,115 @@ mod tests {
         let lines = read_until_tag(&mut reader, "a3").await;
         let combined = lines.join("\n");
         assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+    }
+
+    async fn imap_cmd_bytes(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<u8> {
+        writer.write_all(format!("{} {}\r\n", tag, cmd).as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            let start = out.len();
+            let n = reader.read_until(b'\n', &mut out).await.unwrap();
+            if n == 0 || out[start..].starts_with(format!("{} ", tag).as_bytes()) {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fetching_one_uid_of_many_matches_the_full_folder_render() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=40 {
+            let id = format!("many-{}", n);
+            if n == 17 {
+                seed_copy_source(
+                    &db,
+                    &id,
+                    "with attachment",
+                    &[crate::db::CachedAttachment {
+                        seq: 0,
+                        name: "figures.csv".to_string(),
+                        content_type: "text/csv".to_string(),
+                        content_id: None,
+                        is_inline: false,
+                        size: 11,
+                        data: b"a,b\r\n1,2\r\n".to_vec(),
+                    }],
+                );
+            } else {
+                seed(&db, &id, "inbox", &format!("subject {}", n));
+                db.update_cached_body(&id, &format!("body number {}", n), None).unwrap();
+            }
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = db.list_cached_messages("inbox").unwrap();
+        let render_old = |uid: u32| {
+            let m = full.iter().find(|m| m.imap_uid == uid).unwrap();
+            let atts = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&m.aster_id).unwrap()
+            } else {
+                Vec::new()
+            };
+            crate::message_render::render(m, &atts, true)
+        };
+
+        for uid in [17u32, 3, 40] {
+            let r = render_old(uid);
+            let resp = imap_cmd_bytes(
+                &mut reader,
+                &mut writer,
+                "f1",
+                &format!("UID FETCH {} (FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[])", uid),
+            )
+            .await;
+            let mut expected = format!(
+                "* {} FETCH (FLAGS () UID {} RFC822.SIZE {} BODYSTRUCTURE {} ",
+                uid, uid, r.size, r.bodystructure
+            )
+            .into_bytes();
+            expected.extend(literal(
+                "BODY[HEADER.FIELDS (SUBJECT)]",
+                filter_header_fields(r.header(), &["SUBJECT".to_string()]),
+            ));
+            expected.push(b' ');
+            expected.extend(literal("BODY[]", &r.text));
+            expected.extend_from_slice(b")\r\nf1 OK FETCH completed\r\n");
+            assert_eq!(
+                String::from_utf8_lossy(&resp),
+                String::from_utf8_lossy(&expected),
+                "UID {}",
+                uid
+            );
+        }
+
+        let r = render_old(17);
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f2", "FETCH 17 (BODY.PEEK[2])").await;
+        let mut expected = b"* 17 FETCH (".to_vec();
+        expected.extend(literal("BODY[2]", r.part_body("2").unwrap()));
+        expected.extend_from_slice(b")\r\nf2 OK FETCH completed\r\n");
+        assert_eq!(String::from_utf8_lossy(&resp), String::from_utf8_lossy(&expected));
+    }
+
+    #[tokio::test]
+    async fn flags_only_fetch_is_unchanged() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=3 {
+            seed(&db, &format!("fl-{}", n), "inbox", "s");
+        }
+        db.update_message_flags(2, "inbox", 1 | 4).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f1", "UID FETCH 1:* (FLAGS)").await;
+        assert_eq!(
+            String::from_utf8_lossy(&resp),
+            "* 1 FETCH (FLAGS () UID 1)\r\n* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\n\
+             * 3 FETCH (FLAGS () UID 3)\r\nf1 OK FETCH completed\r\n"
+        );
     }
 }
