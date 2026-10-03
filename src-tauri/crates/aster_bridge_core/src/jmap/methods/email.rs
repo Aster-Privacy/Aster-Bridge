@@ -845,6 +845,11 @@ pub async fn set(
 ) -> Result<Value, MethodError> {
     let account_id = ctx.require_account(&args).await?;
     let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    if let Some(expected) = args.get("ifInState").and_then(|v| v.as_str()) {
+        if expected != old_state.to_string() {
+            return Err(MethodError::new("stateMismatch", "email state has changed"));
+        }
+    }
 
     let creates = args.get("create").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let updates = args.get("update").and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -1657,6 +1662,39 @@ mod tests {
         let args = json!({"create": {"draft1": {"subject": "x"}}});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert_eq!(res["notCreated"]["draft1"]["type"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn set_rejects_stale_if_in_state() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({
+            "ifInState": "999",
+            "update": {"st1": {"/keywords/$seen": true}},
+            "destroy": ["st1"]
+        });
+        assert_eq!(err_kind(set(&ctx, args, &mut HashMap::new()).await), "stateMismatch");
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("st1").unwrap(), 0);
+        assert!(ctx.db.get_cached_message("st1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_accepts_matching_if_in_state() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let state = ctx.db.jmap_state_get("Email").unwrap_or(0).to_string();
+        let args = json!({
+            "ifInState": state,
+            "update": {"st2": {"keywords": {"$seen": true}}}
+        });
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["oldState"], json!(state));
+        assert!(res["updated"].as_object().unwrap().contains_key("st2"));
     }
 
     #[tokio::test]
