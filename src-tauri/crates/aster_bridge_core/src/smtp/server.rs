@@ -1393,12 +1393,7 @@ mod tests {
 
     #[test]
     fn build_send_payload_keeps_blind_recipients_out_of_to() {
-        let raw = b"From: sender@aster.test
-To: list@example.com
-Subject: hi
-
-body
-";
+        let raw = b"From: sender@aster.test\r\nTo: list@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["alice@example.com".to_string(), "bob@example.com".to_string()];
         let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
@@ -1408,12 +1403,7 @@ body
 
     #[test]
     fn build_send_payload_does_not_repeat_the_sender_in_bcc() {
-        let raw = b"From: sender@aster.test
-To: undisclosed-recipients:;
-Subject: hi
-
-body
-";
+        let raw = b"From: sender@aster.test\r\nTo: undisclosed-recipients:;\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["alice@example.com".to_string(), "Sender@aster.test".to_string()];
         let payload = build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap();
         assert_eq!(payload["to"], serde_json::json!(["sender@aster.test"]));
