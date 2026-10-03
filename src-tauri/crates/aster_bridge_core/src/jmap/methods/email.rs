@@ -618,6 +618,23 @@ fn move_flags_for_label(label: &str) -> Option<Value> {
     }
 }
 
+// Patch keys are JSON pointers with an implicit leading "/" (RFC 8620 5.3),
+// so "keywords/$seen" and "/keywords/$seen" name the same path. Returns the
+// key as "keywords", "mailboxIds", "/keywords/<kw>" or "/mailboxIds/<id>".
+fn normalize_patch_key(key: &str) -> Option<String> {
+    let path = key.strip_prefix('/').unwrap_or(key);
+    let mut segments = path.split('/').map(|s| s.replace("~1", "/").replace("~0", "~"));
+    let property = segments.next()?;
+    if property != "keywords" && property != "mailboxIds" {
+        return None;
+    }
+    match (segments.next(), segments.next()) {
+        (None, _) => Some(property),
+        (Some(member), None) => Some(format!("/{}/{}", property, member)),
+        _ => None,
+    }
+}
+
 enum PatchOutcome {
     Applied,
     Rejected(Value),
@@ -637,19 +654,18 @@ async fn apply_update_patch(
         );
     };
 
-    for k in patch_obj.keys() {
-        let supported = k == "keywords"
-            || k.starts_with("/keywords/")
-            || k == "mailboxIds"
-            || k.starts_with("/mailboxIds/");
-        if !supported {
+    let mut normalized = serde_json::Map::new();
+    for (k, v) in patch_obj {
+        let Some(key) = normalize_patch_key(k) else {
             return PatchOutcome::Rejected(json!({
                 "type": "invalidProperties",
                 "properties": [k],
                 "description": "only keywords and mailboxIds updates are supported"
             }));
-        }
+        };
+        normalized.insert(key, v.clone());
     }
+    let patch_obj = &normalized;
 
     let existing = match ctx.db.get_cached_message(id) {
         Ok(Some(m)) => m,
@@ -829,6 +845,11 @@ pub async fn set(
 ) -> Result<Value, MethodError> {
     let account_id = ctx.require_account(&args).await?;
     let old_state = ctx.db.jmap_state_get("Email").unwrap_or(0);
+    if let Some(expected) = args.get("ifInState").and_then(|v| v.as_str()) {
+        if expected != old_state.to_string() {
+            return Err(MethodError::new("stateMismatch", "email state has changed"));
+        }
+    }
 
     let creates = args.get("create").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let updates = args.get("update").and_then(|v| v.as_object()).cloned().unwrap_or_default();
@@ -1482,6 +1503,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_patch_accepts_pointer_without_leading_slash() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("s5", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({"update": {"s5": {"keywords/$seen": true, "keywords/$flagged": true}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(
+            res["updated"].as_object().unwrap().contains_key("s5"),
+            "patch rejected: {}",
+            res["notUpdated"]
+        );
+        assert_eq!(ctx.db.get_message_flags_by_id("s5").unwrap(), 1 | 4);
+        let captured = calls.lock().await.clone();
+        assert!(captured
+            .iter()
+            .any(|(m, id, body)| m == "PATCH" && id == "s5" && body["is_read"] == json!(true)));
+    }
+
+    #[test]
+    fn normalize_patch_key_handles_both_forms_and_escapes() {
+        assert_eq!(normalize_patch_key("keywords").as_deref(), Some("keywords"));
+        assert_eq!(normalize_patch_key("/mailboxIds").as_deref(), Some("mailboxIds"));
+        assert_eq!(normalize_patch_key("keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("/keywords/$seen").as_deref(), Some("/keywords/$seen"));
+        assert_eq!(normalize_patch_key("mailboxIds/mbx_inbox").as_deref(), Some("/mailboxIds/mbx_inbox"));
+        assert_eq!(normalize_patch_key("keywords/a~1b~0c").as_deref(), Some("/keywords/a/b~c"));
+        assert_eq!(normalize_patch_key("keywords/~01").as_deref(), Some("/keywords/~1"));
+        assert_eq!(normalize_patch_key("subject"), None);
+        assert_eq!(normalize_patch_key("/keywordsx/$seen"), None);
+        assert_eq!(normalize_patch_key("keywords/a/b"), None);
+    }
+
+    #[tokio::test]
     async fn set_rejects_non_keyword_patch() {
         let (ctx, _d) = test_ctx();
         insert_msg(&ctx, &cached("s3", "inbox"));
@@ -1546,8 +1601,8 @@ mod tests {
         let (ctx, calls, _d) = test_ctx_with_backend(false).await;
         insert_msg(&ctx, &cached("mv2", "inbox"));
         let args = json!({"update": {"mv2": {
-            "/mailboxIds/mbx_trash": true,
-            "/mailboxIds/mbx_inbox": Value::Null
+            "mailboxIds/mbx_trash": true,
+            "mailboxIds/mbx_inbox": Value::Null
         }}});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert!(
@@ -1607,6 +1662,39 @@ mod tests {
         let args = json!({"create": {"draft1": {"subject": "x"}}});
         let res = ok(set(&ctx, args, &mut HashMap::new()).await);
         assert_eq!(res["notCreated"]["draft1"]["type"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn set_rejects_stale_if_in_state() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let args = json!({
+            "ifInState": "999",
+            "update": {"st1": {"/keywords/$seen": true}},
+            "destroy": ["st1"]
+        });
+        assert_eq!(err_kind(set(&ctx, args, &mut HashMap::new()).await), "stateMismatch");
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("st1").unwrap(), 0);
+        assert!(ctx.db.get_cached_message("st1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_accepts_matching_if_in_state() {
+        let (ctx, _calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("st2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        let state = ctx.db.jmap_state_get("Email").unwrap_or(0).to_string();
+        let args = json!({
+            "ifInState": state,
+            "update": {"st2": {"keywords": {"$seen": true}}}
+        });
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert_eq!(res["oldState"], json!(state));
+        assert!(res["updated"].as_object().unwrap().contains_key("st2"));
     }
 
     #[tokio::test]
