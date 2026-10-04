@@ -499,7 +499,14 @@ impl Database {
     }
 
     fn prepare_schema(conn: &Connection) -> Result<(), String> {
-        conn.pragma_update(None, "journal_mode", "WAL")
+        let journal_mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| e.to_string())?;
+        }
+        conn.pragma_update(None, "cache_size", -65536)
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| e.to_string())?;
@@ -1060,6 +1067,82 @@ impl Database {
                 rusqlite::params![aster_id],
                 |r| r.get::<_, i64>(0),
             )
+        })
+    }
+
+    pub fn cached_sync_states(
+        &self,
+        aster_ids: &[&str],
+    ) -> Result<HashMap<String, CachedSyncState>, String> {
+        let mut out: HashMap<String, CachedSyncState> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, body_cached, folder, flags, raw_headers
+                     FROM message_cache WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        CachedSyncState {
+                            body_cached: r.get::<_, i64>(1)? == 1,
+                            folder: r.get(2)?,
+                            flags: r.get(3)?,
+                            raw_headers: r.get(4)?,
+                            uid_folders: Vec::new(),
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (id, state) = row?;
+                    out.insert(id, state);
+                }
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, folder FROM uid_map WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, folder) = row?;
+                    if let Some(state) = out.get_mut(&id) {
+                        state.uid_folders.push(folder);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn set_message_flags_if_unchanged(
+        &self,
+        updates: &[(String, i64, i64)],
+    ) -> Result<Vec<String>, String> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stale = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2 AND flags = ?3",
+                )?;
+                for (aster_id, expected, flags) in updates {
+                    if stmt.execute(rusqlite::params![flags, aster_id, expected])? == 0 {
+                        stale.push(aster_id.clone());
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(stale)
         })
     }
 
@@ -1767,6 +1850,60 @@ impl Database {
         })
     }
 
+    pub fn get_cached_messages(
+        &self,
+        aster_ids: &[String],
+        with_body: bool,
+    ) -> Result<HashMap<String, CachedMessage>, String> {
+        let body_col = if with_body { "m.body_text" } else { "NULL" };
+        self.with_conn(|conn| {
+            let mut out = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, {}, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                     FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                     WHERE m.aster_id IN ({})",
+                    body_col,
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok(CachedMessage {
+                        aster_id: row.get(0)?,
+                        folder: row.get(1)?,
+                        subject: row.get(2)?,
+                        sender: row.get(3)?,
+                        recipients: row.get(4)?,
+                        date: row.get(5)?,
+                        size: row.get(6)?,
+                        flags: row.get(7)?,
+                        body_text: row.get(8)?,
+                        raw_headers: row.get(9)?,
+                        imap_uid: row.get::<_, i64>(10)? as u32,
+                        thread_id: row.get(11)?,
+                        attachments_state: row.get(12)?,
+                    })
+                })?;
+                for r in rows {
+                    let m = r?;
+                    out.insert(m.aster_id.clone(), m);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+}
+
+const SQL_IN_CHUNK: usize = 500;
+
+fn sql_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+fn unique_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2142,6 +2279,42 @@ impl Database {
         })
     }
 
+    pub fn get_attachment_meta_for_messages(
+        &self,
+        aster_ids: &[String],
+    ) -> Result<HashMap<String, Vec<CachedAttachment>>, String> {
+        self.with_conn(|conn| {
+            let mut out: HashMap<String, Vec<CachedAttachment>> = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT aster_id, seq, name, content_type, content_id, is_inline, size
+                     FROM message_attachment WHERE aster_id IN ({}) ORDER BY aster_id, seq ASC",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CachedAttachment {
+                            seq: row.get(1)?,
+                            name: row.get(2)?,
+                            content_type: row.get(3)?,
+                            content_id: row.get(4)?,
+                            is_inline: row.get::<_, i64>(5)? != 0,
+                            size: row.get(6)?,
+                            data: Vec::new(),
+                        },
+                    ))
+                })?;
+                for r in rows {
+                    let (id, a) = r?;
+                    out.entry(id).or_default().push(a);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_attachment_meta_for_folder(
         &self,
         folder: &str,
@@ -2253,6 +2426,15 @@ pub struct CachedAttachment {
 }
 
 #[derive(Debug, Clone)]
+pub struct CachedSyncState {
+    pub body_cached: bool,
+    pub folder: String,
+    pub flags: i64,
+    pub raw_headers: Option<String>,
+    pub uid_folders: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CachedMessage {
     pub aster_id: String,
     pub folder: String,
@@ -2359,6 +2541,30 @@ mod encryption_tests {
         let reopened = Database::open_with_key(dir.path(), &key).unwrap();
         assert!(reopened.get_cached_message("a1").unwrap().is_some());
         assert_eq!(quarantined_files(dir.path()).len(), 1, "a healthy database is not quarantined again");
+    }
+
+    #[test]
+    fn connection_pragmas_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[4u8; 32]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let get = |name: &str| -> String {
+            conn.query_row(&format!("PRAGMA {}", name), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{:?}", other),
+            })
+            .unwrap()
+        };
+        assert_eq!(get("journal_mode"), "wal");
+        assert_eq!(get("synchronous"), "1");
+        assert_eq!(get("cache_size"), "-65536");
+        assert_eq!(get("secure_delete"), "1");
+        assert_eq!(get("foreign_keys"), "1");
+        assert!(!get("cipher_version").is_empty());
     }
 
     #[test]
@@ -3070,6 +3276,50 @@ mod db_tests {
         let snip = db.fts_snippet("a1", "quick").unwrap();
         assert!(snip.is_some());
         assert!(db.fts_snippet("a1", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_cached_messages_batches_and_skips_body() {
+        let (_d, db) = open_db();
+        for i in 0..1200 {
+            if i % 3 == 0 {
+                insert(&db, &format!("m{}", i), "inbox");
+            }
+        }
+        let att = |seq: i64| CachedAttachment {
+            seq,
+            name: format!("f{}.txt", seq),
+            content_type: "text/plain".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 3,
+            data: b"abc".to_vec(),
+        };
+        db.replace_message_attachments("m3", &[att(1), att(0)]).unwrap();
+        db.replace_message_attachments("m1197", &[att(0)]).unwrap();
+
+        let mut ids: Vec<String> = (0..1200).map(|i| format!("m{}", i)).collect();
+        ids.push("m0".to_string());
+        let with_body = db.get_cached_messages(&ids, true).unwrap();
+        assert_eq!(with_body.len(), 400);
+        let one = db.get_cached_message("m999").unwrap().unwrap();
+        let batched = &with_body["m999"];
+        assert_eq!(batched.body_text, one.body_text);
+        assert_eq!(batched.raw_headers, one.raw_headers);
+        assert_eq!(batched.subject, one.subject);
+
+        let meta_only = db.get_cached_messages(&ids, false).unwrap();
+        assert_eq!(meta_only.len(), 400);
+        assert!(meta_only.values().all(|m| m.body_text.is_none()));
+        assert_eq!(meta_only["m999"].subject, one.subject);
+
+        let atts = db.get_attachment_meta_for_messages(&ids).unwrap();
+        assert_eq!(atts.len(), 2);
+        let seqs: Vec<i64> = atts["m3"].iter().map(|a| a.seq).collect();
+        assert_eq!(seqs, vec![0, 1]);
+        assert!(atts["m3"].iter().all(|a| a.data.is_empty()));
+        assert_eq!(atts["m1197"].len(), 1);
+        assert!(db.get_cached_messages(&[], true).unwrap().is_empty());
     }
 
     #[test]

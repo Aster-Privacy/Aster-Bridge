@@ -904,17 +904,18 @@ async fn open_tls_cert(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn set_tls_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
-    guard.config.tls_enabled = enabled;
     if enabled && guard.tls_server_config.is_none() {
-        match tls::ensure_cert(&guard.config.data_dir) {
-            Ok((certs, key)) => {
-                if let Ok(sc) = tls::server_config(certs, key) {
-                    guard.tls_server_config = Some(sc);
-                }
-            }
-            Err(e) => tracing::warn!("ensure_cert failed: {}", e),
-        }
+        let (certs, key) = tls::ensure_cert(&guard.config.data_dir).map_err(|e| {
+            tracing::warn!("ensure_cert failed: {}", e);
+            format!("Could not create the TLS certificate: {}", e)
+        })?;
+        let sc = tls::server_config(certs, key).map_err(|e| {
+            tracing::warn!("TLS server config failed: {}", e);
+            format!("Could not load the TLS certificate: {}", e)
+        })?;
+        guard.tls_server_config = Some(sc);
     }
+    guard.config.tls_enabled = enabled;
     config::save_config(&guard.config)
 }
 
