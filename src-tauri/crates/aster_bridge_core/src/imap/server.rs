@@ -919,14 +919,20 @@ async fn report_mailbox_changes(
 ) -> std::io::Result<()> {
     if expunge {
         let present: std::collections::HashSet<u32> = current.iter().copied().collect();
-        let mut i = 0;
-        while i < conn.uids.len() {
-            if present.contains(&conn.uids[i]) {
-                i += 1;
-                continue;
+        let mut expunges = String::new();
+        let mut seq = 0usize;
+        let mut removed = 0usize;
+        conn.uids.retain(|uid| {
+            seq += 1;
+            if present.contains(uid) {
+                return true;
             }
-            conn.uids.remove(i);
-            writer.write_all(format!("* {} EXPUNGE\r\n", i + 1).as_bytes()).await?;
+            expunges.push_str(&format!("* {} EXPUNGE\r\n", seq - removed));
+            removed += 1;
+            false
+        });
+        if !expunges.is_empty() {
+            writer.write_all(expunges.as_bytes()).await?;
         }
     }
     let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
@@ -1838,11 +1844,19 @@ where
                             };
                             let current: Vec<u32> = current_meta.iter().map(|m| m.imap_uid).collect();
                             report_mailbox_changes(&mut writer, &mut conn, &current, true).await?;
+                            let mut seq_by_uid: Option<std::collections::HashMap<u32, usize>> = None;
                             for m in &current_meta {
                                 if idle_flags.get(&m.imap_uid).is_none_or(|old| *old == m.flags) {
                                     continue;
                                 }
-                                let Some(seq) = conn.uids.iter().position(|u| *u == m.imap_uid) else {
+                                let seq_by_uid = seq_by_uid.get_or_insert_with(|| {
+                                    let mut map = std::collections::HashMap::with_capacity(conn.uids.len());
+                                    for (i, uid) in conn.uids.iter().enumerate() {
+                                        map.entry(*uid).or_insert(i);
+                                    }
+                                    map
+                                });
+                                let Some(&seq) = seq_by_uid.get(&m.imap_uid) else {
                                     continue;
                                 };
                                 writer
@@ -7650,6 +7664,103 @@ mod tests {
         let lines = read_until_tag(&mut reader, "a3").await;
         let combined = lines.join("\n");
         assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+    }
+
+    fn expunges_one_at_a_time(uids: &mut Vec<u32>, present: &[u32]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < uids.len() {
+            if present.contains(&uids[i]) {
+                i += 1;
+                continue;
+            }
+            uids.remove(i);
+            out.push_str(&format!("* {} EXPUNGE\r\n", i + 1));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn many_expunges_at_once_match_one_at_a_time_removal() {
+        let session_uids: Vec<u32> = (1..=200).collect();
+        let current: Vec<u32> = session_uids
+            .iter()
+            .copied()
+            .filter(|u| !(*u == 1 || *u == 200 || (40..=90).contains(u) || u % 7 == 0))
+            .chain([201, 202])
+            .collect();
+        let mut expected_uids = session_uids.clone();
+        let mut expected = expunges_one_at_a_time(&mut expected_uids, &current);
+        expected_uids.extend([201, 202]);
+        expected.push_str(&format!("* {} EXISTS\r\n", expected_uids.len()));
+
+        let mut conn = ImapConnection {
+            state: ImapState::Selected,
+            selected_mailbox: Some("INBOX".to_string()),
+            selected_folder: Some("inbox".to_string()),
+            uids: session_uids,
+            read_only: false,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &current, true).await.unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        assert_eq!(conn.uids, expected_uids);
+
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &[2, 3], false).await.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(conn.uids, expected_uids);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_many_expunges_and_flag_changes_at_once() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        for n in 1..=12 {
+            seed(&db, &format!("ib-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        for n in [2, 3, 4, 8, 12] {
+            db.delete_message_by_aster_id(&format!("ib-{}", n)).unwrap();
+        }
+        db.update_message_flags(9, "inbox", 1).unwrap();
+        db.update_message_flags(11, "inbox", 4).unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "9".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let mut lines = Vec::new();
+        for _ in 0..7 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("update not delivered")
+                .unwrap();
+            lines.push(line.trim_end().to_string());
+        }
+        assert_eq!(
+            lines,
+            vec![
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 5 EXPUNGE",
+                "* 8 EXPUNGE",
+                "* 5 FETCH (UID 9 FLAGS (\\Seen))",
+                "* 7 FETCH (UID 11 FLAGS (\\Flagged))",
+            ]
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let rest = read_until_tag(&mut reader, "i1").await.join("\n");
+        assert_eq!(rest, "i1 OK IDLE terminated");
     }
 
     async fn imap_cmd_bytes(
