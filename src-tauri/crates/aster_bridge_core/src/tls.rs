@@ -34,6 +34,8 @@ pub fn key_pem_path(data_dir: &Path) -> PathBuf {
     data_dir.join("tls.key")
 }
 
+const RENEW_BEFORE_EXPIRY_DAYS: u64 = 30;
+
 pub fn ensure_cert(
     data_dir: &Path,
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
@@ -41,12 +43,14 @@ pub fn ensure_cert(
     let key_path = key_pem_path(data_dir);
 
     if cert_path.exists() && key_path.exists() {
-        let should_renew = cert_older_than_days(&cert_path, 700);
         if let Ok((certs, key)) = load_existing(&cert_path, &key_path) {
-            if !should_renew {
+            if !expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS) {
                 return Ok((certs, key));
             }
-            tracing::info!("TLS cert is older than 700 days; regenerating");
+            tracing::info!(
+                "TLS cert expires within {} days; regenerating",
+                RENEW_BEFORE_EXPIRY_DAYS
+            );
         } else {
             tracing::warn!("existing TLS material failed to parse; regenerating");
         }
@@ -156,13 +160,15 @@ fn persist_pair(cert_path: &Path, cert_pem: &[u8], key_path: &Path, key_pem: &[u
 
 #[cfg(unix)]
 fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .mode(0o600)
         .open(path)
+        .map_err(|e| e.to_string())?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
     use std::io::Write;
     f.write_all(bytes).map_err(|e| e.to_string())?;
@@ -235,11 +241,34 @@ pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn cert_older_than_days(cert_path: &Path, days: u64) -> bool {
-    let Ok(metadata) = std::fs::metadata(cert_path) else { return true };
-    let Ok(modified) = metadata.modified() else { return true };
-    let Ok(age) = modified.elapsed() else { return true };
-    age > std::time::Duration::from_secs(days * 86400)
+fn expires_within_days(cert_der: &[u8], days: u64) -> bool {
+    let Some(not_after) = cert_not_after(cert_der) else { return true };
+    let horizon = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 86400);
+    not_after <= horizon
+}
+
+fn cert_not_after(cert_der: &[u8]) -> Option<std::time::SystemTime> {
+    use der::asn1::{AnyRef, GeneralizedTime, UtcTime};
+    use der::{Decode, SliceReader, Tag, Tagged};
+
+    let cert = AnyRef::from_der(cert_der).ok()?;
+    let tbs = AnyRef::decode(&mut SliceReader::new(cert.value()).ok()?).ok()?;
+    let mut fields = SliceReader::new(tbs.value()).ok()?;
+    if AnyRef::decode(&mut fields).ok()?.tag().is_context_specific() {
+        AnyRef::decode(&mut fields).ok()?;
+    }
+    AnyRef::decode(&mut fields).ok()?;
+    AnyRef::decode(&mut fields).ok()?;
+    let validity = AnyRef::decode(&mut fields).ok()?;
+    let mut times = SliceReader::new(validity.value()).ok()?;
+    AnyRef::decode(&mut times).ok()?;
+    let not_after = AnyRef::decode(&mut times).ok()?;
+    let since_epoch = match not_after.tag() {
+        Tag::UtcTime => UtcTime::try_from(not_after).ok()?.to_unix_duration(),
+        Tag::GeneralizedTime => GeneralizedTime::try_from(not_after).ok()?.to_unix_duration(),
+        _ => return None,
+    };
+    Some(std::time::UNIX_EPOCH + since_epoch)
 }
 
 pub fn cert_fingerprint_sha256(data_dir: &Path) -> Option<String> {
@@ -318,6 +347,73 @@ mod tests {
 
         let (certs2, _key2) = ensure_cert(dir.path()).unwrap();
         assert_eq!(certs1[0].as_ref(), certs2[0].as_ref());
+    }
+
+    fn write_cert_valid_for(dir: &Path, days: i64) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(days);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(cert_pem_path(dir), cert.pem()).unwrap();
+        std::fs::write(key_pem_path(dir), key_pair.serialize_pem()).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn reads_not_after_from_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let der = write_cert_valid_for(dir.path(), 100);
+        let not_after = cert_not_after(&der).expect("notAfter must parse");
+        let left = not_after
+            .duration_since(std::time::SystemTime::now())
+            .unwrap()
+            .as_secs();
+        assert!((99 * 86400..=100 * 86400).contains(&left), "left={}", left);
+        assert!(!expires_within_days(&der, 30));
+        assert!(expires_within_days(&der, 120));
+        assert!(expires_within_days(b"not a certificate", 30));
+    }
+
+    #[test]
+    fn a_certificate_close_to_expiry_is_renewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_valid_for(dir.path(), 10);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_ne!(certs[0].as_ref(), &old[..]);
+        assert!(!expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(key_pem_path(dir.path())).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn file_times_do_not_force_a_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = write_cert_valid_for(dir.path(), 400);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(cert_pem_path(dir.path()))
+            .unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86400 * 30);
+        file.set_modified(future).unwrap();
+        drop(file);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(certs[0].as_ref(), &current[..]);
+
+        let file = std::fs::File::options()
+            .write(true)
+            .open(cert_pem_path(dir.path()))
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86400))
+            .unwrap();
+        drop(file);
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(certs[0].as_ref(), &current[..]);
     }
 
     #[test]

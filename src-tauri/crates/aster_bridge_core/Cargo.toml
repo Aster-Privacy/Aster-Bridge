@@ -41,6 +41,7 @@ axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rcgen = "0.13"
 rustls = { workspace = true }
 rustls-pemfile = "2"
+der = "0.7"
 webpki-roots = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 subtle = "2"
