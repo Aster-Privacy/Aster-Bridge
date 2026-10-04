@@ -863,26 +863,28 @@ mod token_refresh_wait_tests {
 mod tests {
     use super::*;
 
-    fn free_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    }
-
     #[test]
     fn jmap_drifting_off_a_busy_port_does_not_take_the_carddav_port() {
+        let imap_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let smtp_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = held.local_addr().unwrap().port();
         if busy > u16::MAX - 40 {
             return;
         }
         let mut config = BridgeConfig::default();
-        config.imap_port = free_port();
-        config.smtp_port = free_port();
+        config.imap_port = imap_probe.local_addr().unwrap().port();
+        config.smtp_port = smtp_probe.local_addr().unwrap().port();
         config.jmap_port = busy;
         config.carddav_port = busy + 1;
         config.pop3_port = busy + 2;
         config.jmap_enabled = true;
         config.carddav_enabled = true;
+        drop(imap_probe);
+        drop(smtp_probe);
+        if crate::config::validate_ports(&config).is_err() {
+            return;
+        }
 
         let plan = plan_ports(&config, false).unwrap_or_else(|_| panic!("ports must plan"));
         let ports = plan.ports;
