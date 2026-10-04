@@ -136,7 +136,10 @@ pub fn data_dir() -> Result<PathBuf, String> {
 }
 
 pub fn load_config() -> Result<BridgeConfig, String> {
-    let dir = data_dir()?;
+    load_config_from(data_dir()?)
+}
+
+fn load_config_from(dir: PathBuf) -> Result<BridgeConfig, String> {
     let config_path = dir.join("config.toml");
 
     let mut config = if config_path.exists() {
@@ -151,13 +154,12 @@ pub fn load_config() -> Result<BridgeConfig, String> {
 
     config.data_dir = dir;
     if let Err(e) = validate_ports(&config) {
+        let reset = repair_ports(&mut config);
         eprintln!(
-            "invalid port configuration ({}); resetting imap/smtp ports to defaults",
-            e
+            "invalid port configuration ({}); reset {} to free defaults",
+            e,
+            reset.join(", ")
         );
-        let defaults = BridgeConfig::default();
-        config.imap_port = defaults.imap_port;
-        config.smtp_port = defaults.smtp_port;
         validate_ports(&config)?;
         save_config(&config)?;
     }
@@ -204,6 +206,50 @@ pub fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn repair_ports(c: &mut BridgeConfig) -> Vec<&'static str> {
+    let d = BridgeConfig::default();
+    let mut slots = [
+        ("imap_port", &mut c.imap_port, d.imap_port),
+        ("imap_implicit_tls_port", &mut c.imap_implicit_tls_port, d.imap_implicit_tls_port),
+        ("smtp_port", &mut c.smtp_port, d.smtp_port),
+        ("smtp_implicit_tls_port", &mut c.smtp_implicit_tls_port, d.smtp_implicit_tls_port),
+        ("jmap_port", &mut c.jmap_port, d.jmap_port),
+        ("pop3_port", &mut c.pop3_port, d.pop3_port),
+        ("pop3s_port", &mut c.pop3s_port, d.pop3s_port),
+        ("carddav_port", &mut c.carddav_port, d.carddav_port),
+    ];
+    let values: Vec<u16> = slots.iter().map(|(_, port, _)| **port).collect();
+    let keep: Vec<bool> = (0..slots.len())
+        .map(|i| {
+            if values[i] < 1024 {
+                return false;
+            }
+            let sharing: Vec<usize> = (0..slots.len()).filter(|&j| values[j] == values[i]).collect();
+            let owner = sharing
+                .iter()
+                .copied()
+                .find(|&j| values[j] == slots[j].2)
+                .unwrap_or(sharing[0]);
+            owner == i
+        })
+        .collect();
+    let mut used: Vec<u16> = (0..slots.len()).filter(|&i| keep[i]).map(|i| values[i]).collect();
+    let mut reset = Vec::new();
+    for (i, (name, port, default)) in slots.iter_mut().enumerate() {
+        if keep[i] {
+            continue;
+        }
+        let mut candidate = *default;
+        while used.contains(&candidate) {
+            candidate = candidate.checked_add(1).unwrap_or(1024).max(1024);
+        }
+        **port = candidate;
+        used.push(candidate);
+        reset.push(*name);
+    }
+    reset
 }
 
 pub fn save_config(config: &BridgeConfig) -> Result<(), String> {
@@ -296,6 +342,66 @@ mod tests {
         let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         let parsed: BridgeConfig = toml::from_str(&contents).unwrap();
         assert_eq!(parsed.smtp_port, 2025);
+    }
+
+    #[test]
+    fn repair_moves_a_drifted_port_back_and_keeps_the_owner() {
+        let mut c = BridgeConfig::default();
+        c.jmap_port = c.carddav_port;
+        let reset = repair_ports(&mut c);
+        assert_eq!(reset, vec!["jmap_port"]);
+        assert_eq!(c.jmap_port, default_jmap_port());
+        assert_eq!(c.carddav_port, default_carddav_port());
+        validate_ports(&c).expect("repaired ports must validate");
+    }
+
+    #[test]
+    fn repair_picks_the_next_free_port_when_the_default_is_taken() {
+        let mut c = BridgeConfig::default();
+        c.imap_port = 2000;
+        c.smtp_port = 2000;
+        c.jmap_port = default_carddav_port();
+        c.carddav_port = default_jmap_port();
+        c.pop3_port = 80;
+        let reset = repair_ports(&mut c);
+        assert_eq!(reset, vec!["smtp_port", "pop3_port"]);
+        assert_eq!(c.imap_port, 2000);
+        assert_eq!(c.smtp_port, 1025);
+        assert_eq!(c.pop3_port, default_pop3_port());
+        validate_ports(&c).expect("repaired ports must validate");
+    }
+
+    #[test]
+    fn repair_resolves_a_custom_port_sitting_on_a_default() {
+        let mut c = BridgeConfig::default();
+        c.carddav_port = c.jmap_port;
+        c.pop3_port = default_carddav_port();
+        let reset = repair_ports(&mut c);
+        validate_ports(&c).expect("repaired ports must validate");
+        assert_eq!(reset, vec!["carddav_port"]);
+        assert_eq!(c.jmap_port, default_jmap_port());
+        assert_eq!(c.pop3_port, default_carddav_port());
+        assert_eq!(c.carddav_port, default_carddav_port() + 1);
+    }
+
+    #[test]
+    fn load_config_recovers_from_jmap_and_carddav_sharing_a_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stored = BridgeConfig::default();
+        stored.jmap_port = 1081;
+        stored.carddav_port = 1081;
+        let contents = toml::to_string_pretty(&stored).unwrap();
+        std::fs::write(dir.path().join("config.toml"), contents).unwrap();
+
+        let loaded = load_config_from(dir.path().to_path_buf()).expect("config must load");
+        assert_eq!(loaded.carddav_port, 1081);
+        assert_eq!(loaded.jmap_port, 1080);
+        validate_ports(&loaded).unwrap();
+
+        let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let saved: BridgeConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(saved.jmap_port, 1080);
+        assert_eq!(saved.carddav_port, 1081);
     }
 
     #[test]
