@@ -467,6 +467,7 @@ where
 
 pub struct Database {
     conn: Mutex<Connection>,
+    pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
 }
 
 impl Database {
@@ -495,6 +496,7 @@ impl Database {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            app_password_cache: Default::default(),
         })
     }
 
@@ -1808,7 +1810,7 @@ impl Database {
     }
 
     pub fn clear_user_data(&self) -> Result<(), String> {
-        self.with_conn(|conn| {
+        let result = self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
@@ -1824,7 +1826,9 @@ impl Database {
                  DELETE FROM outbox;",
             )?;
             Ok(())
-        })
+        });
+        self.app_password_cache.clear();
+        result
     }
 
     pub fn db_stats(&self) -> Result<(i64, i64, Option<String>), String> {
@@ -2392,7 +2396,7 @@ impl Database {
     }
 
     pub fn clear_all_user_data(&self) -> Result<(), String> {
-        self.with_conn(|conn| {
+        let result = self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
@@ -2408,7 +2412,9 @@ impl Database {
                  DELETE FROM outbox;",
             )?;
             Ok(())
-        })
+        });
+        self.app_password_cache.clear();
+        result
     }
 
 }

@@ -522,6 +522,7 @@ impl BridgeRuntime {
         opts: StartOptions,
     ) -> Result<RunningBridge, StartError> {
         tracing::info!("starting bridge on plan {}", grant.plan_code());
+        deps.db.app_password_cache.clear();
         let tls_cfg = if opts.config.tls_enabled {
             opts.tls.clone()
         } else {
