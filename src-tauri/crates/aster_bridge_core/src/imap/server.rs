@@ -622,19 +622,29 @@ fn search_eval(
     }
 }
 
-fn uid_validity(db: &Database) -> u64 {
+fn uid_validity(db: &Database) -> std::result::Result<u64, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    if let Ok(Some(v)) = db.get_sync_state("uid_validity") {
+    if let Some(v) = db.get_sync_state("uid_validity")? {
         if let Ok(n) = v.parse::<u64>() {
-            return n;
+            return Ok(n);
         }
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1);
-    let _ = db.set_sync_state("uid_validity", &now.to_string());
-    now
+    db.set_sync_state("uid_validity", &now.to_string())?;
+    Ok(now)
+}
+
+fn append_completed(db: &Database, uid: impl std::fmt::Display) -> String {
+    match uid_validity(db) {
+        Ok(validity) => format!("[APPENDUID {} {}] APPEND completed", validity, uid),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for APPENDUID: {}", e);
+            "APPEND completed".to_string()
+        }
+    }
 }
 
 /// Whether a STORE item is `FLAGS`, `+FLAGS` or `-FLAGS` (with or without
@@ -1904,6 +1914,14 @@ where
                     }
                 };
                 let aster_folder = entry.label.as_str();
+                let validity = match uid_validity(&db) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("STATUS could not read UIDVALIDITY: {}", e);
+                        write_no(&mut writer, &tag, "[UNAVAILABLE] mailbox state is unavailable, try again").await?;
+                        continue;
+                    }
+                };
                 let count = db.count_cached_messages(aster_folder).unwrap_or(0);
                 let uid_next = db.uid_next(aster_folder).unwrap_or(1);
                 let unseen = db.count_unread_messages(aster_folder).unwrap_or(0);
@@ -1914,7 +1932,7 @@ where
                             quote_imap_string(&mailbox),
                             count,
                             unseen,
-                            uid_validity(&db),
+                            validity,
                             uid_next
                         )
                         .as_bytes(),
@@ -1999,11 +2017,7 @@ where
                                         write_ok(
                                             &mut writer,
                                             &tag,
-                                            &format!(
-                                                "[APPENDUID {} {}] APPEND completed",
-                                                uid_validity(&db),
-                                                uid
-                                            ),
+                                            &append_completed(&db, uid),
                                         )
                                         .await?;
                                     }
@@ -2044,11 +2058,7 @@ where
                                     write_ok(
                                         &mut writer,
                                         &tag,
-                                        &format!(
-                                            "[APPENDUID {} {}] APPEND completed",
-                                            uid_validity(&db),
-                                            uid
-                                        ),
+                                        &append_completed(&db, uid),
                                     )
                                     .await?;
                                     continue;
@@ -2094,11 +2104,7 @@ where
                                         write_ok(
                                             &mut writer,
                                             &tag,
-                                            &format!(
-                                                "[APPENDUID {} {}] APPEND completed",
-                                                uid_validity(&db),
-                                                uid
-                                            ),
+                                            &append_completed(&db, uid),
                                         )
                                         .await?;
                                     }
@@ -2111,11 +2117,7 @@ where
                                                 write_ok(
                                                     &mut writer,
                                                     &tag,
-                                                    &format!(
-                                                        "[APPENDUID {} {}] APPEND completed",
-                                                        uid_validity(&db),
-                                                        uid
-                                                    ),
+                                                    &append_completed(&db, uid),
                                                 )
                                                 .await?
                                             }
@@ -3047,9 +3049,18 @@ async fn handle_copy_move(
     let token = session.read().await.access_token.to_string();
     let validity = {
         let db = Arc::clone(db);
-        tokio::task::spawn_blocking(move || uid_validity(&db))
-            .await
-            .unwrap_or(1)
+        match tokio::task::spawn_blocking(move || uid_validity(&db)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!("{} could not read UIDVALIDITY: {}", verb, e);
+                return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!("{} UIDVALIDITY task failed: {}", verb, e);
+                return write_no(writer, tag, "[SERVERBUG] mailbox state is unavailable").await;
+            }
+        }
     };
     let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
     if let Err(e) = relabel_with_backoff(
@@ -3319,12 +3330,14 @@ async fn handle_copy(
     }
     let src_set = copies.iter().map(|(s, ..)| s.to_string()).collect::<Vec<_>>().join(",");
     let dst_set = copies.iter().map(|(_, d, ..)| d.to_string()).collect::<Vec<_>>().join(",");
-    write_ok(
-        writer,
-        tag,
-        &format!("[COPYUID {} {} {}] COPY completed", uid_validity(db), src_set, dst_set),
-    )
-    .await
+    let completed = match uid_validity(db) {
+        Ok(validity) => format!("[COPYUID {} {} {}] COPY completed", validity, src_set, dst_set),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for COPYUID: {}", e);
+            "COPY completed".to_string()
+        }
+    };
+    write_ok(writer, tag, &completed).await
 }
 
 async fn handle_select(
@@ -3343,6 +3356,14 @@ async fn handle_select(
         }
     };
     let aster_folder = entry.label.as_str();
+    let validity = match uid_validity(db) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("{} could not read UIDVALIDITY: {}", command, e);
+            return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                .await;
+        }
+    };
 
     let messages = db.list_cached_messages(aster_folder).unwrap_or_default();
     let count = messages.len();
@@ -3369,7 +3390,7 @@ async fn handle_select(
     }
 
     writer
-        .write_all(format!("* OK [UIDVALIDITY {}]\r\n", uid_validity(db)).as_bytes())
+        .write_all(format!("* OK [UIDVALIDITY {}]\r\n", validity).as_bytes())
         .await?;
     let uid_next = db.uid_next(aster_folder).unwrap_or(1);
     writer
@@ -4931,6 +4952,69 @@ mod tests {
             selects,
             seen
         );
+    }
+
+    fn break_uid_validity_read(db: &Database) {
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE sync_state SET value = x'00ff' WHERE key = 'uid_validity'",
+                [],
+            )
+        })
+        .unwrap();
+    }
+
+    fn uid_validity_value_type(db: &Database) -> String {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT typeof(value) FROM sync_state WHERE key = 'uid_validity'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn uid_validity_is_kept_when_the_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let first = uid_validity(&db).unwrap();
+        assert_eq!(uid_validity(&db).unwrap(), first);
+
+        break_uid_validity_read(&db);
+        assert!(uid_validity(&db).is_err());
+        assert_eq!(uid_validity_value_type(&db), "blob", "a failed read must not write a new value");
+    }
+
+    #[tokio::test]
+    async fn select_examine_and_status_fail_when_uid_validity_cannot_be_read() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let stored = db.get_sync_state("uid_validity").unwrap().unwrap();
+
+        break_uid_validity_read(&db);
+        for (tag, command) in [
+            ("a3", "SELECT INBOX"),
+            ("a4", "EXAMINE INBOX"),
+            ("a5", "STATUS INBOX (UIDVALIDITY)"),
+        ] {
+            writer
+                .write_all(format!("{} {}\r\n", tag, command).as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reply = read_until_tag(&mut reader, tag).await.join("|");
+            assert!(reply.contains(&format!("{} NO", tag)), "{} must fail: {}", command, reply);
+            assert!(!reply.contains("UIDVALIDITY "), "{} leaked a validity: {}", command, reply);
+        }
+        assert_eq!(uid_validity_value_type(&db), "blob");
+
+        db.set_sync_state("uid_validity", &stored).unwrap();
+        writer.write_all(b"a6 SELECT INBOX\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let reply = read_until_tag(&mut reader, "a6").await.join("|");
+        assert!(reply.contains(&format!("[UIDVALIDITY {}]", stored)), "validity changed: {}", reply);
     }
 
     #[tokio::test]
