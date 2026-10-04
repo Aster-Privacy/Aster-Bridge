@@ -87,7 +87,7 @@ pub async fn build_session(ctx: &Arc<JmapContext>, port: u16, use_https: bool) -
         },
         "username": email,
         "apiUrl": format!("{}://127.0.0.1:{}/jmap/api", scheme, port),
-        "downloadUrl": format!("{}://127.0.0.1:{}/jmap/download/{{accountId}}/{{blobId}}/{{name}}", scheme, port),
+        "downloadUrl": format!("{}://127.0.0.1:{}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}", scheme, port),
         "uploadUrl": format!("{}://127.0.0.1:{}/jmap/upload/{{accountId}}", scheme, port),
         "eventSourceUrl": format!("{}://127.0.0.1:{}/jmap/eventsource?types={{types}}&closeafter={{closeafter}}&ping={{ping}}", scheme, port),
         "state": session_state
@@ -197,5 +197,6 @@ mod tests {
         assert!(url.contains("{accountId}"));
         assert!(url.contains("{blobId}"));
         assert!(url.contains("{name}"));
+        assert!(url.contains("{type}"));
     }
 }

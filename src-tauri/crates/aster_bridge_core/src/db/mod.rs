@@ -467,6 +467,7 @@ where
 
 pub struct Database {
     conn: Mutex<Connection>,
+    pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
 }
 
 impl Database {
@@ -495,11 +496,19 @@ impl Database {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            app_password_cache: Default::default(),
         })
     }
 
     fn prepare_schema(conn: &Connection) -> Result<(), String> {
-        conn.pragma_update(None, "journal_mode", "WAL")
+        let journal_mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| e.to_string())?;
+        }
+        conn.pragma_update(None, "cache_size", -65536)
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| e.to_string())?;
@@ -677,22 +686,46 @@ impl Database {
                 recipients,
                 body_text,
                 tokenize = 'unicode61 remove_diacritics 2'
-            );
+            );",
+        ).map_err(|e| e.to_string())?;
 
-            CREATE TRIGGER IF NOT EXISTS message_cache_ai AFTER INSERT ON message_cache BEGIN
-                INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+        let update_trigger: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if update_trigger.is_some_and(|sql| !sql.contains("UPDATE OF")) {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS message_cache_ai;
+                 DROP TRIGGER IF EXISTS message_cache_ad;
+                 DROP TRIGGER IF EXISTS message_cache_au;
+                 DELETE FROM message_fts;",
+            ).map_err(|e| format!("FTS migration failed: {}", e))?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS message_cache_ai AFTER INSERT ON message_cache BEGIN
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
                         COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
             END;
 
             CREATE TRIGGER IF NOT EXISTS message_cache_ad AFTER DELETE ON message_cache BEGIN
-                DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS message_cache_au AFTER UPDATE ON message_cache BEGIN
-                DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
-                INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+            CREATE TRIGGER IF NOT EXISTS message_cache_au
+            AFTER UPDATE OF subject, sender, recipients, body_text ON message_cache
+            WHEN OLD.subject IS NOT NEW.subject OR OLD.sender IS NOT NEW.sender
+              OR OLD.recipients IS NOT NEW.recipients OR OLD.body_text IS NOT NEW.body_text
+            BEGIN
+                DELETE FROM message_fts WHERE rowid = OLD.rowid;
+                INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                VALUES (NEW.rowid, NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
                         COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
             END;",
         ).map_err(|e| e.to_string())?;
@@ -705,8 +738,8 @@ impl Database {
             .unwrap_or(0);
         if fts_count == 0 && cache_count > 0 {
             conn.execute_batch(
-                "INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
-                 SELECT aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                "INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid, aster_id, COALESCE(subject,''), COALESCE(sender,''),
                         COALESCE(recipients,''), COALESCE(body_text,'')
                  FROM message_cache;",
             ).map_err(|e| format!("FTS backfill failed: {}", e))?;
@@ -1060,6 +1093,82 @@ impl Database {
                 rusqlite::params![aster_id],
                 |r| r.get::<_, i64>(0),
             )
+        })
+    }
+
+    pub fn cached_sync_states(
+        &self,
+        aster_ids: &[&str],
+    ) -> Result<HashMap<String, CachedSyncState>, String> {
+        let mut out: HashMap<String, CachedSyncState> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, body_cached, folder, flags, raw_headers
+                     FROM message_cache WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        CachedSyncState {
+                            body_cached: r.get::<_, i64>(1)? == 1,
+                            folder: r.get(2)?,
+                            flags: r.get(3)?,
+                            raw_headers: r.get(4)?,
+                            uid_folders: Vec::new(),
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (id, state) = row?;
+                    out.insert(id, state);
+                }
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, folder FROM uid_map WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, folder) = row?;
+                    if let Some(state) = out.get_mut(&id) {
+                        state.uid_folders.push(folder);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn set_message_flags_if_unchanged(
+        &self,
+        updates: &[(String, i64, i64)],
+    ) -> Result<Vec<String>, String> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stale = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE message_cache SET flags = ?1 WHERE aster_id = ?2 AND flags = ?3",
+                )?;
+                for (aster_id, expected, flags) in updates {
+                    if stmt.execute(rusqlite::params![flags, aster_id, expected])? == 0 {
+                        stale.push(aster_id.clone());
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(stale)
         })
     }
 
@@ -1701,7 +1810,7 @@ impl Database {
     }
 
     pub fn clear_user_data(&self) -> Result<(), String> {
-        self.with_conn(|conn| {
+        let result = self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
@@ -1717,7 +1826,9 @@ impl Database {
                  DELETE FROM outbox;",
             )?;
             Ok(())
-        })
+        });
+        self.app_password_cache.clear();
+        result
     }
 
     pub fn db_stats(&self) -> Result<(i64, i64, Option<String>), String> {
@@ -1767,6 +1878,60 @@ impl Database {
         })
     }
 
+    pub fn get_cached_messages(
+        &self,
+        aster_ids: &[String],
+        with_body: bool,
+    ) -> Result<HashMap<String, CachedMessage>, String> {
+        let body_col = if with_body { "m.body_text" } else { "NULL" };
+        self.with_conn(|conn| {
+            let mut out = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, {}, m.raw_headers, COALESCE(u.imap_uid, 0), m.thread_id, m.attachments_state
+                     FROM message_cache m LEFT JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                     WHERE m.aster_id IN ({})",
+                    body_col,
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok(CachedMessage {
+                        aster_id: row.get(0)?,
+                        folder: row.get(1)?,
+                        subject: row.get(2)?,
+                        sender: row.get(3)?,
+                        recipients: row.get(4)?,
+                        date: row.get(5)?,
+                        size: row.get(6)?,
+                        flags: row.get(7)?,
+                        body_text: row.get(8)?,
+                        raw_headers: row.get(9)?,
+                        imap_uid: row.get::<_, i64>(10)? as u32,
+                        thread_id: row.get(11)?,
+                        attachments_state: row.get(12)?,
+                    })
+                })?;
+                for r in rows {
+                    let m = r?;
+                    out.insert(m.aster_id.clone(), m);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+}
+
+const SQL_IN_CHUNK: usize = 500;
+
+fn sql_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+fn unique_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2142,6 +2307,42 @@ impl Database {
         })
     }
 
+    pub fn get_attachment_meta_for_messages(
+        &self,
+        aster_ids: &[String],
+    ) -> Result<HashMap<String, Vec<CachedAttachment>>, String> {
+        self.with_conn(|conn| {
+            let mut out: HashMap<String, Vec<CachedAttachment>> = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT aster_id, seq, name, content_type, content_id, is_inline, size
+                     FROM message_attachment WHERE aster_id IN ({}) ORDER BY aster_id, seq ASC",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CachedAttachment {
+                            seq: row.get(1)?,
+                            name: row.get(2)?,
+                            content_type: row.get(3)?,
+                            content_id: row.get(4)?,
+                            is_inline: row.get::<_, i64>(5)? != 0,
+                            size: row.get(6)?,
+                            data: Vec::new(),
+                        },
+                    ))
+                })?;
+                for r in rows {
+                    let (id, a) = r?;
+                    out.entry(id).or_default().push(a);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_attachment_meta_for_folder(
         &self,
         folder: &str,
@@ -2195,7 +2396,7 @@ impl Database {
     }
 
     pub fn clear_all_user_data(&self) -> Result<(), String> {
-        self.with_conn(|conn| {
+        let result = self.with_conn(|conn| {
             conn.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
@@ -2211,7 +2412,9 @@ impl Database {
                  DELETE FROM outbox;",
             )?;
             Ok(())
-        })
+        });
+        self.app_password_cache.clear();
+        result
     }
 
 }
@@ -2250,6 +2453,15 @@ pub struct CachedAttachment {
     pub is_inline: bool,
     pub size: i64,
     pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedSyncState {
+    pub body_cached: bool,
+    pub folder: String,
+    pub flags: i64,
+    pub raw_headers: Option<String>,
+    pub uid_folders: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2359,6 +2571,30 @@ mod encryption_tests {
         let reopened = Database::open_with_key(dir.path(), &key).unwrap();
         assert!(reopened.get_cached_message("a1").unwrap().is_some());
         assert_eq!(quarantined_files(dir.path()).len(), 1, "a healthy database is not quarantined again");
+    }
+
+    #[test]
+    fn connection_pragmas_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[4u8; 32]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let get = |name: &str| -> String {
+            conn.query_row(&format!("PRAGMA {}", name), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{:?}", other),
+            })
+            .unwrap()
+        };
+        assert_eq!(get("journal_mode"), "wal");
+        assert_eq!(get("synchronous"), "1");
+        assert_eq!(get("cache_size"), "-65536");
+        assert_eq!(get("secure_delete"), "1");
+        assert_eq!(get("foreign_keys"), "1");
+        assert!(!get("cipher_version").is_empty());
     }
 
     #[test]
@@ -2616,6 +2852,7 @@ mod encryption_tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     fn open_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
@@ -3070,6 +3307,191 @@ mod db_tests {
         let snip = db.fts_snippet("a1", "quick").unwrap();
         assert!(snip.is_some());
         assert!(db.fts_snippet("a1", "").unwrap().is_none());
+    }
+
+    fn fts_subject(db: &Database, aster_id: &str) -> Option<String> {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subject FROM message_fts WHERE aster_id = ?1",
+                [aster_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .unwrap()
+    }
+
+    fn mark_fts_row(db: &Database, aster_id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_fts SET subject = 'untouched' WHERE aster_id = ?1",
+                [aster_id],
+            )
+        })
+        .unwrap();
+    }
+
+    fn fts_rowids_match_cache(db: &Database) -> bool {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM message_fts) = (SELECT COUNT(*) FROM message_cache)
+                    AND (SELECT COUNT(*) FROM message_fts f
+                         JOIN message_cache c ON c.rowid = f.rowid AND c.aster_id = f.aster_id)
+                        = (SELECT COUNT(*) FROM message_cache)",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fts_untouched_by_non_text_updates() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        mark_fts_row(&db, "a1");
+
+        db.set_message_flags_by_id("a1", 3).unwrap();
+        db.set_folder_if_changed("a1", "archive").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = 2, attachment_attempts = 1 WHERE aster_id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        db.upsert_cached_message("a1", "archive", Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-02"), 11, Some("body"), Some("headers"))
+            .unwrap();
+
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+    }
+
+    #[test]
+    fn fts_follows_text_updates_and_deletes() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a1", "inbox", Some("quarterly report"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, None, None)
+            .unwrap();
+        assert_eq!(db.fts_search("quarterly", 10).unwrap(), vec!["a1".to_string()]);
+        db.update_cached_body("a2", "lighthouse keeper", None).unwrap();
+        assert_eq!(db.fts_search("lighthouse", 10).unwrap(), vec!["a2".to_string()]);
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("quarterly report"));
+
+        db.delete_message_by_aster_id("a1").unwrap();
+        assert!(fts_subject(&db, "a1").is_none());
+        assert!(db.fts_search("quarterly", 10).unwrap().is_empty());
+        assert!(fts_rowids_match_cache(&db));
+    }
+
+    #[test]
+    fn legacy_fts_triggers_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        insert(&db, "a1", "inbox");
+        insert(&db, "a2", "inbox");
+        db.upsert_cached_message("a3", "inbox", Some("harbour lights"), None, None, Some("2026-01-03"), 0, None, None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "DROP TRIGGER message_cache_ai;
+                 DROP TRIGGER message_cache_ad;
+                 DROP TRIGGER message_cache_au;
+                 DELETE FROM message_fts;
+                 INSERT INTO message_fts(rowid, aster_id, subject, sender, recipients, body_text)
+                 SELECT rowid + 100, aster_id, COALESCE(subject,''), COALESCE(sender,''),
+                        COALESCE(recipients,''), COALESCE(body_text,'')
+                 FROM message_cache;
+                 CREATE TRIGGER message_cache_ai AFTER INSERT ON message_cache BEGIN
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;
+                 CREATE TRIGGER message_cache_ad AFTER DELETE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                 END;
+                 CREATE TRIGGER message_cache_au AFTER UPDATE ON message_cache BEGIN
+                     DELETE FROM message_fts WHERE aster_id = OLD.aster_id;
+                     INSERT INTO message_fts(aster_id, subject, sender, recipients, body_text)
+                     VALUES (NEW.aster_id, COALESCE(NEW.subject,''), COALESCE(NEW.sender,''),
+                             COALESCE(NEW.recipients,''), COALESCE(NEW.body_text,''));
+                 END;",
+            )
+        })
+        .unwrap();
+        assert!(!fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert!(fts_rowids_match_cache(&db));
+        let au: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_cache_au'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(au.contains("UPDATE OF"));
+        assert_eq!(db.fts_search("harbour", 10).unwrap(), vec!["a3".to_string()]);
+
+        mark_fts_row(&db, "a1");
+        db.set_message_flags_by_id("a1", 1).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"));
+        db.delete_message_by_aster_id("a3").unwrap();
+        assert!(db.fts_search("harbour", 10).unwrap().is_empty());
+        insert(&db, "a4", "inbox");
+        assert!(fts_rowids_match_cache(&db));
+        drop(db);
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(fts_subject(&db, "a1").as_deref(), Some("untouched"), "a migrated index is not rebuilt again");
+    }
+
+    #[test]
+    fn get_cached_messages_batches_and_skips_body() {
+        let (_d, db) = open_db();
+        for i in 0..1200 {
+            if i % 3 == 0 {
+                insert(&db, &format!("m{}", i), "inbox");
+            }
+        }
+        let att = |seq: i64| CachedAttachment {
+            seq,
+            name: format!("f{}.txt", seq),
+            content_type: "text/plain".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 3,
+            data: b"abc".to_vec(),
+        };
+        db.replace_message_attachments("m3", &[att(1), att(0)]).unwrap();
+        db.replace_message_attachments("m1197", &[att(0)]).unwrap();
+
+        let mut ids: Vec<String> = (0..1200).map(|i| format!("m{}", i)).collect();
+        ids.push("m0".to_string());
+        let with_body = db.get_cached_messages(&ids, true).unwrap();
+        assert_eq!(with_body.len(), 400);
+        let one = db.get_cached_message("m999").unwrap().unwrap();
+        let batched = &with_body["m999"];
+        assert_eq!(batched.body_text, one.body_text);
+        assert_eq!(batched.raw_headers, one.raw_headers);
+        assert_eq!(batched.subject, one.subject);
+
+        let meta_only = db.get_cached_messages(&ids, false).unwrap();
+        assert_eq!(meta_only.len(), 400);
+        assert!(meta_only.values().all(|m| m.body_text.is_none()));
+        assert_eq!(meta_only["m999"].subject, one.subject);
+
+        let atts = db.get_attachment_meta_for_messages(&ids).unwrap();
+        assert_eq!(atts.len(), 2);
+        let seqs: Vec<i64> = atts["m3"].iter().map(|a| a.seq).collect();
+        assert_eq!(seqs, vec![0, 1]);
+        assert!(atts["m3"].iter().all(|a| a.data.is_empty()));
+        assert_eq!(atts["m1197"].len(), 1);
+        assert!(db.get_cached_messages(&[], true).unwrap().is_empty());
     }
 
     #[test]

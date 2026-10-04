@@ -229,6 +229,8 @@ fn build_rustls_config() -> Result<ClientConfig, String> {
     Ok(config)
 }
 
+pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 pub fn pinned_client_builder(
     default_headers: reqwest::header::HeaderMap,
     user_agent: &str,
@@ -241,7 +243,7 @@ pub fn pinned_client_builder(
         .no_proxy()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(20))
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(20))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())

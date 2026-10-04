@@ -463,6 +463,12 @@ fn search_matches_noting(
     true
 }
 
+fn search_needs_body(criteria_upper: &str) -> bool {
+    tokenize_search_criteria(criteria_upper)
+        .iter()
+        .any(|t| t == "BODY" || t == "TEXT")
+}
+
 fn search_eval(
     msg: &CachedMessage,
     position: SearchPosition,
@@ -622,19 +628,29 @@ fn search_eval(
     }
 }
 
-fn uid_validity(db: &Database) -> u64 {
+fn uid_validity(db: &Database) -> std::result::Result<u64, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    if let Ok(Some(v)) = db.get_sync_state("uid_validity") {
+    if let Some(v) = db.get_sync_state("uid_validity")? {
         if let Ok(n) = v.parse::<u64>() {
-            return n;
+            return Ok(n);
         }
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(1);
-    let _ = db.set_sync_state("uid_validity", &now.to_string());
-    now
+    db.set_sync_state("uid_validity", &now.to_string())?;
+    Ok(now)
+}
+
+fn append_completed(db: &Database, uid: impl std::fmt::Display) -> String {
+    match uid_validity(db) {
+        Ok(validity) => format!("[APPENDUID {} {}] APPEND completed", validity, uid),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for APPENDUID: {}", e);
+            "APPEND completed".to_string()
+        }
+    }
 }
 
 /// Whether a STORE item is `FLAGS`, `+FLAGS` or `-FLAGS` (with or without
@@ -909,14 +925,20 @@ async fn report_mailbox_changes(
 ) -> std::io::Result<()> {
     if expunge {
         let present: std::collections::HashSet<u32> = current.iter().copied().collect();
-        let mut i = 0;
-        while i < conn.uids.len() {
-            if present.contains(&conn.uids[i]) {
-                i += 1;
-                continue;
+        let mut expunges = String::new();
+        let mut seq = 0usize;
+        let mut removed = 0usize;
+        conn.uids.retain(|uid| {
+            seq += 1;
+            if present.contains(uid) {
+                return true;
             }
-            conn.uids.remove(i);
-            writer.write_all(format!("* {} EXPUNGE\r\n", i + 1).as_bytes()).await?;
+            expunges.push_str(&format!("* {} EXPUNGE\r\n", seq - removed));
+            removed += 1;
+            false
+        });
+        if !expunges.is_empty() {
+            writer.write_all(expunges.as_bytes()).await?;
         }
     }
     let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
@@ -936,17 +958,27 @@ async fn sync_selected(
     conn: &mut ImapConnection,
     expunge: bool,
 ) -> std::io::Result<()> {
+    sync_selected_meta(writer, db, conn, expunge).await.map(|_| ())
+}
+
+async fn sync_selected_meta(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
+    conn: &mut ImapConnection,
+    expunge: bool,
+) -> std::io::Result<Option<Vec<CachedMessage>>> {
     if conn.state != ImapState::Selected {
-        return Ok(());
+        return Ok(None);
     }
     let Some(folder) = conn.selected_folder.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
-    let Ok(current) = db.list_cached_message_meta(folder) else {
-        return Ok(());
+    let Ok(listing) = db.list_cached_message_meta(folder) else {
+        return Ok(None);
     };
-    let current: Vec<u32> = current.iter().map(|m| m.imap_uid).collect();
-    report_mailbox_changes(writer, conn, &current, expunge).await
+    let current: Vec<u32> = listing.iter().map(|m| m.imap_uid).collect();
+    report_mailbox_changes(writer, conn, &current, expunge).await?;
+    Ok(Some(listing))
 }
 
 pub async fn run(
@@ -1443,7 +1475,7 @@ where
                 } else {
                     ""
                 };
-                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                let mut synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
 
                 match subcmd.as_str() {
                     "FETCH" => {
@@ -1459,11 +1491,17 @@ where
                             continue;
                         }
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
-                        let messages = db.list_cached_messages(folder).unwrap_or_default();
                         let criteria_upper = subargs.trim().to_ascii_uppercase();
                         let Ok(criteria) = strip_search_charset(&criteria_upper) else {
                             write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                             continue;
+                        };
+                        let messages = if search_needs_body(criteria) {
+                            db.list_cached_messages(folder).unwrap_or_default()
+                        } else {
+                            synced_meta
+                                .take()
+                                .unwrap_or_else(|| db.list_cached_message_meta(folder).unwrap_or_default())
                         };
                         let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                         let view = MailboxView::new(&conn.uids, &messages);
@@ -1497,7 +1535,9 @@ where
                         let uid_set_spec = &subargs[..set_end];
                         let op_and_flags = subargs[set_end..].trim();
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox").to_string();
-                        let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
                         let uids = parse_set(uid_set_spec, view.max_uid);
                         // Routed like STORE: an X-GM-LABELS item fell through
@@ -1578,7 +1618,9 @@ where
                         }
                         let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
                         let uid_set_spec = subargs.trim();
-                        let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
                         let targets: Vec<(u32, String)> = view.iter()
                             .filter(|(_, m)| m.flags & 8 != 0)
@@ -1615,11 +1657,15 @@ where
             "SEARCH" => {
                 require_selected!(conn, writer, tag);
                 let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
-                let messages = db.list_cached_messages(folder).unwrap_or_default();
                 let criteria_upper = args.trim().to_ascii_uppercase();
                 let Ok(criteria) = strip_search_charset(&criteria_upper) else {
                     write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                     continue;
+                };
+                let messages = if search_needs_body(criteria) {
+                    db.list_cached_messages(folder).unwrap_or_default()
+                } else {
+                    db.list_cached_message_meta(folder).unwrap_or_default()
                 };
                 let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
@@ -1653,7 +1699,7 @@ where
                 let upper_store = op_and_flags.to_ascii_uppercase();
                 let is_gm_labels = upper_store.contains("X-GM-LABELS");
                 let folder = conn.selected_folder.clone().unwrap_or_default();
-                let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
                 let seqs = parse_set(set_part, view.len());
                 if is_gm_labels {
@@ -1723,9 +1769,10 @@ where
                     write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
                     continue;
                 }
-                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                let synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
                 let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
-                let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                let messages = synced_meta
+                    .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                 let targets: Vec<(u32, String)> = messages.iter()
                     .filter(|m| m.flags & 8 != 0)
                     .map(|m| (m.imap_uid, m.aster_id.clone()))
@@ -1828,11 +1875,19 @@ where
                             };
                             let current: Vec<u32> = current_meta.iter().map(|m| m.imap_uid).collect();
                             report_mailbox_changes(&mut writer, &mut conn, &current, true).await?;
+                            let mut seq_by_uid: Option<std::collections::HashMap<u32, usize>> = None;
                             for m in &current_meta {
                                 if idle_flags.get(&m.imap_uid).is_none_or(|old| *old == m.flags) {
                                     continue;
                                 }
-                                let Some(seq) = conn.uids.iter().position(|u| *u == m.imap_uid) else {
+                                let seq_by_uid = seq_by_uid.get_or_insert_with(|| {
+                                    let mut map = std::collections::HashMap::with_capacity(conn.uids.len());
+                                    for (i, uid) in conn.uids.iter().enumerate() {
+                                        map.entry(*uid).or_insert(i);
+                                    }
+                                    map
+                                });
+                                let Some(&seq) = seq_by_uid.get(&m.imap_uid) else {
                                     continue;
                                 };
                                 writer
@@ -1871,7 +1926,7 @@ where
                 require_selected!(conn, writer, tag);
                 let folder = conn.selected_folder.clone().unwrap_or_default();
                 if !conn.read_only {
-                    let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                    let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                     let targets: Vec<(u32, String)> = messages.iter()
                         .filter(|m| m.flags & 8 != 0)
                         .map(|m| (m.imap_uid, m.aster_id.clone()))
@@ -1904,6 +1959,14 @@ where
                     }
                 };
                 let aster_folder = entry.label.as_str();
+                let validity = match uid_validity(&db) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("STATUS could not read UIDVALIDITY: {}", e);
+                        write_no(&mut writer, &tag, "[UNAVAILABLE] mailbox state is unavailable, try again").await?;
+                        continue;
+                    }
+                };
                 let count = db.count_cached_messages(aster_folder).unwrap_or(0);
                 let uid_next = db.uid_next(aster_folder).unwrap_or(1);
                 let unseen = db.count_unread_messages(aster_folder).unwrap_or(0);
@@ -1914,7 +1977,7 @@ where
                             quote_imap_string(&mailbox),
                             count,
                             unseen,
-                            uid_validity(&db),
+                            validity,
                             uid_next
                         )
                         .as_bytes(),
@@ -1999,11 +2062,7 @@ where
                                         write_ok(
                                             &mut writer,
                                             &tag,
-                                            &format!(
-                                                "[APPENDUID {} {}] APPEND completed",
-                                                uid_validity(&db),
-                                                uid
-                                            ),
+                                            &append_completed(&db, uid),
                                         )
                                         .await?;
                                     }
@@ -2044,11 +2103,7 @@ where
                                     write_ok(
                                         &mut writer,
                                         &tag,
-                                        &format!(
-                                            "[APPENDUID {} {}] APPEND completed",
-                                            uid_validity(&db),
-                                            uid
-                                        ),
+                                        &append_completed(&db, uid),
                                     )
                                     .await?;
                                     continue;
@@ -2094,11 +2149,7 @@ where
                                         write_ok(
                                             &mut writer,
                                             &tag,
-                                            &format!(
-                                                "[APPENDUID {} {}] APPEND completed",
-                                                uid_validity(&db),
-                                                uid
-                                            ),
+                                            &append_completed(&db, uid),
                                         )
                                         .await?;
                                     }
@@ -2111,11 +2162,7 @@ where
                                                 write_ok(
                                                     &mut writer,
                                                     &tag,
-                                                    &format!(
-                                                        "[APPENDUID {} {}] APPEND completed",
-                                                        uid_validity(&db),
-                                                        uid
-                                                    ),
+                                                    &append_completed(&db, uid),
                                                 )
                                                 .await?
                                             }
@@ -3024,7 +3071,7 @@ async fn handle_copy_move(
     let messages = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
-        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
             .await
             .unwrap_or_default()
     };
@@ -3047,9 +3094,18 @@ async fn handle_copy_move(
     let token = session.read().await.access_token.to_string();
     let validity = {
         let db = Arc::clone(db);
-        tokio::task::spawn_blocking(move || uid_validity(&db))
-            .await
-            .unwrap_or(1)
+        match tokio::task::spawn_blocking(move || uid_validity(&db)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!("{} could not read UIDVALIDITY: {}", verb, e);
+                return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!("{} UIDVALIDITY task failed: {}", verb, e);
+                return write_no(writer, tag, "[SERVERBUG] mailbox state is unavailable").await;
+            }
+        }
     };
     let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
     if let Err(e) = relabel_with_backoff(
@@ -3086,7 +3142,7 @@ async fn handle_copy_move(
             }
         }
     }
-    let (src_uids, tgt_uids) = {
+    let assigned = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
         let target = target_internal.clone();
@@ -3094,6 +3150,7 @@ async fn handle_copy_move(
         tokio::task::spawn_blocking(move || {
             let mut src: Vec<u32> = Vec::new();
             let mut tgt: Vec<u32> = Vec::new();
+            let mut all_assigned = true;
             for (_, m) in &entries {
                 let _ = db.upsert_cached_message(
                     &m.aster_id,
@@ -3108,19 +3165,33 @@ async fn handle_copy_move(
                 );
                 let _ = db.remove_uid_mapping(m.imap_uid as i64, &folder);
                 src.push(m.imap_uid);
-                tgt.push(db.assign_uid_if_missing(&target, &m.aster_id).unwrap_or(0));
+                match db.assign_uid_if_missing(&target, &m.aster_id) {
+                    Ok(uid) => tgt.push(uid),
+                    Err(e) => {
+                        tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
+                        all_assigned = false;
+                    }
+                }
             }
-            (src, tgt)
+            (src, tgt, all_assigned)
         })
         .await
-        .unwrap_or_default()
     };
-    let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-    let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let (src_uids, tgt_uids, all_assigned) = match assigned {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("{} cache update task failed: {}", verb, e);
+            return write_no(writer, tag, "[SERVERBUG] could not update the local mailbox").await;
+        }
+    };
 
-    writer
-        .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
-        .await?;
+    if all_assigned {
+        let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        writer
+            .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
+            .await?;
+    }
     for uid in &src_uids {
         if let Some(seq) = conn.expunged(*uid) {
             writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
@@ -3176,7 +3247,7 @@ async fn handle_copy(
     let messages = {
         let db = Arc::clone(db);
         let folder = source_folder.to_string();
-        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
             .await
             .unwrap_or_default()
     };
@@ -3192,6 +3263,17 @@ async fn handle_copy(
         })
         .map(|(_, m)| m.clone())
         .collect();
+    let selected: Vec<CachedMessage> = {
+        let db = Arc::clone(db);
+        tokio::task::spawn_blocking(move || {
+            selected
+                .into_iter()
+                .filter_map(|m| db.get_cached_message(&m.aster_id).ok().flatten())
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
     if selected.is_empty() {
         return write_ok(writer, tag, "COPY completed").await;
     }
@@ -3304,12 +3386,14 @@ async fn handle_copy(
     }
     let src_set = copies.iter().map(|(s, ..)| s.to_string()).collect::<Vec<_>>().join(",");
     let dst_set = copies.iter().map(|(_, d, ..)| d.to_string()).collect::<Vec<_>>().join(",");
-    write_ok(
-        writer,
-        tag,
-        &format!("[COPYUID {} {} {}] COPY completed", uid_validity(db), src_set, dst_set),
-    )
-    .await
+    let completed = match uid_validity(db) {
+        Ok(validity) => format!("[COPYUID {} {} {}] COPY completed", validity, src_set, dst_set),
+        Err(e) => {
+            tracing::warn!("UIDVALIDITY unavailable for COPYUID: {}", e);
+            "COPY completed".to_string()
+        }
+    };
+    write_ok(writer, tag, &completed).await
 }
 
 async fn handle_select(
@@ -3328,8 +3412,16 @@ async fn handle_select(
         }
     };
     let aster_folder = entry.label.as_str();
+    let validity = match uid_validity(db) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("{} could not read UIDVALIDITY: {}", command, e);
+            return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
+                .await;
+        }
+    };
 
-    let messages = db.list_cached_messages(aster_folder).unwrap_or_default();
+    let messages = db.list_cached_message_meta(aster_folder).unwrap_or_default();
     let count = messages.len();
     if count == 0 {
         crate::sync::poller::try_kick_sync();
@@ -3354,7 +3446,7 @@ async fn handle_select(
     }
 
     writer
-        .write_all(format!("* OK [UIDVALIDITY {}]\r\n", uid_validity(db)).as_bytes())
+        .write_all(format!("* OK [UIDVALIDITY {}]\r\n", validity).as_bytes())
         .await?;
     let uid_next = db.uid_next(aster_folder).unwrap_or(1);
     writer
@@ -3719,12 +3811,7 @@ async fn handle_fetch(
         || wants_rfc822_text
         || wants_bodystructure
         || header_fields.is_some();
-    let messages = if needs_body {
-        db.list_cached_messages(folder)
-    } else {
-        db.list_cached_message_meta(folder)
-    }
-    .unwrap_or_default();
+    let messages = db.list_cached_message_meta(folder).unwrap_or_default();
     let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
     let folder_attachment_meta = if !needs_body && wants_size {
         db.list_attachment_meta_for_folder(folder).unwrap_or_default()
@@ -3742,9 +3829,21 @@ async fn handle_fetch(
         } else {
             view.by_seq(*n).map(|m| (*n as usize, m))
         };
-        let Some((seq_num, msg)) = found else {
+        let Some((seq_num, meta)) = found else {
             continue;
         };
+        let with_body = if needs_body {
+            let Ok(Some(stored)) = db.get_cached_message(&meta.aster_id) else {
+                continue;
+            };
+            Some(CachedMessage {
+                body_text: stored.body_text,
+                ..meta.clone()
+            })
+        } else {
+            None
+        };
+        let msg = with_body.as_ref().unwrap_or(meta);
         let uid = msg.imap_uid;
         let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
         let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
@@ -4916,6 +5015,69 @@ mod tests {
             selects,
             seen
         );
+    }
+
+    fn break_uid_validity_read(db: &Database) {
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE sync_state SET value = x'00ff' WHERE key = 'uid_validity'",
+                [],
+            )
+        })
+        .unwrap();
+    }
+
+    fn uid_validity_value_type(db: &Database) -> String {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT typeof(value) FROM sync_state WHERE key = 'uid_validity'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn uid_validity_is_kept_when_the_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let first = uid_validity(&db).unwrap();
+        assert_eq!(uid_validity(&db).unwrap(), first);
+
+        break_uid_validity_read(&db);
+        assert!(uid_validity(&db).is_err());
+        assert_eq!(uid_validity_value_type(&db), "blob", "a failed read must not write a new value");
+    }
+
+    #[tokio::test]
+    async fn select_examine_and_status_fail_when_uid_validity_cannot_be_read() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let stored = db.get_sync_state("uid_validity").unwrap().unwrap();
+
+        break_uid_validity_read(&db);
+        for (tag, command) in [
+            ("a3", "SELECT INBOX"),
+            ("a4", "EXAMINE INBOX"),
+            ("a5", "STATUS INBOX (UIDVALIDITY)"),
+        ] {
+            writer
+                .write_all(format!("{} {}\r\n", tag, command).as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reply = read_until_tag(&mut reader, tag).await.join("|");
+            assert!(reply.contains(&format!("{} NO", tag)), "{} must fail: {}", command, reply);
+            assert!(!reply.contains("UIDVALIDITY "), "{} leaked a validity: {}", command, reply);
+        }
+        assert_eq!(uid_validity_value_type(&db), "blob");
+
+        db.set_sync_state("uid_validity", &stored).unwrap();
+        writer.write_all(b"a6 SELECT INBOX\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let reply = read_until_tag(&mut reader, "a6").await.join("|");
+        assert!(reply.contains(&format!("[UIDVALIDITY {}]", stored)), "validity changed: {}", reply);
     }
 
     #[tokio::test]
@@ -6216,6 +6378,27 @@ mod tests {
             !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
             "MOVE stored a new message"
         );
+    }
+
+    #[tokio::test]
+    async fn move_leaves_out_copyuid_when_a_target_uid_cannot_be_assigned() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-moving", "moving", &[]);
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TEMP TRIGGER refuse_archive_uid BEFORE INSERT ON uid_map
+                 WHEN NEW.folder = 'archive'
+                 BEGIN SELECT RAISE(ABORT, 'uid_map unavailable'); END;",
+            )
+        })
+        .unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(!resp.contains("COPYUID"), "a COPYUID with an unassigned UID: {}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(resp.contains("m1 OK"), "{}", resp);
     }
 
     #[tokio::test]
@@ -7523,5 +7706,257 @@ mod tests {
         let lines = read_until_tag(&mut reader, "a3").await;
         let combined = lines.join("\n");
         assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+    }
+
+    #[test]
+    fn search_needs_body_only_for_body_and_text_keys() {
+        assert!(search_needs_body("BODY \"HELLO\""));
+        assert!(search_needs_body("OR SUBJECT X TEXT Y"));
+        assert!(search_needs_body("NOT (BODY X)"));
+        assert!(!search_needs_body("ALL"));
+        assert!(!search_needs_body("UNSEEN SUBJECT \"BODYGUARD\" FROM ALICE"));
+        assert!(!search_needs_body("HEADER MESSAGE-ID X UID 1:*"));
+    }
+
+    #[tokio::test]
+    async fn search_reads_bodies_only_when_the_criteria_need_them() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "srch-1", "inbox", "first");
+        seed(&db, "srch-2", "inbox", "second");
+        db.update_cached_body("srch-2", "a needle in here", None).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH BODY needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH TEXT needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "SEARCH NOT BODY needle").await;
+        assert!(resp.contains("* SEARCH 1\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s4", "UID SEARCH SUBJECT second").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s5", "SEARCH ALL").await;
+        assert!(resp.contains("* SEARCH 1 2\n"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_keeps_the_cached_body_of_the_moved_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "mv-body", "inbox", "keep my body");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(resp.contains("m1 OK"), "{}", resp);
+        let moved = db.get_cached_message("mv-body").unwrap().unwrap();
+        assert_eq!(moved.folder, "archive");
+        assert_eq!(moved.body_text.as_deref(), Some("hello body"));
+        assert!(db.body_cached("mv-body"));
+    }
+
+    fn expunges_one_at_a_time(uids: &mut Vec<u32>, present: &[u32]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < uids.len() {
+            if present.contains(&uids[i]) {
+                i += 1;
+                continue;
+            }
+            uids.remove(i);
+            out.push_str(&format!("* {} EXPUNGE\r\n", i + 1));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn many_expunges_at_once_match_one_at_a_time_removal() {
+        let session_uids: Vec<u32> = (1..=200).collect();
+        let current: Vec<u32> = session_uids
+            .iter()
+            .copied()
+            .filter(|u| !(*u == 1 || *u == 200 || (40..=90).contains(u) || u % 7 == 0))
+            .chain([201, 202])
+            .collect();
+        let mut expected_uids = session_uids.clone();
+        let mut expected = expunges_one_at_a_time(&mut expected_uids, &current);
+        expected_uids.extend([201, 202]);
+        expected.push_str(&format!("* {} EXISTS\r\n", expected_uids.len()));
+
+        let mut conn = ImapConnection {
+            state: ImapState::Selected,
+            selected_mailbox: Some("INBOX".to_string()),
+            selected_folder: Some("inbox".to_string()),
+            uids: session_uids,
+            read_only: false,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &current, true).await.unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        assert_eq!(conn.uids, expected_uids);
+
+        let mut out: Vec<u8> = Vec::new();
+        report_mailbox_changes(&mut out, &mut conn, &[2, 3], false).await.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(conn.uids, expected_uids);
+    }
+
+    #[tokio::test]
+    async fn idle_reports_many_expunges_and_flag_changes_at_once() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        for n in 1..=12 {
+            seed(&db, &format!("ib-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        writer.write_all(b"i1 IDLE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "));
+
+        for n in [2, 3, 4, 8, 12] {
+            db.delete_message_by_aster_id(&format!("ib-{}", n)).unwrap();
+        }
+        db.update_message_flags(9, "inbox", 1).unwrap();
+        db.update_message_flags(11, "inbox", 4).unwrap();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "9".to_string());
+        let _ = tx.send(StateChange { changed });
+
+        let mut lines = Vec::new();
+        for _ in 0..7 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("update not delivered")
+                .unwrap();
+            lines.push(line.trim_end().to_string());
+        }
+        assert_eq!(
+            lines,
+            vec![
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 2 EXPUNGE",
+                "* 5 EXPUNGE",
+                "* 8 EXPUNGE",
+                "* 5 FETCH (UID 9 FLAGS (\\Seen))",
+                "* 7 FETCH (UID 11 FLAGS (\\Flagged))",
+            ]
+        );
+
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let rest = read_until_tag(&mut reader, "i1").await.join("\n");
+        assert_eq!(rest, "i1 OK IDLE terminated");
+    }
+
+    async fn imap_cmd_bytes(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        cmd: &str,
+    ) -> Vec<u8> {
+        writer.write_all(format!("{} {}\r\n", tag, cmd).as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            let start = out.len();
+            let n = reader.read_until(b'\n', &mut out).await.unwrap();
+            if n == 0 || out[start..].starts_with(format!("{} ", tag).as_bytes()) {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fetching_one_uid_of_many_matches_the_full_folder_render() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=40 {
+            let id = format!("many-{}", n);
+            if n == 17 {
+                seed_copy_source(
+                    &db,
+                    &id,
+                    "with attachment",
+                    &[crate::db::CachedAttachment {
+                        seq: 0,
+                        name: "figures.csv".to_string(),
+                        content_type: "text/csv".to_string(),
+                        content_id: None,
+                        is_inline: false,
+                        size: 11,
+                        data: b"a,b\r\n1,2\r\n".to_vec(),
+                    }],
+                );
+            } else {
+                seed(&db, &id, "inbox", &format!("subject {}", n));
+                db.update_cached_body(&id, &format!("body number {}", n), None).unwrap();
+            }
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = db.list_cached_messages("inbox").unwrap();
+        let render_old = |uid: u32| {
+            let m = full.iter().find(|m| m.imap_uid == uid).unwrap();
+            let atts = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&m.aster_id).unwrap()
+            } else {
+                Vec::new()
+            };
+            crate::message_render::render(m, &atts, true)
+        };
+
+        for uid in [17u32, 3, 40] {
+            let r = render_old(uid);
+            let resp = imap_cmd_bytes(
+                &mut reader,
+                &mut writer,
+                "f1",
+                &format!("UID FETCH {} (FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[])", uid),
+            )
+            .await;
+            let mut expected = format!(
+                "* {} FETCH (FLAGS () UID {} RFC822.SIZE {} BODYSTRUCTURE {} ",
+                uid, uid, r.size, r.bodystructure
+            )
+            .into_bytes();
+            expected.extend(literal(
+                "BODY[HEADER.FIELDS (SUBJECT)]",
+                filter_header_fields(r.header(), &["SUBJECT".to_string()]),
+            ));
+            expected.push(b' ');
+            expected.extend(literal("BODY[]", &r.text));
+            expected.extend_from_slice(b")\r\nf1 OK FETCH completed\r\n");
+            assert_eq!(
+                String::from_utf8_lossy(&resp),
+                String::from_utf8_lossy(&expected),
+                "UID {}",
+                uid
+            );
+        }
+
+        let r = render_old(17);
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f2", "FETCH 17 (BODY.PEEK[2])").await;
+        let mut expected = b"* 17 FETCH (".to_vec();
+        expected.extend(literal("BODY[2]", r.part_body("2").unwrap()));
+        expected.extend_from_slice(b")\r\nf2 OK FETCH completed\r\n");
+        assert_eq!(String::from_utf8_lossy(&resp), String::from_utf8_lossy(&expected));
+    }
+
+    #[tokio::test]
+    async fn flags_only_fetch_is_unchanged() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=3 {
+            seed(&db, &format!("fl-{}", n), "inbox", "s");
+        }
+        db.update_message_flags(2, "inbox", 1 | 4).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "f1", "UID FETCH 1:* (FLAGS)").await;
+        assert_eq!(
+            String::from_utf8_lossy(&resp),
+            "* 1 FETCH (FLAGS () UID 1)\r\n* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\n\
+             * 3 FETCH (FLAGS () UID 3)\r\nf1 OK FETCH completed\r\n"
+        );
     }
 }
