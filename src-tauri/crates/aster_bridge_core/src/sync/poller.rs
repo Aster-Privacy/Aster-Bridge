@@ -2245,6 +2245,11 @@ mod tests {
         (dir, db)
     }
 
+    #[test]
+    fn idle_http_connections_outlive_the_poll_interval() {
+        assert!(crate::tls_pinning::POOL_IDLE_TIMEOUT.as_secs() > POLL_INTERVAL_SECS);
+    }
+
     fn envelope_b64(json: &serde_json::Value) -> String {
         STANDARD.encode(json.to_string().as_bytes())
     }

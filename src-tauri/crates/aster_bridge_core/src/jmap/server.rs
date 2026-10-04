@@ -243,6 +243,12 @@ mod e2e_tests {
     use uuid::Uuid;
 
     async fn start_server() -> (String, String, tempfile::TempDir) {
+        let (base, auth, dir, _tx) = start_server_with_broadcaster().await;
+        (base, auth, dir)
+    }
+
+    async fn start_server_with_broadcaster(
+    ) -> (String, String, tempfile::TempDir, broadcast::Sender<StateChange>) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
@@ -275,13 +281,13 @@ mod e2e_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url_base = format!("http://{}", listener.local_addr().unwrap());
         let (tx, _rx) = broadcast::channel(8);
-        let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+        let (s, d, c, p, t) = (session.clone(), db.clone(), client.clone(), passwords.clone(), tx.clone());
         tokio::spawn(async move {
-            let _ = serve(listener, s, d, c, p, tx).await;
+            let _ = serve(listener, s, d, c, p, t).await;
         });
         for _ in 0..200 {
             if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                return (url_base, auth, dir);
+                return (url_base, auth, dir, tx);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -988,6 +994,43 @@ mod e2e_tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["@type"], "StateChange");
         assert!(v["changed"].is_object());
+    }
+
+    #[tokio::test]
+    async fn ws_close_releases_the_push_subscription() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (base, auth, _dir, tx) = start_server_with_broadcaster().await;
+        let idle = tx.receiver_count();
+        let ws_url = base.replacen("http://", "ws://", 1) + "/jmap/ws";
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", auth.parse().unwrap());
+        req.headers_mut()
+            .insert("sec-websocket-protocol", "jmap".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        let mut subscribed = false;
+        for _ in 0..200 {
+            if tx.receiver_count() > idle {
+                subscribed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(subscribed, "the socket never subscribed to state changes");
+
+        ws.close(None).await.unwrap();
+        drop(ws);
+        let mut released = false;
+        for _ in 0..300 {
+            if tx.receiver_count() == idle {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "a closed socket kept {} subscriptions", tx.receiver_count() - idle);
     }
 
     #[tokio::test]
