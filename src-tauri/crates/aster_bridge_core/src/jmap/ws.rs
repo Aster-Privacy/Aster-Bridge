@@ -64,18 +64,18 @@ async fn serve(socket: WebSocket, state: AppState) {
     let account_id = state.ctx.account_id().await;
     let push_filter = Arc::new(Mutex::new(PushFilter::default()));
 
-    let send_task = tokio::spawn(send_loop(
+    let mut send_task = tokio::spawn(send_loop(
         sender,
         out_rx,
         state.clone(),
         account_id.clone(),
         push_filter.clone(),
     ));
-    let recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
+    let mut recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
 
     tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     }
 }
 
