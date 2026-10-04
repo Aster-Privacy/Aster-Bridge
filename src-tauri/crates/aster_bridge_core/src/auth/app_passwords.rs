@@ -39,9 +39,62 @@ fn dummy_hash() -> &'static str {
     })
 }
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use hmac::{Hmac, Mac};
+use rand_core::RngCore;
+use rusqlite::OptionalExtension;
+use sha2::Sha256;
 
 use crate::db::Database;
+
+const VERIFY_CACHE_TTL: Duration = Duration::from_secs(300);
+const VERIFY_CACHE_MAX: usize = 64;
+const RECORD_USE_INTERVAL: Duration = Duration::from_secs(60);
+const RECORD_USE_MAX: usize = 256;
+
+struct CachedVerify {
+    id: String,
+    hash: String,
+    at: Instant,
+}
+
+#[derive(Default)]
+pub struct VerifyCache {
+    matches: Mutex<HashMap<[u8; 32], CachedVerify>>,
+    last_recorded: Mutex<HashMap<String, Instant>>,
+}
+
+impl VerifyCache {
+    pub fn clear(&self) {
+        if let Ok(mut matches) = self.matches.lock() {
+            matches.clear();
+        }
+    }
+}
+
+fn verify_cache_secret() -> &'static [u8; 32] {
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
+        secret
+    })
+}
+
+fn verify_cache_key(username: &str, password: &str) -> [u8; 32] {
+    let user = username.to_ascii_lowercase();
+    let normalized = password.replace('-', "");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(verify_cache_secret())
+        .expect("HMAC accepts any key length");
+    mac.update(&(user.len() as u64).to_le_bytes());
+    mac.update(user.as_bytes());
+    mac.update(&(normalized.len() as u64).to_le_bytes());
+    mac.update(normalized.as_bytes());
+    mac.finalize().into_bytes().into()
+}
 
 const PASSWORD_CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 const PASSWORD_SEGMENT_LEN: usize = 4;
@@ -118,6 +171,10 @@ impl AppPasswords {
     }
 
     pub fn verify_and_id(&self, password: &str) -> Option<String> {
+        self.verify_match(password).map(|(id, _)| id)
+    }
+
+    fn verify_match(&self, password: &str) -> Option<(String, String)> {
         let normalized = password.replace('-', "");
         let rows: Vec<(String, String)> = self
             .db
@@ -133,12 +190,12 @@ impl AppPasswords {
             .unwrap_or_default();
 
         let argon2 = argon2_pinned();
-        let mut matched: Option<String> = None;
+        let mut matched: Option<(String, String)> = None;
         for (id, hash_str) in &rows {
             match PasswordHash::new(hash_str) {
                 Ok(parsed) => {
                     if argon2.verify_password(normalized.as_bytes(), &parsed).is_ok() && matched.is_none() {
-                        matched = Some(id.clone());
+                        matched = Some((id.clone(), hash_str.clone()));
                     }
                 }
                 Err(_) => {
@@ -163,6 +220,82 @@ impl AppPasswords {
             .await
             .ok()
             .flatten()
+    }
+
+    pub async fn verify_and_id_cached(&self, username: &str, password: &str) -> Option<String> {
+        let key = verify_cache_key(username, password);
+        if let Some(id) = self.cached_match(&key) {
+            return Some(id);
+        }
+        let db = self.db.clone();
+        let pw = password.to_string();
+        let (id, hash) = tokio::task::spawn_blocking(move || AppPasswords { db }.verify_match(&pw))
+            .await
+            .ok()
+            .flatten()?;
+        if let Ok(mut cache) = self.db.app_password_cache.matches.lock() {
+            let now = Instant::now();
+            if cache.len() >= VERIFY_CACHE_MAX {
+                cache.retain(|_, e| now.duration_since(e.at) < VERIFY_CACHE_TTL);
+            }
+            if cache.len() >= VERIFY_CACHE_MAX {
+                if let Some(oldest) = cache.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| *k) {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(key, CachedVerify { id: id.clone(), hash, at: now });
+        }
+        Some(id)
+    }
+
+    fn cached_match(&self, key: &[u8; 32]) -> Option<String> {
+        let (id, hash) = {
+            let mut cache = self.db.app_password_cache.matches.lock().ok()?;
+            let entry = cache.get(key)?;
+            if entry.at.elapsed() >= VERIFY_CACHE_TTL {
+                cache.remove(key);
+                return None;
+            }
+            (entry.id.clone(), entry.hash.clone())
+        };
+        let current: Option<String> = self
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT hash FROM app_passwords WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .ok()
+            .flatten();
+        if current.as_deref() == Some(hash.as_str()) {
+            return Some(id);
+        }
+        if let Ok(mut cache) = self.db.app_password_cache.matches.lock() {
+            cache.remove(key);
+        }
+        None
+    }
+
+    pub fn record_use_throttled(&self, password_id: &str, client_label: Option<&str>) {
+        {
+            let Ok(mut marks) = self.db.app_password_cache.last_recorded.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            if let Some(last) = marks.get(password_id) {
+                if now.duration_since(*last) < RECORD_USE_INTERVAL {
+                    return;
+                }
+            }
+            if marks.len() >= RECORD_USE_MAX {
+                marks.retain(|_, t| now.duration_since(*t) < RECORD_USE_INTERVAL);
+            }
+            marks.insert(password_id.to_string(), now);
+        }
+        self.record_use(password_id, client_label);
     }
 
     pub fn record_use(&self, password_id: &str, client_label: Option<&str>) {
@@ -217,10 +350,12 @@ impl AppPasswords {
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
-        self.db.with_conn(|conn| {
+        let result = self.db.with_conn(|conn| {
             conn.execute("DELETE FROM app_passwords WHERE id = ?1", rusqlite::params![id])?;
             Ok(())
-        })
+        });
+        self.db.app_password_cache.clear();
+        result
     }
 }
 
@@ -324,6 +459,96 @@ mod tests {
         let entry = ap.list().into_iter().find(|e| e.id == id).unwrap();
         assert_eq!(entry.use_count, 2);
         assert!(entry.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cached_verify_remembers_a_match_by_digest() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("cached", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id.clone()));
+        let key = verify_cache_key("u@aster.test", &pw);
+        assert!(ap.db.app_password_cache.matches.lock().unwrap().contains_key(&key));
+        assert_eq!(ap.verify_and_id_cached("U@Aster.Test", &pw).await, Some(id));
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", "wrong-wrong-wrong-x").await, None);
+        assert!(!ap
+            .db
+            .app_password_cache
+            .matches
+            .lock()
+            .unwrap()
+            .contains_key(&verify_cache_key("u@aster.test", "wrong-wrong-wrong-x")));
+    }
+
+    #[tokio::test]
+    async fn revoked_password_stops_working_immediately() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("revoked", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id.clone()));
+        ap.delete(&id).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, None);
+    }
+
+    #[tokio::test]
+    async fn revoke_through_another_instance_stops_cached_password() {
+        let (_dir, db) = test_db();
+        let serving = AppPasswords::new(db.clone());
+        let managing = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = managing.store("other-instance", &pw).unwrap();
+        assert_eq!(serving.verify_and_id_cached("u@aster.test", &pw).await, Some(id.clone()));
+        managing.delete(&id).unwrap();
+        assert_eq!(serving.verify_and_id_cached("u@aster.test", &pw).await, None);
+    }
+
+    #[tokio::test]
+    async fn row_removed_without_clearing_cache_is_not_honoured() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db.clone());
+        let pw = generate_app_password();
+        let id = ap.store("raw-delete", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id.clone()));
+        db.with_conn(|conn| {
+            conn.execute("DELETE FROM app_passwords WHERE id = ?1", rusqlite::params![id])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_user_data_stops_cached_password() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db.clone());
+        let pw = generate_app_password();
+        let id = ap.store("signed-out", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id));
+        db.clear_all_user_data().unwrap();
+        assert!(!ap
+            .db
+            .app_password_cache
+            .matches
+            .lock()
+            .unwrap()
+            .contains_key(&verify_cache_key("u@aster.test", &pw)));
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, None);
+    }
+
+    #[test]
+    fn record_use_throttled_writes_once_per_interval() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("throttled", &pw).unwrap();
+        for _ in 0..5 {
+            ap.record_use_throttled(&id, Some("DAVx5"));
+        }
+        let entry = ap.list().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(entry.use_count, 1);
+        assert_eq!(entry.last_client.as_deref(), Some("DAVx5"));
     }
 
     #[test]

@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.1 - 2026-10-04
+
+### What's new
+- Folders open faster and searches return sooner in your mail app, especially in large mailboxes.
+- Attachments for older messages download several at a time, so a new mailbox finishes syncing sooner.
+- Contacts and calendar apps connect faster after the first sign-in with an app password.
+
+### Fixed
+- Attachments with accented or non-Latin file names keep their names when you download them.
+- Sender and recipient names that contain commas or other punctuation display correctly.
+- If two Aster Bridge services are set to the same port, Aster Bridge repairs the setting and starts normally.
+- Aster Bridge renews its local certificate before the certificate expires, and it reports an error if the certificate can't be loaded.
+- Your mail app no longer downloads a folder again after a temporary read error.
+
 ## 1.0.0 - 2026-10-03
 
 ### What's new

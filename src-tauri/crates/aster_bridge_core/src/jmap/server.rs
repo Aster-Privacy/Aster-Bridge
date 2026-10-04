@@ -247,12 +247,36 @@ mod e2e_tests {
     use uuid::Uuid;
 
     async fn start_server() -> (String, String, tempfile::TempDir) {
+        let (base, auth, dir, _passwords, _id, _tx) = start_server_full().await;
+        (base, auth, dir)
+    }
+
+    async fn start_server_with_passwords(
+    ) -> (String, String, tempfile::TempDir, Arc<AppPasswords>, String) {
+        let (base, auth, dir, passwords, pw_id, _tx) = start_server_full().await;
+        (base, auth, dir, passwords, pw_id)
+    }
+
+    async fn start_server_with_broadcaster(
+    ) -> (String, String, tempfile::TempDir, broadcast::Sender<StateChange>) {
+        let (base, auth, dir, _passwords, _id, tx) = start_server_full().await;
+        (base, auth, dir, tx)
+    }
+
+    async fn start_server_full() -> (
+        String,
+        String,
+        tempfile::TempDir,
+        Arc<AppPasswords>,
+        String,
+        broadcast::Sender<StateChange>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
 
         let passwords = Arc::new(AppPasswords::new(db.clone()));
-        let _id = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let pw_id = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
 
         let session = Arc::new(RwLock::new(Session {
             data_kek: None,
@@ -280,13 +304,13 @@ mod e2e_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url_base = format!("http://{}", listener.local_addr().unwrap());
         let (tx, _rx) = broadcast::channel(8);
-        let (s, d, c, p) = (session.clone(), db.clone(), client.clone(), passwords.clone());
+        let (s, d, c, p, t) = (session.clone(), db.clone(), client.clone(), passwords.clone(), tx.clone());
         tokio::spawn(async move {
-            let _ = serve(listener, s, d, c, p, tx).await;
+            let _ = serve(listener, s, d, c, p, t).await;
         });
         for _ in 0..200 {
             if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                return (url_base, auth, dir);
+                return (url_base, auth, dir, passwords, pw_id, tx);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -313,6 +337,29 @@ mod e2e_tests {
             .unwrap();
         assert_eq!(r.status(), 401);
         assert!(r.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn revoked_app_password_is_rejected_on_next_request() {
+        let (base, auth, _dir, passwords, pw_id) = start_server_with_passwords().await;
+        let http = reqwest::Client::new();
+        for _ in 0..2 {
+            let r = http
+                .get(format!("{}/jmap/session", base))
+                .header("authorization", auth.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+        }
+        passwords.delete(&pw_id).unwrap();
+        let r = http
+            .get(format!("{}/jmap/session", base))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
     }
 
     #[tokio::test]
@@ -677,13 +724,48 @@ mod e2e_tests {
                 "{}/jmap/download/{}/{}/anything.bin",
                 base, acct, blob_id
             ))
-            .header("authorization", auth)
+            .header("authorization", auth.clone())
             .send()
             .await
             .unwrap();
         assert_eq!(r_dl.status(), 200);
         let bytes = r_dl.bytes().await.unwrap();
         assert_eq!(&bytes[..], payload);
+
+        let template = sess["downloadUrl"].as_str().unwrap();
+        let url = template
+            .replace("{accountId}", &acct)
+            .replace("{blobId}", &blob_id)
+            .replace("{name}", "notes.txt")
+            .replace("{type}", "text%2Fplain");
+        let url = format!("{}{}", base, &url[url.find("/jmap/").unwrap()..]);
+        let r_typed = client
+            .get(url)
+            .header("authorization", auth.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_typed.status(), 200);
+        assert_eq!(r_typed.headers()["content-type"], "text/plain");
+        assert_eq!(&r_typed.bytes().await.unwrap()[..], payload);
+
+        let r_named = client
+            .get(format!(
+                "{}/jmap/download/{}/{}/r%C3%A9sum%C3%A9.txt",
+                base, acct, blob_id
+            ))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_named.status(), 200);
+        let disposition = r_named.headers()["content-disposition"].to_str().unwrap().to_string();
+        assert!(
+            disposition.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.txt"),
+            "{}",
+            disposition
+        );
+        assert_eq!(&r_named.bytes().await.unwrap()[..], payload);
     }
 
     #[tokio::test]
@@ -994,6 +1076,43 @@ mod e2e_tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["@type"], "StateChange");
         assert!(v["changed"].is_object());
+    }
+
+    #[tokio::test]
+    async fn ws_close_releases_the_push_subscription() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (base, auth, _dir, tx) = start_server_with_broadcaster().await;
+        let idle = tx.receiver_count();
+        let ws_url = base.replacen("http://", "ws://", 1) + "/jmap/ws";
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", auth.parse().unwrap());
+        req.headers_mut()
+            .insert("sec-websocket-protocol", "jmap".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        let mut subscribed = false;
+        for _ in 0..200 {
+            if tx.receiver_count() > idle {
+                subscribed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(subscribed, "the socket never subscribed to state changes");
+
+        ws.close(None).await.unwrap();
+        drop(ws);
+        let mut released = false;
+        for _ in 0..300 {
+            if tx.receiver_count() == idle {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "a closed socket kept {} subscriptions", tx.receiver_count() - idle);
     }
 
     #[tokio::test]

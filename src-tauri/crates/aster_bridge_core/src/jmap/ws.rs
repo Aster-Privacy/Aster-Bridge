@@ -75,8 +75,8 @@ async fn serve(socket: WebSocket, state: AppState) {
     let mut recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
 
     tokio::select! {
-        _ = &mut send_task => {},
-        _ = &mut recv_task => {},
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
         _ = shutdown.closed() => {
             send_task.abort();
             recv_task.abort();

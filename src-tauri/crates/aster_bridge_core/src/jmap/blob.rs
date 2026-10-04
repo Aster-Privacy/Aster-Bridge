@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -58,18 +58,38 @@ pub async fn upload(
     .into_response()
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DownloadQuery {
+    accept: Option<String>,
+}
+
+fn requested_type(query: &DownloadQuery) -> Option<&str> {
+    let accept = query.accept.as_deref()?.trim();
+    let usable = !accept.is_empty()
+        && accept.len() <= 255
+        && accept.contains('/')
+        && accept.bytes().all(|b| b.is_ascii_graphic() || b == b' ');
+    usable.then_some(accept)
+}
+
 pub async fn download(
     _auth: AuthedAccount,
     Path((account_id, blob_id, name)): Path<(String, String, String)>,
+    query: Option<Query<DownloadQuery>>,
     State(state): State<AppState>,
 ) -> Response {
     let expected = state.ctx.account_id().await;
     if account_id != expected {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     }
+    let query = query.map(|Query(q)| q).unwrap_or_default();
+    let accept = requested_type(&query);
+    let respond = |data: Vec<u8>, stored_type: &str, name: &str| {
+        build_blob_response(data, accept.unwrap_or(stored_type), name)
+    };
     if let Ok(Some((data, ctype))) = state.ctx.db.jmap_blob_get(&blob_id) {
         let ct = ctype.as_deref().unwrap_or("application/octet-stream");
-        return build_blob_response(data, ct, &name);
+        return respond(data, ct, &name);
     }
 
     if let Some((aster_id, seq)) = parse_attachment_blob_id(&blob_id) {
@@ -80,7 +100,7 @@ pub async fn download(
                 } else {
                     "application/octet-stream".to_string()
                 };
-                return build_blob_response(att.data, &ct, &name);
+                return respond(att.data, &ct, &name);
             }
         }
         return (StatusCode::NOT_FOUND, "blob not found").into_response();
@@ -93,7 +113,7 @@ pub async fn download(
             Vec::new()
         };
         let body = mime::build_rfc5322(&m, &attachments);
-        return build_blob_response(body, "message/rfc822", &name);
+        return respond(body, "message/rfc822", &name);
     }
 
     (StatusCode::NOT_FOUND, "blob not found").into_response()
@@ -117,8 +137,7 @@ fn build_blob_response(data: Vec<u8>, content_type: &str, name: &str) -> Respons
         header::CONTENT_TYPE,
         HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
-    let disp = format!("attachment; filename=\"{}\"", sanitize(name));
-    if let Ok(v) = HeaderValue::from_str(&disp) {
+    if let Ok(v) = HeaderValue::from_str(&content_disposition(name)) {
         h.insert(header::CONTENT_DISPOSITION, v);
     } else {
         h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
@@ -129,6 +148,48 @@ fn build_blob_response(data: Vec<u8>, content_type: &str, name: &str) -> Respons
         HeaderValue::from_static("sandbox; default-src 'none'"),
     );
     (StatusCode::OK, h, data).into_response()
+}
+
+fn content_disposition(name: &str) -> String {
+    let fallback = sanitize(name);
+    let unicode = sanitize_unicode(name);
+    if unicode.is_empty() || unicode == fallback {
+        return format!("attachment; filename=\"{}\"", fallback);
+    }
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        fallback,
+        percent_encoding::utf8_percent_encode(&unicode, RFC8187_ATTR_CHAR)
+    )
+}
+
+const RFC8187_ATTR_CHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'!')
+    .remove(b'#')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'^')
+    .remove(b'_')
+    .remove(b'`')
+    .remove(b'|')
+    .remove(b'~');
+
+fn sanitize_unicode(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | '"' | ':' | '*' | '?' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(128)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn sanitize(s: &str) -> String {
@@ -229,6 +290,36 @@ mod tests {
     fn sanitize_replaces_unsafe_with_underscore() {
         assert_eq!(sanitize("a/b\\c d"), "a_b_c_d");
         assert_eq!(sanitize("../../etc/passwd"), ".._.._etc_passwd");
+    }
+
+    #[test]
+    fn requested_type_accepts_media_types_only() {
+        let q = |s: &str| DownloadQuery { accept: Some(s.to_string()) };
+        assert_eq!(requested_type(&q("text/plain")), Some("text/plain"));
+        assert_eq!(requested_type(&q("text/plain; charset=utf-8")), Some("text/plain; charset=utf-8"));
+        assert_eq!(requested_type(&q("")), None);
+        assert_eq!(requested_type(&q("plain")), None);
+        assert_eq!(requested_type(&q("text/plain\r\nX: y")), None);
+        assert_eq!(requested_type(&DownloadQuery::default()), None);
+    }
+
+    #[test]
+    fn non_ascii_names_keep_an_encoded_utf8_filename() {
+        let disp = content_disposition("Résumé 2026.pdf");
+        assert_eq!(
+            disp,
+            "attachment; filename=\"R_sum__2026.pdf\"; filename*=UTF-8''R%C3%A9sum%C3%A9%202026.pdf"
+        );
+        assert!(HeaderValue::from_str(&disp).is_ok());
+        let disp = content_disposition("報告.txt");
+        assert!(disp.ends_with("filename*=UTF-8''%E5%A0%B1%E5%91%8A.txt"), "{}", disp);
+    }
+
+    #[test]
+    fn ascii_names_keep_the_plain_filename_only() {
+        assert_eq!(content_disposition("report-1.pdf"), "attachment; filename=\"report-1.pdf\"");
+        let disp = content_disposition("../x\"\r\n.txt");
+        assert!(!disp.contains('/') && !disp.contains('\r') && !disp.contains('\n'), "{}", disp);
     }
 
     #[test]
