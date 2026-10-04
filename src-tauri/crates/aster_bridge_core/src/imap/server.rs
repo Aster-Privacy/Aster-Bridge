@@ -973,6 +973,7 @@ pub async fn serve(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let mut acceptor = crate::accept::ResilientAcceptor::new("IMAP");
+    let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -997,7 +998,8 @@ pub async fn serve(
         let broadcaster = broadcaster.clone();
         let tls_config = tls_config.clone();
 
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
             let _permit = permit;
             if let Err(e) = run_session(
                 stream, session, db, client, passwords, broadcaster, tls_config,
@@ -1006,7 +1008,7 @@ pub async fn serve(
             {
                 tracing::error!("IMAP connection error: {}", e);
             }
-        });
+        }));
     }
 }
 
@@ -1025,6 +1027,7 @@ pub async fn run_implicit_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let mut conn_acceptor = crate::accept::ResilientAcceptor::new("IMAPS");
+    let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -1047,7 +1050,8 @@ pub async fn run_implicit_tls(
         let broadcaster = broadcaster.clone();
         let acceptor = acceptor.clone();
 
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "IMAPS").await {
                 Some(s) => s,
@@ -1060,7 +1064,7 @@ pub async fn run_implicit_tls(
             {
                 tracing::error!("IMAPS connection error: {}", e);
             }
-        });
+        }));
     }
 }
 

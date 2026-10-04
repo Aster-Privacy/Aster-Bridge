@@ -120,7 +120,14 @@ fn build_blob_response(data: Vec<u8>, content_type: &str, name: &str) -> Respons
     let disp = format!("attachment; filename=\"{}\"", sanitize(name));
     if let Ok(v) = HeaderValue::from_str(&disp) {
         h.insert(header::CONTENT_DISPOSITION, v);
+    } else {
+        h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
     }
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
     (StatusCode::OK, h, data).into_response()
 }
 
@@ -157,6 +164,35 @@ fn sha256_hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blob_response_cannot_run_as_a_page_on_the_local_origin() {
+        let response = build_blob_response(
+            b"<script>alert(1)</script>".to_vec(),
+            "text/html",
+            "page.html",
+        );
+        let headers = response.headers();
+        assert_eq!(headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "sandbox; default-src 'none'"
+        );
+        let disposition = headers.get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        assert!(disposition.starts_with("attachment"), "got {}", disposition);
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/html");
+    }
+
+    #[test]
+    fn a_blob_with_an_unusable_content_type_is_still_a_download() {
+        let response = build_blob_response(vec![1, 2, 3], "text/html\r\nX-Injected: 1", "a\"b\r\n.html");
+        let headers = response.headers();
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/octet-stream");
+        assert!(headers.get("x-injected").is_none());
+        let disposition = headers.get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        assert_eq!(disposition, "attachment; filename=\"a_b__.html\"");
+        assert_eq!(headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    }
 
     #[test]
     fn sha256_hex_known_vector() {

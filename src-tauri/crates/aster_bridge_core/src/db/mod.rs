@@ -465,6 +465,11 @@ where
     }
 }
 
+const WIRE_SIZE_REVISION: i64 = 1;
+const PENDING_CLEAR_MARKER: &str = "user_data_clear_pending";
+const CLEAR_ATTEMPTS: u32 = 5;
+const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -712,6 +717,26 @@ impl Database {
             ).map_err(|e| format!("FTS backfill failed: {}", e))?;
         }
 
+        let schema_revision: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if schema_revision < WIRE_SIZE_REVISION {
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 UPDATE message_cache
+                 SET size = length(CAST(body_text AS BLOB))
+                     + (length(body_text) - length(replace(body_text, char(10), '')))
+                     + (length(body_text) - length(replace(body_text, char(13), '')))
+                     - (length(body_text) - length(replace(body_text, char(13) || char(10), '')))
+                 WHERE body_text IS NOT NULL
+                   AND (instr(body_text, char(10)) > 0 OR instr(body_text, char(13)) > 0);
+                 PRAGMA user_version = {};
+                 COMMIT;",
+                WIRE_SIZE_REVISION
+            ))
+            .map_err(|e| format!("message size repair failed: {}", e))?;
+        }
+
         verify_required_columns(conn)
     }
 
@@ -825,7 +850,9 @@ impl Database {
         let sender = sender.map(strip_c0_controls);
         let recipients = recipients.map(strip_c0_controls);
         let body_text = body_text.map(strip_c0_controls);
-        let size = body_text.as_ref().map_or(size, |b| b.len() as i64);
+        let size = body_text
+            .as_ref()
+            .map_or(size, |b| crate::message_render::crlf_normalized_len(b) as i64);
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO message_cache (aster_id, folder, subject, sender, recipients, date, size, body_cached, body_text, raw_headers)
@@ -891,7 +918,7 @@ impl Database {
         raw_headers: Option<&str>,
     ) -> Result<(), String> {
         let body = strip_c0_controls(body_text);
-        let size = body.len() as i64;
+        let size = crate::message_render::crlf_normalized_len(&body) as i64;
         self.with_conn(|conn| {
             match raw_headers {
                 Some(rh) => conn.execute(
@@ -2245,9 +2272,45 @@ impl Database {
         })
     }
 
+    pub fn clear_pending(data_dir: &Path) -> bool {
+        data_dir.join(PENDING_CLEAR_MARKER).exists()
+    }
+
+    pub async fn clear_user_data_or_defer(&self, data_dir: &Path) -> Result<(), String> {
+        let marker = data_dir.join(PENDING_CLEAR_MARKER);
+        let marked = std::fs::write(&marker, b"").is_ok();
+        let mut last_error = String::new();
+        for attempt in 0..CLEAR_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CLEAR_RETRY_DELAY).await;
+            }
+            match self.clear_all_user_data() {
+                Ok(()) => {
+                    if marked {
+                        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => last_error = e,
+            }
+        }
+        Err(last_error)
+    }
+
+    pub fn finish_pending_clear(&self, data_dir: &Path) -> Result<bool, String> {
+        let marker = data_dir.join(PENDING_CLEAR_MARKER);
+        if !marker.exists() {
+            return Ok(false);
+        }
+        self.clear_all_user_data()?;
+        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     pub fn clear_all_user_data(&self) -> Result<(), String> {
         self.with_conn(|conn| {
-            conn.execute_batch(
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
                  DELETE FROM message_attachment;
@@ -2261,7 +2324,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM outbox;",
             )?;
-            Ok(())
+            tx.commit()
         })
     }
 
@@ -3178,6 +3241,103 @@ mod db_tests {
         db.clear_user_data().unwrap();
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
         assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_clear_removes_nothing_and_leaves_a_marker() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        db.with_conn(|conn| conn.execute_batch("ALTER TABLE outbox RENAME TO outbox_aside;"))
+            .unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let outcome = rt.block_on(db.clear_user_data_or_defer(dir.path()));
+
+        assert!(outcome.is_err());
+        assert!(Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
+        assert!(db.finish_pending_clear(dir.path()).is_err());
+        assert!(Database::clear_pending(dir.path()));
+
+        db.with_conn(|conn| conn.execute_batch("ALTER TABLE outbox_aside RENAME TO outbox;"))
+            .unwrap();
+        assert_eq!(db.finish_pending_clear(dir.path()), Ok(true));
+        assert!(!Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+        assert_eq!(db.finish_pending_clear(dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn a_successful_clear_leaves_no_marker() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(db.clear_user_data_or_defer(dir.path())).unwrap();
+        assert!(!Database::clear_pending(dir.path()));
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
+    }
+
+    #[test]
+    fn stored_size_counts_every_line_break_as_two_bytes() {
+        let (_d, db) = open_db();
+        let raw = "one\ntwo\r\nthree\rfour";
+        db.upsert_cached_message("a1", "inbox", None, None, None, None, 0, Some(raw), None)
+            .unwrap();
+        db.upsert_cached_message("a2", "inbox", None, None, None, None, 0, None, None)
+            .unwrap();
+        db.update_cached_body("a2", raw, None).unwrap();
+        let expected = "one\r\ntwo\r\nthree\r\nfour".len() as i64;
+        for id in ["a1", "a2"] {
+            let stored = db.get_cached_message(id).unwrap().unwrap();
+            assert_eq!(stored.size, expected, "{}", id);
+            assert_eq!(stored.body_text.as_deref(), Some(raw));
+        }
+        let meta = db.list_cached_message_meta("inbox").unwrap();
+        let full = db.list_cached_messages("inbox").unwrap();
+        for (m, f) in meta.iter().zip(full.iter()) {
+            assert_eq!(
+                crate::message_render::rendered_size(m, &[]),
+                crate::message_render::render_text(f, &[]).len()
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_stored_before_line_break_normalizing_are_repaired_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = ["one\ntwo\r\nthree\rfour", "plain", "\n\n", "caf\u{e9}\n\u{1f600}\r\n"];
+        {
+            let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+            for (i, body) in bodies.iter().enumerate() {
+                let id = format!("m{}", i);
+                db.upsert_cached_message(&id, "inbox", None, None, None, None, 0, Some(body), None)
+                    .unwrap();
+            }
+            db.upsert_cached_message("nobody", "inbox", None, None, None, None, 4321, None, None)
+                .unwrap();
+            db.with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE message_cache SET size = length(CAST(body_text AS BLOB)) WHERE body_text IS NOT NULL;
+                     PRAGMA user_version = 0;",
+                )
+            })
+            .unwrap();
+        }
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        for (i, body) in bodies.iter().enumerate() {
+            let stored = db.get_cached_message(&format!("m{}", i)).unwrap().unwrap();
+            assert_eq!(
+                stored.size,
+                crate::message_render::crlf_normalized_len(body) as i64,
+                "body {}",
+                i
+            );
+        }
+        assert_eq!(db.get_cached_message("nobody").unwrap().unwrap().size, 4321);
+        let revision: i64 = db
+            .with_conn(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(revision, WIRE_SIZE_REVISION);
     }
 
     #[test]

@@ -110,6 +110,40 @@ pub fn base64_encoded_len(raw_len: usize) -> usize {
     b64 + b64.div_ceil(BASE64_LINE) * 2
 }
 
+pub fn crlf_normalized_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'\n' if i == 0 || bytes[i - 1] != b'\r' => len += 1,
+            b'\r' if bytes.get(i + 1) != Some(&b'\n') => len += 1,
+            _ => {}
+        }
+    }
+    len
+}
+
+pub fn to_crlf(s: &str) -> std::borrow::Cow<'_, str> {
+    if crlf_normalized_len(s) == s.len() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(crlf_normalized_len(s));
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str("\r\n");
+            }
+            '\n' => out.push_str("\r\n"),
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn sanitize_header(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
@@ -356,8 +390,8 @@ fn detect_html(meta: &serde_json::Value, body: &str) -> bool {
 
 fn note_suffix(note: Option<&str>, is_html: bool) -> String {
     match note {
-        Some(n) if is_html => format!("\n<p>{}</p>", escape_html_text(n)),
-        Some(n) => format!("\n\n{}", n),
+        Some(n) if is_html => format!("\r\n<p>{}</p>", escape_html_text(n)),
+        Some(n) => format!("\r\n\r\n{}", n),
         None => String::new(),
     }
 }
@@ -439,7 +473,8 @@ struct TextPart<'a> {
 impl<'a> TextPart<'a> {
     fn write(&self, out: &mut Out) {
         match self.body {
-            Some(b) => out.push(b),
+            Some(b) if out.materialize => out.push(&to_crlf(b)),
+            Some(b) => out.len += crlf_normalized_len(b),
             None => out.len += self.body_len_hint,
         }
         out.push(&self.suffix);
@@ -754,7 +789,7 @@ mod tests {
             sender: Some("Alice <alice@example.com>".to_string()),
             recipients: Some("bob@example.com".to_string()),
             date: Some("2026-09-01T10:00:00Z".to_string()),
-            size: body.map(|b| b.len() as i64).unwrap_or(0),
+            size: body.map(|b| crlf_normalized_len(b) as i64).unwrap_or(0),
             flags: 0,
             body_text: body.map(str::to_string),
             raw_headers: raw.map(str::to_string),
@@ -776,19 +811,59 @@ mod tests {
         }
     }
 
+    fn has_bare_line_break(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.iter().enumerate().any(|(i, b)| match b {
+            b'\n' => i == 0 || bytes[i - 1] != b'\r',
+            b'\r' => bytes.get(i + 1) != Some(&b'\n'),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn rendered_bodies_use_crlf_line_endings_only() {
+        let body = "first\nsecond\r\nthird\rfourth\n";
+        for raw in [
+            "{\"is_html\":false}",
+            "{\"is_html\":true}",
+            "{\"is_html\":false,\"sender_unverified\":true}",
+            "{\"is_html\":true,\"sender_unverified\":true}",
+        ] {
+            let mut m = msg(Some(body), Some(raw), 0);
+            m.size = crlf_normalized_len(body) as i64;
+            let r = render(&m, &[], true);
+            assert!(!has_bare_line_break(&r.text), "{}", raw);
+            assert!(r.text.contains("first\r\nsecond\r\nthird\r\nfourth\r\n"), "{}", raw);
+            assert_eq!(r.size, r.text.len());
+            assert_eq!(render(&m, &[], false).size, r.text.len());
+            let mut meta_only = m.clone();
+            meta_only.body_text = None;
+            assert_eq!(rendered_size(&meta_only, &[]), r.text.len(), "{}", raw);
+        }
+    }
+
+    #[test]
+    fn crlf_helpers_agree_and_leave_clean_text_alone() {
+        for s in ["", "a", "a\r\nb", "\n", "\r", "\r\r\n\n", "a\nb\rc\r\nd", "caf\u{e9}\n\u{1f600}"] {
+            let converted = to_crlf(s);
+            assert_eq!(converted.len(), crlf_normalized_len(s), "{:?}", s);
+            assert!(!has_bare_line_break(&converted), "{:?}", s);
+            assert_eq!(to_crlf(&converted), converted, "{:?}", s);
+        }
+        assert!(matches!(to_crlf("a\r\nb"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(to_crlf("a\nb\rc"), "a\r\nb\r\nc");
+    }
+
     #[test]
     fn unverified_sender_shows_a_note_in_text_and_html() {
         let plain = msg(Some("hello"), Some("{\"is_html\":false,\"sender_unverified\":true}"), 0);
         let r = render(&plain, &[], true);
-        assert!(r.text.ends_with(&format!("hello
-
-{}", SENDER_UNVERIFIED_NOTE)));
+        assert!(r.text.ends_with(&format!("hello\r\n\r\n{}", SENDER_UNVERIFIED_NOTE)));
         assert_eq!(rendered_size(&plain, &[]), r.text.len());
 
         let html = msg(Some("<p>hi</p>"), Some("{\"is_html\":true,\"sender_unverified\":true}"), 0);
         let r = render(&html, &[], true);
-        assert!(r.text.contains("<p>hi</p>
-<p>[Aster Bridge could not confirm"));
+        assert!(r.text.contains("<p>hi</p>\r\n<p>[Aster Bridge could not confirm"));
 
         let verified = msg(Some("hello"), Some("{\"is_html\":false}"), 0);
         assert!(!render(&verified, &[], true).text.contains("could not confirm"));
@@ -976,7 +1051,7 @@ X-Evil"
         let raw = "{\"is_html\":false,\"attachment_count\":2,\"attachments\":[{\"seq\":0,\"name\":\"a.pdf\",\"type\":\"application/pdf\",\"size\":5},{\"seq\":1,\"name\":\"b.png\",\"type\":\"image/png\"}]}";
         let m = msg(Some("body"), Some(raw), ATTACHMENTS_FAILED);
         let r = render(&m, &[], true);
-        assert!(r.body().starts_with("body\n\n[Aster Bridge could not download 2 attachments: a.pdf (application/pdf, 5 B), b.png (image/png). To get them, open the message in the Aster web or mobile app.]"));
+        assert!(r.body().starts_with("body\r\n\r\n[Aster Bridge could not download 2 attachments: a.pdf (application/pdf, 5 B), b.png (image/png). To get them, open the message in the Aster web or mobile app.]"));
         assert!(r.header().contains("text/plain"));
     }
 

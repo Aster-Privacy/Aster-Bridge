@@ -99,6 +99,7 @@ pub async fn serve_with_tls(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let mut acceptor = crate::accept::ResilientAcceptor::new("POP3");
+    let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -120,12 +121,13 @@ pub async fn serve_with_tls(
         let client = client.clone();
         let tls_config = tls_config.clone();
 
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
             let _permit = permit;
             if let Err(e) = run_session(stream, session, db, client, passwords, tls_config).await {
                 tracing::error!("POP3 connection error: {}", e);
             }
-        });
+        }));
     }
 }
 
@@ -143,6 +145,7 @@ pub async fn run_implicit_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let mut conn_acceptor = crate::accept::ResilientAcceptor::new("POP3S");
+    let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !peer.ip().is_loopback() {
@@ -164,7 +167,8 @@ pub async fn run_implicit_tls(
         let client = client.clone();
         let acceptor = acceptor.clone();
 
-        tokio::spawn(async move {
+        let shutdown = shutdown.clone();
+        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "POP3S").await {
                 Some(s) => s,
@@ -173,7 +177,7 @@ pub async fn run_implicit_tls(
             if let Err(e) = run_session(tls_stream, session, db, client, passwords, None).await {
                 tracing::error!("POP3S connection error: {}", e);
             }
-        });
+        }));
     }
 }
 
@@ -844,6 +848,70 @@ mod tests {
         );
 
         let _ = handle.await;
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_open_session() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let listener_task = tokio::spawn(shutdown.scope(async move {
+            let _ = serve_with_tls(listener, session, db, client, passwords, None).await;
+        }));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("+OK"), "greeting was {:?}", line);
+
+        let mut rest = Vec::new();
+        let still_open = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(still_open.is_err(), "the session ended before connections were closed");
+
+        trigger.close_connections();
+        listener_task.abort();
+
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(
+            matches!(closed, Ok(Ok(_)) | Ok(Err(_))),
+            "the session stayed open after connections were closed"
+        );
         drop(dir);
     }
 

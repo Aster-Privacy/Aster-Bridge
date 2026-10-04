@@ -557,6 +557,7 @@ mod tests {
             identity_key: None,
             ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
+            ratchet_recovery: Default::default(),
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
             default_sender_id: None,

@@ -2774,10 +2774,15 @@ export function BridgeApp() {
 
   const handle_sign_out = async () => {
     invalidate_preferences_sync();
-    try { await api.sign_out(); } catch { /* ignore */ }
+    let data_cleared = true;
+    try { await api.sign_out(); } catch { data_cleared = false; }
     clear_cached_preferences();
     apply_preferences(default_resolved_preferences());
-    show_toast(i18next.t("toast_signed_out"), "success");
+    if (data_cleared) {
+      show_toast(i18next.t("toast_signed_out"), "success");
+    } else {
+      show_toast(i18next.t("toast_signed_out_data_kept"), "error");
+    }
     force_link_device();
   };
 

@@ -30,6 +30,7 @@ pub struct AppState {
     pub auth: Arc<JmapAuth>,
     pub bind_port: u16,
     pub use_https: bool,
+    pub shutdown: crate::shutdown::ConnectionShutdown,
 }
 
 impl FromRef<AppState> for Arc<JmapAuth> {
@@ -70,6 +71,7 @@ pub async fn run(
         tracing::info!("JMAP server listening on https://{}", sock_addr);
         let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
         return axum_server::bind_rustls(sock_addr, rustls_cfg)
+            .handle(crate::shutdown::closing_handle(crate::shutdown::current()))
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| e.to_string());
@@ -107,6 +109,7 @@ pub async fn serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(crate::shutdown::current().closed())
     .await
     .map_err(|e| e.to_string())
 }
@@ -134,6 +137,7 @@ fn build_app(
         auth,
         bind_port,
         use_https,
+        shutdown: crate::shutdown::current(),
     };
 
     Router::new()

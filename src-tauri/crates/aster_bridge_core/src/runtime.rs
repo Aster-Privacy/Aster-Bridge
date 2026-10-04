@@ -298,6 +298,7 @@ struct Inner {
     handles: StdMutex<Vec<(Service, JoinHandle<()>)>>,
     stop_tx: watch::Sender<Option<StopReason>>,
     sync_trigger: SyncTriggerTx,
+    connections: crate::shutdown::ShutdownTrigger,
 }
 
 impl Inner {
@@ -312,6 +313,7 @@ impl Inner {
                 false
             }
         });
+        self.connections.close_connections();
         let handles = match self.handles.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
@@ -473,12 +475,17 @@ fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> 
 
 type StopSender = mpsc::UnboundedSender<StopReason>;
 
-fn spawn_listener<F, E>(service: Service, fatal: Option<StopSender>, fut: F) -> JoinHandle<()>
+fn spawn_listener<F, E>(
+    service: Service,
+    fatal: Option<StopSender>,
+    shutdown: crate::shutdown::ConnectionShutdown,
+    fut: F,
+) -> JoinHandle<()>
 where
     F: std::future::Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    tokio::spawn(async move {
+    tokio::spawn(shutdown.scope(async move {
         if let Err(e) = fut.await {
             tracing::error!("{} server error: {}", service.label(), e);
             if let Some(tx) = fatal {
@@ -489,7 +496,7 @@ where
                 )));
             }
         }
-    })
+    }))
 }
 
 pub struct BridgeRuntime;
@@ -526,6 +533,7 @@ impl BridgeRuntime {
         let (stop_signal_tx, mut stop_signal_rx) = mpsc::unbounded_channel::<StopReason>();
         let mut handles: Vec<(Service, JoinHandle<()>)> = Vec::new();
         let broadcaster = crate::jmap::state::broadcaster();
+        let (connections, conn_shutdown) = crate::shutdown::channel();
 
         {
             let addr = format!("{}:{}", host, ports.imap);
@@ -540,7 +548,7 @@ impl BridgeRuntime {
             let fut = async move { crate::imap::server::run(&addr, s, d, c, p, b, t).await };
             handles.push((
                 Service::Imap,
-                spawn_listener(Service::Imap, Some(stop_signal_tx.clone()), fut),
+                spawn_listener(Service::Imap, Some(stop_signal_tx.clone()), conn_shutdown.clone(), fut),
             ));
         }
 
@@ -556,7 +564,7 @@ impl BridgeRuntime {
             let fut = async move {
                 crate::imap::server::run_implicit_tls(&addr, s, d, c, p, b, cfg).await
             };
-            handles.push((Service::Imaps, spawn_listener(Service::Imaps, None, fut)));
+            handles.push((Service::Imaps, spawn_listener(Service::Imaps, None, conn_shutdown.clone(), fut)));
         }
 
         {
@@ -571,7 +579,7 @@ impl BridgeRuntime {
             let fut = async move { crate::smtp::server::run(&addr, s, c, p, d, t).await };
             handles.push((
                 Service::Smtp,
-                spawn_listener(Service::Smtp, Some(stop_signal_tx.clone()), fut),
+                spawn_listener(Service::Smtp, Some(stop_signal_tx.clone()), conn_shutdown.clone(), fut),
             ));
         }
 
@@ -586,7 +594,7 @@ impl BridgeRuntime {
             let fut = async move {
                 crate::smtp::server::run_implicit_tls(&addr, s, c, p, d, cfg).await
             };
-            handles.push((Service::Smtps, spawn_listener(Service::Smtps, None, fut)));
+            handles.push((Service::Smtps, spawn_listener(Service::Smtps, None, conn_shutdown.clone(), fut)));
         }
 
         if plan.jmap_enabled {
@@ -600,7 +608,7 @@ impl BridgeRuntime {
             );
             let t = if jmap_https { tls_cfg.clone() } else { None };
             let fut = async move { crate::jmap::server::run(&addr, s, d, c, p, b, t).await };
-            handles.push((Service::Jmap, spawn_listener(Service::Jmap, None, fut)));
+            handles.push((Service::Jmap, spawn_listener(Service::Jmap, None, conn_shutdown.clone(), fut)));
         }
 
         if plan.carddav_enabled {
@@ -608,7 +616,7 @@ impl BridgeRuntime {
             let (s, c, p) = (session.clone(), client.clone(), passwords.clone());
             let t = if carddav_https { tls_cfg.clone() } else { None };
             let fut = async move { crate::dav::server::run(&addr, s, c, p, t).await };
-            handles.push((Service::Carddav, spawn_listener(Service::Carddav, None, fut)));
+            handles.push((Service::Carddav, spawn_listener(Service::Carddav, None, conn_shutdown.clone(), fut)));
         }
 
         if ports.pop3 != 0 {
@@ -621,7 +629,7 @@ impl BridgeRuntime {
                 tls_cfg.clone(),
             );
             let fut = async move { crate::pop3::server::run(&addr, s, d, c, p, t).await };
-            handles.push((Service::Pop3, spawn_listener(Service::Pop3, None, fut)));
+            handles.push((Service::Pop3, spawn_listener(Service::Pop3, None, conn_shutdown.clone(), fut)));
         }
 
         if let (Some(cfg), true) = (tls_cfg.clone(), ports.pop3s != 0) {
@@ -635,7 +643,7 @@ impl BridgeRuntime {
             let fut = async move {
                 crate::pop3::server::run_implicit_tls(&addr, s, d, c, p, cfg).await
             };
-            handles.push((Service::Pop3s, spawn_listener(Service::Pop3s, None, fut)));
+            handles.push((Service::Pop3s, spawn_listener(Service::Pop3s, None, conn_shutdown.clone(), fut)));
         }
 
         let (sync_tx, sync_rx) = poller::sync_trigger_channel();
@@ -774,6 +782,7 @@ impl BridgeRuntime {
             handles: StdMutex::new(handles),
             stop_tx,
             sync_trigger: sync_tx,
+            connections,
         });
 
         let weak: Weak<Inner> = Arc::downgrade(&inner);

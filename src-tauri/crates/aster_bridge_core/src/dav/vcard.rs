@@ -225,16 +225,40 @@ fn entries<'a>(contact: &'a Value, key: &str) -> &'a [Value] {
         .unwrap_or(&[])
 }
 
+fn param_list_value(raw: &str) -> String {
+    raw.split(',')
+        .filter_map(|item| {
+            let cleaned: String = item
+                .chars()
+                .filter(|c| !c.is_control() && *c != '"')
+                .collect();
+            let cleaned = cleaned.trim();
+            if cleaned.is_empty() {
+                None
+            } else if cleaned.contains([';', ':']) {
+                Some(format!("\"{}\"", cleaned))
+            } else {
+                Some(cleaned.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn push_property(out: &mut String, name: &str, params: &[(&str, &str)], value: &str) {
     if value.is_empty() {
         return;
     }
     let mut line = String::from(name);
     for (key, param_value) in params {
+        let safe_value = param_list_value(param_value);
+        if safe_value.is_empty() {
+            continue;
+        }
         line.push(';');
         line.push_str(key);
         line.push('=');
-        line.push_str(param_value);
+        line.push_str(&safe_value);
     }
     line.push(':');
     line.push_str(value);
@@ -864,6 +888,55 @@ mod tests {
             "groups": ["Pioneers", "Math"],
             "is_favorite": true
         })
+    }
+
+    #[test]
+    fn a_type_label_cannot_add_a_property_or_a_line() {
+        let contact = serde_json::json!({
+            "first_name": "Eve",
+            "email_entries": [
+                { "value": "eve@example.com", "type": "work:x\r\nTEL:+1999\r\nEMAIL" },
+                { "value": "two@example.com", "type": "home;X-EVIL=1:injected@example.com\nNOTE:pwned" }
+            ],
+            "phone_entries": [{ "value": "+15550000", "type": "cell\",\"x\":y" }],
+            "address_entries": [{ "type": "home\nORG:Evil", "street": "1 Road" }]
+        });
+        let card = contact_to_vcard("uid-9", &contact, "2026-10-03T00:00:00Z");
+
+        assert!(!card.contains("\r\nTEL:+1999"));
+        assert!(!card.contains("\r\nNOTE:pwned"));
+        assert!(!card.contains("\r\nORG:Evil"));
+        for line in card.split("\r\n") {
+            assert!(!line.contains('\r') && !line.contains('\n'), "{:?}", line);
+        }
+
+        let properties = parse_properties(&card);
+        let names: Vec<&str> = properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "EMAIL").count(), 2);
+        assert_eq!(names.iter().filter(|n| **n == "TEL").count(), 1);
+        assert!(!names.contains(&"NOTE"));
+        assert!(!names.contains(&"ORG"));
+        let emails: Vec<&str> = properties
+            .iter()
+            .filter(|p| p.name == "EMAIL")
+            .map(|p| p.value.as_str())
+            .collect();
+        assert_eq!(emails, vec!["eve@example.com", "two@example.com"]);
+        let tel = properties.iter().find(|p| p.name == "TEL").unwrap();
+        assert_eq!(tel.value, "+15550000");
+        assert!(properties.iter().all(|p| !p.params.iter().any(|(k, _)| k == "X-EVIL")));
+    }
+
+    #[test]
+    fn type_labels_are_cleaned_but_ordinary_ones_pass_through() {
+        assert_eq!(param_list_value("INTERNET,WORK"), "INTERNET,WORK");
+        assert_eq!(param_list_value("My Label"), "My Label");
+        assert_eq!(param_list_value("a:b"), "\"a:b\"");
+        assert_eq!(param_list_value("a;b,c"), "\"a;b\",c");
+        assert_eq!(param_list_value("a\r\nb"), "ab");
+        assert_eq!(param_list_value("\"quoted\""), "quoted");
+        assert_eq!(param_list_value(" , ,"), "");
+        assert_eq!(param_list_value("\r\n"), "");
     }
 
     #[test]

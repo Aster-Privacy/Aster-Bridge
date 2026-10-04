@@ -431,15 +431,20 @@ async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> R
     guard.pending_code_normalized = None;
     guard.pending_expires_in = None;
 
-    let _ = guard.db.clear_all_user_data();
-
     let data_dir = guard.config.data_dir.clone();
+    let cleared = guard.db.clear_user_data_or_defer(&data_dir).await;
+
     auth::device_identity::clear_identity(&data_dir);
     auth::device_identity::clear_passphrase(&data_dir);
     guard.identity.device_id = None;
 
     drop(guard);
     let _ = app_handle.emit("state_updated", ());
+
+    if let Err(e) = cleared {
+        tracing::error!("signed out, but stored user data was not cleared: {}", e);
+        return Err("user_data_not_cleared".to_string());
+    }
 
     tracing::info!("signed out");
 
@@ -1473,6 +1478,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
+
+        match db.finish_pending_clear(&cfg.data_dir) {
+            Ok(true) => tracing::info!("finished clearing user data left by an earlier sign-out"),
+            Ok(false) => {}
+            Err(e) => tracing::error!("stored user data is still waiting to be cleared: {}", e),
+        }
 
         let identity = match auth::device_identity::get_or_create_identity(&cfg.data_dir) {
             Ok(id) => id,

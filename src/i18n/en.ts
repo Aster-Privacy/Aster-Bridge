@@ -260,6 +260,7 @@ const en = {
   toast_password_deleted: "App password deleted",
   toast_password_delete_failed: "Failed to delete app password",
   toast_signed_out: "Signed out",
+  toast_signed_out_data_kept: "You're signed out, but Aster Bridge couldn't delete the mail stored on this device. Restart Aster Bridge to finish.",
   toast_provisioned: "Provisioned {{label}} - config copied to clipboard",
   toast_provision_failed: "Provisioning failed",
   toast_retry_queued: "Retry queued",

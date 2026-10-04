@@ -1266,9 +1266,7 @@ mod tests {
         m.raw_headers = Some(json!({"is_html": false, "sender_unverified": true}).to_string());
         let v = serialize_email(&m, &HashMap::new(), &None, true, &[]);
         let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
-        assert!(value.starts_with("this is the body text here
-
-"));
+        assert!(value.starts_with("this is the body text here\r\n\r\n"));
         assert!(value.ends_with(crate::message_render::SENDER_UNVERIFIED_NOTE));
     }
 

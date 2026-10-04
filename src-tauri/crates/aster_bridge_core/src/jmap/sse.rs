@@ -47,6 +47,7 @@ pub async fn eventsource(
 
     let rx = state.ctx.broadcaster.subscribe();
     let close_after_first = params.closeafter == "state";
+    let shutdown = state.shutdown.clone();
     let db = state.ctx.db.clone();
     let acct = account_id.clone();
 
@@ -70,7 +71,17 @@ pub async fn eventsource(
             return;
         }
         let mut live = Box::pin(live);
-        while let Some(ev) = live.next().await {
+        let closed = shutdown.closed();
+        tokio::pin!(closed);
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = &mut closed => None,
+                ev = live.next() => ev,
+            };
+            let Some(ev) = next else {
+                break;
+            };
             yield Ok::<_, Infallible>(ev);
         }
     };
