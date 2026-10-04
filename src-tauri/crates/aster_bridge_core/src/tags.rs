@@ -31,7 +31,25 @@ pub const MAX_KEYWORD_LEN: usize = 128;
 
 const SHIFT: char = '&';
 const UNSHIFT: char = '-';
-const RESERVED_KEYWORDS: [&str; 2] = ["Junk", "NonJunk"];
+const RESERVED_KEYWORDS: [&str; 17] = [
+    "Junk",
+    "NonJunk",
+    "NotJunk",
+    "JunkRecorded",
+    "Forwarded",
+    "Redirected",
+    "MDNSent",
+    "receipt-handled",
+    "Recent",
+    "Deleted",
+    "Seen",
+    "Answered",
+    "Flagged",
+    "Draft",
+    "Old",
+    "Phishing",
+    "NotPhishing",
+];
 const ATOM_SPECIALS: &[u8] = b"(){%*\"\\]";
 
 pub fn validate_name(name: &str) -> Result<(), &'static str> {
@@ -224,12 +242,47 @@ mod tests {
 
     #[test]
     fn reserved_names_never_collide_with_local_keywords() {
-        for name in ["$label1", "Junk", "nonjunk"] {
+        for name in ["$label1", "Junk", "nonjunk", "Forwarded", "receipt-handled", "SEEN"] {
             let keyword = keyword_for_name(name).unwrap();
             assert!(is_atom(&keyword), "{}", keyword);
             assert!(!is_local_keyword(&keyword), "{}", keyword);
             assert_eq!(name_for_keyword(&keyword).as_deref(), Some(name));
         }
+    }
+
+    #[test]
+    fn client_internal_keywords_stay_local_in_any_case() {
+        for keyword in [
+            "Junk",
+            "NonJunk",
+            "NotJunk",
+            "JunkRecorded",
+            "Forwarded",
+            "Redirected",
+            "MDNSent",
+            "receipt-handled",
+            "Recent",
+            "Deleted",
+            "Seen",
+            "Answered",
+            "Flagged",
+            "Draft",
+            "Old",
+            "Phishing",
+            "NotPhishing",
+            "$label1",
+        ] {
+            for variant in [
+                keyword.to_string(),
+                keyword.to_ascii_lowercase(),
+                keyword.to_ascii_uppercase(),
+            ] {
+                assert!(is_local_keyword(&variant), "{}", variant);
+                assert_eq!(name_for_keyword(&variant), None, "{}", variant);
+            }
+        }
+        assert!(!is_local_keyword("Work"));
+        assert!(!is_local_keyword("Forwarded2"));
     }
 
     #[test]

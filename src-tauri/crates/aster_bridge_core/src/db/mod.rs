@@ -473,6 +473,7 @@ const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 pub struct Database {
     conn: Mutex<Connection>,
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
+    pub(crate) tag_lock: tokio::sync::Mutex<()>,
 }
 
 impl Database {
@@ -502,6 +503,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             app_password_cache: Default::default(),
+            tag_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1388,6 +1390,23 @@ impl Database {
             )?;
             tx.commit()?;
             Ok(true)
+        })
+    }
+
+    pub fn upsert_custom_tag(&self, tag: &CustomTag) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO custom_tag (tag_token, server_id, name, keyword)
+                 VALUES (?1, ?2, ?3, CASE WHEN EXISTS (
+                    SELECT 1 FROM custom_tag WHERE keyword = ?4 AND tag_token != ?1
+                 ) THEN NULL ELSE ?4 END)
+                 ON CONFLICT(tag_token) DO UPDATE SET
+                    server_id = excluded.server_id,
+                    name = excluded.name,
+                    keyword = excluded.keyword",
+                rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
+            )?;
+            Ok(())
         })
     }
 
@@ -3894,6 +3913,36 @@ mod db_tests {
         db.clear_all_user_data().unwrap();
         assert!(db.list_custom_tags().unwrap().is_empty());
         assert!(db.message_tags(&ids).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upserting_a_tag_touches_one_row_and_never_duplicates_a_keyword() {
+        let (_d, db) = open_db();
+        insert(&db, "t-u", "inbox");
+        db.replace_custom_tags(&[custom_tag("tok-a", "A", Some("A")), custom_tag("tok-b", "B", Some("B"))])
+            .unwrap();
+        let ids = vec!["t-u".to_string()];
+        db.add_message_tag(&ids, "tok-a").unwrap();
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], custom_tag("tok-a", "A", Some("A")));
+        assert_eq!(tags[1], custom_tag("tok-b", "B", Some("B")));
+        assert_eq!(tags[2], custom_tag("tok-c", "C", Some("C")));
+        assert_eq!(db.messages_with_tag("tok-a").unwrap(), ids);
+
+        db.upsert_custom_tag(&custom_tag("tok-d", "a", Some("a"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[3], custom_tag("tok-d", "a", None));
+        assert_eq!(tags[0].keyword.as_deref(), Some("A"));
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C2", Some("C2"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[2], custom_tag("tok-c", "C2", Some("C2")));
     }
 
     #[test]

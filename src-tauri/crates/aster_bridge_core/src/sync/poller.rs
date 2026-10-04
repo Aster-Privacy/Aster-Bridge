@@ -1983,6 +1983,8 @@ async fn sync_custom_folders(
     Ok(record_mailbox_diff(db, &before, &after))
 }
 
+const TAG_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 async fn sync_custom_tags(
     db: &Database,
     client: &ApiClient,
@@ -1993,9 +1995,10 @@ async fn sync_custom_tags(
     let Some(identity_key) = identity_key else {
         return Ok(Vec::new());
     };
-    let defs = client
-        .list_tags(access_token)
+    let _guard = db.tag_lock.lock().await;
+    let defs = tokio::time::timeout(TAG_LIST_TIMEOUT, client.list_tags(access_token))
         .await
+        .map_err(|_| "failed to sync labels: timed out".to_string())?
         .map_err(|e| format!("failed to sync labels: {}", e))?;
     let tags = crate::tags::tags_from_definitions(&defs, identity_key, previous_keys);
     let before = db.list_custom_tags()?;

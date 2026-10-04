@@ -810,28 +810,35 @@ fn apply_keywords(current: &[String], op: i8, given: &[String]) -> Vec<String> {
     out
 }
 
-/// Store the keywords a STORE asks for and return the message's keywords
-/// afterwards, for the FETCH response.
 fn store_message_keywords(
     db: &Database,
     aster_id: &str,
     current: &[String],
     op: i8,
     given: Option<&[String]>,
-) -> Vec<String> {
-    let Some(given) = given else { return current.to_vec() };
-    // `+FLAGS (\Seen)` leaves keywords alone; `FLAGS (\Seen)` replaces them.
+    label_keywords: &[String],
+) {
+    let Some(given) = given else { return };
     if op != 0 && given.is_empty() {
-        return current.to_vec();
+        return;
     }
-    let updated = apply_keywords(current, op, given);
+    let storable: Vec<String> = given
+        .iter()
+        .filter(|keyword| op == -1 || !has_keyword(label_keywords, keyword) || has_keyword(current, keyword))
+        .cloned()
+        .collect();
+    let updated = apply_keywords(current, op, &storable);
     if updated != current {
         if let Err(e) = db.set_message_keywords(aster_id, &updated) {
             tracing::warn!("keyword store failed for {}: {}", aster_id, e);
-            return current.to_vec();
         }
     }
-    updated
+}
+
+#[derive(Default)]
+struct TagStoreResult {
+    label_keywords: Vec<String>,
+    failure: Option<&'static str>,
 }
 
 async fn store_tag_keywords(
@@ -841,10 +848,10 @@ async fn store_tag_keywords(
     item_ids: &[String],
     op: i8,
     given: Option<&[String]>,
-) {
-    let Some(given) = given else { return };
+) -> TagStoreResult {
+    let Some(given) = given else { return TagStoreResult::default() };
     if op != 0 && given.is_empty() {
-        return;
+        return TagStoreResult::default();
     }
     let keywords: Vec<String> = given
         .iter()
@@ -855,7 +862,8 @@ async fn store_tag_keywords(
         let s = session.read().await;
         (s.access_token.to_string(), s.identity_key.clone())
     };
-    match crate::tag_ops::apply_keywords(
+    let mut budget = crate::tag_ops::MAX_CREATED_PER_COMMAND;
+    let outcome = crate::tag_ops::apply_keywords(
         db,
         client,
         &access_token,
@@ -863,16 +871,23 @@ async fn store_tag_keywords(
         item_ids,
         op,
         &keywords,
+        &mut budget,
     )
-    .await
-    {
-        Ok(changed) => {
-            if !changed.is_empty() {
-                let refs: Vec<&str> = changed.iter().map(|id| id.as_str()).collect();
-                let _ = db.jmap_record_updated_batch("Email", &refs);
-            }
-        }
-        Err(e) => tracing::warn!("label keyword store failed: {:?}", e),
+    .await;
+    if !outcome.changed.is_empty() {
+        let refs: Vec<&str> = outcome.changed.iter().map(|id| id.as_str()).collect();
+        let _ = db.jmap_record_updated_batch("Email", &refs);
+    }
+    if !outcome.failed.is_empty() {
+        tracing::warn!("label keyword store failed for {} keywords", outcome.failed.len());
+    }
+    let label_keywords: Vec<String> = keywords
+        .into_iter()
+        .filter(|keyword| !has_keyword(&outcome.unmapped, keyword))
+        .collect();
+    TagStoreResult {
+        label_keywords,
+        failure: outcome.error.as_ref().map(|e| e.imap_response()),
     }
 }
 
@@ -1610,33 +1625,54 @@ where
                             .iter()
                             .filter_map(|uid| view.by_uid(*uid).map(|(_, m)| m.aster_id.clone()))
                             .collect();
-                        store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
-                            .await;
+                        let tag_store =
+                            store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                                .await;
                         let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                        let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
                         for uid in &uids {
                             if let Some((seq, m)) = view.by_uid(*uid) {
                                 let old_flags = m.flags as u32;
-                                let new_flags = apply_flags(old_flags, op, flag_mask);
-                                let _ = db.update_message_flags(m.imap_uid as i64, &folder, new_flags as i64);
-                                let keywords = store_message_keywords(
+                                let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                                let new_flags = if db
+                                    .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                    .is_ok()
+                                {
+                                    wanted_flags
+                                } else {
+                                    old_flags
+                                };
+                                store_message_keywords(
                                     &db,
                                     &m.aster_id,
                                     folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                                     op,
                                     store_keywords.as_deref(),
+                                    &tag_store.label_keywords,
                                 );
                                 if (old_flags & 1) != (new_flags & 1) {
                                     seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                                 }
-                                if !silent {
-                                    writer
-                                        .write_all(
-                                            format!("* {} FETCH (UID {} FLAGS ({}))\r\n", seq, uid, flags_to_str(new_flags, &keywords))
-                                            .as_bytes(),
+                                stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
+                            }
+                        }
+                        if !silent {
+                            let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                            for (seq, uid, aster_id, new_flags) in &stored_rows {
+                                let keywords =
+                                    stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
+                                writer
+                                    .write_all(
+                                        format!(
+                                            "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                                            seq,
+                                            uid,
+                                            flags_to_str(*new_flags, keywords)
                                         )
-                                        .await?;
-                                }
+                                        .as_bytes(),
+                                    )
+                                    .await?;
                             }
                         }
                         if !seen_changes.is_empty() {
@@ -1657,7 +1693,10 @@ where
                                 }
                             });
                         }
-                        write_ok(&mut writer, &tag, "UID STORE completed").await?;
+                        match tag_store.failure {
+                            Some(text) => write_no(&mut writer, &tag, text).await?,
+                            None => write_ok(&mut writer, &tag, "UID STORE completed").await?,
+                        }
                     }
                     "EXPUNGE" => {
                         if conn.state != ImapState::Selected {
@@ -1754,6 +1793,7 @@ where
                 let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
                 let seqs = parse_set(set_part, view.len());
+                let mut store_failure: Option<&'static str> = None;
                 if is_gm_labels {
                     for s in &seqs {
                         if let Some(m) = view.by_seq(*s) {
@@ -1771,33 +1811,49 @@ where
                         .iter()
                         .filter_map(|s| view.by_seq(*s).map(|m| m.aster_id.clone()))
                         .collect();
-                    store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
-                        .await;
+                    let tag_store =
+                        store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                            .await;
+                    store_failure = tag_store.failure;
                     let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                     let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                    let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
                     for s in &seqs {
                         if let Some(m) = view.by_seq(*s) {
                             let old_flags = m.flags as u32;
-                            let new_flags = apply_flags(old_flags, op, flag_mask);
-                            let _ = db.update_message_flags(m.imap_uid as i64, &folder, new_flags as i64);
-                            let keywords = store_message_keywords(
+                            let wanted_flags = apply_flags(old_flags, op, flag_mask);
+                            let new_flags = if db
+                                .update_message_flags(m.imap_uid as i64, &folder, wanted_flags as i64)
+                                .is_ok()
+                            {
+                                wanted_flags
+                            } else {
+                                old_flags
+                            };
+                            store_message_keywords(
                                 &db,
                                 &m.aster_id,
                                 folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                                 op,
                                 store_keywords.as_deref(),
+                                &tag_store.label_keywords,
                             );
                             if (old_flags & 1) != (new_flags & 1) {
                                 seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                             }
-                            if !silent {
-                                writer
-                                    .write_all(
-                                        format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(new_flags, &keywords))
+                            stored_rows.push((*s, m.aster_id.clone(), new_flags));
+                        }
+                    }
+                    if !silent {
+                        let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
+                        for (s, aster_id, new_flags) in &stored_rows {
+                            let keywords = stored_keywords.get(aster_id).map(Vec::as_slice).unwrap_or(&[]);
+                            writer
+                                .write_all(
+                                    format!("* {} FETCH (FLAGS ({}))\r\n", s, flags_to_str(*new_flags, keywords))
                                         .as_bytes(),
-                                    )
-                                    .await?;
-                            }
+                                )
+                                .await?;
                         }
                     }
                     if !seen_changes.is_empty() {
@@ -1819,7 +1875,10 @@ where
                         });
                     }
                 }
-                write_ok(&mut writer, &tag, "STORE completed").await?;
+                match store_failure {
+                    Some(text) => write_no(&mut writer, &tag, text).await?,
+                    None => write_ok(&mut writer, &tag, "STORE completed").await?,
+                }
             }
             "EXPUNGE" => {
                 require_selected!(conn, writer, tag);
@@ -3434,6 +3493,18 @@ async fn handle_copy(
             let _ = db.set_message_keywords(aster_id, keywords);
         }
     }
+    let label_pairs: Vec<(String, String)> = selected
+        .iter()
+        .zip(copies.iter())
+        .map(|(source, (_, _, copy_id, _))| (source.aster_id.clone(), copy_id.clone()))
+        .collect();
+    let access_token = session.read().await.access_token.to_string();
+    if crate::tag_ops::copy_tags(db, client, &access_token, &label_pairs)
+        .await
+        .is_err()
+    {
+        tracing::warn!("COPY could not carry labels over to the copies");
+    }
     let new_ids: Vec<&str> = copies.iter().map(|(_, _, id, _)| id.as_str()).collect();
     let _ = db.jmap_record_sync_batch("Email", &new_ids);
     let _ = db.jmap_state_bump("Mailbox");
@@ -4151,6 +4222,10 @@ mod tests {
         let c_label_add = calls.clone();
         let c_label_remove = calls.clone();
         let label_ids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c_tag_create = calls.clone();
+        let c_tag_add = calls.clone();
+        let c_tag_remove = calls.clone();
+        let tag_ids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stored_writer = stored.clone();
@@ -4460,6 +4535,52 @@ mod tests {
                             .lock()
                             .await
                             .push(("REMOVE_LABEL".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/tags",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_create.clone();
+                    let tag_ids = tag_ids.clone();
+                    async move {
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls.lock().await.push(("CREATE_TAG".to_string(), token.to_string()));
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                        let n = tag_ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({"id": format!("srv-tag-{}", n), "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_add.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("ADD_TAG".to_string(), format!("{}|{}", token, count)));
+                        Json(serde_json::json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags/remove",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = c_tag_remove.clone();
+                    async move {
+                        let count = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
+                        calls
+                            .lock()
+                            .await
+                            .push(("REMOVE_TAG".to_string(), format!("{}|{}", token, count)));
                         Json(serde_json::json!({"success": true})).into_response()
                     }
                 }),
@@ -7148,6 +7269,135 @@ mod tests {
         let resp = imap_cmd_lines(&mut reader, &mut writer, "t7", "STORE 2 FLAGS (\\Seen)").await;
         assert!(!resp.contains("$label2") && !resp.contains("Work"), "{}", resp);
         assert_eq!(db.message_keywords("tag-2").unwrap(), Vec::<String>::new());
+    }
+
+    fn work_label() -> crate::db::CustomTag {
+        crate::db::CustomTag {
+            tag_token: "tok-work".to_string(),
+            server_id: "id-work".to_string(),
+            name: "Work".to_string(),
+            keyword: Some("Work".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_label_write_answers_no_and_is_not_stored_locally() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(true, Some("test-ik")).await;
+        seed(&db, "lab-1", "inbox", "first");
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1 +FLAGS (Fresh Work $label1)").await;
+        assert!(resp.contains("s1 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(!resp.contains("s1 OK"), "{}", resp);
+        let fetch_at = resp.find("* 1 FETCH (FLAGS (").unwrap_or_else(|| panic!("no FETCH in {}", resp));
+        assert!(fetch_at < resp.find("s1 NO").unwrap(), "{}", resp);
+        assert!(resp.contains("Work") && resp.contains("$label1"), "{}", resp);
+        assert!(!resp.contains("Fresh"), "{}", resp);
+
+        let stored = db.message_keywords("lab-1").unwrap();
+        assert!(stored.contains(&"Work".to_string()), "{:?}", stored);
+        assert!(stored.contains(&"$label1".to_string()), "{:?}", stored);
+        assert!(!stored.contains(&"Fresh".to_string()), "{:?}", stored);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+
+        let uid = db.get_cached_message("lab-1").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s2",
+            &format!("UID STORE {} +FLAGS (Other)", uid),
+        )
+        .await;
+        assert!(resp.contains("s2 NO [UNAVAILABLE]"), "{}", resp);
+        assert!(resp.contains(&format!("* 1 FETCH (UID {} FLAGS (", uid)), "{}", resp);
+        assert!(!resp.contains("Other"), "{}", resp);
+        assert!(!db.message_keywords("lab-1").unwrap().contains(&"Other".to_string()));
+    }
+
+    #[tokio::test]
+    async fn client_internal_keywords_are_stored_without_a_label_call() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "lab-2", "inbox", "first");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s1",
+            "STORE 1 +FLAGS (NonJunk $Forwarded forwarded MDNSent)",
+        )
+        .await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        assert!(resp.contains("NonJunk") && resp.contains("MDNSent"), "{}", resp);
+
+        let stored = db.message_keywords("lab-2").unwrap();
+        for keyword in ["NonJunk", "$Forwarded", "forwarded", "MDNSent"] {
+            assert!(stored.contains(&keyword.to_string()), "{:?}", stored);
+        }
+        assert!(db.list_custom_tags().unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(
+            !log.iter().any(|(m, _)| m == "CREATE_TAG" || m == "ADD_TAG" || m == "REMOVE_TAG"),
+            "{:?}",
+            log
+        );
+    }
+
+    #[tokio::test]
+    async fn one_store_creates_at_most_ten_labels() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "lab-3", "inbox", "first");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let names: Vec<String> = (0..12).map(|n| format!("New{}", n)).collect();
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s1",
+            &format!("STORE 1 +FLAGS ({})", names.join(" ")),
+        )
+        .await;
+        assert!(resp.contains("s1 NO [LIMIT]"), "{}", resp);
+        assert!(resp.contains("New9"), "{}", resp);
+        assert!(!resp.contains("New10") && !resp.contains("New11"), "{}", resp);
+
+        assert_eq!(db.list_custom_tags().unwrap().len(), 10);
+        let stored = db.message_keywords("lab-3").unwrap();
+        assert_eq!(stored.len(), 10, "{:?}", stored);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 10, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_copy_keeps_the_label_keywords_of_its_source() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-labelled", "labelled", &[]);
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        db.add_message_tag(&["msg-labelled".to_string()], "tok-work").unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "UID COPY 1 Archive").await;
+        assert!(resp.contains("c1 OK [COPYUID "), "{}", resp);
+
+        let archived = db.list_cached_messages("archive").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            db.message_keywords(&archived[0].aster_id).unwrap(),
+            vec!["Work".to_string()],
+            "the copy lost its label"
+        );
+        assert_eq!(db.message_keywords("msg-labelled").unwrap(), vec!["Work".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
     }
 
     #[test]

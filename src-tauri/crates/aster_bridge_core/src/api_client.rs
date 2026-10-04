@@ -58,11 +58,28 @@ fn urlencoding_path(segment: &str) -> String {
 async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    map_error_body(status, &body)
+}
+
+fn is_plan_limit_error(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .map(|code| code == "PLAN_LIMIT_EXCEEDED")
+            })
+            .unwrap_or(false)
+}
+
+fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
     if status == reqwest::StatusCode::UNAUTHORIZED {
         crate::auth::session::request_token_refresh();
     }
     if status == reqwest::StatusCode::FORBIDDEN {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
             if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
                 let msg = parsed
                     .get("message")
@@ -74,7 +91,7 @@ async fn map_response_error(resp: reqwest::Response) -> BridgeError {
         }
     }
     if status == reqwest::StatusCode::BAD_REQUEST {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
             if parsed.get("code").and_then(|v| v.as_str()) == Some("ATTACHMENTS_TOO_LARGE") {
                 let msg = parsed
                     .get("error")
@@ -1550,7 +1567,12 @@ impl ApiClient {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(map_response_error(resp).await);
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if is_plan_limit_error(status, &text) {
+                return Err(BridgeError::PlanLimit("label limit reached".to_string()));
+            }
+            return Err(map_error_body(status, &text));
         }
         let parsed: CreateTagResponse = resp.json().await?;
         Ok(parsed.id)
