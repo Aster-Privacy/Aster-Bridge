@@ -265,6 +265,10 @@ fn display_name(contact: &Value) -> String {
     if !full.is_empty() {
         return full;
     }
+    fallback_display_name(contact)
+}
+
+fn fallback_display_name(contact: &Value) -> String {
     for key in ["nickname", "company"] {
         let candidate = string_field(contact, key).trim();
         if !candidate.is_empty() {
@@ -784,7 +788,15 @@ pub fn vcard_to_contact(text: &str) -> Map<String, Value> {
         }
     }
 
-    if !contact.contains_key("first_name") && !contact.contains_key("last_name") {
+    let fallback = fallback_display_name(&serde_json::json!({
+        "nickname": contact.get("nickname"),
+        "company": contact.get("company"),
+        "emails": emails,
+    }));
+    if !contact.contains_key("first_name")
+        && !contact.contains_key("last_name")
+        && formatted_name != fallback
+    {
         let mut parts = formatted_name.splitn(2, ' ');
         let first = parts.next().unwrap_or("").trim().to_string();
         let last = parts.next().unwrap_or("").trim().to_string();
@@ -943,6 +955,50 @@ mod tests {
         let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Grace Hopper\r\nEND:VCARD\r\n";
         let parsed = vcard_to_contact(card);
 
+        assert_eq!(parsed["first_name"], Value::from("Grace"));
+        assert_eq!(parsed["last_name"], Value::from("Hopper"));
+    }
+
+    fn assert_nameless_round_trip(contact: Value) {
+        let card = contact_to_vcard("nameless-1", &contact, "1");
+        let parsed = vcard_to_contact(&card);
+        assert_eq!(parsed["first_name"], Value::from(""), "card: {}", card);
+        assert_eq!(parsed["last_name"], Value::from(""), "card: {}", card);
+    }
+
+    #[test]
+    fn company_only_contact_keeps_an_empty_name() {
+        let contact = serde_json::json!({"company": "Acme Corp", "emails": ["sales@acme.example"]});
+        assert_nameless_round_trip(contact.clone());
+        let parsed = vcard_to_contact(&contact_to_vcard("c", &contact, "1"));
+        assert_eq!(parsed["company"], Value::from("Acme Corp"));
+    }
+
+    #[test]
+    fn nickname_only_contact_keeps_an_empty_name() {
+        let contact = serde_json::json!({"nickname": "Big Al", "company": "Acme Corp"});
+        assert_nameless_round_trip(contact.clone());
+        let parsed = vcard_to_contact(&contact_to_vcard("n", &contact, "1"));
+        assert_eq!(parsed["nickname"], Value::from("Big Al"));
+    }
+
+    #[test]
+    fn email_only_contact_keeps_an_empty_name() {
+        assert_nameless_round_trip(serde_json::json!({"emails": ["solo@example.com"]}));
+    }
+
+    #[test]
+    fn company_card_without_n_is_not_split_into_a_name() {
+        let card = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Acme Corp\r\nORG:Acme Corp\r\nEND:VCARD\r\n";
+        let parsed = vcard_to_contact(card);
+        assert_eq!(parsed["first_name"], Value::from(""));
+        assert_eq!(parsed["last_name"], Value::from(""));
+    }
+
+    #[test]
+    fn empty_n_with_a_personal_formatted_name_still_fills_the_name() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Grace Hopper\r\nN:;;;;\r\nORG:Navy\r\nEND:VCARD\r\n";
+        let parsed = vcard_to_contact(card);
         assert_eq!(parsed["first_name"], Value::from("Grace"));
         assert_eq!(parsed["last_name"], Value::from("Hopper"));
     }
