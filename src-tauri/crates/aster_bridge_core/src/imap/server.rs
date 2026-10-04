@@ -463,6 +463,12 @@ fn search_matches_noting(
     true
 }
 
+fn search_needs_body(criteria_upper: &str) -> bool {
+    tokenize_search_criteria(criteria_upper)
+        .iter()
+        .any(|t| t == "BODY" || t == "TEXT")
+}
+
 fn search_eval(
     msg: &CachedMessage,
     position: SearchPosition,
@@ -952,17 +958,27 @@ async fn sync_selected(
     conn: &mut ImapConnection,
     expunge: bool,
 ) -> std::io::Result<()> {
+    sync_selected_meta(writer, db, conn, expunge).await.map(|_| ())
+}
+
+async fn sync_selected_meta(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Database,
+    conn: &mut ImapConnection,
+    expunge: bool,
+) -> std::io::Result<Option<Vec<CachedMessage>>> {
     if conn.state != ImapState::Selected {
-        return Ok(());
+        return Ok(None);
     }
     let Some(folder) = conn.selected_folder.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
-    let Ok(current) = db.list_cached_message_meta(folder) else {
-        return Ok(());
+    let Ok(listing) = db.list_cached_message_meta(folder) else {
+        return Ok(None);
     };
-    let current: Vec<u32> = current.iter().map(|m| m.imap_uid).collect();
-    report_mailbox_changes(writer, conn, &current, expunge).await
+    let current: Vec<u32> = listing.iter().map(|m| m.imap_uid).collect();
+    report_mailbox_changes(writer, conn, &current, expunge).await?;
+    Ok(Some(listing))
 }
 
 pub async fn run(
@@ -1459,7 +1475,7 @@ where
                 } else {
                     ""
                 };
-                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                let mut synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
 
                 match subcmd.as_str() {
                     "FETCH" => {
@@ -1475,11 +1491,17 @@ where
                             continue;
                         }
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
-                        let messages = db.list_cached_messages(folder).unwrap_or_default();
                         let criteria_upper = subargs.trim().to_ascii_uppercase();
                         let Ok(criteria) = strip_search_charset(&criteria_upper) else {
                             write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                             continue;
+                        };
+                        let messages = if search_needs_body(criteria) {
+                            db.list_cached_messages(folder).unwrap_or_default()
+                        } else {
+                            synced_meta
+                                .take()
+                                .unwrap_or_else(|| db.list_cached_message_meta(folder).unwrap_or_default())
                         };
                         let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                         let view = MailboxView::new(&conn.uids, &messages);
@@ -1513,7 +1535,9 @@ where
                         let uid_set_spec = &subargs[..set_end];
                         let op_and_flags = subargs[set_end..].trim();
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox").to_string();
-                        let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
                         let uids = parse_set(uid_set_spec, view.max_uid);
                         // Routed like STORE: an X-GM-LABELS item fell through
@@ -1594,7 +1618,9 @@ where
                         }
                         let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
                         let uid_set_spec = subargs.trim();
-                        let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                        let messages = synced_meta
+                            .take()
+                            .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
                         let targets: Vec<(u32, String)> = view.iter()
                             .filter(|(_, m)| m.flags & 8 != 0)
@@ -1631,11 +1657,15 @@ where
             "SEARCH" => {
                 require_selected!(conn, writer, tag);
                 let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
-                let messages = db.list_cached_messages(folder).unwrap_or_default();
                 let criteria_upper = args.trim().to_ascii_uppercase();
                 let Ok(criteria) = strip_search_charset(&criteria_upper) else {
                     write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                     continue;
+                };
+                let messages = if search_needs_body(criteria) {
+                    db.list_cached_messages(folder).unwrap_or_default()
+                } else {
+                    db.list_cached_message_meta(folder).unwrap_or_default()
                 };
                 let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
@@ -1669,7 +1699,7 @@ where
                 let upper_store = op_and_flags.to_ascii_uppercase();
                 let is_gm_labels = upper_store.contains("X-GM-LABELS");
                 let folder = conn.selected_folder.clone().unwrap_or_default();
-                let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
                 let seqs = parse_set(set_part, view.len());
                 if is_gm_labels {
@@ -1739,9 +1769,10 @@ where
                     write_no(&mut writer, &tag, "[READ-ONLY] Mailbox is read-only").await?;
                     continue;
                 }
-                sync_selected(&mut writer, &db, &mut conn, true).await?;
+                let synced_meta = sync_selected_meta(&mut writer, &db, &mut conn, true).await?;
                 let folder = conn.selected_folder.clone().unwrap_or_else(|| "inbox".to_string());
-                let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                let messages = synced_meta
+                    .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                 let targets: Vec<(u32, String)> = messages.iter()
                     .filter(|m| m.flags & 8 != 0)
                     .map(|m| (m.imap_uid, m.aster_id.clone()))
@@ -1895,7 +1926,7 @@ where
                 require_selected!(conn, writer, tag);
                 let folder = conn.selected_folder.clone().unwrap_or_default();
                 if !conn.read_only {
-                    let messages = db.list_cached_messages(&folder).unwrap_or_default();
+                    let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                     let targets: Vec<(u32, String)> = messages.iter()
                         .filter(|m| m.flags & 8 != 0)
                         .map(|m| (m.imap_uid, m.aster_id.clone()))
@@ -3040,7 +3071,7 @@ async fn handle_copy_move(
     let messages = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
-        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
             .await
             .unwrap_or_default()
     };
@@ -3216,7 +3247,7 @@ async fn handle_copy(
     let messages = {
         let db = Arc::clone(db);
         let folder = source_folder.to_string();
-        tokio::task::spawn_blocking(move || db.list_cached_messages(&folder).unwrap_or_default())
+        tokio::task::spawn_blocking(move || db.list_cached_message_meta(&folder).unwrap_or_default())
             .await
             .unwrap_or_default()
     };
@@ -3232,6 +3263,17 @@ async fn handle_copy(
         })
         .map(|(_, m)| m.clone())
         .collect();
+    let selected: Vec<CachedMessage> = {
+        let db = Arc::clone(db);
+        tokio::task::spawn_blocking(move || {
+            selected
+                .into_iter()
+                .filter_map(|m| db.get_cached_message(&m.aster_id).ok().flatten())
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
     if selected.is_empty() {
         return write_ok(writer, tag, "COPY completed").await;
     }
@@ -3379,7 +3421,7 @@ async fn handle_select(
         }
     };
 
-    let messages = db.list_cached_messages(aster_folder).unwrap_or_default();
+    let messages = db.list_cached_message_meta(aster_folder).unwrap_or_default();
     let count = messages.len();
     if count == 0 {
         crate::sync::poller::try_kick_sync();
@@ -7664,6 +7706,51 @@ mod tests {
         let lines = read_until_tag(&mut reader, "a3").await;
         let combined = lines.join("\n");
         assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+    }
+
+    #[test]
+    fn search_needs_body_only_for_body_and_text_keys() {
+        assert!(search_needs_body("BODY \"HELLO\""));
+        assert!(search_needs_body("OR SUBJECT X TEXT Y"));
+        assert!(search_needs_body("NOT (BODY X)"));
+        assert!(!search_needs_body("ALL"));
+        assert!(!search_needs_body("UNSEEN SUBJECT \"BODYGUARD\" FROM ALICE"));
+        assert!(!search_needs_body("HEADER MESSAGE-ID X UID 1:*"));
+    }
+
+    #[tokio::test]
+    async fn search_reads_bodies_only_when_the_criteria_need_them() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "srch-1", "inbox", "first");
+        seed(&db, "srch-2", "inbox", "second");
+        db.update_cached_body("srch-2", "a needle in here", None).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "SEARCH BODY needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s2", "UID SEARCH TEXT needle").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "SEARCH NOT BODY needle").await;
+        assert!(resp.contains("* SEARCH 1\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s4", "UID SEARCH SUBJECT second").await;
+        assert!(resp.contains("* SEARCH 2\n"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s5", "SEARCH ALL").await;
+        assert!(resp.contains("* SEARCH 1 2\n"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn move_keeps_the_cached_body_of_the_moved_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "mv-body", "inbox", "keep my body");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(resp.contains("m1 OK"), "{}", resp);
+        let moved = db.get_cached_message("mv-body").unwrap().unwrap();
+        assert_eq!(moved.folder, "archive");
+        assert_eq!(moved.body_text.as_deref(), Some("hello body"));
+        assert!(db.body_cached("mv-body"));
     }
 
     fn expunges_one_at_a_time(uids: &mut Vec<u32>, present: &[u32]) -> String {
