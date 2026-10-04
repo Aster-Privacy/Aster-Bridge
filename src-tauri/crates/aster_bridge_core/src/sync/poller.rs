@@ -301,6 +301,7 @@ fn attachment_display_name(a: &EnvelopeAttachment) -> String {
 
 const ATTACHMENT_INLINE_DOWNLOADS_PER_PASS: usize = 25;
 const ATTACHMENT_BACKLOG_BATCH: usize = 25;
+const ATTACHMENT_BACKLOG_PER_PASS: usize = 100;
 const ATTACHMENT_BACKLOG_CONCURRENCY: usize = 4;
 const ATTACHMENT_BACKLOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 const ATTACHMENT_MAX_ATTEMPTS: i64 = 5;
@@ -732,7 +733,8 @@ async fn backfill_pending_attachments(
     let mut tried: HashSet<String> = HashSet::new();
     let mut stop = false;
 
-    while !stop && std::time::Instant::now() < deadline {
+    while !stop && tried.len() < ATTACHMENT_BACKLOG_PER_PASS && std::time::Instant::now() < deadline
+    {
         let limit = (skip.len() + tried.len() + ATTACHMENT_BACKLOG_BATCH) as i64;
         let backlog = match db.list_attachment_backlog(limit) {
             Ok(b) => b,
@@ -4747,6 +4749,39 @@ mod tests {
             assert_eq!(stored.len(), 1);
             assert_eq!(stored[0].data, b"payload".to_vec());
         }
+    }
+
+    #[tokio::test]
+    async fn a_backlog_pass_stops_at_the_per_pass_cap() {
+        let (_dir, db) = temp_db();
+        let key = [13u8; 32];
+        let ids = seed_backlog_with_keys(&db, ATTACHMENT_BACKLOG_PER_PASS + 30, &key);
+        let row = sealed_attachment_row(0, &key, b"payload", "a.txt", "text/plain");
+        let (base, hits) =
+            spawn_mock_attachment_server(vec![], serde_json::json!({}), vec![row]).await;
+        let client = ApiClient::new_with_base_url(&base);
+
+        let updated = backfill_pending_attachments(
+            &db,
+            &client,
+            "tok",
+            b"pass",
+            None,
+            &[],
+            &[],
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(updated.len(), ATTACHMENT_BACKLOG_PER_PASS);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            ATTACHMENT_BACKLOG_PER_PASS
+        );
+        assert_eq!(
+            db.list_attachment_backlog(1000).unwrap().len(),
+            ids.len() - ATTACHMENT_BACKLOG_PER_PASS
+        );
     }
 
     #[tokio::test]
