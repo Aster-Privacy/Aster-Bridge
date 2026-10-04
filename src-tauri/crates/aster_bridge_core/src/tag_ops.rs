@@ -23,6 +23,10 @@ use crate::db::{CustomTag, Database};
 use crate::error::BridgeError;
 
 pub const MAX_CREATED_PER_COMMAND: usize = 10;
+pub const MAX_MIGRATION_ATTEMPTS: u32 = 5;
+
+const MIGRATION_STATE_KEY: &str = "local_keyword_migration";
+const MIGRATION_DONE: &str = "done";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagOpError {
@@ -92,12 +96,17 @@ fn clean_name(name: &str) -> Result<String, TagOpError> {
 
 fn find_by_name<'a>(tags: &'a [CustomTag], name: &str) -> Option<&'a CustomTag> {
     let wanted = name.to_lowercase();
-    let mut matches = tags.iter().filter(|tag| tag.name.to_lowercase() == wanted);
-    let first = matches.next()?;
-    if first.keyword.is_some() {
-        return Some(first);
-    }
-    Some(matches.find(|tag| tag.keyword.is_some()).unwrap_or(first))
+    tags.iter()
+        .find(|tag| {
+            tag.keyword
+                .as_deref()
+                .and_then(crate::tags::keyword_text)
+                .is_some_and(|text| text.to_lowercase() == wanted)
+        })
+        .or_else(|| {
+            tags.iter()
+                .find(|tag| tag.keyword.is_none() && tag.name.to_lowercase() == wanted)
+        })
 }
 
 fn store(db: &Database, mut tag: CustomTag) -> Result<CustomTag, TagOpError> {
@@ -306,6 +315,75 @@ pub async fn apply_keywords(
         push_unique(&mut outcome.changed, &ids);
     }
     outcome
+}
+
+pub async fn migrate_local_keywords(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: Option<&str>,
+) -> Vec<String> {
+    let state = db.get_sync_state(MIGRATION_STATE_KEY).ok().flatten();
+    if state.as_deref() == Some(MIGRATION_DONE) {
+        return Vec::new();
+    }
+    let attempts: u32 = state.and_then(|value| value.parse().ok()).unwrap_or(0);
+    let Ok(stored) = db.local_keyword_messages() else {
+        return Vec::new();
+    };
+    let groups: Vec<(String, Vec<String>)> = stored
+        .into_iter()
+        .filter(|(keyword, _)| crate::tags::name_for_keyword(keyword).is_some())
+        .collect();
+    if groups.is_empty() {
+        let _ = db.set_sync_state(MIGRATION_STATE_KEY, MIGRATION_DONE);
+        return Vec::new();
+    }
+    if identity_key.is_none() {
+        return Vec::new();
+    }
+    let mut budget = MAX_CREATED_PER_COMMAND;
+    let mut changed: Vec<String> = Vec::new();
+    let mut failed = false;
+    let mut paused = false;
+    let mut blocked = false;
+    for (keyword, ids) in &groups {
+        let outcome = apply_keywords(
+            db,
+            client,
+            access_token,
+            identity_key,
+            ids,
+            1,
+            std::slice::from_ref(keyword),
+            &mut budget,
+        )
+        .await;
+        push_unique(&mut changed, &outcome.changed);
+        match outcome.error {
+            None => {}
+            Some(TagOpError::TooManyNew) => {
+                paused = true;
+                break;
+            }
+            Some(TagOpError::LimitReached) => {
+                blocked = true;
+                break;
+            }
+            Some(_) => failed = true,
+        }
+    }
+    let next = if blocked {
+        MIGRATION_DONE.to_string()
+    } else if paused {
+        attempts.to_string()
+    } else if failed && attempts + 1 < MAX_MIGRATION_ATTEMPTS {
+        (attempts + 1).to_string()
+    } else {
+        MIGRATION_DONE.to_string()
+    };
+    let _ = db.set_sync_state(MIGRATION_STATE_KEY, &next);
+    changed
 }
 
 pub async fn copy_tags(
@@ -667,6 +745,127 @@ mod tests {
         assert_eq!(tags.iter().filter(|tag| tag.keyword.as_deref() == Some("Fresh")).count(), 1);
         assert_eq!(db.messages_with_tag("tok-home").unwrap(), strings(&["m-1"]));
         assert_eq!(db.message_keywords("m-2").unwrap(), strings(&["Fresh"]));
+    }
+
+    fn cache(db: &Database, ids: &[&str]) {
+        for id in ids {
+            db.upsert_cached_message(id, "inbox", Some("s"), None, None, None, 1, None, None)
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leaf_name_does_not_resolve_to_a_nested_label() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        let mut nested = stored_tag("tok-nested", "Acme");
+        nested.keyword = Some("Clients/Acme".to_string());
+        db.replace_custom_tags(&[stored_tag("tok-clients", "Clients"), nested]).unwrap();
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let outcome = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["clients/acme", "Acme"]),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(count(&calls, "create").await, 1);
+        let held = db.message_tags(&ids).unwrap().get("m-1").unwrap().clone();
+        assert_eq!(held.len(), 2);
+        assert!(held.contains(&"tok-nested".to_string()));
+        assert!(!held.contains(&"tok-clients".to_string()));
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags.iter().filter(|tag| tag.keyword.as_deref() == Some("Acme")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_keywords_become_labels_once() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1", "m-2"]);
+        db.set_message_keywords("m-1", &strings(&["work", "$label1", "Fresh"])).unwrap();
+        db.set_message_keywords("m-2", &strings(&["Work", "NonJunk"])).unwrap();
+        db.set_message_keywords("gone", &strings(&["Lost"])).unwrap();
+        db.replace_custom_tags(&[stored_tag("tok-work", "Work")]).unwrap();
+
+        let mut changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        changed.sort();
+
+        assert_eq!(changed, strings(&["m-1", "m-2"]));
+        assert_eq!(count(&calls, "create").await, 1);
+        assert_eq!(db.messages_with_tag("tok-work").unwrap(), strings(&["m-1", "m-2"]));
+        assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["$label1", "Fresh", "Work"]));
+        assert_eq!(db.message_keywords("m-2").unwrap(), strings(&["NonJunk", "Work"]));
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+
+        let before = calls.lock().await.len();
+        assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
+        assert_eq!(calls.lock().await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn the_keyword_migration_waits_for_an_unlocked_session() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1"]);
+        db.set_message_keywords("m-1", &strings(&["Fresh"])).unwrap();
+
+        assert!(migrate_local_keywords(&db, &client, "stub", None).await.is_empty());
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap(), None);
+        assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["Fresh"]));
+    }
+
+    #[tokio::test]
+    async fn the_keyword_migration_stops_at_the_label_limit() {
+        let (_dir, db, client, calls) = setup(CreateMode::Limit).await;
+        cache(&db, &["m-1"]);
+        db.set_message_keywords("m-1", &strings(&["Fresh", "Other"])).unwrap();
+
+        assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
+        assert_eq!(count(&calls, "create").await, 1);
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["Fresh", "Other"]));
+    }
+
+    #[tokio::test]
+    async fn the_keyword_migration_gives_up_after_repeated_failures() {
+        let (_dir, db, client, calls) = setup(CreateMode::Fail).await;
+        cache(&db, &["m-1"]);
+        db.set_message_keywords("m-1", &strings(&["Fresh"])).unwrap();
+
+        for _ in 0..MAX_MIGRATION_ATTEMPTS + 2 {
+            assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
+        }
+        assert_eq!(count(&calls, "create").await, MAX_MIGRATION_ATTEMPTS as usize);
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["Fresh"]));
+    }
+
+    #[tokio::test]
+    async fn the_keyword_migration_resumes_after_the_creation_cap() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1"]);
+        let keywords: Vec<String> = (0..12).map(|n| format!("New{:02}", n)).collect();
+        db.set_message_keywords("m-1", &keywords).unwrap();
+
+        migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        assert_eq!(count(&calls, "create").await, 10);
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some("0"));
+
+        migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        assert_eq!(count(&calls, "create").await, 12);
+        assert_eq!(db.message_tags(&strings(&["m-1"])).unwrap().get("m-1").unwrap().len(), 12);
+
+        migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(count(&calls, "create").await, 12);
     }
 
     #[tokio::test]

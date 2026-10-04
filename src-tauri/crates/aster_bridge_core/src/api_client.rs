@@ -548,6 +548,8 @@ pub struct TagDefinition {
     pub tag_token: String,
     pub encrypted_name: String,
     pub name_nonce: String,
+    #[serde(default)]
+    pub parent_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

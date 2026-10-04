@@ -2140,7 +2140,13 @@ async fn run_sync_pass(
     let known_tokens: HashSet<String> = custom_folders.iter().map(|f| f.label_token.clone()).collect();
 
     match sync_custom_tags(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
-        Ok(affected) => updated_ids.extend(affected),
+        Ok(affected) => {
+            updated_ids.extend(affected);
+            updated_ids.extend(
+                crate::tag_ops::migrate_local_keywords(db, client, &access_token, identity_key.as_deref())
+                    .await,
+            );
+        }
         Err(msg) => tracing::warn!("{}", msg),
     }
     let known_tags: HashSet<String> = db

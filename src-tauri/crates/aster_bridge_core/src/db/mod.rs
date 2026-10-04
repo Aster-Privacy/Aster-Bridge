@@ -1341,6 +1341,26 @@ impl Database {
         })
     }
 
+    pub fn local_keyword_messages(&self) -> Result<Vec<(String, Vec<String>)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT k.keyword, k.aster_id FROM message_keywords k
+                 JOIN message_cache m ON m.aster_id = k.aster_id
+                 ORDER BY k.keyword, k.aster_id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for row in rows {
+                let (keyword, id) = row?;
+                match out.last_mut() {
+                    Some((known, ids)) if known.eq_ignore_ascii_case(&keyword) => ids.push(id),
+                    _ => out.push((keyword, vec![id])),
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_custom_tags(&self) -> Result<Vec<CustomTag>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(

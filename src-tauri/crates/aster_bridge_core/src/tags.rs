@@ -18,7 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
@@ -28,6 +28,8 @@ use crate::db::CustomTag;
 
 pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_KEYWORD_LEN: usize = 128;
+pub const MAX_PATH_DEPTH: usize = 8;
+pub const PATH_SEPARATOR: &str = "/";
 
 const SHIFT: char = '&';
 const UNSHIFT: char = '-';
@@ -141,13 +143,44 @@ fn decode_keyword(keyword: &str) -> Option<String> {
     Some(out)
 }
 
-pub fn keyword_for_name(name: &str) -> Option<String> {
-    validate_name(name).ok()?;
-    if name.trim() != name {
+fn keyword_for_text(text: &str) -> Option<String> {
+    if text.trim().is_empty() || text.trim() != text || text.chars().any(|c| c.is_control()) {
         return None;
     }
-    let keyword = encode_name(name);
+    let keyword = encode_name(text);
     (keyword.len() <= MAX_KEYWORD_LEN).then_some(keyword)
+}
+
+pub fn keyword_for_name(name: &str) -> Option<String> {
+    validate_name(name).ok()?;
+    keyword_for_text(name)
+}
+
+pub fn keyword_text(keyword: &str) -> Option<String> {
+    decode_keyword(keyword)
+}
+
+pub fn label_paths(parents: &HashMap<String, (String, Option<String>)>) -> HashMap<String, String> {
+    parents
+        .iter()
+        .map(|(token, (name, parent))| {
+            let mut segments: Vec<&str> = vec![name.as_str()];
+            let mut seen: HashSet<&str> = HashSet::from([token.as_str()]);
+            let mut cursor = parent.as_deref();
+            while let Some(parent_token) = cursor {
+                if segments.len() >= MAX_PATH_DEPTH || !seen.insert(parent_token) {
+                    break;
+                }
+                let Some((parent_name, grandparent)) = parents.get(parent_token) else {
+                    break;
+                };
+                segments.push(parent_name.as_str());
+                cursor = grandparent.as_deref();
+            }
+            segments.reverse();
+            (token.clone(), segments.join(PATH_SEPARATOR))
+        })
+        .collect()
 }
 
 pub fn name_for_keyword(keyword: &str) -> Option<String> {
@@ -159,11 +192,14 @@ pub fn name_for_keyword(keyword: &str) -> Option<String> {
     canonical.eq_ignore_ascii_case(keyword).then_some(name)
 }
 
-pub fn assign_keywords(tags: &mut [CustomTag]) {
+pub fn assign_keywords(tags: &mut [CustomTag], paths: &HashMap<String, String>) {
     tags.sort_by(|a, b| a.tag_token.cmp(&b.tag_token));
     let mut taken: HashSet<String> = HashSet::new();
     for tag in tags.iter_mut() {
-        tag.keyword = keyword_for_name(&tag.name)
+        tag.keyword = paths
+            .get(&tag.tag_token)
+            .and_then(|path| keyword_for_text(path))
+            .or_else(|| keyword_for_name(&tag.name))
             .filter(|keyword| taken.insert(keyword.to_ascii_lowercase()));
     }
 }
@@ -173,6 +209,7 @@ pub fn tags_from_definitions(
     identity_key: &str,
     previous_keys: &[String],
 ) -> Vec<CustomTag> {
+    let mut parents: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut tags: Vec<CustomTag> = definitions
         .iter()
         .filter(|definition| !definition.tag_token.is_empty())
@@ -183,6 +220,10 @@ pub fn tags_from_definitions(
                 identity_key,
                 previous_keys,
             )?;
+            parents.insert(
+                definition.tag_token.clone(),
+                (name.clone(), definition.parent_token.clone()),
+            );
             Some(CustomTag {
                 tag_token: definition.tag_token.clone(),
                 server_id: definition.id.clone(),
@@ -191,7 +232,7 @@ pub fn tags_from_definitions(
             })
         })
         .collect();
-    assign_keywords(&mut tags);
+    assign_keywords(&mut tags, &label_paths(&parents));
     tags
 }
 
@@ -301,10 +342,82 @@ mod tests {
         assert_eq!(keyword_for_name(&"é".repeat(100)), None);
     }
 
+    fn parent_map(rows: &[(&str, &str, Option<&str>)]) -> HashMap<String, (String, Option<String>)> {
+        rows.iter()
+            .map(|(token, name, parent)| {
+                (token.to_string(), (name.to_string(), parent.map(str::to_string)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_labels_are_exposed_by_their_full_path() {
+        let parents = parent_map(&[
+            ("a", "Clients", None),
+            ("b", "Acme", Some("a")),
+            ("c", "Vendors", None),
+            ("d", "Acme", Some("c")),
+            ("e", "2026 Q1", Some("b")),
+        ]);
+        let mut tags = vec![
+            tag("a", "Clients"),
+            tag("b", "Acme"),
+            tag("c", "Vendors"),
+            tag("d", "Acme"),
+            tag("e", "2026 Q1"),
+        ];
+        assign_keywords(&mut tags, &label_paths(&parents));
+        let keywords: Vec<Option<&str>> = tags.iter().map(|t| t.keyword.as_deref()).collect();
+        assert_eq!(
+            keywords,
+            vec![
+                Some("Clients"),
+                Some("Clients/Acme"),
+                Some("Vendors"),
+                Some("Vendors/Acme"),
+                Some("Clients/Acme/2026&ACA-Q1"),
+            ]
+        );
+        assert_eq!(
+            keyword_text("Clients/Acme/2026&ACA-Q1").as_deref(),
+            Some("Clients/Acme/2026 Q1")
+        );
+    }
+
+    #[test]
+    fn a_parent_cycle_or_a_missing_parent_ends_the_path() {
+        let parents = parent_map(&[
+            ("a", "One", Some("b")),
+            ("b", "Two", Some("a")),
+            ("c", "Orphan", Some("gone")),
+        ]);
+        let paths = label_paths(&parents);
+        assert_eq!(paths["a"], "Two/One");
+        assert_eq!(paths["b"], "One/Two");
+        assert_eq!(paths["c"], "Orphan");
+    }
+
+    #[test]
+    fn a_path_too_long_for_a_keyword_falls_back_to_the_leaf_name() {
+        let long = "x".repeat(90);
+        let parents = parent_map(&[("a", &long, None), ("b", "Leaf", Some("a"))]);
+        let mut tags = vec![tag("a", &long), tag("b", "Leaf")];
+        assign_keywords(&mut tags, &label_paths(&parents));
+        assert_eq!(tags[0].keyword.as_deref(), Some(long.as_str()));
+        assert_eq!(tags[1].keyword.as_deref(), Some(format!("{}/Leaf", long).as_str()));
+
+        let longer = "y".repeat(100);
+        let parents = parent_map(&[("a", &longer, None), ("b", &longer, Some("a"))]);
+        let mut tags = vec![tag("a", &longer), tag("b", &longer)];
+        assign_keywords(&mut tags, &label_paths(&parents));
+        assert_eq!(tags[0].keyword.as_deref(), Some(longer.as_str()));
+        assert_eq!(tags[1].keyword, None);
+    }
+
     #[test]
     fn duplicate_keywords_go_to_the_first_token() {
         let mut tags = vec![tag("b", "work"), tag("a", "Work"), tag("c", "Home")];
-        assign_keywords(&mut tags);
+        assign_keywords(&mut tags, &HashMap::new());
         assert_eq!(tags[0].keyword.as_deref(), Some("Work"));
         assert_eq!(tags[1].keyword, None);
         assert_eq!(tags[2].keyword.as_deref(), Some("Home"));
