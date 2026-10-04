@@ -29,7 +29,7 @@ use crate::auth::session::Session;
 use crate::crypto::envelope::decrypt_envelope_with_previous_keys;
 use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
 use crate::db::{
-    CachedAttachment, CachedMessage, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
+    CachedAttachment, CachedMessage, CachedSyncState, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
     ATTACHMENTS_STORED,
 };
 use crate::error::BridgeError;
@@ -806,12 +806,11 @@ fn extract_from_field(v: &serde_json::Value) -> Option<String> {
     }
     let email = from.get("email").and_then(|x| x.as_str()).unwrap_or("");
     let name = from.get("name").and_then(|x| x.as_str()).unwrap_or("");
-    if email.is_empty() && name.is_empty() {
+    let mailbox = crate::address::format_mailbox(name, email);
+    if mailbox.is_empty() {
         None
-    } else if name.is_empty() {
-        Some(email.to_string())
     } else {
-        Some(format!("{} <{}>", name, email))
+        Some(mailbox)
     }
 }
 
@@ -824,12 +823,9 @@ fn extract_recipients(v: &serde_json::Value, key: &str) -> Option<String> {
         } else {
             let email = r.get("email").and_then(|x| x.as_str()).unwrap_or("");
             let name = r.get("name").and_then(|x| x.as_str()).unwrap_or("");
-            if !email.is_empty() {
-                if name.is_empty() {
-                    parts.push(email.to_string());
-                } else {
-                    parts.push(format!("{} <{}>", name, email));
-                }
+            let mailbox = crate::address::format_mailbox(name, email);
+            if !mailbox.is_empty() {
+                parts.push(mailbox);
             }
         }
     }
@@ -855,6 +851,14 @@ fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
+    let new_flags = server_flags(current, item);
+    if new_flags == current {
+        return false;
+    }
+    db.set_message_flags_by_id(&item.id, new_flags).is_ok()
+}
+
+fn server_flags(current: i64, item: &MailItem) -> i64 {
     let mut new_flags = current;
     if let Some(read) = item.is_read {
         if read {
@@ -870,10 +874,44 @@ fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
             new_flags &= !4;
         }
     }
-    if new_flags == current {
-        return false;
+    new_flags
+}
+
+enum CachedShortcut {
+    Unchanged,
+    FlagsOnly(i64),
+}
+
+fn cached_shortcut(
+    state: Option<&CachedSyncState>,
+    folder: &str,
+    item: &MailItem,
+) -> Option<CachedShortcut> {
+    if !is_valid_item_id(&item.id) {
+        return None;
     }
-    db.set_message_flags_by_id(&item.id, new_flags).is_ok()
+    let state = state?;
+    if !state.body_cached
+        || state.folder != folder
+        || !state.uid_folders.iter().any(|f| f == folder)
+    {
+        return None;
+    }
+    let meta = state
+        .raw_headers
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    if let Some(serde_json::Value::Object(meta)) = meta {
+        if !meta.contains_key(ADDRESS_META_VERSION_KEY) && !meta.contains_key("draft_api") {
+            return None;
+        }
+    }
+    let new_flags = server_flags(state.flags, item);
+    if new_flags == state.flags {
+        Some(CachedShortcut::Unchanged)
+    } else {
+        Some(CachedShortcut::FlagsOnly(new_flags))
+    }
 }
 
 struct PreparedMessage {
@@ -1714,6 +1752,13 @@ async fn run_sync_pass(
                         resp.has_more
                     );
                     let mut new_ids: Vec<String> = Vec::new();
+                    let page_ids: Vec<&str> = resp.items.iter().map(|i| i.id.as_str()).collect();
+                    let mut id_counts: HashMap<&str, usize> = HashMap::new();
+                    for id in &page_ids {
+                        *id_counts.entry(id).or_default() += 1;
+                    }
+                    let snapshot = db.cached_sync_states(&page_ids).unwrap_or_default();
+                    let mut flag_updates: Vec<(&MailItem, i64, i64)> = Vec::new();
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
                         listed_ids.push(item.id.clone());
@@ -1722,6 +1767,17 @@ async fn run_sync_pass(
                         } else {
                             target_folder(&resp.label, item, &known_tokens)
                         };
+                        if id_counts.get(item.id.as_str()) == Some(&1) {
+                            let state = snapshot.get(&item.id);
+                            match cached_shortcut(state, &item_folder, item) {
+                                Some(CachedShortcut::Unchanged) => continue,
+                                Some(CachedShortcut::FlagsOnly(flags)) => {
+                                    flag_updates.push((item, state.map_or(0, |s| s.flags), flags));
+                                    continue;
+                                }
+                                None => {}
+                            }
+                        }
                         let outcome = match prepare_mail_item(
                             db,
                             &item_folder,
@@ -1831,6 +1887,19 @@ async fn run_sync_pass(
                                 let meta = serde_json::Value::Object(meta_map).to_string();
                                 let _ = db.update_cached_body(&item.id, &plaintext, Some(&meta));
                             }
+                        }
+                    }
+                    let writes: Vec<(String, i64, i64)> = flag_updates
+                        .iter()
+                        .map(|(item, expected, flags)| (item.id.clone(), *expected, *flags))
+                        .collect();
+                    let stale: HashSet<String> = match db.set_message_flags_if_unchanged(&writes) {
+                        Ok(stale) => stale.into_iter().collect(),
+                        Err(_) => writes.into_iter().map(|(id, _, _)| id).collect(),
+                    };
+                    for (item, _, _) in &flag_updates {
+                        if !stale.contains(&item.id) || reconcile_server_flags(db, item) {
+                            updated_ids.push(item.id.clone());
                         }
                     }
                     if !new_ids.is_empty() {
@@ -2249,6 +2318,11 @@ mod tests {
         (dir, db)
     }
 
+    #[test]
+    fn idle_http_connections_outlive_the_poll_interval() {
+        assert!(crate::tls_pinning::POOL_IDLE_TIMEOUT.as_secs() > POLL_INTERVAL_SECS);
+    }
+
     fn envelope_b64(json: &serde_json::Value) -> String {
         STANDARD.encode(json.to_string().as_bytes())
     }
@@ -2508,6 +2582,27 @@ mod tests {
             extract_recipients(&v, "to"),
             Some("raw@example.com, Carol <carol@example.com>, dave@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn display_names_with_commas_stay_a_single_address() {
+        let v = serde_json::json!({
+            "from": {"name": "Doe, John", "email": "john@example.com"},
+            "to": [
+                {"name": "Roe, Jane", "email": "jane@example.com"},
+                {"name": "Carol", "email": "carol@example.com"}
+            ]
+        });
+        let from = extract_from_field(&v).unwrap();
+        assert_eq!(from, "\"Doe, John\" <john@example.com>");
+        assert_eq!(crate::address::split_address_list(&from).len(), 1);
+        assert_eq!(
+            crate::address::parse_mailbox(&from),
+            ("Doe, John".to_string(), "john@example.com".to_string())
+        );
+        let to = extract_recipients(&v, "to").unwrap();
+        assert_eq!(to, "\"Roe, Jane\" <jane@example.com>, Carol <carol@example.com>");
+        assert_eq!(crate::address::split_address_list(&to).len(), 2);
     }
 
     #[test]
@@ -3800,6 +3895,105 @@ mod tests {
             1,
             "web-read message must become \\Seen on the bridge"
         );
+        let change = rx.try_recv().expect("flag change must broadcast state");
+        assert!(change.changed.contains_key("Email"));
+    }
+
+    #[test]
+    fn cached_shortcut_only_skips_items_that_need_no_other_change() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "s", "body_text": "b", "from": "a@b.c"});
+        let item = item_with_envelope("shortcut-1", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        let states = db.cached_sync_states(&["shortcut-1", "missing"]).unwrap();
+        assert_eq!(states.len(), 1);
+        let state = states.get("shortcut-1").unwrap();
+        assert!(state.body_cached);
+        assert_eq!(state.folder, "inbox");
+        assert_eq!(state.uid_folders, vec!["inbox".to_string()]);
+
+        assert!(matches!(
+            cached_shortcut(Some(state), "inbox", &item),
+            Some(CachedShortcut::Unchanged)
+        ));
+        let mut read = item.clone();
+        read.is_read = Some(true);
+        assert!(matches!(
+            cached_shortcut(Some(state), "inbox", &read),
+            Some(CachedShortcut::FlagsOnly(f)) if f == state.flags | 1
+        ));
+        assert!(cached_shortcut(Some(state), "archive", &item).is_none());
+        assert!(cached_shortcut(None, "inbox", &item).is_none());
+
+        let mut unmapped = state.clone();
+        unmapped.uid_folders.clear();
+        assert!(cached_shortcut(Some(&unmapped), "inbox", &item).is_none());
+        let mut not_backfilled = state.clone();
+        not_backfilled.raw_headers = Some(r#"{"is_html":false}"#.to_string());
+        assert!(cached_shortcut(Some(&not_backfilled), "inbox", &item).is_none());
+        let mut no_body = state.clone();
+        no_body.body_cached = false;
+        assert!(cached_shortcut(Some(&no_body), "inbox", &item).is_none());
+    }
+
+    #[test]
+    fn flag_batch_skips_rows_changed_since_the_snapshot() {
+        let (_dir, db) = temp_db();
+        for id in ["batch-a", "batch-b"] {
+            let item = item_with_envelope(id, &serde_json::json!({"subject": "s", "body_text": "b"}));
+            cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        }
+        let a = db.get_message_flags_by_id("batch-a").unwrap();
+        let b = db.get_message_flags_by_id("batch-b").unwrap();
+        db.set_message_flags_by_id("batch-b", b | 8).unwrap();
+        let stale = db
+            .set_message_flags_if_unchanged(&[
+                ("batch-a".to_string(), a, a | 1),
+                ("batch-b".to_string(), b, b | 4),
+            ])
+            .unwrap();
+        assert_eq!(stale, vec!["batch-b".to_string()]);
+        assert_eq!(db.get_message_flags_by_id("batch-a").unwrap(), a | 1);
+        assert_eq!(db.get_message_flags_by_id("batch-b").unwrap(), b | 8);
+        assert!(db.set_message_flags_if_unchanged(&[]).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resync_of_cached_mail_updates_only_what_the_server_changed() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        for id in ["same-1", "same-2", "starred-3"] {
+            let item = item_with_envelope(id, &serde_json::json!({"subject": "s", "body_text": "b"}));
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        }
+        let before: Vec<_> = ["same-1", "same-2"]
+            .iter()
+            .map(|id| db.get_cached_message(id).unwrap().unwrap())
+            .collect();
+
+        let mut starred = server_item_json("starred-3", "s");
+        starred["is_starred"] = serde_json::json!(true);
+        let items = vec![
+            server_item_json("same-1", "s"),
+            server_item_json("same-2", "s"),
+            starred,
+        ];
+        let base = spawn_mock_list_server(items).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+        let (tx, mut rx) = broadcast::channel(8);
+
+        run_sync_pass(&session, &client, &db, Some(&tx), false)
+            .await
+            .unwrap();
+
+        assert_eq!(db.get_message_flags_by_id("starred-3").unwrap() & 4, 4);
+        for old in &before {
+            let now = db.get_cached_message(&old.aster_id).unwrap().unwrap();
+            assert_eq!(now.flags, old.flags);
+            assert_eq!(now.raw_headers, old.raw_headers);
+            assert_eq!(now.body_text, old.body_text);
+        }
         let change = rx.try_recv().expect("flag change must broadcast state");
         assert!(change.changed.contains_key("Email"));
     }
