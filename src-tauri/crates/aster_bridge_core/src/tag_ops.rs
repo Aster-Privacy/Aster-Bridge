@@ -225,6 +225,7 @@ pub async fn apply_keywords(
         return outcome;
     }
     let _guard = db.tag_lock.lock().await;
+    db.tag_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut tags = match db.list_custom_tags() {
         Ok(tags) => tags,
         Err(e) => {
@@ -396,6 +397,7 @@ pub async fn copy_tags(
         return Ok(());
     }
     let _guard = db.tag_lock.lock().await;
+    db.tag_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let sources: Vec<String> = pairs.iter().map(|(source, _)| source.clone()).collect();
     let current = db.message_tags(&sources).map_err(TagOpError::Server)?;
     let mut by_token: Vec<(String, Vec<String>)> = Vec::new();
@@ -783,6 +785,30 @@ mod tests {
         let tags = db.list_custom_tags().unwrap();
         assert_eq!(tags.len(), 3);
         assert_eq!(tags.iter().filter(|tag| tag.keyword.as_deref() == Some("Acme")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_label_write_is_counted_for_a_running_sync_pass() {
+        let (_dir, db, client, _calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&[stored_tag("tok-work", "Work")]).unwrap();
+        let before = db.tag_writes.load(std::sync::atomic::Ordering::SeqCst);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &strings(&["m-1"]),
+            1,
+            &strings(&["Work"]),
+            &mut budget,
+        )
+        .await;
+        copy_tags(&db, &client, "stub", &[("m-1".to_string(), "m-2".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(db.tag_writes.load(std::sync::atomic::Ordering::SeqCst), before + 2);
     }
 
     #[tokio::test]

@@ -474,6 +474,7 @@ pub struct Database {
     conn: Mutex<Connection>,
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
+    pub(crate) tag_writes: std::sync::atomic::AtomicU64,
 }
 
 impl Database {
@@ -504,6 +505,7 @@ impl Database {
             conn: Mutex::new(conn),
             app_password_cache: Default::default(),
             tag_lock: tokio::sync::Mutex::new(()),
+            tag_writes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

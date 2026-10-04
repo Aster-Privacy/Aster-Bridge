@@ -2139,6 +2139,7 @@ async fn run_sync_pass(
     let custom_folders = db.list_custom_folders().unwrap_or_default();
     let known_tokens: HashSet<String> = custom_folders.iter().map(|f| f.label_token.clone()).collect();
 
+    let tag_writes_at_start = db.tag_writes.load(std::sync::atomic::Ordering::SeqCst);
     match sync_custom_tags(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
         Ok(affected) => {
             updated_ids.extend(affected);
@@ -2232,7 +2233,9 @@ async fn run_sync_pass(
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
                         listed_ids.push(item.id.clone());
-                        if is_valid_item_id(&item.id) {
+                        if is_valid_item_id(&item.id)
+                            && db.tag_writes.load(std::sync::atomic::Ordering::SeqCst) == tag_writes_at_start
+                        {
                             if let Some(wanted) = server_tags_differ(item, &known_tags, &tag_snapshot) {
                                 if db.set_message_tags(&item.id, &wanted).unwrap_or(false)
                                     && snapshot.contains_key(&item.id)
