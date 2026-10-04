@@ -121,14 +121,41 @@ fn generate_and_persist(
     if let Some(parent) = cert_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(cert_path, cert_pem.as_bytes()).map_err(|e| e.to_string())?;
-    write_key_restricted(key_path, key_pem.as_bytes())?;
+    persist_pair(cert_path, cert_pem.as_bytes(), key_path, key_pem.as_bytes())?;
 
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::try_from(key_pair.serialize_der())
         .map_err(|e| e.to_string())?;
 
     Ok((vec![cert_der], key_der))
+}
+
+fn persist_pair(cert_path: &Path, cert_pem: &[u8], key_path: &Path, key_pem: &[u8]) -> TlsResult<()> {
+    use std::io::Write;
+    let cert_tmp = crate::atomic_file::temp_path_beside(cert_path);
+    let key_tmp = crate::atomic_file::temp_path_beside(key_path);
+    let written = (|| -> TlsResult<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cert_tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(cert_pem).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        write_key_restricted(&key_tmp, key_pem)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+        return Err(e);
+    }
+    if let Err(e) = crate::atomic_file::replace(&key_tmp, key_path) {
+        let _ = std::fs::remove_file(&cert_tmp);
+        return Err(e);
+    }
+    crate::atomic_file::replace(&cert_tmp, cert_path)?;
+    crate::atomic_file::sync_parent_dir(cert_path);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -145,6 +172,7 @@ fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
         .map_err(|e| e.to_string())?;
     use std::io::Write;
     f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -186,7 +214,7 @@ fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
     }
 
     f.write_all(bytes).map_err(|e| e.to_string())?;
-    f.flush().map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -386,6 +414,34 @@ mod tests {
         drop(file);
         let (certs, _key) = ensure_cert(dir.path()).unwrap();
         assert_eq!(certs[0].as_ref(), &current[..]);
+    }
+
+    #[test]
+    fn regenerating_replaces_both_files_without_leaving_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(cert_pem_path(dir.path()), b"not a certificate").unwrap();
+        std::fs::write(key_pem_path(dir.path()), b"not a key").unwrap();
+        let (certs, key) = ensure_cert(dir.path()).unwrap();
+
+        let (stored_certs, stored_key) =
+            load_existing(&cert_pem_path(dir.path()), &key_pem_path(dir.path())).unwrap();
+        assert_eq!(stored_certs[0].as_ref(), certs[0].as_ref());
+        assert_eq!(stored_key.secret_der(), key.secret_der());
+        server_config(stored_certs, stored_key).expect("the stored pair must belong together");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(names.is_empty(), "temp files left behind: {:?}", names);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(key_pem_path(dir.path())).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[tokio::test]
