@@ -677,13 +677,31 @@ mod e2e_tests {
                 "{}/jmap/download/{}/{}/anything.bin",
                 base, acct, blob_id
             ))
-            .header("authorization", auth)
+            .header("authorization", auth.clone())
             .send()
             .await
             .unwrap();
         assert_eq!(r_dl.status(), 200);
         let bytes = r_dl.bytes().await.unwrap();
         assert_eq!(&bytes[..], payload);
+
+        let r_named = client
+            .get(format!(
+                "{}/jmap/download/{}/{}/r%C3%A9sum%C3%A9.txt",
+                base, acct, blob_id
+            ))
+            .header("authorization", auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_named.status(), 200);
+        let disposition = r_named.headers()["content-disposition"].to_str().unwrap().to_string();
+        assert!(
+            disposition.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.txt"),
+            "{}",
+            disposition
+        );
+        assert_eq!(&r_named.bytes().await.unwrap()[..], payload);
     }
 
     #[tokio::test]
