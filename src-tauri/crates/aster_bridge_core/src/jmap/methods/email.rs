@@ -84,7 +84,8 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
         match messages.get(id) {
             Some(m) => {
                 let attachments = attachment_meta.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                list.push(serialize_email(m, &label_to_id, &properties, fetch_text, attachments))
+                let stored_keywords = ctx.db.message_keywords(id).unwrap_or_default();
+                list.push(serialize_email(m, &label_to_id, &properties, fetch_text, attachments, &stored_keywords))
             }
             None => not_found.push(id.clone()),
         }
@@ -105,6 +106,7 @@ fn serialize_email(
     properties: &Option<Vec<String>>,
     fetch_text: bool,
     attachments: &[CachedAttachment],
+    stored_keywords: &[String],
 ) -> Value {
     let mailbox_id = label_to_id.get(&m.folder).cloned().unwrap_or_default();
     let mut mailbox_ids = serde_json::Map::new();
@@ -116,6 +118,9 @@ fn serialize_email(
     if m.flags & 4 != 0 { keywords.insert("$flagged".to_string(), json!(true)); }
     if m.flags & 8 != 0 { keywords.insert("$deleted".to_string(), json!(true)); }
     if m.flags & 16 != 0 { keywords.insert("$draft".to_string(), json!(true)); }
+    for keyword in stored_keywords {
+        keywords.entry(keyword.clone()).or_insert(json!(true));
+    }
 
     let meta: Value = m
         .raw_headers
@@ -687,6 +692,151 @@ enum PatchOutcome {
     Rejected(Value),
 }
 
+fn is_tag_keyword(keyword: &str) -> bool {
+    keyword_bit(keyword) == 0 && !crate::tags::is_local_keyword(keyword)
+}
+
+fn tag_error(e: crate::tag_ops::TagOpError) -> Value {
+    use crate::tag_ops::TagOpError;
+    match e {
+        TagOpError::Invalid(description) => json!({
+            "type": "invalidProperties",
+            "properties": ["keywords"],
+            "description": description
+        }),
+        TagOpError::LimitReached => json!({
+            "type": "overQuota",
+            "description": "your plan's label limit is reached"
+        }),
+        TagOpError::TooManyNew => json!({
+            "type": "overQuota",
+            "description": "too many new labels in one request"
+        }),
+        TagOpError::Locked => json!({
+            "type": "forbidden",
+            "description": "unlock Aster Bridge to change labels"
+        }),
+        TagOpError::Busy => json!({
+            "type": "rateLimit",
+            "description": "too many requests; try again shortly"
+        }),
+        TagOpError::AlreadyExists
+        | TagOpError::NotFound
+        | TagOpError::ParentRejected
+        | TagOpError::Server(_) => json!({
+            "type": "serverFail",
+            "description": "could not update labels"
+        }),
+    }
+}
+
+fn invalid_keywords() -> Value {
+    json!({
+        "type": "invalidProperties",
+        "properties": ["keywords"],
+        "description": "a keyword cannot be used as a label"
+    })
+}
+
+fn enabled_tag_keywords(patch_obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let enabled = |v: &Value| v.as_bool().unwrap_or(false);
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        return kw_obj
+            .iter()
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k))
+            .map(|(k, _)| k.clone())
+            .collect();
+    }
+    patch_obj
+        .iter()
+        .filter(|(_, v)| enabled(v))
+        .filter_map(|(k, _)| k.strip_prefix("/keywords/"))
+        .filter(|keyword| is_tag_keyword(keyword))
+        .map(|keyword| keyword.to_string())
+        .collect()
+}
+
+fn has_unmappable_keyword(db: &crate::db::Database, patch_obj: &serde_json::Map<String, Value>) -> bool {
+    let wanted = enabled_tag_keywords(patch_obj);
+    if wanted.is_empty() {
+        return false;
+    }
+    let tags = db.list_custom_tags().unwrap_or_default();
+    wanted.iter().any(|keyword| {
+        crate::tags::find_by_keyword(&tags, keyword).is_none()
+            && crate::tags::name_for_keyword(keyword).is_none()
+    })
+}
+
+async fn apply_tag_keywords(
+    ctx: &Arc<JmapContext>,
+    access_token: &str,
+    id: &str,
+    patch_obj: &serde_json::Map<String, Value>,
+    label_budget: &mut usize,
+) -> Result<(), Value> {
+    let enabled = |v: &Value| v.as_bool().unwrap_or(false);
+    let mut steps: Vec<(i8, Vec<String>)> = Vec::new();
+    if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
+        let given: Vec<String> = kw_obj
+            .iter()
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        steps.push((0, given));
+    } else {
+        let mut adds: Vec<String> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        for (k, v) in patch_obj {
+            let Some(keyword) = k.strip_prefix("/keywords/").filter(|kw| is_tag_keyword(kw)) else {
+                continue;
+            };
+            if enabled(v) {
+                adds.push(keyword.to_string());
+            } else {
+                removes.push(keyword.to_string());
+            }
+        }
+        if !adds.is_empty() {
+            steps.push((1, adds));
+        }
+        if !removes.is_empty() {
+            steps.push((-1, removes));
+        }
+    }
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let identity_key = ctx.session.read().await.identity_key.clone();
+    let ids = [id.to_string()];
+    for (op, keywords) in steps {
+        let outcome = crate::tag_ops::apply_keywords(
+            &ctx.db,
+            &ctx.client,
+            access_token,
+            identity_key.as_deref(),
+            &ids,
+            op,
+            &keywords,
+            label_budget,
+        )
+        .await;
+        if !outcome.unmapped.is_empty() || outcome.error.is_some() {
+            if !outcome.changed.is_empty() {
+                let refs: Vec<&str> = outcome.changed.iter().map(|changed| changed.as_str()).collect();
+                let _ = ctx.db.jmap_record_updated_batch("Email", &refs);
+            }
+            if !outcome.unmapped.is_empty() {
+                return Err(invalid_keywords());
+            }
+            if let Some(e) = outcome.error {
+                return Err(tag_error(e));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn apply_update_patch(
     ctx: &Arc<JmapContext>,
     access_token: &str,
@@ -694,6 +844,7 @@ async fn apply_update_patch(
     id: &str,
     patch: &Value,
     mailbox_counts_touched: &mut bool,
+    label_budget: &mut usize,
 ) -> PatchOutcome {
     let Some(patch_obj) = patch.as_object() else {
         return PatchOutcome::Rejected(
@@ -720,6 +871,10 @@ async fn apply_update_patch(
             return PatchOutcome::Rejected(json!({"type": "notFound"}));
         }
     };
+
+    if has_unmappable_keyword(&ctx.db, patch_obj) {
+        return PatchOutcome::Rejected(invalid_keywords());
+    }
 
     let mut move_target: Option<String> = None;
     if let Some(mb_obj) = patch_obj.get("mailboxIds").and_then(|v| v.as_object()) {
@@ -821,6 +976,10 @@ async fn apply_update_patch(
             let _ = ctx.db.assign_uid_if_missing(target, id);
             *mailbox_counts_touched = true;
         }
+    }
+
+    if let Err(rejection) = apply_tag_keywords(ctx, access_token, id, patch_obj, label_budget).await {
+        return PatchOutcome::Rejected(rejection);
     }
 
     let old_flags = ctx.db.get_message_flags_by_id(id).unwrap_or(existing.flags) as u32;
@@ -932,6 +1091,7 @@ pub async fn set(
     let mut destroyed: Vec<String> = Vec::new();
     let mut not_destroyed = serde_json::Map::new();
     let mut mailbox_counts_touched = false;
+    let mut label_budget = crate::tag_ops::MAX_CREATED_PER_COMMAND;
 
     for (id, patch) in &updates {
         match apply_update_patch(
@@ -941,6 +1101,7 @@ pub async fn set(
             id,
             patch,
             &mut mailbox_counts_touched,
+            &mut label_budget,
         )
         .await
         {
@@ -1193,7 +1354,7 @@ mod tests {
         let m = cached("e1", "inbox");
         let mut label_to_id = HashMap::new();
         label_to_id.insert("inbox".to_string(), "mbx_inbox".to_string());
-        let v = serialize_email(&m, &label_to_id, &None, false, &[]);
+        let v = serialize_email(&m, &label_to_id, &None, false, &[], &[]);
         assert_eq!(v.get("id"), Some(&json!("e1")));
         assert_eq!(v.get("blobId"), Some(&json!("e1")));
         assert_eq!(v.get("threadId"), Some(&json!("thread-1")));
@@ -1209,7 +1370,7 @@ mod tests {
     fn serialize_email_threadid_falls_back_to_id() {
         let mut m = cached("e2", "inbox");
         m.thread_id = None;
-        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
         assert_eq!(v.get("threadId"), Some(&json!("e2")));
     }
 
@@ -1217,7 +1378,7 @@ mod tests {
     fn serialize_email_property_selection() {
         let m = cached("e3", "inbox");
         let props = Some(vec!["subject".to_string()]);
-        let v = serialize_email(&m, &HashMap::new(), &props, false, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &props, false, &[], &[]);
         let obj = v.as_object().unwrap();
         assert!(obj.contains_key("id"));
         assert!(obj.contains_key("subject"));
@@ -1229,7 +1390,7 @@ mod tests {
     fn serialize_email_keywords_from_flags() {
         let mut m = cached("e4", "inbox");
         m.flags = 1 | 4 | 16;
-        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
         assert_eq!(v.pointer("/keywords/$seen"), Some(&json!(true)));
         assert_eq!(v.pointer("/keywords/$flagged"), Some(&json!(true)));
         assert_eq!(v.pointer("/keywords/$draft"), Some(&json!(true)));
@@ -1240,7 +1401,7 @@ mod tests {
     fn serialize_email_html_body_when_html() {
         let mut m = cached("e5", "inbox");
         m.raw_headers = Some(json!({"is_html": true}).to_string());
-        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
         assert!(v.get("htmlBody").unwrap().as_array().unwrap().len() == 1);
         assert!(v.get("textBody").unwrap().as_array().unwrap().is_empty());
     }
@@ -1249,7 +1410,7 @@ mod tests {
     fn serialize_email_reports_attachments_when_the_envelope_had_them() {
         let mut m = cached("e5a", "inbox");
         m.raw_headers = Some(json!({"is_html": false, "attachment_count": 2}).to_string());
-        let v = serialize_email(&m, &HashMap::new(), &None, false, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, false, &[], &[]);
         assert_eq!(v.get("hasAttachment"), Some(&json!(true)));
     }
 
@@ -1258,12 +1419,12 @@ mod tests {
         let mut m = cached("e5b", "inbox");
         m.raw_headers = Some(json!({"is_html": false, "attachment_count": 0}).to_string());
         assert_eq!(
-            serialize_email(&m, &HashMap::new(), &None, false, &[]).get("hasAttachment"),
+            serialize_email(&m, &HashMap::new(), &None, false, &[], &[]).get("hasAttachment"),
             Some(&json!(false))
         );
         let legacy = cached("e5c", "inbox");
         assert_eq!(
-            serialize_email(&legacy, &HashMap::new(), &None, false, &[]).get("hasAttachment"),
+            serialize_email(&legacy, &HashMap::new(), &None, false, &[], &[]).get("hasAttachment"),
             Some(&json!(false))
         );
     }
@@ -1271,7 +1432,7 @@ mod tests {
     #[test]
     fn serialize_email_fetch_text_populates_body_values() {
         let m = cached("e6", "inbox");
-        let v = serialize_email(&m, &HashMap::new(), &None, true, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
         assert_eq!(
             v.pointer("/bodyValues/1/value"),
             Some(&json!("this is the body text here"))
@@ -1282,7 +1443,7 @@ mod tests {
     fn serialize_email_marks_unverified_sender_in_body_values() {
         let mut m = cached("e7", "inbox");
         m.raw_headers = Some(json!({"is_html": false, "sender_unverified": true}).to_string());
-        let v = serialize_email(&m, &HashMap::new(), &None, true, &[]);
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
         let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
         assert!(value.starts_with("this is the body text here\r\n\r\n"));
         assert!(value.ends_with(crate::message_render::SENDER_UNVERIFIED_NOTE));
@@ -1320,7 +1481,8 @@ mod tests {
                     } else {
                         Vec::new()
                     };
-                    list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments))
+                    let stored_keywords = ctx.db.message_keywords(&m.aster_id).unwrap_or_default();
+                    list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments, &stored_keywords))
                 }
                 _ => not_found.push(json!(id)),
             }
@@ -1591,7 +1753,49 @@ mod tests {
         let calls: CapturedCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let c1 = calls.clone();
         let c2 = calls.clone();
+        let c3 = calls.clone();
+        let c4 = calls.clone();
+        let c5 = calls.clone();
         let app = Router::new()
+            .route(
+                "/mail/v1/tags",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c4.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "tags".to_string(), body));
+                        Json(json!({"id": "srv-tag", "success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c5.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "bulk/tags".to_string(), body));
+                        Json(json!({"success": true})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/bulk/tags/remove",
+                axum::routing::post(move |Json(body): Json<Value>| {
+                    let calls = c3.clone();
+                    async move {
+                        calls
+                            .lock()
+                            .await
+                            .push(("POST".to_string(), "bulk/tags/remove".to_string(), body));
+                        Json(json!({"success": true})).into_response()
+                    }
+                }),
+            )
             .route(
                 "/bridge/v1/messages/:id/metadata",
                 patch(move |AxumPath(id): AxumPath<String>, Json(body): Json<Value>| {
@@ -1688,6 +1892,118 @@ mod tests {
                 .iter()
                 .any(|(m, id, body)| m == "PATCH" && id == "s1" && body["is_starred"] == json!(true)),
             "star state must be pushed to backend: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn get_reports_label_keywords_and_set_removes_them() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("tg1", "inbox");
+        m.flags = 1;
+        insert_msg(&ctx, &m);
+        ctx.db
+            .replace_custom_tags(&[crate::db::CustomTag {
+                tag_token: "tok-work".to_string(),
+                server_id: "tag-1".to_string(),
+                name: "Work Stuff".to_string(),
+                keyword: crate::tags::keyword_for_name("Work Stuff"),
+            }])
+            .unwrap();
+        ctx.db.add_message_tag(&["tg1".to_string()], "tok-work").unwrap();
+
+        let res = ok(get(&ctx, json!({"ids": ["tg1"], "properties": ["keywords"]})).await);
+        assert_eq!(res["list"][0]["keywords"]["Work&ACA-Stuff"], json!(true));
+        assert_eq!(res["list"][0]["keywords"]["$seen"], json!(true));
+
+        let args = json!({"update": {"tg1": {"keywords/Work&ACA-Stuff": null}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("tg1"), "{:?}", res);
+        assert!(ctx.db.message_tags(&["tg1".to_string()]).unwrap().is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("tg1").unwrap(), 1);
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, route, body)| m == "POST"
+                && route == "bulk/tags/remove"
+                && body["tag_token"] == json!("tok-work")
+                && body["ids"] == json!(["tg1"])),
+            "the label removal must be sent to the backend: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_a_keyword_that_cannot_name_a_label() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("kw1", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        for patch in [
+            json!({"keywords/broken&shift": true, "keywords/$seen": true}),
+            json!({"keywords": {"$seen": true, "broken&shift": true}}),
+        ] {
+            let res = ok(set(&ctx, json!({"update": {"kw1": patch}}), &mut HashMap::new()).await);
+            assert_eq!(res["notUpdated"]["kw1"]["type"], json!("invalidProperties"), "{:?}", res);
+            assert_eq!(res["notUpdated"]["kw1"]["properties"], json!(["keywords"]), "{:?}", res);
+            assert!(res["updated"].as_object().unwrap().is_empty(), "{:?}", res);
+        }
+        assert!(calls.lock().await.is_empty());
+        assert_eq!(ctx.db.get_message_flags_by_id("kw1").unwrap(), 0);
+        assert!(ctx.db.list_custom_tags().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_keyword_replace_leaves_client_internal_keywords_alone() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        let mut m = cached("kw2", "inbox");
+        m.flags = 0;
+        insert_msg(&ctx, &m);
+        ctx.db
+            .set_message_keywords("kw2", &["$label1".to_string(), "NonJunk".to_string()])
+            .unwrap();
+        let args = json!({"update": {"kw2": {"keywords": {"$seen": true, "$label2": true, "Forwarded": true}}}});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("kw2"), "{:?}", res);
+        let stored = ctx.db.message_keywords("kw2").unwrap();
+        assert!(stored.contains(&"$label1".to_string()), "{:?}", stored);
+        assert!(stored.contains(&"NonJunk".to_string()), "{:?}", stored);
+        assert!(ctx.db.list_custom_tags().unwrap().is_empty());
+        let captured = calls.lock().await.clone();
+        assert!(
+            !captured.iter().any(|(m, _, _)| m == "POST"),
+            "no label call is expected: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn one_set_call_creates_at_most_ten_labels() {
+        let (ctx, calls, _d) = test_ctx_with_backend(false).await;
+        ctx.session.write().await.identity_key = Some("test-ik".to_string());
+        let mut first = cached("cap1", "inbox");
+        first.flags = 0;
+        insert_msg(&ctx, &first);
+        let mut second = cached("cap2", "inbox");
+        second.flags = 0;
+        insert_msg(&ctx, &second);
+        let mut first_patch = serde_json::Map::new();
+        for n in 0..10 {
+            first_patch.insert(format!("keywords/First{}", n), json!(true));
+        }
+        let args = json!({"update": {
+            "cap1": Value::Object(first_patch),
+            "cap2": {"keywords/Extra": true}
+        }});
+        let res = ok(set(&ctx, args, &mut HashMap::new()).await);
+        assert!(res["updated"].as_object().unwrap().contains_key("cap1"), "{:?}", res);
+        assert_eq!(res["notUpdated"]["cap2"]["type"], json!("overQuota"), "{:?}", res);
+        assert_eq!(ctx.db.list_custom_tags().unwrap().len(), 10);
+        assert!(ctx.db.message_tags(&["cap2".to_string()]).unwrap().is_empty());
+        let captured = calls.lock().await.clone();
+        assert_eq!(
+            captured.iter().filter(|(_, route, _)| route == "tags").count(),
+            10,
+            "{:?}",
             captured
         );
     }

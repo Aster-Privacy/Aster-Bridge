@@ -473,6 +473,8 @@ const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 pub struct Database {
     conn: Mutex<Connection>,
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
+    pub(crate) tag_lock: tokio::sync::Mutex<()>,
+    pub(crate) tag_writes: std::sync::atomic::AtomicU64,
 }
 
 impl Database {
@@ -502,6 +504,8 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             app_password_cache: Default::default(),
+            tag_lock: tokio::sync::Mutex::new(()),
+            tag_writes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -640,6 +644,21 @@ impl Database {
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT
              );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS custom_tag (
+                tag_token TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                keyword TEXT COLLATE NOCASE
+             );
+             CREATE TABLE IF NOT EXISTS message_tag (
+                aster_id TEXT NOT NULL,
+                tag_token TEXT NOT NULL,
+                PRIMARY KEY (aster_id, tag_token)
+             );
+             CREATE INDEX IF NOT EXISTS idx_message_tag_token ON message_tag(tag_token);",
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
@@ -1267,7 +1286,12 @@ impl Database {
     pub fn message_keywords(&self, aster_id: &str) -> Result<Vec<String>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT keyword FROM message_keywords WHERE aster_id = ?1 ORDER BY keyword",
+                "SELECT keyword FROM message_keywords WHERE aster_id = ?1
+                 UNION
+                 SELECT t.keyword FROM message_tag a
+                 JOIN custom_tag t ON t.tag_token = a.tag_token
+                 WHERE a.aster_id = ?1 AND t.keyword IS NOT NULL
+                 ORDER BY 1",
             )?;
             let rows = stmt
                 .query_map([aster_id], |r| r.get::<_, String>(0))?
@@ -1283,7 +1307,12 @@ impl Database {
                 "SELECT k.aster_id, k.keyword FROM message_keywords k
                  JOIN message_cache m ON m.aster_id = k.aster_id
                  WHERE m.folder = ?1
-                 ORDER BY k.keyword",
+                 UNION
+                 SELECT a.aster_id, t.keyword FROM message_tag a
+                 JOIN custom_tag t ON t.tag_token = a.tag_token
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1 AND t.keyword IS NOT NULL
+                 ORDER BY 2",
             )?;
             let mut out: HashMap<String, Vec<String>> = HashMap::new();
             let rows = stmt.query_map([folder], |r| {
@@ -1303,8 +1332,202 @@ impl Database {
             tx.execute("DELETE FROM message_keywords WHERE aster_id = ?1", [aster_id])?;
             for keyword in keywords {
                 tx.execute(
-                    "INSERT OR IGNORE INTO message_keywords (aster_id, keyword) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO message_keywords (aster_id, keyword)
+                     SELECT ?1, ?2 WHERE NOT EXISTS (
+                        SELECT 1 FROM custom_tag WHERE keyword = ?2
+                     )",
                     rusqlite::params![aster_id, keyword],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn local_keyword_messages(&self) -> Result<Vec<(String, Vec<String>)>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT k.keyword, k.aster_id FROM message_keywords k
+                 JOIN message_cache m ON m.aster_id = k.aster_id
+                 ORDER BY k.keyword, k.aster_id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for row in rows {
+                let (keyword, id) = row?;
+                match out.last_mut() {
+                    Some((known, ids)) if known.eq_ignore_ascii_case(&keyword) => ids.push(id),
+                    _ => out.push((keyword, vec![id])),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn list_custom_tags(&self) -> Result<Vec<CustomTag>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag_token, server_id, name, keyword FROM custom_tag ORDER BY tag_token",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CustomTag {
+                        tag_token: r.get(0)?,
+                        server_id: r.get(1)?,
+                        name: r.get(2)?,
+                        keyword: r.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn replace_custom_tags(&self, tags: &[CustomTag]) -> Result<bool, String> {
+        let mut incoming: Vec<CustomTag> = tags.to_vec();
+        incoming.sort_by(|a, b| a.tag_token.cmp(&b.tag_token));
+        incoming.dedup_by(|a, b| a.tag_token == b.tag_token);
+        if self.list_custom_tags()? == incoming {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM custom_tag", [])?;
+            for tag in &incoming {
+                tx.execute(
+                    "INSERT INTO custom_tag (tag_token, server_id, name, keyword) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM message_tag WHERE tag_token NOT IN (SELECT tag_token FROM custom_tag)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM message_keywords WHERE EXISTS (
+                    SELECT 1 FROM message_tag a
+                    JOIN custom_tag t ON t.tag_token = a.tag_token
+                    WHERE a.aster_id = message_keywords.aster_id AND t.keyword = message_keywords.keyword
+                 )",
+                [],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn upsert_custom_tag(&self, tag: &CustomTag) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO custom_tag (tag_token, server_id, name, keyword)
+                 VALUES (?1, ?2, ?3, CASE WHEN EXISTS (
+                    SELECT 1 FROM custom_tag WHERE keyword = ?4 AND tag_token != ?1
+                 ) THEN NULL ELSE ?4 END)
+                 ON CONFLICT(tag_token) DO UPDATE SET
+                    server_id = excluded.server_id,
+                    name = excluded.name,
+                    keyword = excluded.keyword",
+                rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_custom_tag(&self, tag_token: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids = {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+                let rows = stmt
+                    .query_map([tag_token], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            tx.execute("DELETE FROM message_tag WHERE tag_token = ?1", [tag_token])?;
+            tx.execute("DELETE FROM custom_tag WHERE tag_token = ?1", [tag_token])?;
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
+    pub fn messages_with_tag(&self, tag_token: &str) -> Result<Vec<String>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+            let rows = stmt
+                .query_map([tag_token], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn message_tags(&self, aster_ids: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag_token FROM message_tag WHERE aster_id = ?1 ORDER BY tag_token",
+            )?;
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            for id in aster_ids {
+                let tokens = stmt
+                    .query_map([id], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if !tokens.is_empty() {
+                    out.insert(id.clone(), tokens);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_message_tags(&self, aster_id: &str, tag_tokens: &[String]) -> Result<bool, String> {
+        let mut wanted: Vec<String> = tag_tokens.to_vec();
+        wanted.sort();
+        wanted.dedup();
+        let current = self
+            .message_tags(&[aster_id.to_string()])?
+            .remove(aster_id)
+            .unwrap_or_default();
+        if current == wanted {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM message_tag WHERE aster_id = ?1", [aster_id])?;
+            for token in &wanted {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_tag (aster_id, tag_token) VALUES (?1, ?2)",
+                    rusqlite::params![aster_id, token],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn add_message_tag(&self, aster_ids: &[String], tag_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for id in aster_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_tag (aster_id, tag_token) VALUES (?1, ?2)",
+                    rusqlite::params![id, tag_token],
+                )?;
+                tx.execute(
+                    "DELETE FROM message_keywords WHERE aster_id = ?1 AND keyword IN (
+                        SELECT keyword FROM custom_tag WHERE tag_token = ?2 AND keyword IS NOT NULL
+                     )",
+                    rusqlite::params![id, tag_token],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn remove_message_tag(&self, aster_ids: &[String], tag_token: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for id in aster_ids {
+                tx.execute(
+                    "DELETE FROM message_tag WHERE aster_id = ?1 AND tag_token = ?2",
+                    rusqlite::params![id, tag_token],
                 )?;
             }
             tx.commit()
@@ -1892,6 +2115,8 @@ impl Database {
             conn.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
+                 DELETE FROM message_tag;
+                 DELETE FROM custom_tag;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -2514,6 +2739,8 @@ impl Database {
             tx.execute_batch(
                 "DELETE FROM message_cache;
                  DELETE FROM message_keywords;
+                 DELETE FROM message_tag;
+                 DELETE FROM custom_tag;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -2531,6 +2758,14 @@ impl Database {
         result
     }
 
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomTag {
+    pub tag_token: String,
+    pub server_id: String,
+    pub name: String,
+    pub keyword: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3641,6 +3876,110 @@ mod db_tests {
 
         db.clear_all_user_data().unwrap();
         assert!(db.message_keywords("kw-b").unwrap().is_empty());
+    }
+
+    fn custom_tag(token: &str, name: &str, keyword: Option<&str>) -> CustomTag {
+        CustomTag {
+            tag_token: token.to_string(),
+            server_id: format!("id-{}", token),
+            name: name.to_string(),
+            keyword: keyword.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn tag_keywords_join_the_stored_keywords_of_a_message() {
+        let (_d, db) = open_db();
+        insert(&db, "t-a", "inbox");
+        insert(&db, "t-b", "inbox");
+        db.set_message_keywords("t-a", &["$label1".to_string()]).unwrap();
+        assert!(db
+            .replace_custom_tags(&[
+                custom_tag("tok-work", "Work", Some("Work")),
+                custom_tag("tok-hidden", "work", None),
+            ])
+            .unwrap());
+        assert!(!db
+            .replace_custom_tags(&[
+                custom_tag("tok-hidden", "work", None),
+                custom_tag("tok-work", "Work", Some("Work")),
+            ])
+            .unwrap());
+
+        let ids = vec!["t-a".to_string(), "t-b".to_string()];
+        db.add_message_tag(&ids, "tok-work").unwrap();
+        db.add_message_tag(&ids[..1], "tok-hidden").unwrap();
+        assert_eq!(db.message_keywords("t-a").unwrap(), vec!["$label1", "Work"]);
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Work"]);
+        let inbox = db.folder_keywords("inbox").unwrap();
+        assert_eq!(inbox.get("t-a").unwrap(), &vec!["$label1".to_string(), "Work".to_string()]);
+        assert_eq!(
+            db.message_tags(&ids).unwrap().get("t-a").unwrap(),
+            &vec!["tok-hidden".to_string(), "tok-work".to_string()]
+        );
+
+        db.set_message_keywords("t-b", &["work".to_string(), "Later".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Later", "Work"]);
+
+        db.remove_message_tag(&ids[1..], "tok-work").unwrap();
+        assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Later"]);
+        assert!(db.set_message_tags("t-b", &["tok-work".to_string()]).unwrap());
+        assert!(!db.set_message_tags("t-b", &["tok-work".to_string()]).unwrap());
+
+        let mut affected = db.delete_custom_tag("tok-work").unwrap();
+        affected.sort();
+        assert_eq!(affected, ids);
+        assert_eq!(db.message_keywords("t-a").unwrap(), vec!["$label1"]);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.list_custom_tags().unwrap().is_empty());
+        assert!(db.message_tags(&ids).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upserting_a_tag_touches_one_row_and_never_duplicates_a_keyword() {
+        let (_d, db) = open_db();
+        insert(&db, "t-u", "inbox");
+        db.replace_custom_tags(&[custom_tag("tok-a", "A", Some("A")), custom_tag("tok-b", "B", Some("B"))])
+            .unwrap();
+        let ids = vec!["t-u".to_string()];
+        db.add_message_tag(&ids, "tok-a").unwrap();
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        db.upsert_custom_tag(&custom_tag("tok-c", "C", Some("C"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], custom_tag("tok-a", "A", Some("A")));
+        assert_eq!(tags[1], custom_tag("tok-b", "B", Some("B")));
+        assert_eq!(tags[2], custom_tag("tok-c", "C", Some("C")));
+        assert_eq!(db.messages_with_tag("tok-a").unwrap(), ids);
+
+        db.upsert_custom_tag(&custom_tag("tok-d", "a", Some("a"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[3], custom_tag("tok-d", "a", None));
+        assert_eq!(tags[0].keyword.as_deref(), Some("A"));
+
+        db.upsert_custom_tag(&custom_tag("tok-c", "C2", Some("C2"))).unwrap();
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[2], custom_tag("tok-c", "C2", Some("C2")));
+    }
+
+    #[test]
+    fn replacing_tags_drops_assignments_of_removed_tags() {
+        let (_d, db) = open_db();
+        insert(&db, "t-c", "inbox");
+        db.replace_custom_tags(&[custom_tag("tok-a", "A", Some("A")), custom_tag("tok-b", "B", Some("B"))])
+            .unwrap();
+        let ids = vec!["t-c".to_string()];
+        db.add_message_tag(&ids, "tok-a").unwrap();
+        db.add_message_tag(&ids, "tok-b").unwrap();
+        assert_eq!(db.messages_with_tag("tok-a").unwrap(), ids);
+        db.replace_custom_tags(&[custom_tag("tok-b", "B2", Some("B2"))]).unwrap();
+        assert_eq!(db.message_keywords("t-c").unwrap(), vec!["B2"]);
+        assert!(db.messages_with_tag("tok-a").unwrap().is_empty());
     }
 
     #[test]

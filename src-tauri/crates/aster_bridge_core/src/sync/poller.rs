@@ -1983,6 +1983,57 @@ async fn sync_custom_folders(
     Ok(record_mailbox_diff(db, &before, &after))
 }
 
+const TAG_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+async fn sync_custom_tags(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+) -> Result<Vec<String>, String> {
+    let Some(identity_key) = identity_key else {
+        return Ok(Vec::new());
+    };
+    let _guard = db.tag_lock.lock().await;
+    let defs = tokio::time::timeout(TAG_LIST_TIMEOUT, client.list_tags(access_token))
+        .await
+        .map_err(|_| "failed to sync labels: timed out".to_string())?
+        .map_err(|e| format!("failed to sync labels: {}", e))?;
+    let tags = crate::tags::tags_from_definitions(&defs, identity_key, previous_keys);
+    let before = db.list_custom_tags()?;
+    let mut affected: Vec<String> = Vec::new();
+    for old in &before {
+        let keyword_now = tags
+            .iter()
+            .find(|tag| tag.tag_token == old.tag_token)
+            .map(|tag| &tag.keyword);
+        if keyword_now != Some(&old.keyword) {
+            affected.extend(db.messages_with_tag(&old.tag_token)?);
+        }
+    }
+    db.replace_custom_tags(&tags)?;
+    Ok(affected)
+}
+
+fn server_tags_differ(
+    item: &MailItem,
+    known: &HashSet<String>,
+    cached: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut wanted: Vec<String> = item
+        .tag_tokens
+        .as_ref()?
+        .iter()
+        .filter(|token| known.contains(*token))
+        .cloned()
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    let current = cached.get(&item.id).map(|tokens| tokens.as_slice()).unwrap_or(&[]);
+    (current != wanted.as_slice()).then_some(wanted)
+}
+
 fn custom_folder_of(item: &MailItem, known: &HashSet<String>) -> Option<String> {
     item.labels
         .as_ref()?
@@ -2088,6 +2139,24 @@ async fn run_sync_pass(
     let custom_folders = db.list_custom_folders().unwrap_or_default();
     let known_tokens: HashSet<String> = custom_folders.iter().map(|f| f.label_token.clone()).collect();
 
+    let tag_writes_at_start = db.tag_writes.load(std::sync::atomic::Ordering::SeqCst);
+    match sync_custom_tags(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
+        Ok(affected) => {
+            updated_ids.extend(affected);
+            updated_ids.extend(
+                crate::tag_ops::migrate_local_keywords(db, client, &access_token, identity_key.as_deref())
+                    .await,
+            );
+        }
+        Err(msg) => tracing::warn!("{}", msg),
+    }
+    let known_tags: HashSet<String> = db
+        .list_custom_tags()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tag| tag.tag_token)
+        .collect();
+
     let queries = build_folder_queries();
     let total_folders = queries.len() + custom_folders.len();
     for folder_idx in 0..total_folders {
@@ -2158,10 +2227,23 @@ async fn run_sync_pass(
                         *id_counts.entry(id).or_default() += 1;
                     }
                     let snapshot = db.cached_sync_states(&page_ids).unwrap_or_default();
+                    let owned_ids: Vec<String> = page_ids.iter().map(|id| id.to_string()).collect();
+                    let tag_snapshot = db.message_tags(&owned_ids).unwrap_or_default();
                     let mut flag_updates: Vec<(&MailItem, i64, i64)> = Vec::new();
                     for item in &resp.items {
                         seen_ids.insert(item.id.clone());
                         listed_ids.push(item.id.clone());
+                        if is_valid_item_id(&item.id)
+                            && db.tag_writes.load(std::sync::atomic::Ordering::SeqCst) == tag_writes_at_start
+                        {
+                            if let Some(wanted) = server_tags_differ(item, &known_tags, &tag_snapshot) {
+                                if db.set_message_tags(&item.id, &wanted).unwrap_or(false)
+                                    && snapshot.contains_key(&item.id)
+                                {
+                                    updated_ids.push(item.id.clone());
+                                }
+                            }
+                        }
                         let item_folder = if custom_folder.is_some() {
                             resp.label.clone()
                         } else {
@@ -2742,6 +2824,7 @@ mod tests {
             has_attachments: None,
             attachment_count: None,
             labels: None,
+            tag_tokens: None,
         }
     }
 

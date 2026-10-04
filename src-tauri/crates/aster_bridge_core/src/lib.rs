@@ -49,5 +49,7 @@ pub mod shutdown;
 pub mod smtp;
 pub mod sync;
 pub mod system_tools;
+pub mod tag_ops;
+pub mod tags;
 pub mod tls;
 pub mod tls_pinning;
