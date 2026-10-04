@@ -22,6 +22,7 @@ pub mod accept;
 pub mod address;
 pub mod account_state;
 pub mod api_client;
+pub mod atomic_file;
 pub mod auth;
 pub mod config;
 pub mod conn_limit;
