@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -58,18 +58,38 @@ pub async fn upload(
     .into_response()
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DownloadQuery {
+    accept: Option<String>,
+}
+
+fn requested_type(query: &DownloadQuery) -> Option<&str> {
+    let accept = query.accept.as_deref()?.trim();
+    let usable = !accept.is_empty()
+        && accept.len() <= 255
+        && accept.contains('/')
+        && accept.bytes().all(|b| b.is_ascii_graphic() || b == b' ');
+    usable.then_some(accept)
+}
+
 pub async fn download(
     _auth: AuthedAccount,
     Path((account_id, blob_id, name)): Path<(String, String, String)>,
+    query: Option<Query<DownloadQuery>>,
     State(state): State<AppState>,
 ) -> Response {
     let expected = state.ctx.account_id().await;
     if account_id != expected {
         return (StatusCode::NOT_FOUND, "unknown account").into_response();
     }
+    let query = query.map(|Query(q)| q).unwrap_or_default();
+    let accept = requested_type(&query);
+    let respond = |data: Vec<u8>, stored_type: &str, name: &str| {
+        build_blob_response(data, accept.unwrap_or(stored_type), name)
+    };
     if let Ok(Some((data, ctype))) = state.ctx.db.jmap_blob_get(&blob_id) {
         let ct = ctype.as_deref().unwrap_or("application/octet-stream");
-        return build_blob_response(data, ct, &name);
+        return respond(data, ct, &name);
     }
 
     if let Some((aster_id, seq)) = parse_attachment_blob_id(&blob_id) {
@@ -80,7 +100,7 @@ pub async fn download(
                 } else {
                     "application/octet-stream".to_string()
                 };
-                return build_blob_response(att.data, &ct, &name);
+                return respond(att.data, &ct, &name);
             }
         }
         return (StatusCode::NOT_FOUND, "blob not found").into_response();
@@ -93,7 +113,7 @@ pub async fn download(
             Vec::new()
         };
         let body = mime::build_rfc5322(&m, &attachments);
-        return build_blob_response(body, "message/rfc822", &name);
+        return respond(body, "message/rfc822", &name);
     }
 
     (StatusCode::NOT_FOUND, "blob not found").into_response()
@@ -234,6 +254,17 @@ mod tests {
     fn sanitize_replaces_unsafe_with_underscore() {
         assert_eq!(sanitize("a/b\\c d"), "a_b_c_d");
         assert_eq!(sanitize("../../etc/passwd"), ".._.._etc_passwd");
+    }
+
+    #[test]
+    fn requested_type_accepts_media_types_only() {
+        let q = |s: &str| DownloadQuery { accept: Some(s.to_string()) };
+        assert_eq!(requested_type(&q("text/plain")), Some("text/plain"));
+        assert_eq!(requested_type(&q("text/plain; charset=utf-8")), Some("text/plain; charset=utf-8"));
+        assert_eq!(requested_type(&q("")), None);
+        assert_eq!(requested_type(&q("plain")), None);
+        assert_eq!(requested_type(&q("text/plain\r\nX: y")), None);
+        assert_eq!(requested_type(&DownloadQuery::default()), None);
     }
 
     #[test]

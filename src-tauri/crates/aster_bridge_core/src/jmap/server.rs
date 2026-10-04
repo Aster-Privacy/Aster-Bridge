@@ -685,6 +685,23 @@ mod e2e_tests {
         let bytes = r_dl.bytes().await.unwrap();
         assert_eq!(&bytes[..], payload);
 
+        let template = sess["downloadUrl"].as_str().unwrap();
+        let url = template
+            .replace("{accountId}", &acct)
+            .replace("{blobId}", &blob_id)
+            .replace("{name}", "notes.txt")
+            .replace("{type}", "text%2Fplain");
+        let url = format!("{}{}", base, &url[url.find("/jmap/").unwrap()..]);
+        let r_typed = client
+            .get(url)
+            .header("authorization", auth.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_typed.status(), 200);
+        assert_eq!(r_typed.headers()["content-type"], "text/plain");
+        assert_eq!(&r_typed.bytes().await.unwrap()[..], payload);
+
         let r_named = client
             .get(format!(
                 "{}/jmap/download/{}/{}/r%C3%A9sum%C3%A9.txt",
