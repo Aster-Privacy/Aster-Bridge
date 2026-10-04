@@ -720,7 +720,10 @@ fn tag_error(e: crate::tag_ops::TagOpError) -> Value {
             "type": "rateLimit",
             "description": "too many requests; try again shortly"
         }),
-        TagOpError::AlreadyExists | TagOpError::NotFound | TagOpError::Server(_) => json!({
+        TagOpError::AlreadyExists
+        | TagOpError::NotFound
+        | TagOpError::ParentRejected
+        | TagOpError::Server(_) => json!({
             "type": "serverFail",
             "description": "could not update labels"
         }),

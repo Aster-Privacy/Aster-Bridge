@@ -37,6 +37,7 @@ pub enum TagOpError {
     LimitReached,
     TooManyNew,
     Busy,
+    ParentRejected,
     Server(String),
 }
 
@@ -117,19 +118,22 @@ fn store(db: &Database, mut tag: CustomTag, path: Option<&str>) -> Result<Custom
     Ok(tag)
 }
 
-fn nested_target(tags: &[CustomTag], path: &str) -> Option<(String, String)> {
+fn is_parent_rejection(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Api(text) if text.contains("TAG_PARENT_"))
+}
+
+fn nested_target(tags: &[CustomTag], path: &str) -> Option<(String, String, String)> {
     let (parent_path, leaf) = path.rsplit_once(crate::tags::PATH_SEPARATOR)?;
     if leaf.trim() != leaf || crate::tags::validate_name(leaf).is_err() {
         return None;
     }
     let wanted = parent_path.to_lowercase();
-    let parent = tags.iter().find(|tag| {
-        tag.keyword
-            .as_deref()
-            .and_then(crate::tags::keyword_text)
-            .is_some_and(|text| text.to_lowercase() == wanted)
+    let (parent, parent_text) = tags.iter().find_map(|tag| {
+        let text = tag.keyword.as_deref().and_then(crate::tags::keyword_text)?;
+        (text.to_lowercase() == wanted).then_some((tag, text))
     })?;
-    Some((parent.tag_token.clone(), leaf.to_string()))
+    let stored_path = format!("{}{}{}", parent_text, crate::tags::PATH_SEPARATOR, leaf);
+    Some((parent.tag_token.clone(), leaf.to_string(), stored_path))
 }
 
 async fn create(
@@ -153,7 +157,13 @@ async fn create(
     let server_id = client
         .create_tag(access_token, &body)
         .await
-        .map_err(|e| server_error("create the label", &e))?;
+        .map_err(|e| {
+            if parent.is_some() && is_parent_rejection(&e) {
+                TagOpError::ParentRejected
+            } else {
+                server_error("create the label", &e)
+            }
+        })?;
     store(
         db,
         CustomTag {
@@ -191,11 +201,12 @@ async fn resolve(
     *budget -= 1;
     let nested = nested_target(tags.as_slice(), &name);
     let tag = match nested {
-        Some((parent_token, leaf)) => {
-            match create(db, client, access_token, identity_key, &leaf, Some((&parent_token, &name))).await {
-                Ok(tag) => tag,
-                Err(TagOpError::Busy) => return Err(TagOpError::Busy),
-                Err(_) => create(db, client, access_token, identity_key, &name, None).await?,
+        Some((parent_token, leaf, path)) => {
+            match create(db, client, access_token, identity_key, &leaf, Some((&parent_token, &path))).await {
+                Err(TagOpError::ParentRejected) => {
+                    create(db, client, access_token, identity_key, &name, None).await?
+                }
+                other => other?,
             }
         }
         None => create(db, client, access_token, identity_key, &name, None).await?,
@@ -470,6 +481,8 @@ mod tests {
         Accept,
         Fail,
         Limit,
+        RejectParent,
+        FailNested,
     }
 
     async fn spawn_backend(mode: CreateMode) -> (String, Calls) {
@@ -488,8 +501,24 @@ mod tests {
                             guard.push(("create".to_string(), body));
                             guard.iter().filter(|(kind, _)| kind == "create").count()
                         };
+                        let nested = calls
+                            .lock()
+                            .await
+                            .last()
+                            .is_some_and(|(_, body)| body.get("parent_token").is_some());
                         match mode {
-                            CreateMode::Accept => {
+                            CreateMode::RejectParent if nested => (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "tags cannot be nested this deeply",
+                                    "code": "TAG_PARENT_TOO_DEEP"
+                                })),
+                            )
+                                .into_response(),
+                            CreateMode::FailNested if nested => {
+                                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                            }
+                            CreateMode::Accept | CreateMode::RejectParent | CreateMode::FailNested => {
                                 Json(serde_json::json!({"id": format!("srv-tag-{}", created)})).into_response()
                             }
                             CreateMode::Fail => {
@@ -810,14 +839,89 @@ mod tests {
         let tags = db.list_custom_tags().unwrap();
         let child = tags
             .iter()
-            .find(|tag| tag.keyword.as_deref() == Some("clients/Fresh"))
+            .find(|tag| tag.keyword.as_deref() == Some("Clients/Fresh"))
             .expect("child label stored under its path");
         assert_eq!(child.name, "Fresh");
-        assert!(tags.iter().any(|tag| tag.name == "Missing/Leaf"));
-        assert_eq!(
-            db.message_keywords("m-1").unwrap().len(),
-            2
-        );
+        let flat = tags
+            .iter()
+            .find(|tag| tag.name == "Missing/Leaf")
+            .expect("flat label stored");
+        let mut expected = vec![child.tag_token.clone(), flat.tag_token.clone()];
+        expected.sort();
+        let mut applied = db.message_tags(&ids).unwrap().get("m-1").cloned().unwrap();
+        applied.sort();
+        assert_eq!(applied, expected);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_parent_falls_back_to_a_flat_label() {
+        let (_dir, db, client, calls) = setup(CreateMode::RejectParent).await;
+        db.replace_custom_tags(&[stored_tag("tok-clients", "Clients")]).unwrap();
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let outcome = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["Clients/Fresh"]),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(count(&calls, "create").await, 2);
+        let tags = db.list_custom_tags().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().any(|tag| tag.name == "Clients/Fresh"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_nested_creation_is_not_retried_as_a_flat_label() {
+        let (_dir, db, client, calls) = setup(CreateMode::FailNested).await;
+        db.replace_custom_tags(&[stored_tag("tok-clients", "Clients")]).unwrap();
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let outcome = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["Clients/Fresh"]),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(outcome.failed, strings(&["Clients/Fresh"]));
+        assert!(outcome.error.unwrap().imap_response().starts_with("[UNAVAILABLE]"));
+        assert_eq!(count(&calls, "create").await, 1);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_label_limit_on_a_nested_creation_is_reported_once() {
+        let (_dir, db, client, calls) = setup(CreateMode::Limit).await;
+        db.replace_custom_tags(&[stored_tag("tok-clients", "Clients")]).unwrap();
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let outcome = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["Clients/Fresh"]),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(outcome.error, Some(TagOpError::LimitReached));
+        assert_eq!(count(&calls, "create").await, 1);
     }
 
     fn cache(db: &Database, ids: &[&str]) {
