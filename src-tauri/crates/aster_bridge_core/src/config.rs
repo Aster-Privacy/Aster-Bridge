@@ -148,7 +148,7 @@ fn load_config_from(dir: PathBuf) -> Result<BridgeConfig, String> {
     } else {
         let default = BridgeConfig::default();
         let contents = toml::to_string_pretty(&default).map_err(|e| e.to_string())?;
-        std::fs::write(&config_path, contents).map_err(|e| e.to_string())?;
+        crate::atomic_file::write(&config_path, contents.as_bytes())?;
         default
     };
 
@@ -255,16 +255,7 @@ fn repair_ports(c: &mut BridgeConfig) -> Vec<&'static str> {
 pub fn save_config(config: &BridgeConfig) -> Result<(), String> {
     let config_path = config.data_dir.join("config.toml");
     let contents = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    let scratch = config_path.with_extension("toml.new");
-    let _ = std::fs::remove_file(&scratch);
-    std::fs::write(&scratch, contents).map_err(|e| e.to_string())?;
-    match std::fs::rename(&scratch, &config_path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&scratch);
-            Err(e.to_string())
-        }
-    }
+    crate::atomic_file::write(&config_path, contents.as_bytes())
 }
 
 #[cfg(test)]
@@ -411,6 +402,35 @@ mod tests {
         let saved: BridgeConfig = toml::from_str(&saved).unwrap();
         assert_eq!(saved.jmap_port, 1080);
         assert_eq!(saved.carddav_port, 1081);
+    }
+
+    #[test]
+    fn concurrent_saves_never_fail_or_leave_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles: Vec<_> = (0..8u16)
+            .map(|i| {
+                let data_dir = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let mut c = BridgeConfig::default();
+                    c.data_dir = data_dir;
+                    c.smtp_port = 3000 + i;
+                    for _ in 0..25 {
+                        save_config(&c).expect("a concurrent save must not fail");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let parsed: BridgeConfig = toml::from_str(&contents).unwrap();
+        assert!((3000..3008).contains(&parsed.smtp_port));
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["config.toml".to_string()]);
     }
 
     #[test]
