@@ -569,6 +569,8 @@ pub struct CreateTagBody<'a> {
     pub tag_token: &'a str,
     pub encrypted_name: &'a str,
     pub name_nonce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_token: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]

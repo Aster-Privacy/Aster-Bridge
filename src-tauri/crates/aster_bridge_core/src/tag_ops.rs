@@ -109,10 +109,27 @@ fn find_by_name<'a>(tags: &'a [CustomTag], name: &str) -> Option<&'a CustomTag> 
         })
 }
 
-fn store(db: &Database, mut tag: CustomTag) -> Result<CustomTag, TagOpError> {
-    tag.keyword = crate::tags::keyword_for_name(&tag.name);
+fn store(db: &Database, mut tag: CustomTag, path: Option<&str>) -> Result<CustomTag, TagOpError> {
+    tag.keyword = path
+        .and_then(crate::tags::keyword_for_name)
+        .or_else(|| crate::tags::keyword_for_name(&tag.name));
     db.upsert_custom_tag(&tag).map_err(TagOpError::Server)?;
     Ok(tag)
+}
+
+fn nested_target(tags: &[CustomTag], path: &str) -> Option<(String, String)> {
+    let (parent_path, leaf) = path.rsplit_once(crate::tags::PATH_SEPARATOR)?;
+    if leaf.trim() != leaf || crate::tags::validate_name(leaf).is_err() {
+        return None;
+    }
+    let wanted = parent_path.to_lowercase();
+    let parent = tags.iter().find(|tag| {
+        tag.keyword
+            .as_deref()
+            .and_then(crate::tags::keyword_text)
+            .is_some_and(|text| text.to_lowercase() == wanted)
+    })?;
+    Some((parent.tag_token.clone(), leaf.to_string()))
 }
 
 async fn create(
@@ -121,6 +138,7 @@ async fn create(
     access_token: &str,
     identity_key: &str,
     name: &str,
+    parent: Option<(&str, &str)>,
 ) -> Result<CustomTag, TagOpError> {
     let name = clean_name(name)?;
     let (encrypted_name, name_nonce) = crate::crypto::tag::encrypt_tag_name(&name, identity_key)
@@ -130,6 +148,7 @@ async fn create(
         tag_token: &tag_token,
         encrypted_name: &encrypted_name,
         name_nonce: &name_nonce,
+        parent_token: parent.map(|(token, _)| token),
     };
     let server_id = client
         .create_tag(access_token, &body)
@@ -143,6 +162,7 @@ async fn create(
             name,
             keyword: None,
         },
+        parent.map(|(_, path)| path),
     )
 }
 
@@ -169,7 +189,17 @@ async fn resolve(
         return Err(TagOpError::TooManyNew);
     }
     *budget -= 1;
-    let tag = create(db, client, access_token, identity_key, &name).await?;
+    let nested = nested_target(tags.as_slice(), &name);
+    let tag = match nested {
+        Some((parent_token, leaf)) => {
+            match create(db, client, access_token, identity_key, &leaf, Some((&parent_token, &name))).await {
+                Ok(tag) => tag,
+                Err(TagOpError::Busy) => return Err(TagOpError::Busy),
+                Err(_) => create(db, client, access_token, identity_key, &name, None).await?,
+            }
+        }
+        None => create(db, client, access_token, identity_key, &name, None).await?,
+    };
     let token = tag.tag_token.clone();
     tags.push(tag);
     Ok(Some(token))
@@ -747,6 +777,47 @@ mod tests {
         assert_eq!(tags.iter().filter(|tag| tag.keyword.as_deref() == Some("Fresh")).count(), 1);
         assert_eq!(db.messages_with_tag("tok-home").unwrap(), strings(&["m-1"]));
         assert_eq!(db.message_keywords("m-2").unwrap(), strings(&["Fresh"]));
+    }
+
+    #[tokio::test]
+    async fn a_new_path_keyword_becomes_a_child_of_its_parent_label() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&[stored_tag("tok-clients", "Clients")]).unwrap();
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let outcome = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["clients/Fresh", "Missing/Leaf"]),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(outcome.error, None);
+        let log = calls.lock().await.clone();
+        let created: Vec<&serde_json::Value> = log
+            .iter()
+            .filter(|(kind, _)| kind == "create")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0]["parent_token"], "tok-clients");
+        assert!(created[1].get("parent_token").is_none());
+        let tags = db.list_custom_tags().unwrap();
+        let child = tags
+            .iter()
+            .find(|tag| tag.keyword.as_deref() == Some("clients/Fresh"))
+            .expect("child label stored under its path");
+        assert_eq!(child.name, "Fresh");
+        assert!(tags.iter().any(|tag| tag.name == "Missing/Leaf"));
+        assert_eq!(
+            db.message_keywords("m-1").unwrap().len(),
+            2
+        );
     }
 
     fn cache(db: &Database, ids: &[&str]) {
