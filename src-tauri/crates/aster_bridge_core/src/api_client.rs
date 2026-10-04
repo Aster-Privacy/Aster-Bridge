@@ -489,6 +489,8 @@ pub struct MailItem {
     pub attachment_count: Option<i16>,
     #[serde(default)]
     pub labels: Option<Vec<MailItemLabel>>,
+    #[serde(default)]
+    pub tag_tokens: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -521,6 +523,39 @@ pub struct FolderListResponse {
     pub labels: Vec<FolderDefinition>,
     #[serde(default)]
     pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TagDefinition {
+    pub id: String,
+    pub tag_token: String,
+    pub encrypted_name: String,
+    pub name_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagListResponse {
+    pub tags: Vec<TagDefinition>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTagResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateTagBody<'a> {
+    pub tag_token: &'a str,
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateTagBody<'a> {
+    pub encrypted_name: &'a str,
+    pub name_nonce: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1477,6 +1512,105 @@ impl ApiClient {
 
     pub async fn remove_from_folder(&self, access_token: &str, item_ids: &[String], label_token: &str) -> Result<()> {
         self.bulk_folder_request(access_token, "bulk/labels/remove", item_ids, label_token).await
+    }
+
+    pub async fn list_tags(&self, access_token: &str) -> Result<Vec<TagDefinition>> {
+        let mut out = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let resp = self
+                .client
+                .get(format!("{}/mail/v1/tags", self.base_url))
+                .bearer_auth(access_token)
+                .query(&[
+                    ("limit", Self::FOLDER_PAGE_LIMIT.to_string()),
+                    ("offset", offset.to_string()),
+                ])
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+            let page: TagListResponse = resp.json().await?;
+            let fetched = page.tags.len() as i64;
+            out.extend(page.tags);
+            if !page.has_more || fetched == 0 || offset >= 20_000 {
+                return Ok(out);
+            }
+            offset += fetched;
+        }
+    }
+
+    pub async fn create_tag(&self, access_token: &str, body: &CreateTagBody<'_>) -> Result<String> {
+        let resp = self
+            .client
+            .post(format!("{}/mail/v1/tags", self.base_url))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        let parsed: CreateTagResponse = resp.json().await?;
+        Ok(parsed.id)
+    }
+
+    pub async fn update_tag(&self, access_token: &str, tag_id: &str, body: &UpdateTagBody<'_>) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!("{}/mail/v1/tags/{}", self.base_url, urlencoding_path(tag_id)))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_tag(&self, access_token: &str, tag_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/mail/v1/tags/{}", self.base_url, urlencoding_path(tag_id)))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
+    }
+
+    pub async fn add_tag(&self, access_token: &str, item_ids: &[String], tag_token: &str) -> Result<()> {
+        self.bulk_tag_request(access_token, "bulk/tags", item_ids, tag_token).await
+    }
+
+    pub async fn remove_tag(&self, access_token: &str, item_ids: &[String], tag_token: &str) -> Result<()> {
+        self.bulk_tag_request(access_token, "bulk/tags/remove", item_ids, tag_token).await
+    }
+
+    async fn bulk_tag_request(
+        &self,
+        access_token: &str,
+        route: &str,
+        item_ids: &[String],
+        tag_token: &str,
+    ) -> Result<()> {
+        for chunk in item_ids.chunks(Self::MAX_BULK_FOLDER_ITEMS) {
+            let resp = self
+                .client
+                .post(format!("{}/bridge/v1/messages/{}", self.base_url, route))
+                .bearer_auth(access_token)
+                .json(&serde_json::json!({"ids": chunk, "tag_token": tag_token}))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(map_response_error(resp).await);
+            }
+        }
+        Ok(())
     }
 
     async fn bulk_folder_request(

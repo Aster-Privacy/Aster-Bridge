@@ -1027,6 +1027,7 @@ async fn import_message(
         has_attachments: Some(attachment_count > 0),
         attachment_count: Some(attachment_count.min(i16::MAX as usize) as i16),
         labels: None,
+        tag_tokens: None,
     };
 
     let local_attachments: Vec<crate::db::CachedAttachment> = message

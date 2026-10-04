@@ -34,4 +34,5 @@ pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;
 pub mod sent_copy;
+pub mod tag;
 pub mod vault;

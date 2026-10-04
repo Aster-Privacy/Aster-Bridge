@@ -834,6 +834,48 @@ fn store_message_keywords(
     updated
 }
 
+async fn store_tag_keywords(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    item_ids: &[String],
+    op: i8,
+    given: Option<&[String]>,
+) {
+    let Some(given) = given else { return };
+    if op != 0 && given.is_empty() {
+        return;
+    }
+    let keywords: Vec<String> = given
+        .iter()
+        .filter(|keyword| !crate::tags::is_local_keyword(keyword))
+        .cloned()
+        .collect();
+    let (access_token, identity_key) = {
+        let s = session.read().await;
+        (s.access_token.to_string(), s.identity_key.clone())
+    };
+    match crate::tag_ops::apply_keywords(
+        db,
+        client,
+        &access_token,
+        identity_key.as_deref(),
+        item_ids,
+        op,
+        &keywords,
+    )
+    .await
+    {
+        Ok(changed) => {
+            if !changed.is_empty() {
+                let refs: Vec<&str> = changed.iter().map(|id| id.as_str()).collect();
+                let _ = db.jmap_record_updated_batch("Email", &refs);
+            }
+        }
+        Err(e) => tracing::warn!("label keyword store failed: {:?}", e),
+    }
+}
+
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
 const MAX_DRAINABLE_APPEND_BYTES: usize = 256 * 1024 * 1024;
 
@@ -1564,6 +1606,12 @@ where
                         }
                         let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
                         let store_keywords = parse_store_keywords(op_and_flags);
+                        let stored_ids: Vec<String> = uids
+                            .iter()
+                            .filter_map(|uid| view.by_uid(*uid).map(|(_, m)| m.aster_id.clone()))
+                            .collect();
+                        store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                            .await;
                         let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
                         for uid in &uids {
@@ -1719,6 +1767,12 @@ where
                 } else {
                     let (op, flag_mask, silent) = parse_store_flags(op_and_flags);
                     let store_keywords = parse_store_keywords(op_and_flags);
+                    let stored_ids: Vec<String> = seqs
+                        .iter()
+                        .filter_map(|s| view.by_seq(*s).map(|m| m.aster_id.clone()))
+                        .collect();
+                    store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
+                        .await;
                     let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
                     let mut seen_changes: Vec<(String, bool)> = Vec::new();
                     for s in &seqs {
