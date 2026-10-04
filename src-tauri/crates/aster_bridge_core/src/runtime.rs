@@ -418,14 +418,35 @@ fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> 
         .map_err(|e| port_error(Service::Imap, config.imap_port, e))?;
     let smtp = port_picker::pick_startup_port(host, config.smtp_port)
         .map_err(|e| port_error(Service::Smtp, config.smtp_port, e))?;
+    let configured = [
+        config.imap_port,
+        config.smtp_port,
+        config.imap_implicit_tls_port,
+        config.smtp_implicit_tls_port,
+        config.jmap_port,
+        config.pop3_port,
+        config.pop3s_port,
+        config.carddav_port,
+    ];
+    let mut chosen = vec![imap, smtp];
+    let mut pick_free = |preferred: u16| -> Result<u16, String> {
+        let avoid: Vec<u16> = configured
+            .iter()
+            .copied()
+            .filter(|&p| p != preferred)
+            .chain(chosen.iter().copied())
+            .collect();
+        let port = port_picker::pick_free_port_avoiding(host, preferred, &avoid)?;
+        chosen.push(port);
+        Ok(port)
+    };
     let jmap = if config.jmap_enabled {
-        port_picker::pick_available_port(host, config.jmap_port)
-            .map_err(|e| port_error(Service::Jmap, config.jmap_port, e))?
+        pick_free(config.jmap_port).map_err(|e| port_error(Service::Jmap, config.jmap_port, e))?
     } else {
         0
     };
     let carddav = if config.carddav_enabled {
-        match port_picker::pick_available_port(host, config.carddav_port) {
+        match pick_free(config.carddav_port) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("CardDAV listener disabled: {}", e);
@@ -449,9 +470,9 @@ fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> 
     };
     let imaps = pick_tls(Service::Imaps, config.imap_implicit_tls_port);
     let smtps = pick_tls(Service::Smtps, config.smtp_implicit_tls_port);
-    let pop3 = port_picker::pick_available_port(host, config.pop3_port).unwrap_or(0);
+    let pop3 = pick_free(config.pop3_port).unwrap_or(0);
     let pop3s = if tls {
-        port_picker::pick_available_port(host, config.pop3s_port).unwrap_or(0)
+        pick_free(config.pop3s_port).unwrap_or(0)
     } else {
         0
     };
@@ -835,5 +856,49 @@ mod token_refresh_wait_tests {
         assert!(should_refresh_early(0, start, later));
         assert!(!should_refresh_early(0, start, start + Duration::from_secs(5)));
         assert!(!should_refresh_early(2, start, later));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jmap_drifting_off_a_busy_port_does_not_take_the_carddav_port() {
+        let imap_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let smtp_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        if busy > u16::MAX - 40 {
+            return;
+        }
+        let mut config = BridgeConfig::default();
+        config.imap_port = imap_probe.local_addr().unwrap().port();
+        config.smtp_port = smtp_probe.local_addr().unwrap().port();
+        config.jmap_port = busy;
+        config.carddav_port = busy + 1;
+        config.pop3_port = busy + 2;
+        config.jmap_enabled = true;
+        config.carddav_enabled = true;
+        drop(imap_probe);
+        drop(smtp_probe);
+        if crate::config::validate_ports(&config).is_err() {
+            return;
+        }
+
+        let plan = plan_ports(&config, false).unwrap_or_else(|_| panic!("ports must plan"));
+        let ports = plan.ports;
+        assert_ne!(ports.jmap, busy);
+        assert_ne!(ports.jmap, ports.carddav);
+        assert_ne!(ports.jmap, config.carddav_port);
+        assert_ne!(ports.jmap, config.pop3_port);
+        if ports.carddav != 0 && ports.pop3 != 0 {
+            assert_ne!(ports.carddav, ports.pop3);
+        }
+
+        let mut saved = config.clone();
+        ports.apply_to_config(&mut saved);
+        crate::config::validate_ports(&saved).expect("saved ports must stay distinct");
+        drop(held);
     }
 }

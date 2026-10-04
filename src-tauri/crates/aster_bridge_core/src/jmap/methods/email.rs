@@ -58,17 +58,35 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
     let mut list = Vec::new();
     let mut not_found = Vec::new();
 
+    let wants = |name: &str| {
+        properties
+            .as_ref()
+            .map(|p| p.iter().any(|s| s == name))
+            .unwrap_or(true)
+    };
+    let with_body = fetch_text || wants("preview");
+    let mut messages = ctx.db.get_cached_messages(&want, with_body).unwrap_or_default();
+    let stored: Vec<String> = messages
+        .values()
+        .filter(|m| m.attachments_state == ATTACHMENTS_STORED)
+        .map(|m| m.aster_id.clone())
+        .collect();
+    let attachment_meta = ctx
+        .db
+        .get_attachment_meta_for_messages(&stored)
+        .unwrap_or_default();
+    if !with_body && wants("size") {
+        let sized: Vec<String> = attachment_meta.keys().cloned().collect();
+        messages.extend(ctx.db.get_cached_messages(&sized, true).unwrap_or_default());
+    }
+
     for id in &want {
-        match ctx.db.get_cached_message(id) {
-            Ok(Some(m)) => {
-                let attachments = if m.attachments_state == ATTACHMENTS_STORED {
-                    ctx.db.get_message_attachment_meta(&m.aster_id).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments))
+        match messages.get(id) {
+            Some(m) => {
+                let attachments = attachment_meta.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                list.push(serialize_email(m, &label_to_id, &properties, fetch_text, attachments))
             }
-            _ => not_found.push(id.clone()),
+            None => not_found.push(id.clone()),
         }
     }
 
@@ -1264,6 +1282,89 @@ mod tests {
         assert_eq!(res["list"].as_array().unwrap().len(), 1);
         assert_eq!(res["notFound"], json!(["missing"]));
         assert_eq!(res["list"][0]["id"], json!("g1"));
+    }
+
+    async fn get_one_by_one(ctx: &Arc<JmapContext>, args: Value) -> Value {
+        let mut res = ok(get(ctx, args.clone()).await);
+        let properties = args.get("properties").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>()
+        });
+        let fetch_text = args.get("fetchTextBodyValues").and_then(|v| v.as_bool()).unwrap_or(false)
+            || properties
+                .as_ref()
+                .map(|p| p.iter().any(|s| s == "bodyValues" || s == "textBody" || s == "htmlBody"))
+                .unwrap_or(false);
+        let label_to_id = store::label_to_mailbox_id_map(&ctx.db);
+        let mut list = Vec::new();
+        let mut not_found = Vec::new();
+        for id in args["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()) {
+            match ctx.db.get_cached_message(id) {
+                Ok(Some(m)) => {
+                    let attachments = if m.attachments_state == ATTACHMENTS_STORED {
+                        ctx.db.get_message_attachment_meta(&m.aster_id).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    list.push(serialize_email(&m, &label_to_id, &properties, fetch_text, &attachments))
+                }
+                _ => not_found.push(json!(id)),
+            }
+        }
+        res["list"] = Value::Array(list);
+        res["notFound"] = Value::Array(not_found);
+        res
+    }
+
+    #[tokio::test]
+    async fn get_batched_matches_one_by_one() {
+        let (ctx, _d) = test_ctx();
+        insert_msg(&ctx, &cached("b1", "inbox"));
+
+        let mut html = cached("b2", "sent");
+        html.raw_headers = Some(json!({"is_html": true, "message_id": "mid-2@test", "attachment_count": 2}).to_string());
+        html.body_text = Some("<p>see the attached files</p>".to_string());
+        insert_msg(&ctx, &html);
+        let att = |seq: i64, name: &str, cid: Option<&str>, inline: bool| CachedAttachment {
+            seq,
+            name: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            content_id: cid.map(str::to_string),
+            is_inline: inline,
+            size: 2048 * (seq + 1),
+            data: vec![b'x'; 16],
+        };
+        ctx.db
+            .replace_message_attachments("b2", &[att(0, "report.pdf", None, false), att(1, "logo.png", Some("<logo@x>"), true)])
+            .unwrap();
+        ctx.db.set_attachments_state("b2", ATTACHMENTS_STORED).unwrap();
+
+        let mut no_body = cached("b3", "inbox");
+        no_body.body_text = None;
+        no_body.thread_id = None;
+        insert_msg(&ctx, &no_body);
+        ctx.db.set_attachments_state("b3", ATTACHMENTS_STORED).unwrap();
+
+        let ids = json!(["b2", "missing", "b1", "b3", "b2"]);
+        let cases = [
+            json!({"ids": ids}),
+            json!({"ids": ids, "properties": ["subject", "size", "receivedAt"]}),
+            json!({"ids": ids, "properties": ["size", "attachments", "hasAttachment"]}),
+            json!({"ids": ids, "properties": ["preview"]}),
+            json!({"ids": ids, "properties": ["bodyValues"]}),
+            json!({"ids": ids, "properties": ["textBody", "htmlBody", "bodyStructure"]}),
+            json!({"ids": ids, "properties": ["subject"], "fetchTextBodyValues": true}),
+            json!({"ids": ids, "properties": []}),
+        ];
+        for args in cases {
+            let batched = ok(get(&ctx, args.clone()).await);
+            let one_by_one = get_one_by_one(&ctx, args.clone()).await;
+            assert_eq!(
+                serde_json::to_string(&batched).unwrap(),
+                serde_json::to_string(&one_by_one).unwrap(),
+                "args: {}",
+                args
+            );
+        }
     }
 
     #[tokio::test]
