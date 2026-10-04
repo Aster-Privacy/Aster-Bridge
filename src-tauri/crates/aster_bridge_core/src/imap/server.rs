@@ -3086,7 +3086,7 @@ async fn handle_copy_move(
             }
         }
     }
-    let (src_uids, tgt_uids) = {
+    let assigned = {
         let db = Arc::clone(db);
         let folder = source_folder.clone();
         let target = target_internal.clone();
@@ -3094,6 +3094,7 @@ async fn handle_copy_move(
         tokio::task::spawn_blocking(move || {
             let mut src: Vec<u32> = Vec::new();
             let mut tgt: Vec<u32> = Vec::new();
+            let mut all_assigned = true;
             for (_, m) in &entries {
                 let _ = db.upsert_cached_message(
                     &m.aster_id,
@@ -3108,19 +3109,33 @@ async fn handle_copy_move(
                 );
                 let _ = db.remove_uid_mapping(m.imap_uid as i64, &folder);
                 src.push(m.imap_uid);
-                tgt.push(db.assign_uid_if_missing(&target, &m.aster_id).unwrap_or(0));
+                match db.assign_uid_if_missing(&target, &m.aster_id) {
+                    Ok(uid) => tgt.push(uid),
+                    Err(e) => {
+                        tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
+                        all_assigned = false;
+                    }
+                }
             }
-            (src, tgt)
+            (src, tgt, all_assigned)
         })
         .await
-        .unwrap_or_default()
     };
-    let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-    let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let (src_uids, tgt_uids, all_assigned) = match assigned {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("{} cache update task failed: {}", verb, e);
+            return write_no(writer, tag, "[SERVERBUG] could not update the local mailbox").await;
+        }
+    };
 
-    writer
-        .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
-        .await?;
+    if all_assigned {
+        let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let tgt_set = tgt_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        writer
+            .write_all(format!("* OK [COPYUID {} {} {}]\r\n", validity, src_set, tgt_set).as_bytes())
+            .await?;
+    }
     for uid in &src_uids {
         if let Some(seq) = conn.expunged(*uid) {
             writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
@@ -6216,6 +6231,27 @@ mod tests {
             !calls.lock().await.iter().any(|(m, _)| m == "POST_IMPORT_EMAILS"),
             "MOVE stored a new message"
         );
+    }
+
+    #[tokio::test]
+    async fn move_leaves_out_copyuid_when_a_target_uid_cannot_be_assigned() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-moving", "moving", &[]);
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TEMP TRIGGER refuse_archive_uid BEFORE INSERT ON uid_map
+                 WHEN NEW.folder = 'archive'
+                 BEGIN SELECT RAISE(ABORT, 'uid_map unavailable'); END;",
+            )
+        })
+        .unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 1 Archive").await;
+        assert!(!resp.contains("COPYUID"), "a COPYUID with an unassigned UID: {}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert!(resp.contains("m1 OK"), "{}", resp);
     }
 
     #[tokio::test]
