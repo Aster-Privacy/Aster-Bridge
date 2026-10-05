@@ -727,6 +727,7 @@ pub async fn first_time_setup(
                     &login_resp.email,
                     None,
                     &passphrase,
+                    &ratchet_recovery.storage_keys,
                 )
                 .await;
                 let default_sender_id = fetch_default_sender_id(client, &access_token).await;

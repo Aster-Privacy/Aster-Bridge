@@ -910,6 +910,7 @@ async fn serve_real() {
     {
         let ids = crate::auth::session::build_send_identities(
             &client, &session.access_token, &session.email, None, &session.vault_passphrase,
+            &session.ratchet_recovery.storage_keys,
         ).await;
         println!("serve_real: {} send identities", ids.len());
         for id in &ids {
