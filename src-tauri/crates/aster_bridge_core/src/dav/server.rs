@@ -1058,6 +1058,21 @@ mod e2e_tests {
     }
 
     async fn start_dav_counting() -> (String, String, Rows, Arc<AtomicUsize>, tempfile::TempDir) {
+        let (base, auth, rows, list_calls, dir, _task) =
+            start_dav_scoped(crate::shutdown::ConnectionShutdown::never()).await;
+        (base, auth, rows, list_calls, dir)
+    }
+
+    async fn start_dav_scoped(
+        shutdown: crate::shutdown::ConnectionShutdown,
+    ) -> (
+        String,
+        String,
+        Rows,
+        Arc<AtomicUsize>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (api_base, rows, list_calls) = stub_backend().await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1093,9 +1108,9 @@ mod e2e_tests {
         );
 
         let (s, c, p) = (session.clone(), client.clone(), passwords.clone());
-        tokio::spawn(async move {
+        let task = tokio::spawn(shutdown.scope(async move {
             let _ = serve(listener, s, c, p).await;
-        });
+        }));
 
         for _ in 0..200 {
             if reqwest::Client::new()
@@ -1104,7 +1119,7 @@ mod e2e_tests {
                 .await
                 .is_ok()
             {
-                return (base, auth, rows, list_calls, dir);
+                return (base, auth, rows, list_calls, dir, task);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1660,5 +1675,56 @@ mod e2e_tests {
         .unwrap();
 
         assert!(response.status() == 404 || response.status() == 400);
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_idle_keep_alive_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let (base, auth, _rows, _list_calls, _dir, task) = start_dav_scoped(shutdown).await;
+        let host = base.trim_start_matches("http://").to_string();
+
+        let mut stream = tokio::net::TcpStream::connect(&host).await.unwrap();
+        let request = format!(
+            "OPTIONS /dav/ HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\n\r\n",
+            host, auth
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let wait = if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(20)
+            };
+            match tokio::time::timeout(wait, stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => panic!("the connection closed before the bridge stopped"),
+                Ok(Ok(n)) => seen.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => panic!("read failed before the bridge stopped: {}", e),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).starts_with("HTTP/1.1 "),
+            "response was {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        trigger.close_connections();
+        task.abort();
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+            .await
+            .expect("a keep-alive connection stayed open after connections were closed")
+            .ok();
+
+        stream.write_all(request.as_bytes()).await.ok();
+        let mut late = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut late)).await;
+        assert!(late.is_empty(), "the closed connection still answered a request");
     }
 }

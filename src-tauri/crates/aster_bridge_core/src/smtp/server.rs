@@ -143,7 +143,17 @@ pub async fn run(
 ) -> Result<()> {
     let listener = crate::port_picker::bind_loopback_listener(addr).await?;
     tracing::info!("SMTP server listening on {} (STARTTLS={})", addr, tls_config.is_some());
+    serve(listener, session, client, passwords, db, tls_config).await
+}
 
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     let mut acceptor = crate::accept::ResilientAcceptor::new("SMTP");
     let shutdown = crate::shutdown::current();
     loop {
@@ -1514,5 +1524,82 @@ mod tests {
         .unwrap();
         assert!(payload.get("sender_alias_hash").is_none());
         assert!(payload.get("sender_display_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_open_session() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let listener_task = tokio::spawn(shutdown.scope(async move {
+            let _ = serve(listener, session, client, passwords, db, None).await;
+        }));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("220"), "greeting was {:?}", line);
+
+        reader.get_mut().write_all(b"EHLO client.test\r\n").await.unwrap();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("250"), "EHLO reply was {:?}", line);
+            if line.starts_with("250 ") {
+                break;
+            }
+        }
+
+        let mut rest = Vec::new();
+        let still_open = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(still_open.is_err(), "the session closed before the bridge stopped");
+
+        trigger.close_connections();
+        listener_task.abort();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_to_end(&mut rest),
+        )
+        .await
+        .expect("an open SMTP session stayed open after connections were closed")
+        .ok();
+
+        reader.get_mut().write_all(b"NOOP\r\n").await.ok();
+        line.clear();
+        let after = reader.read_line(&mut line).await.unwrap_or(0);
+        assert_eq!(after, 0, "the closed session still answered {:?}", line);
+        drop(dir);
     }
 }

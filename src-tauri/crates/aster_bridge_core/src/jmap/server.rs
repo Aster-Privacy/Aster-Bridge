@@ -271,6 +271,22 @@ mod e2e_tests {
         String,
         broadcast::Sender<StateChange>,
     ) {
+        let (base, auth, dir, passwords, pw_id, tx, _task) =
+            start_server_scoped(crate::shutdown::ConnectionShutdown::never()).await;
+        (base, auth, dir, passwords, pw_id, tx)
+    }
+
+    async fn start_server_scoped(
+        shutdown: crate::shutdown::ConnectionShutdown,
+    ) -> (
+        String,
+        String,
+        tempfile::TempDir,
+        Arc<AppPasswords>,
+        String,
+        broadcast::Sender<StateChange>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
         let _ = db.seed_jmap_mailboxes();
@@ -305,12 +321,12 @@ mod e2e_tests {
         let url_base = format!("http://{}", listener.local_addr().unwrap());
         let (tx, _rx) = broadcast::channel(8);
         let (s, d, c, p, t) = (session.clone(), db.clone(), client.clone(), passwords.clone(), tx.clone());
-        tokio::spawn(async move {
+        let task = tokio::spawn(shutdown.scope(async move {
             let _ = serve(listener, s, d, c, p, t).await;
-        });
+        }));
         for _ in 0..200 {
             if reqwest::get(format!("{}/.well-known/jmap", url_base)).await.is_ok() {
-                return (url_base, auth, dir, passwords, pw_id, tx);
+                return (url_base, auth, dir, passwords, pw_id, tx, task);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1122,5 +1138,167 @@ mod e2e_tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn closing_connections_ends_an_open_websocket() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let (base, auth, _dir, _passwords, _id, tx, task) = start_server_scoped(shutdown).await;
+        let idle = tx.receiver_count();
+        let ws_url = base.replacen("http://", "ws://", 1) + "/jmap/ws";
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", auth.parse().unwrap());
+        req.headers_mut()
+            .insert("sec-websocket-protocol", "jmap".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        let enable = json!({
+            "@type": "WebSocketPushEnable",
+            "dataTypes": ["Email","Mailbox"]
+        });
+        ws.send(Message::Text(enable.to_string())).await.unwrap();
+        let first = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["@type"], "StateChange");
+
+        let quiet = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
+        assert!(quiet.is_err(), "the socket closed before the bridge stopped");
+
+        trigger.close_connections();
+        task.abort();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "an open WebSocket stayed open after connections were closed");
+
+        let request = json!({
+            "@type": "Request",
+            "id": "late",
+            "using": ["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],
+            "methodCalls": [["Mailbox/get", {}, "c0"]]
+        });
+        let _ = ws.send(Message::Text(request.to_string())).await;
+        let late = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+        assert!(
+            !matches!(late, Ok(Some(Ok(Message::Text(_))))),
+            "the closed socket still answered a request"
+        );
+
+        let mut released = false;
+        for _ in 0..300 {
+            if tx.receiver_count() == idle {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "the closed socket kept its state subscription");
+    }
+
+    #[tokio::test]
+    async fn closing_connections_ends_an_open_event_stream() {
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let (base, auth, _dir, _passwords, _id, tx, task) = start_server_scoped(shutdown).await;
+        let idle = tx.receiver_count();
+
+        let mut resp = reqwest::Client::new()
+            .get(format!("{}/jmap/eventsource?types=*&closeafter=no&ping=300", base))
+            .header("authorization", &auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let first = resp.chunk().await.unwrap().expect("no initial state event");
+        assert!(String::from_utf8_lossy(&first).contains("StateChange"));
+
+        let quiet = tokio::time::timeout(Duration::from_millis(200), resp.chunk()).await;
+        assert!(quiet.is_err(), "the stream closed before the bridge stopped");
+
+        trigger.close_connections();
+        task.abort();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "an open event stream stayed open after connections were closed");
+
+        let mut released = false;
+        for _ in 0..300 {
+            if tx.receiver_count() == idle {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "the closed stream kept its state subscription");
+    }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_idle_keep_alive_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let (base, auth, _dir, _passwords, _id, _tx, task) = start_server_scoped(shutdown).await;
+        let host = base.trim_start_matches("http://").to_string();
+
+        let mut stream = tokio::net::TcpStream::connect(&host).await.unwrap();
+        let request = format!(
+            "GET /jmap/session HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\n\r\n",
+            host, auth
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let wait = if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(20)
+            };
+            match tokio::time::timeout(wait, stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => panic!("the connection closed before the bridge stopped"),
+                Ok(Ok(n)) => seen.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => panic!("read failed before the bridge stopped: {}", e),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).starts_with("HTTP/1.1 200"),
+            "response was {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        trigger.close_connections();
+        task.abort();
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+            .await
+            .expect("a keep-alive connection stayed open after connections were closed")
+            .ok();
+
+        stream.write_all(request.as_bytes()).await.ok();
+        let mut late = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut late)).await;
+        assert!(late.is_empty(), "the closed connection still answered a request");
     }
 }

@@ -8330,4 +8330,81 @@ mod tests {
              * 3 FETCH (FLAGS () UID 3)\r\nf1 OK FETCH completed\r\n"
         );
     }
+
+    #[tokio::test]
+    async fn closing_connections_drops_an_open_session() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        let (state_tx, _state_rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let listener_task = tokio::spawn(shutdown.scope(async move {
+            let _ = serve(listener, session, db, client, passwords, state_tx, None).await;
+        }));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("* OK"), "greeting was {:?}", line);
+
+        write_half
+            .write_all(b"a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\n")
+            .await
+            .unwrap();
+        let login = read_until_tag(&mut reader, "a1").await;
+        assert!(
+            login.last().is_some_and(|l| l.starts_with("a1 OK")),
+            "login reply was {:?}",
+            login
+        );
+
+        let mut rest = Vec::new();
+        let still_open = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(still_open.is_err(), "the session closed before the bridge stopped");
+
+        trigger.close_connections();
+        listener_task.abort();
+
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+            .await
+            .expect("a signed-in IMAP session stayed open after connections were closed")
+            .ok();
+
+        write_half.write_all(b"a2 NOOP\r\n").await.ok();
+        line.clear();
+        let after = reader.read_line(&mut line).await.unwrap_or(0);
+        assert_eq!(after, 0, "the closed session still answered {:?}", line);
+        drop(dir);
+    }
 }
