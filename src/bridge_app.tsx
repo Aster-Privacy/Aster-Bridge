@@ -49,6 +49,7 @@ import {
 } from "./updater";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
 import { notify_native } from "@/notify";
+import { listen_tauri } from "@/lib/tauri_events";
 import { DEFAULT_PROFILE_COLOR, HEX_COLOR, profile_gradient_background } from "@/lib/profile_palette";
 import {
   Button,
@@ -2561,14 +2562,9 @@ export function BridgeApp() {
   }, [sync_theme, apply_import_progress]);
 
   useEffect(() => {
-    let cleanup: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten_state = await listen("state_updated", () => { load_state(); });
-      cleanup = () => { unlisten_state(); };
-      await load_state();
-    })();
-    return () => { if (cleanup) cleanup(); };
+    const sub = listen_tauri("state_updated", () => { load_state(); });
+    sub.ready.then(() => load_state());
+    return sub.unlisten;
   }, [load_state]);
 
   useEffect(() => {
@@ -2592,10 +2588,8 @@ export function BridgeApp() {
   }, []);
 
   useEffect(() => {
-    let cleanup: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten_progress = await listen<SyncProgress>("sync_progress", (e) => {
+    const subs = [
+      listen_tauri<SyncProgress>("sync_progress", (e) => {
         latest_sync.current = e.payload;
         if (sync_hide_timer.current) { clearTimeout(sync_hide_timer.current); sync_hide_timer.current = null; }
         if (sync_visible.current) {
@@ -2609,8 +2603,8 @@ export function BridgeApp() {
             }
           }, 350);
         }
-      });
-      const unlisten_done = await listen<{ failed: boolean }>("sync_done", (e) => {
+      }),
+      listen_tauri<{ failed: boolean }>("sync_done", (e) => {
         latest_sync.current = null;
         if (sync_show_timer.current) { clearTimeout(sync_show_timer.current); sync_show_timer.current = null; }
         if (!sync_visible.current) return;
@@ -2621,18 +2615,17 @@ export function BridgeApp() {
           sync_visible.current = false;
           set_sync_progress(null);
         }, e.payload.failed ? 0 : 1200);
-      });
-      const unlisten_import = await listen<ImportProgress>("import_progress", (e) => {
+      }),
+      listen_tauri<ImportProgress>("import_progress", (e) => {
         apply_import_progress(e.payload);
-      });
-      const unlisten_revoked = await listen("bridge_access_revoked", async () => {
+      }),
+      listen_tauri("bridge_access_revoked", async () => {
         try { await api.stop_bridge(); } catch { /* ignore */ }
         show_toast(i18next.t("toast_bridge_upgrade_required"), "error");
         await load_state();
-      });
-      cleanup = () => { unlisten_progress(); unlisten_done(); unlisten_import(); unlisten_revoked(); };
-    })();
-    return () => { if (cleanup) cleanup(); };
+      }),
+    ];
+    return () => { subs.forEach((sub) => sub.unlisten()); };
   }, [load_state, apply_import_progress]);
 
   useEffect(() => {
@@ -2706,21 +2699,16 @@ export function BridgeApp() {
   toggle_ref.current = handle_toggle_bridge;
 
   useEffect(() => {
-    let cleanup: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten = await listen<string>("menu_action", async (event) => {
-        const action = event.payload;
-        if (action === "toggle_bridge") { await toggle_ref.current(); return; }
-        if (action === "sync_now") {
-          try { await api.trigger_sync(); show_toast(i18next.t("toast_sync_started"), "success"); } catch { /* bridge not running */ }
-          return;
-        }
-        window.dispatchEvent(new CustomEvent("aster_menu_action", { detail: action }));
-      });
-      cleanup = () => { unlisten(); };
-    })();
-    return () => { if (cleanup) cleanup(); };
+    const sub = listen_tauri<string>("menu_action", async (event) => {
+      const action = event.payload;
+      if (action === "toggle_bridge") { await toggle_ref.current(); return; }
+      if (action === "sync_now") {
+        try { await api.trigger_sync(); show_toast(i18next.t("toast_sync_started"), "success"); } catch { /* bridge not running */ }
+        return;
+      }
+      window.dispatchEvent(new CustomEvent("aster_menu_action", { detail: action }));
+    });
+    return sub.unlisten;
   }, []);
 
   const handle_generate_password = async (label: string): Promise<string | null> => {
@@ -2759,17 +2747,12 @@ export function BridgeApp() {
   }, []);
 
   useEffect(() => {
-    let cleanup: (() => void) | null = null;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten = await listen("session_expired", async () => {
-        const { getCurrentWindow } = await import("@tauri-apps/api/window");
-        await getCurrentWindow().show();
-        force_link_device();
-      });
-      cleanup = () => { unlisten(); };
-    })();
-    return () => { if (cleanup) cleanup(); };
+    const sub = listen_tauri("session_expired", async () => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().show();
+      force_link_device();
+    });
+    return sub.unlisten;
   }, [force_link_device]);
 
   const handle_sign_out = async () => {
@@ -2797,7 +2780,6 @@ export function BridgeApp() {
 
 
   useEffect(() => {
-    let unlisten_fn: (() => void) | null = null;
     const apply_deep_link = (payload: string) => {
       try {
         const url = new URL(payload);
@@ -2812,18 +2794,14 @@ export function BridgeApp() {
         /* ignore malformed deep link */
       }
     };
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const unlisten = await listen<string>("deep_link", (event) => {
-        apply_deep_link(event.payload);
-      });
-      unlisten_fn = unlisten;
+    const sub = listen_tauri<string>("deep_link", (event) => {
+      apply_deep_link(event.payload);
+    });
+    sub.ready.then(async () => {
       const pending = await api.take_pending_deep_link().catch(() => null);
       if (pending) apply_deep_link(pending);
-    })();
-    return () => {
-      if (unlisten_fn) unlisten_fn();
-    };
+    });
+    return sub.unlisten;
   }, []);
 
   const handle_provision_confirm = async () => {
