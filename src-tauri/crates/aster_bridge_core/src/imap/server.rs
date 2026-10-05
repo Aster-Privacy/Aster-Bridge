@@ -469,6 +469,47 @@ fn search_needs_body(criteria_upper: &str) -> bool {
         .any(|t| t == "BODY" || t == "TEXT")
 }
 
+const MAX_SEARCH_NESTING: usize = 256;
+
+fn search_criteria_too_deeply_nested(criteria_upper: &str) -> bool {
+    enum Frame {
+        Group,
+        Prefix(u8),
+    }
+    fn settle(stack: &mut Vec<Frame>) {
+        while let Some(Frame::Prefix(remaining)) = stack.last_mut() {
+            *remaining -= 1;
+            if *remaining == 0 {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    let parts = tokenize_search_criteria(criteria_upper);
+    let mut stack: Vec<Frame> = Vec::new();
+    for token in &parts {
+        if 1 + stack.len() > MAX_SEARCH_NESTING {
+            return true;
+        }
+        match token.as_str() {
+            "(" => stack.push(Frame::Group),
+            ")" => {
+                while let Some(frame) = stack.pop() {
+                    if matches!(frame, Frame::Group) {
+                        break;
+                    }
+                }
+                settle(&mut stack);
+            }
+            "NOT" => stack.push(Frame::Prefix(1)),
+            "OR" => stack.push(Frame::Prefix(2)),
+            _ => settle(&mut stack),
+        }
+    }
+    false
+}
+
 fn search_eval(
     msg: &CachedMessage,
     position: SearchPosition,
@@ -1557,6 +1598,10 @@ where
                             write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                             continue;
                         };
+                        if search_criteria_too_deeply_nested(criteria) {
+                            write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                            continue;
+                        }
                         let messages = if search_needs_body(criteria) {
                             db.list_cached_messages(folder).unwrap_or_default()
                         } else {
@@ -1753,6 +1798,10 @@ where
                     write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                     continue;
                 };
+                if search_criteria_too_deeply_nested(criteria) {
+                    write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                    continue;
+                }
                 let messages = if search_needs_body(criteria) {
                     db.list_cached_messages(folder).unwrap_or_default()
                 } else {
@@ -6697,6 +6746,16 @@ mod tests {
         assert_eq!(strip_search_charset("CHARSET US-ASCII FROM A"), Ok("FROM A"));
         assert_eq!(strip_search_charset("SUBJECT CHARSET"), Ok("SUBJECT CHARSET"));
         assert_eq!(strip_search_charset("CHARSET ISO-8859-1 ALL"), Err(()));
+    }
+
+    #[test]
+    fn search_criteria_nesting_guard_flags_only_pathological_depth() {
+        assert!(!search_criteria_too_deeply_nested("ALL"));
+        assert!(!search_criteria_too_deeply_nested("OR (FROM a) (SUBJECT b)"));
+        assert!(!search_criteria_too_deeply_nested("NOT NOT NOT UNSEEN"));
+        assert!(!search_criteria_too_deeply_nested(&"( ".repeat(MAX_SEARCH_NESTING - 2)));
+        assert!(search_criteria_too_deeply_nested(&"(".repeat(MAX_SEARCH_NESTING + 10)));
+        assert!(search_criteria_too_deeply_nested(&"(".repeat(8000)));
     }
 
     #[test]
