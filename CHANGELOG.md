@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.3 - 2026-10-05
+
+### Fixed
+- After your encryption keys change, Aster Bridge opens the messages and custom domain addresses that are protected with your earlier keys.
+
 ## 1.0.2 - 2026-10-05
 
 ### What's new
