@@ -440,7 +440,7 @@ fn strip_search_charset(criteria_upper: &str) -> std::result::Result<&str, ()> {
 #[cfg(test)]
 fn search_matches(msg: &CachedMessage, criteria_upper: &str) -> bool {
     let position = SearchPosition { seq: 1, last_seq: 1, last_uid: msg.imap_uid };
-    search_matches_noting(msg, position, &[], criteria_upper, &mut None)
+    search_matches_noting(msg, position, &[], criteria_upper, &mut None).unwrap()
 }
 
 /// Like `search_matches`, against the message's stored keywords, and records
@@ -452,15 +452,16 @@ fn search_matches_noting(
     keywords: &[String],
     criteria_upper: &str,
     unsupported: &mut Option<String>,
-) -> bool {
+) -> std::result::Result<bool, SearchTooDeep> {
     let parts: Vec<String> = tokenize_search_criteria(criteria_upper);
     let mut idx = 0;
+    let mut matched = true;
     while idx < parts.len() {
-        if !search_eval(msg, position, keywords, &parts, &mut idx, unsupported) {
-            return false;
+        if !search_eval(msg, position, keywords, &parts, &mut idx, 1, unsupported)? {
+            matched = false;
         }
     }
-    true
+    Ok(matched)
 }
 
 fn search_needs_body(criteria_upper: &str) -> bool {
@@ -471,44 +472,8 @@ fn search_needs_body(criteria_upper: &str) -> bool {
 
 const MAX_SEARCH_NESTING: usize = 256;
 
-fn search_criteria_too_deeply_nested(criteria_upper: &str) -> bool {
-    enum Frame {
-        Group,
-        Prefix(u8),
-    }
-    fn settle(stack: &mut Vec<Frame>) {
-        while let Some(Frame::Prefix(remaining)) = stack.last_mut() {
-            *remaining -= 1;
-            if *remaining == 0 {
-                stack.pop();
-            } else {
-                break;
-            }
-        }
-    }
-    let parts = tokenize_search_criteria(criteria_upper);
-    let mut stack: Vec<Frame> = Vec::new();
-    for token in &parts {
-        if 1 + stack.len() > MAX_SEARCH_NESTING {
-            return true;
-        }
-        match token.as_str() {
-            "(" => stack.push(Frame::Group),
-            ")" => {
-                while let Some(frame) = stack.pop() {
-                    if matches!(frame, Frame::Group) {
-                        break;
-                    }
-                }
-                settle(&mut stack);
-            }
-            "NOT" => stack.push(Frame::Prefix(1)),
-            "OR" => stack.push(Frame::Prefix(2)),
-            _ => settle(&mut stack),
-        }
-    }
-    false
-}
+#[derive(Debug, PartialEq)]
+struct SearchTooDeep;
 
 fn search_eval(
     msg: &CachedMessage,
@@ -516,15 +481,19 @@ fn search_eval(
     keywords: &[String],
     parts: &[String],
     idx: &mut usize,
+    depth: usize,
     unsupported: &mut Option<String>,
-) -> bool {
-    if *idx >= parts.len() { return true; }
-    match parts[*idx].as_str() {
+) -> std::result::Result<bool, SearchTooDeep> {
+    if depth > MAX_SEARCH_NESTING {
+        return Err(SearchTooDeep);
+    }
+    if *idx >= parts.len() { return Ok(true); }
+    Ok(match parts[*idx].as_str() {
         "(" => {
             *idx += 1;
             let mut result = true;
             while *idx < parts.len() && parts[*idx] != ")" {
-                if !search_eval(msg, position, keywords, parts, idx, unsupported) {
+                if !search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)? {
                     result = false;
                 }
             }
@@ -547,13 +516,13 @@ fn search_eval(
         "UNDRAFT" => { *idx += 1; (msg.flags & 16) == 0 }
         "NOT" => {
             *idx += 1;
-            let v = search_eval(msg, position, keywords, parts, idx, unsupported);
+            let v = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
             !v
         }
         "OR" => {
             *idx += 1;
-            let a = search_eval(msg, position, keywords, parts, idx, unsupported);
-            let b = search_eval(msg, position, keywords, parts, idx, unsupported);
+            let a = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
+            let b = search_eval(msg, position, keywords, parts, idx, depth + 1, unsupported)?;
             a || b
         }
         "FROM" => {
@@ -609,14 +578,14 @@ fn search_eval(
             *idx += 1;
             let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
             let pat_lower = pat.trim_matches('"').to_lowercase();
-            if pat_lower.is_empty() { return true; }
+            if pat_lower.is_empty() { return Ok(true); }
             msg.body_text.as_deref().unwrap_or("").to_lowercase().contains(&pat_lower)
         }
         "TEXT" => {
             *idx += 1;
             let pat = if *idx < parts.len() { let p = parts[*idx].as_str(); *idx += 1; p } else { "" };
             let pat_lower = pat.trim_matches('"').to_lowercase();
-            if pat_lower.is_empty() { return true; }
+            if pat_lower.is_empty() { return Ok(true); }
             let body_lower = msg.body_text.as_deref().unwrap_or("").to_lowercase();
             let subj_lower = msg.subject.as_deref().unwrap_or("").to_lowercase();
             body_lower.contains(&pat_lower) || subj_lower.contains(&pat_lower)
@@ -666,7 +635,7 @@ fn search_eval(
             *idx += 1;
             false
         }
-    }
+    })
 }
 
 fn uid_validity(db: &Database) -> std::result::Result<u64, String> {
@@ -1598,10 +1567,6 @@ where
                             write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                             continue;
                         };
-                        if search_criteria_too_deeply_nested(criteria) {
-                            write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
-                            continue;
-                        }
                         let messages = if search_needs_body(criteria) {
                             db.list_cached_messages(folder).unwrap_or_default()
                         } else {
@@ -1612,16 +1577,23 @@ where
                         let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                         let view = MailboxView::new(&conn.uids, &messages);
                         let mut unsupported = None;
-                        let uids: Vec<String> = view.iter()
-                            .filter(|(seq, m)| search_matches_noting(
+                        let uids: std::result::Result<Vec<String>, SearchTooDeep> = view.iter()
+                            .filter_map(|(seq, m)| match search_matches_noting(
                                 m,
-                                view.position(*seq),
+                                view.position(seq),
                                 folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                                 criteria,
                                 &mut unsupported,
-                            ))
-                            .map(|(_, m)| m.imap_uid.to_string())
+                            ) {
+                                Ok(true) => Some(Ok(m.imap_uid.to_string())),
+                                Ok(false) => None,
+                                Err(e) => Some(Err(e)),
+                            })
                             .collect();
+                        let Ok(uids) = uids else {
+                            write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                            continue;
+                        };
                         if let Some(criterion) = unsupported {
                             tracing::warn!("unsupported SEARCH criterion {}", criterion);
                         }
@@ -1798,10 +1770,6 @@ where
                     write_no(&mut writer, &tag, "[BADCHARSET (US-ASCII UTF-8)] Unsupported charset").await?;
                     continue;
                 };
-                if search_criteria_too_deeply_nested(criteria) {
-                    write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
-                    continue;
-                }
                 let messages = if search_needs_body(criteria) {
                     db.list_cached_messages(folder).unwrap_or_default()
                 } else {
@@ -1810,16 +1778,23 @@ where
                 let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
                 let mut unsupported = None;
-                let matched: Vec<String> = view.iter()
-                    .filter(|(seq, m)| search_matches_noting(
+                let matched: std::result::Result<Vec<String>, SearchTooDeep> = view.iter()
+                    .filter_map(|(seq, m)| match search_matches_noting(
                         m,
-                        view.position(*seq),
+                        view.position(seq),
                         folder_keywords.get(&m.aster_id).map(Vec::as_slice).unwrap_or(&[]),
                         criteria,
                         &mut unsupported,
-                    ))
-                    .map(|(seq, _)| seq.to_string())
+                    ) {
+                        Ok(true) => Some(Ok(seq.to_string())),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
+                    })
                     .collect();
+                let Ok(matched) = matched else {
+                    write_bad(&mut writer, &tag, "SEARCH query nested too deeply").await?;
+                    continue;
+                };
                 if let Some(criterion) = unsupported {
                     tracing::warn!("unsupported SEARCH criterion {}", criterion);
                 }
@@ -6749,13 +6724,33 @@ mod tests {
     }
 
     #[test]
-    fn search_criteria_nesting_guard_flags_only_pathological_depth() {
-        assert!(!search_criteria_too_deeply_nested("ALL"));
-        assert!(!search_criteria_too_deeply_nested("OR (FROM a) (SUBJECT b)"));
-        assert!(!search_criteria_too_deeply_nested("NOT NOT NOT UNSEEN"));
-        assert!(!search_criteria_too_deeply_nested(&"( ".repeat(MAX_SEARCH_NESTING - 2)));
-        assert!(search_criteria_too_deeply_nested(&"(".repeat(MAX_SEARCH_NESTING + 10)));
-        assert!(search_criteria_too_deeply_nested(&"(".repeat(8000)));
+    fn search_depth_is_bounded_by_the_evaluator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        seed(&db, "dp-1", "inbox", "notes (draft)");
+        let msgs = db.list_cached_messages("inbox").unwrap();
+        let m = &msgs[0];
+        let position = SearchPosition::in_folder(0, &msgs);
+        let eval = |criteria: &str| search_matches_noting(m, position, &[], criteria, &mut None);
+
+        assert_eq!(eval("ALL"), Ok(true));
+        assert_eq!(eval("OR (SUBJECT NOPE) (SUBJECT NOTES)"), Ok(true));
+        assert_eq!(eval("NOT NOT NOT ALL"), Ok(false));
+        assert_eq!(eval("HEADER SUBJECT DRAFT"), Ok(true));
+
+        assert_eq!(eval(&format!("{}ALL", "NOT ".repeat(MAX_SEARCH_NESTING - 1))), Ok((MAX_SEARCH_NESTING - 1) % 2 == 0));
+        assert_eq!(eval(&format!("{}ALL", "NOT ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+        assert_eq!(eval(&format!("{}ALL", "( ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "( ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+
+        assert_eq!(eval(&format!("{}ALL", "OR FROM A ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "OR FROM A ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+        assert_eq!(eval(&format!("{}ALL", "OR HEADER X-A B ".repeat(MAX_SEARCH_NESTING - 1))), Ok(true));
+        assert_eq!(eval(&format!("{}ALL", "OR HEADER X-A B ".repeat(MAX_SEARCH_NESTING))), Err(SearchTooDeep));
+
+        assert_eq!(eval(&"SUBJECT \"(\" ".repeat(1000)), Ok(true));
+        assert_eq!(eval(&"HEADER SUBJECT \"(\" ".repeat(1000)), Ok(true));
+        assert_eq!(eval(&"(".repeat(8000)), Err(SearchTooDeep));
     }
 
     #[test]
@@ -6879,6 +6874,55 @@ mod tests {
         // The connection is still in step afterwards.
         let resp = imap_cmd_lines(&mut reader, &mut writer, "l4", "NOOP").await;
         assert!(resp.contains("l4 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_deep_key_chains_and_keeps_the_connection() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "dc-1", "inbox", "project alpha status");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let deep = [
+            format!("{}ALL", "OR FROM a ".repeat(300)),
+            format!("{}ALL", "OR SUBJECT b ".repeat(300)),
+            format!("{}ALL", "OR HEADER SUBJECT a ".repeat(300)),
+            format!("{}ALL", "NOT ".repeat(300)),
+            "(".repeat(8000),
+        ];
+        for (n, criteria) in deep.iter().enumerate() {
+            for command in ["SEARCH", "UID SEARCH"] {
+                let tag = format!("d{}", n);
+                let resp = imap_cmd_lines(&mut reader, &mut writer, &tag, &format!("{} {}", command, criteria)).await;
+                assert!(resp.contains(&format!("{} BAD SEARCH query nested too deeply", tag)), "{}: {}", command, resp);
+                assert!(!resp.contains("* SEARCH"), "{}: {}", command, resp);
+            }
+        }
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "NOOP").await;
+        assert!(resp.contains("n1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "SEARCH OR FROM nobody SUBJECT alpha").await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", &format!("SEARCH {}ALL", "OR FROM a ".repeat(100))).await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn search_does_not_count_quoted_parentheses_as_groups() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        seed(&db, "qp-1", "inbox", "notes (draft)");
+        seed(&db, "qp-2", "inbox", "plain notes");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q1", &format!("SEARCH {}", "SUBJECT \"(\" ".repeat(300))).await;
+        assert!(resp.contains("q1 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q2", &format!("UID SEARCH {}", "HEADER SUBJECT \"(\" ".repeat(300))).await;
+        assert!(resp.contains("q2 OK"), "{}", resp);
+        assert_eq!(search_hits(&resp).len(), 1, "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "q3", "SEARCH OR SUBJECT \"(\" SUBJECT \")\"").await;
+        assert_eq!(search_hits(&resp), vec!["1"], "{}", resp);
     }
 
     #[tokio::test]
@@ -7073,13 +7117,13 @@ mod tests {
         let m = &msgs[0];
         let position = SearchPosition::in_folder(0, &msgs);
         let mut unsupported = None;
-        assert!(!search_matches_noting(m, position, &[], "OLDER 60 UNDELETED", &mut unsupported));
+        assert!(!search_matches_noting(m, position, &[], "OLDER 60 UNDELETED", &mut unsupported).unwrap());
         assert_eq!(unsupported.as_deref(), Some("OLDER"));
         let mut unsupported = None;
-        assert!(search_matches_noting(m, position, &[], "UNDELETED SUBJECT ONE", &mut unsupported));
+        assert!(search_matches_noting(m, position, &[], "UNDELETED SUBJECT ONE", &mut unsupported).unwrap());
         assert_eq!(unsupported, None);
         let mut unsupported = None;
-        assert!(search_matches_noting(m, position, &[], "1:5 UNDELETED", &mut unsupported));
+        assert!(search_matches_noting(m, position, &[], "1:5 UNDELETED", &mut unsupported).unwrap());
         assert_eq!(unsupported, None);
     }
 
@@ -7285,10 +7329,10 @@ mod tests {
         let m = &msgs[0];
         let keywords = vec!["$label1".to_string()];
         let position = SearchPosition::in_folder(0, &msgs);
-        assert!(search_matches_noting(m, position, &keywords, "KEYWORD $LABEL1", &mut None));
-        assert!(!search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL1", &mut None));
-        assert!(!search_matches_noting(m, position, &keywords, "KEYWORD $LABEL2", &mut None));
-        assert!(search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL2", &mut None));
+        assert!(search_matches_noting(m, position, &keywords, "KEYWORD $LABEL1", &mut None).unwrap());
+        assert!(!search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL1", &mut None).unwrap());
+        assert!(!search_matches_noting(m, position, &keywords, "KEYWORD $LABEL2", &mut None).unwrap());
+        assert!(search_matches_noting(m, position, &keywords, "UNKEYWORD $LABEL2", &mut None).unwrap());
     }
 
     #[tokio::test]
