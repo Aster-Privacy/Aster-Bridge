@@ -93,7 +93,10 @@ pub fn decrypt_envelope_with_previous_keys(
         }
     }
 
-    if let Some(ik) = identity_key {
+    for ik in identity_key
+        .into_iter()
+        .chain(previous_keys.iter().map(String::as_str))
+    {
         if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, &nonce_bytes, ik) {
             return Ok(result);
         }
@@ -601,6 +604,27 @@ mod tests {
         assert_eq!(opened, "{\"subject\":\"hi\"}");
         assert!(decrypt_envelope(&envelope, None, b"wrong passphrase", Some(&owner_armored), &[]).is_err());
         assert!(decrypt_envelope(&envelope, None, VAULT_PASSPHRASE.as_bytes(), None, &[]).is_err());
+    }
+
+    #[test]
+    fn identity_key_envelope_opens_with_a_previous_key() {
+        let plaintext = r#"{"subject":"imported"}"#;
+        for version in ENVELOPE_VERSIONS {
+            let (data, nonce) =
+                build_identity_envelope(plaintext.as_bytes(), "old-identity-key", version.as_bytes());
+
+            assert!(decrypt_envelope(&data, Some(&nonce), b"p", Some("new-identity-key"), &[]).is_err());
+            let opened = decrypt_envelope_with_previous_keys(
+                &data,
+                Some(&nonce),
+                b"p",
+                Some("new-identity-key"),
+                &["unrelated-key".to_string(), "old-identity-key".to_string()],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(opened, plaintext);
+        }
     }
 
     #[test]
