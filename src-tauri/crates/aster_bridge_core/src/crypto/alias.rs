@@ -25,7 +25,7 @@ use base64::Engine as _;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{BridgeError, Result};
 
@@ -101,10 +101,37 @@ fn aes_gcm_decrypt(derived_key: &[u8; 32], encrypted_b64: &str, nonce_b64: &str)
         .map_err(|e| BridgeError::Crypto(format!("alias field utf8 decode: {}", e)))
 }
 
+fn aes_gcm_decrypt_with_candidates(
+    derived_keys: &[Zeroizing<[u8; 32]>],
+    encrypted_b64: &str,
+    nonce_b64: &str,
+) -> Result<String> {
+    let mut last_error = BridgeError::Crypto("alias field decrypt failed".to_string());
+    for derived_key in derived_keys {
+        match aes_gcm_decrypt(derived_key, encrypted_b64, nonce_b64) {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
+}
+
+pub fn storage_key_candidates(
+    passphrase: &[u8],
+    vault_storage_keys: &[Zeroizing<[u8; 32]>],
+) -> Vec<Zeroizing<[u8; 32]>> {
+    let mut candidates: Vec<Zeroizing<[u8; 32]>> = vault_storage_keys.to_vec();
+    let passphrase_key = Zeroizing::new(derive_storage_key(passphrase));
+    if !candidates.iter().any(|k| k[..] == passphrase_key[..]) {
+        candidates.push(passphrase_key);
+    }
+    candidates
+}
+
 // Mirrors decrypt_alias (aliases.ts): random aliases store the local part as
 // plain base64; non-random aliases store AES-GCM(derived_key, nonce, local_part).
 pub fn decrypt_alias_local_part(
-    derived_key: &[u8; 32],
+    derived_keys: &[Zeroizing<[u8; 32]>],
     encrypted_local_part: &str,
     local_part_nonce: &str,
     is_random: bool,
@@ -116,26 +143,26 @@ pub fn decrypt_alias_local_part(
         return String::from_utf8(raw)
             .map_err(|e| BridgeError::Crypto(format!("random alias utf8 decode: {}", e)));
     }
-    aes_gcm_decrypt(derived_key, encrypted_local_part, local_part_nonce)
+    aes_gcm_decrypt_with_candidates(derived_keys, encrypted_local_part, local_part_nonce)
 }
 
 // Mirrors decrypt_address_field (domains.ts) for the custom-domain local part.
 pub fn decrypt_domain_local_part(
-    derived_key: &[u8; 32],
+    derived_keys: &[Zeroizing<[u8; 32]>],
     encrypted_local_part: &str,
     local_part_nonce: &str,
 ) -> Result<String> {
-    aes_gcm_decrypt(derived_key, encrypted_local_part, local_part_nonce)
+    aes_gcm_decrypt_with_candidates(derived_keys, encrypted_local_part, local_part_nonce)
 }
 
 // Optional display name field (AES-GCM with the derived key), used by both
 // aliases and custom-domain addresses.
 pub fn decrypt_display_name(
-    derived_key: &[u8; 32],
+    derived_keys: &[Zeroizing<[u8; 32]>],
     encrypted_display_name: &str,
     display_name_nonce: &str,
 ) -> Result<String> {
-    aes_gcm_decrypt(derived_key, encrypted_display_name, display_name_nonce)
+    aes_gcm_decrypt_with_candidates(derived_keys, encrypted_display_name, display_name_nonce)
 }
 
 // Mirrors compute_alias_hash (aliases.ts):
@@ -254,7 +281,7 @@ mod tests {
         let ct = cipher.encrypt(nonce, b"my-alias".as_ref()).unwrap();
         let enc_b64 = STANDARD.encode(&ct);
         let nonce_b64 = STANDARD.encode(nonce_bytes);
-        let out = decrypt_alias_local_part(&key, &enc_b64, &nonce_b64, false).unwrap();
+        let out = decrypt_alias_local_part(&[Zeroizing::new(key)], &enc_b64, &nonce_b64, false).unwrap();
         assert_eq!(out, "my-alias");
     }
 
@@ -262,7 +289,7 @@ mod tests {
     fn random_alias_is_plain_base64() {
         let key = derived();
         let enc = STANDARD.encode(b"rand123");
-        let out = decrypt_alias_local_part(&key, &enc, "", true).unwrap();
+        let out = decrypt_alias_local_part(&[Zeroizing::new(key)], &enc, "", true).unwrap();
         assert_eq!(out, "rand123");
     }
 
@@ -274,6 +301,39 @@ mod tests {
         let ct = cipher.encrypt(nonce, b"x".as_ref()).unwrap();
         let enc_b64 = STANDARD.encode(&ct);
         let bad_nonce = STANDARD.encode([9u8; 12]);
-        assert!(decrypt_alias_local_part(&key, &enc_b64, &bad_nonce, false).is_err());
+        assert!(decrypt_alias_local_part(&[Zeroizing::new(key)], &enc_b64, &bad_nonce, false).is_err());
+    }
+
+    fn seal_field(key: &[u8; 32], plaintext: &[u8]) -> (String, String) {
+        let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+        let nonce_bytes = [5u8; 12];
+        let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext).unwrap();
+        (STANDARD.encode(&ct), STANDARD.encode(nonce_bytes))
+    }
+
+    #[test]
+    fn domain_local_part_opens_with_a_vault_storage_key() {
+        let vault_key = [42u8; 32];
+        let (enc, nonce) = seal_field(&vault_key, b"sales");
+
+        let passphrase_only = storage_key_candidates(b"test-passphrase", &[]);
+        assert!(decrypt_domain_local_part(&passphrase_only, &enc, &nonce).is_err());
+
+        let candidates = storage_key_candidates(b"test-passphrase", &[Zeroizing::new(vault_key)]);
+        assert_eq!(decrypt_domain_local_part(&candidates, &enc, &nonce).unwrap(), "sales");
+        assert_eq!(decrypt_display_name(&candidates, &enc, &nonce).unwrap(), "sales");
+    }
+
+    #[test]
+    fn storage_key_candidates_keep_the_passphrase_key_once() {
+        let passphrase_key = derived();
+        let (enc, nonce) = seal_field(&passphrase_key, b"hello");
+
+        let candidates = storage_key_candidates(b"test-passphrase", &[Zeroizing::new([42u8; 32])]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(decrypt_alias_local_part(&candidates, &enc, &nonce, false).unwrap(), "hello");
+
+        let deduped = storage_key_candidates(b"test-passphrase", &[Zeroizing::new(passphrase_key)]);
+        assert_eq!(deduped.len(), 1);
     }
 }

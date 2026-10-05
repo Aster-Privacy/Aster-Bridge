@@ -133,16 +133,18 @@ pub async fn refresh_send_identities(
     session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
     client: &ApiClient,
 ) {
-    let (access_token, email, passphrase) = {
+    let (access_token, email, passphrase, storage_keys) = {
         let s = session.read().await;
         (
             s.access_token.to_string(),
             s.email.clone(),
-            s.vault_passphrase.clone(),
+            Zeroizing::new(s.vault_passphrase.clone()),
+            s.ratchet_recovery.storage_keys.clone(),
         )
     };
 
-    let identities = build_send_identities(client, &access_token, &email, None, &passphrase).await;
+    let identities =
+        build_send_identities(client, &access_token, &email, None, &passphrase, &storage_keys).await;
     let default_sender_id = fetch_default_sender_id(client, &access_token).await;
 
     let mut s = session.write().await;
@@ -174,6 +176,7 @@ pub async fn build_send_identities(
     primary_email: &str,
     primary_display_name: Option<String>,
     passphrase: &[u8],
+    vault_storage_keys: &[Zeroizing<[u8; 32]>],
 ) -> Vec<SendIdentity> {
     let mut identities = vec![SendIdentity {
         address: primary_email.to_string(),
@@ -184,7 +187,7 @@ pub async fn build_send_identities(
         sender_id: "primary".to_string(),
     }];
 
-    let mut derived_key = alias::derive_storage_key(passphrase);
+    let derived_key = alias::storage_key_candidates(passphrase, vault_storage_keys);
 
     match client.list_all_aliases(access_token).await {
         Ok(aliases) => {
@@ -297,8 +300,6 @@ pub async fn build_send_identities(
         Err(e) => tracing::warn!("failed to list domains for send identities: {}", e),
     }
 
-    derived_key.zeroize();
-
     let custom_domain_count = identities
         .iter()
         .filter(|i| matches!(i.kind, SendIdentityKind::CustomDomain))
@@ -338,9 +339,24 @@ pub fn decrypt_vault_key_material(
         ratchet_identity_public: v.ratchet_identity_public.clone(),
         ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
-        previous_keys: Zeroizing::new(v.previous_keys.clone().unwrap_or_default()),
+        previous_keys: Zeroizing::new(collect_previous_identity_keys(&v)),
         ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault(&v, passphrase),
     })
+}
+
+fn collect_previous_identity_keys(vault: &crate::crypto::vault::VaultContents) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for key in vault
+        .previous_keys
+        .iter()
+        .flatten()
+        .chain(vault.legacy_identity_keys.iter().flatten())
+    {
+        if !key.is_empty() && *key != vault.identity_key && !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys
 }
 
 pub fn inbound_keys_equal(
@@ -440,6 +456,7 @@ pub async fn login_with_passphrase(
         &login_resp.email,
         None,
         &passphrase,
+        &ratchet_recovery.storage_keys,
     )
     .await;
     let default_sender_id = fetch_default_sender_id(client, &access_token).await;
