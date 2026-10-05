@@ -89,6 +89,9 @@ objc2-foundation = { version = "0.3", features = ["NSData"] }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
+[patch.crates-io]
+glib = { path = "patches/glib-0.18.5" }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1
