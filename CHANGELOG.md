@@ -2,6 +2,17 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.2 - 2026-10-05
+
+### What's new
+- Labels that you add in Aster Mail appear as keywords on your messages in your mail app.
+
+### Fixed
+- When you sign out, Aster Bridge closes every open connection from your mail apps and confirms that it removed your local data.
+- Encrypted messages that Aster Bridge couldn't open before now sync to your mail app, and a message whose sender can't be verified is marked as unverified.
+- A search with deeply nested conditions returns an error instead of slowing down Aster Bridge.
+- On Linux, Aster Bridge keeps its window sandbox turned on whenever your system supports it.
+
 ## 1.0.1 - 2026-10-04
 
 ### What's new
