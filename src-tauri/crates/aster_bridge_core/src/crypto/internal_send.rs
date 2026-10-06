@@ -290,6 +290,26 @@ fn sealed_plaintext(payload: &Value) -> String {
     crate::crypto::ratchet_recovery::wrap_subject_bundle(subject, body, &manifest)
 }
 
+fn has_post_quantum_protection(route: &SendRoute) -> bool {
+    matches!(route, SendRoute::Ratchet(target) if target.pq_target.is_some())
+}
+
+fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()> {
+    if !required {
+        return Ok(());
+    }
+    match routed
+        .iter()
+        .find(|recipient| !has_post_quantum_protection(&recipient.route))
+    {
+        Some(recipient) => Err(BridgeError::RecipientKey(format!(
+            "{} cannot receive post-quantum protected mail yet, and Aster Bridge is set to require it, so the message was not sent. To send it anyway, turn off Require post-quantum protection for Aster recipients in the Aster Bridge settings.",
+            recipient.address
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub async fn seal_internal_body(
     payload: &mut Value,
     session: &Arc<RwLock<Session>>,
@@ -350,6 +370,7 @@ pub async fn seal_internal_body(
         });
     }
 
+    enforce_post_quantum(&routed, crate::config::require_post_quantum())?;
     let envelope = seal_routed(&sender, &routed, &plaintext)?;
     for (pin_key, pin) in &pending_pins {
         db.recipient_pin_put(pin_key, pin).map_err(|_| {
@@ -639,6 +660,53 @@ mod tests {
         )
         .expect("opened");
         String::from_utf8(opened).unwrap()
+    }
+
+    #[test]
+    fn requiring_post_quantum_refuses_recipients_without_it() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let account = owner("user");
+        let mut protected = recipient();
+        let (_, encap) = MlKem768::generate(&mut OsRng);
+        protected.bundle.pq_prekey = Some(crate::api_client::BundlePqPrekey {
+            key_id: 9,
+            public_key: STANDARD.encode(encap.as_bytes()),
+        });
+        protected.bundle.x3dh_max_version = Some(2);
+        sign_v2(&mut protected.bundle, &account);
+        let with_pq = routed("pq@astermail.org", Some(&protected.bundle), &account);
+        assert!(has_post_quantum_protection(&with_pq.route));
+
+        let classical = RoutedRecipient {
+            address: "classical@astermail.org".to_string(),
+            route: match with_pq.route.clone() {
+                SendRoute::Ratchet(mut target) => {
+                    target.pq_target = None;
+                    SendRoute::Ratchet(target)
+                }
+                other => other,
+            },
+            account_key: None,
+        };
+        let account_key_only = routed("pgp@astermail.org", None, &account);
+        assert_eq!(account_key_only.route, SendRoute::AccountKey);
+
+        let all_protected = [routed("pq@astermail.org", Some(&protected.bundle), &account)];
+        assert!(enforce_post_quantum(&all_protected, true).is_ok());
+
+        for weak in [classical, account_key_only] {
+            let address = weak.address.clone();
+            let mixed = [routed("pq@astermail.org", Some(&protected.bundle), &account), weak];
+            assert!(enforce_post_quantum(&mixed, false).is_ok());
+            match enforce_post_quantum(&mixed, true) {
+                Err(BridgeError::RecipientKey(message)) => {
+                    assert!(message.starts_with(&address));
+                    assert!(message.contains("post-quantum"));
+                }
+                other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
     }
 
     #[test]

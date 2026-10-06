@@ -1077,6 +1077,7 @@ async fn provision_bundle(
 struct ServiceSettingsResponse {
     service_mode: bool,
     autostart: bool,
+    require_post_quantum: bool,
 }
 
 #[tauri::command]
@@ -1087,7 +1088,15 @@ async fn get_service_settings(
     Ok(ServiceSettingsResponse {
         service_mode: guard.config.service_mode,
         autostart: guard.config.autostart,
+        require_post_quantum: guard.config.require_post_quantum,
     })
+}
+
+#[tauri::command]
+async fn set_require_post_quantum(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    guard.config.require_post_quantum = enabled;
+    config::save_config(&guard.config)
 }
 
 #[tauri::command]
@@ -1469,6 +1478,7 @@ fn main() {
             open_data_directory,
             get_service_settings,
             set_service_mode,
+            set_require_post_quantum,
             set_autostart,
             provision_bundle,
             take_pending_deep_link,

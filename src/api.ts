@@ -245,6 +245,11 @@ export async function open_data_directory(): Promise<void> {
 export interface ServiceSettings {
   service_mode: boolean;
   autostart: boolean;
+  require_post_quantum: boolean;
+}
+
+export async function set_require_post_quantum(enabled: boolean): Promise<void> {
+  return tauri_invoke("set_require_post_quantum", { enabled });
 }
 
 export async function get_service_settings(): Promise<ServiceSettings> {

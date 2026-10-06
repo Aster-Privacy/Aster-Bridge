@@ -1777,6 +1777,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [autostart_loading, set_autostart_loading] = useState(true);
   const [service_mode, set_service_mode] = useState(false);
   const [service_mode_loading, set_service_mode_loading] = useState(true);
+  const [require_post_quantum, set_require_post_quantum] = useState(false);
   const [update_info, set_update_info] = useState<UpdateInfo | null>(null);
   const [update_checking, set_update_checking] = useState(false);
   const [update_installing, set_update_installing] = useState(false);
@@ -1929,6 +1930,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     api.get_service_settings().then((s) => {
       set_autostart(s.autostart);
       set_service_mode(s.service_mode);
+      set_require_post_quantum(s.require_post_quantum);
       set_autostart_loading(false);
       set_service_mode_loading(false);
     }).catch(() => {
@@ -1950,6 +1952,18 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_service_mode(!new_value);
       show_toast(t("toast_background_mode_failed"), "error");
+    }
+  };
+
+  const handle_toggle_require_post_quantum = async () => {
+    const new_value = !require_post_quantum;
+    set_require_post_quantum(new_value);
+    try {
+      await api.set_require_post_quantum(new_value);
+      show_toast(new_value ? t("toast_require_post_quantum_on") : t("toast_require_post_quantum_off"), "success");
+    } catch {
+      set_require_post_quantum(!new_value);
+      show_toast(t("toast_require_post_quantum_failed"), "error");
     }
   };
 
@@ -2045,6 +2059,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
         <SettingRow label={t("run_in_background")} sublabel={t("run_in_background_hint")}>
           <Toggle checked={service_mode} disabled={service_mode_loading} on_click={handle_toggle_service_mode} />
+        </SettingRow>
+        <SettingRow label={t("require_post_quantum")} sublabel={t("require_post_quantum_hint")}>
+          <Toggle checked={require_post_quantum} disabled={service_mode_loading} on_click={handle_toggle_require_post_quantum} />
         </SettingRow>
       </SettingsGroup>
 

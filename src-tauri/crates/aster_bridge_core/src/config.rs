@@ -52,6 +52,8 @@ pub struct BridgeConfig {
     #[serde(default = "default_carddav_https_enabled")]
     pub carddav_https_enabled: bool,
     pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub require_post_quantum: bool,
     #[serde(skip)]
     pub data_dir: PathBuf,
 }
@@ -119,6 +121,7 @@ impl Default for BridgeConfig {
             carddav_enabled: default_carddav_enabled(),
             carddav_https_enabled: default_carddav_https_enabled(),
             poll_interval_secs: 30,
+            require_post_quantum: false,
             data_dir: PathBuf::new(),
         }
     }
@@ -137,6 +140,25 @@ pub fn data_dir() -> Result<PathBuf, String> {
 
 pub fn load_config() -> Result<BridgeConfig, String> {
     load_config_from(data_dir()?)
+}
+
+pub fn require_post_quantum() -> bool {
+    match data_dir() {
+        Ok(dir) => require_post_quantum_in(&dir),
+        Err(_) => true,
+    }
+}
+
+fn require_post_quantum_in(dir: &std::path::Path) -> bool {
+    let config_path = dir.join("config.toml");
+    if !config_path.exists() {
+        return false;
+    }
+    std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|contents| toml::from_str::<BridgeConfig>(&contents).ok())
+        .map(|config| config.require_post_quantum)
+        .unwrap_or(true)
 }
 
 fn load_config_from(dir: PathBuf) -> Result<BridgeConfig, String> {
@@ -273,6 +295,29 @@ mod tests {
         assert!(c.tls_enabled);
         assert!(!c.service_mode);
         validate_ports(&c).expect("default ports must validate");
+    }
+
+    #[test]
+    fn post_quantum_is_required_only_when_the_setting_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!BridgeConfig::default().require_post_quantum);
+        assert!(!require_post_quantum_in(dir.path()));
+
+        let mut c = BridgeConfig::default();
+        c.data_dir = dir.path().to_path_buf();
+        save_config(&c).unwrap();
+        assert!(!require_post_quantum_in(dir.path()));
+
+        c.require_post_quantum = true;
+        save_config(&c).unwrap();
+        assert!(require_post_quantum_in(dir.path()));
+        assert!(load_config_from(dir.path().to_path_buf()).unwrap().require_post_quantum);
+
+        std::fs::write(dir.path().join("config.toml"), "imap_port = 1143\nsmtp_port = 1025\npoll_interval_secs = 30\n").unwrap();
+        assert!(!require_post_quantum_in(dir.path()));
+
+        std::fs::write(dir.path().join("config.toml"), "not toml at all [").unwrap();
+        assert!(require_post_quantum_in(dir.path()));
     }
 
     #[test]
