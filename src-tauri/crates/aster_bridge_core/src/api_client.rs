@@ -1001,6 +1001,29 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn find_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<PrekeyBundle>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
     pub async fn get_recipient_public_key(
         &self,
         access_token: &str,

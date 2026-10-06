@@ -675,6 +675,7 @@ impl Database {
                 identity_fingerprint TEXT NOT NULL,
                 owner_fingerprint TEXT NOT NULL,
                 pq_seen INTEGER NOT NULL DEFAULT 0,
+                flagged INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
              );",
         ).map_err(|e| e.to_string())?;
@@ -1901,7 +1902,7 @@ impl Database {
         use rusqlite::OptionalExtension;
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT identity_fingerprint, owner_fingerprint, pq_seen
+                "SELECT identity_fingerprint, owner_fingerprint, pq_seen, flagged
                  FROM recipient_key_pin WHERE pin_id = ?1",
                 [pin_id],
                 |r| {
@@ -1909,6 +1910,7 @@ impl Database {
                         identity_fingerprint: r.get(0)?,
                         owner_fingerprint: r.get(1)?,
                         pq_seen: r.get::<_, i64>(2)? != 0,
+                        flagged: r.get::<_, i64>(3)? != 0,
                     })
                 },
             )
@@ -1929,22 +1931,32 @@ impl Database {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO recipient_key_pin
-                    (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, flagged, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(pin_id) DO UPDATE SET
                     identity_fingerprint = excluded.identity_fingerprint,
                     owner_fingerprint = excluded.owner_fingerprint,
                     pq_seen = excluded.pq_seen,
+                    flagged = excluded.flagged,
                     updated_at = excluded.updated_at",
                 rusqlite::params![
                     pin_id,
                     pin.identity_fingerprint,
                     pin.owner_fingerprint,
                     pin.pq_seen as i64,
+                    pin.flagged as i64,
                     now
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn recipient_pin_delete(&self, pin_id: &str) -> Result<bool, String> {
+        self.with_conn(|conn| {
+            let removed =
+                conn.execute("DELETE FROM recipient_key_pin WHERE pin_id = ?1", [pin_id])?;
+            Ok(removed > 0)
         })
     }
 
@@ -4069,6 +4081,7 @@ mod db_tests {
             identity_fingerprint: "aa".to_string(),
             owner_fingerprint: "BB".to_string(),
             pq_seen: false,
+            flagged: false,
         };
         db.recipient_pin_put("pin", &first).unwrap();
         assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(first.clone()));
@@ -4076,12 +4089,17 @@ mod db_tests {
         let rotated = RecipientPin {
             identity_fingerprint: "cc".to_string(),
             pq_seen: true,
+            flagged: true,
             ..first
         };
         db.recipient_pin_put("pin", &rotated).unwrap();
         db.repair_cache().unwrap();
         db.clear_user_data().unwrap();
         assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(rotated));
+
+        assert!(db.recipient_pin_delete("pin").unwrap());
+        assert!(!db.recipient_pin_delete("pin").unwrap());
+        assert!(db.recipient_pin_get("pin").unwrap().is_none());
     }
 
     #[test]

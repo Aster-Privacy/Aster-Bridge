@@ -23,7 +23,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::api_client::PrekeyBundle;
-use crate::crypto::ratchet::PQ_IDENTITY_KEY_ID;
+use crate::crypto::ratchet::{PQ_IDENTITY_KEY_ID, X3DH_VERSION_TRANSCRIPT_BOUND};
 use crate::error::BridgeError;
 
 const CLEARTEXT_SIGNATURE_HEADER: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
@@ -40,11 +40,12 @@ pub enum BundleVerdict {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecipientPin {
     pub identity_fingerprint: String,
     pub owner_fingerprint: String,
     pub pq_seen: bool,
+    pub flagged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +55,23 @@ pub struct PqTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrustedBundle {
+pub struct RatchetTarget {
     pub identity_public: Vec<u8>,
     pub signed_prekey: Vec<u8>,
     pub pq_target: Option<PqTarget>,
-    pub pin: RecipientPin,
+    pub transcript_bound: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendRoute {
+    Ratchet(RatchetTarget),
+    AccountKey,
+}
+
+#[derive(Debug)]
+pub struct Evaluation {
+    pub pin: Option<RecipientPin>,
+    pub outcome: Result<SendRoute, BridgeError>,
 }
 
 fn canonical_v1(bundle: &PrekeyBundle) -> String {
@@ -137,6 +150,36 @@ fn refuse(address: &str, reason: &str) -> BridgeError {
     BridgeError::RecipientKey(format!("{} for {}", reason, address))
 }
 
+fn accept_hint(address: &str) -> String {
+    format!(
+        "If you expect this change, confirm it with the recipient, then accept the new key. In Aster Bridge, go to Settings > Advanced and click Accept key, or run: aster-bridge recipient-key accept {}",
+        address
+    )
+}
+
+fn untrusted(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "The encryption keys for {} changed or failed verification, so the message was not sent. {}",
+        address,
+        accept_hint(address)
+    ))
+}
+
+fn downgraded(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "The post-quantum key that {} published before is no longer available, so the message was not sent. {}",
+        address,
+        accept_hint(address)
+    ))
+}
+
+fn no_published_key(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "{} has no published encryption keys, so the message was not sent.",
+        address
+    ))
+}
+
 fn decode_key(address: &str, value: &str, what: &str) -> Result<Vec<u8>, BridgeError> {
     STANDARD
         .decode(value.trim())
@@ -189,64 +232,111 @@ fn select_pq_target(
     Ok(None)
 }
 
-pub fn evaluate_bundle(
+fn ratchet_target(
     address: &str,
     bundle: &PrekeyBundle,
+    covers_pq_identity: bool,
+) -> Result<RatchetTarget, BridgeError> {
+    Ok(RatchetTarget {
+        identity_public: decode_key(address, &bundle.kem_identity_key, "identity key")?,
+        signed_prekey: decode_key(address, &bundle.signed_prekey, "signed prekey")?,
+        pq_target: select_pq_target(bundle, covers_pq_identity, address)?,
+        transcript_bound: bundle.x3dh_max_version.unwrap_or(1)
+            >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND),
+    })
+}
+
+fn changed_pin(existing: Option<&RecipientPin>, pin: RecipientPin) -> Option<RecipientPin> {
+    if existing == Some(&pin) {
+        None
+    } else {
+        Some(pin)
+    }
+}
+
+pub fn evaluate_recipient(
+    address: &str,
+    bundle: Option<&PrekeyBundle>,
     owner_public_key: Option<&str>,
     existing: Option<&RecipientPin>,
-) -> Result<TrustedBundle, BridgeError> {
-    let verdict = verify_bundle(bundle, owner_public_key);
+) -> Evaluation {
+    let base = existing.cloned().unwrap_or_default();
     let owner_fingerprint = owner_public_key
         .and_then(|key| aster_crypto::public_key_fingerprint_hex(key.as_bytes()));
+    let owner_changed = owner_public_key.is_some()
+        && !base.owner_fingerprint.is_empty()
+        && !owner_fingerprint
+            .as_deref()
+            .is_some_and(|current| base.owner_fingerprint.eq_ignore_ascii_case(current));
+    let verdict = bundle.map(|bundle| verify_bundle(bundle, owner_public_key));
 
-    if verdict == BundleVerdict::Tampered {
-        return Err(refuse(
-            address,
-            "the published encryption keys failed signature verification",
-        ));
+    if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged {
+        return Evaluation {
+            pin: changed_pin(
+                existing,
+                RecipientPin {
+                    flagged: true,
+                    ..base
+                },
+            ),
+            outcome: Err(untrusted(address)),
+        };
     }
-    if let (Some(pin), Some(current)) = (existing, owner_fingerprint.as_deref()) {
-        if !pin.owner_fingerprint.eq_ignore_ascii_case(current) {
-            return Err(refuse(
-                address,
-                "the account key changed since you last wrote to this address; the message was not sent",
-            ));
-        }
-    }
-    let advertises_pq = advertised_pq_identity_key(bundle).is_some();
-    if !advertises_pq && existing.is_some_and(|pin| pin.pq_seen) {
-        return Err(refuse(
-            address,
-            "the published keys no longer include the post-quantum key seen before; the message was not sent",
-        ));
-    }
-    let covers_pq_identity = match verdict {
-        BundleVerdict::Verified { covers_pq_identity } => covers_pq_identity,
-        _ => {
-            return Err(refuse(
-                address,
-                "no signed encryption keys are published, so Aster Bridge cannot verify them; send from the Aster Mail app instead",
-            ));
-        }
+
+    let (Some(_), Some(owner_fingerprint)) = (owner_public_key, owner_fingerprint) else {
+        return Evaluation {
+            pin: None,
+            outcome: Err(no_published_key(address)),
+        };
     };
-    let owner_fingerprint = owner_fingerprint.ok_or_else(|| {
-        refuse(address, "the account key could not be read")
-    })?;
 
-    let identity_public = decode_key(address, &bundle.kem_identity_key, "identity key")?;
-    let signed_prekey = decode_key(address, &bundle.signed_prekey, "signed prekey")?;
-    let pq_target = select_pq_target(bundle, covers_pq_identity, address)?;
-
-    Ok(TrustedBundle {
-        pin: RecipientPin {
-            identity_fingerprint: hex(&Sha256::digest(&identity_public)),
+    if let (Some(bundle), Some(BundleVerdict::Verified { covers_pq_identity })) = (bundle, verdict)
+    {
+        let advertises_pq = advertised_pq_identity_key(bundle).is_some();
+        if base.pq_seen && !advertises_pq {
+            return Evaluation {
+                pin: None,
+                outcome: Err(downgraded(address)),
+            };
+        }
+        let target = match ratchet_target(address, bundle, covers_pq_identity) {
+            Ok(target) => target,
+            Err(error) => {
+                return Evaluation {
+                    pin: None,
+                    outcome: Err(error),
+                }
+            }
+        };
+        let pin = RecipientPin {
+            identity_fingerprint: hex(&Sha256::digest(&target.identity_public)),
             owner_fingerprint,
-            pq_seen: advertises_pq || existing.is_some_and(|pin| pin.pq_seen),
-        },
-        identity_public,
-        signed_prekey,
-        pq_target,
-    })
+            pq_seen: base.pq_seen || advertises_pq,
+            flagged: false,
+        };
+        return Evaluation {
+            pin: changed_pin(existing, pin),
+            outcome: Ok(SendRoute::Ratchet(target)),
+        };
+    }
+
+    if base.pq_seen {
+        return Evaluation {
+            pin: None,
+            outcome: Err(downgraded(address)),
+        };
+    }
+
+    Evaluation {
+        pin: changed_pin(
+            existing,
+            RecipientPin {
+                owner_fingerprint,
+                ..base
+            },
+        ),
+        outcome: Ok(SendRoute::AccountKey),
+    }
 }
 
 #[cfg(test)]
@@ -326,11 +416,20 @@ X1OEWHpsCOAO
         bundle
     }
 
-    fn signed_v1_bundle(owner: &Owner, pq_identity: Option<Vec<u8>>) -> PrekeyBundle {
+    pub(crate) fn signed_v1_bundle(owner: &Owner, pq_identity: Option<Vec<u8>>) -> PrekeyBundle {
         let mut bundle = unsigned_bundle(pq_identity);
         let text = canonical_v1(&bundle);
         sign(&mut bundle, owner, &text);
         bundle
+    }
+
+    const BOB: &str = "bob@astermail.org";
+
+    fn ratchet(evaluation: Evaluation) -> RatchetTarget {
+        match evaluation.outcome {
+            Ok(SendRoute::Ratchet(target)) => target,
+            other => panic!("expected the ratchet route, got {:?}", other),
+        }
     }
 
     fn one_time_prekey(fill: u8, len: usize) -> Option<BundlePqPrekey> {
@@ -363,10 +462,10 @@ X1OEWHpsCOAO
             verify_bundle(&bundle, Some(INTEROP_PUBLIC_KEY)),
             BundleVerdict::Tampered
         );
-        assert!(matches!(
-            evaluate_bundle("bob@astermail.org", &bundle, Some(INTEROP_PUBLIC_KEY), None),
-            Err(BridgeError::RecipientKey(_))
-        ));
+        let evaluation =
+            evaluate_recipient(BOB, Some(&bundle), Some(INTEROP_PUBLIC_KEY), None);
+        assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(evaluation.pin.unwrap().flagged);
     }
 
     #[test]
@@ -382,7 +481,66 @@ X1OEWHpsCOAO
     }
 
     #[test]
-    fn an_unsigned_bundle_is_refused() {
+    fn a_v2_signed_bundle_is_verified_and_seals_to_the_signed_post_quantum_key() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
+
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.clone().unwrap();
+        let target = ratchet(evaluation).pq_target.unwrap();
+
+        assert_eq!(target.key_id, PQ_IDENTITY_KEY_ID);
+        assert_eq!(target.public_key, vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]);
+        assert!(pin.pq_seen);
+        assert!(!pin.flagged);
+        assert!(!pin.identity_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_v1_signed_bundle_without_a_post_quantum_key_is_verified() {
+        let alice = owner("alice");
+        let bundle = signed_v1_bundle(&alice, None);
+
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.clone().unwrap();
+
+        assert!(ratchet(evaluation).pq_target.is_none());
+        assert!(!pin.pq_seen);
+        assert!(!pin.identity_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_v1_signed_bundle_with_a_post_quantum_key_is_sealed_not_refused() {
+        let alice = owner("alice");
+        let mut bundle = signed_v1_bundle(&alice, Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
+
+        let target = ratchet(evaluate_recipient(
+            BOB,
+            Some(&bundle),
+            Some(&alice.public_key),
+            None,
+        ))
+        .pq_target
+        .unwrap();
+        assert_eq!(target.key_id, 77);
+        assert_eq!(target.public_key, vec![0x33; ML_KEM_768_PUBLIC_KEY_BYTES]);
+
+        bundle.pq_prekey = None;
+        let target = ratchet(evaluate_recipient(
+            BOB,
+            Some(&bundle),
+            Some(&alice.public_key),
+            None,
+        ))
+        .pq_target
+        .unwrap();
+        assert_eq!(target.key_id, PQ_IDENTITY_KEY_ID);
+    }
+
+    #[test]
+    fn an_unsigned_bundle_routes_to_the_account_key_without_pinning_its_identity() {
         let alice = owner("alice");
         let mut bundle = unsigned_bundle(None);
         assert_eq!(
@@ -395,55 +553,46 @@ X1OEWHpsCOAO
             verify_bundle(&bundle, Some(&alice.public_key)),
             BundleVerdict::Legacy
         );
-        assert!(matches!(
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None),
-            Err(BridgeError::RecipientKey(_))
-        ));
+
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.unwrap();
+        assert_eq!(evaluation.outcome.unwrap(), SendRoute::AccountKey);
+        assert!(pin.identity_fingerprint.is_empty());
+        assert!(!pin.owner_fingerprint.is_empty());
+        assert!(!pin.pq_seen);
     }
 
     #[test]
-    fn a_signed_bundle_without_a_published_account_key_is_refused() {
+    fn an_unsigned_bundle_with_a_post_quantum_key_routes_to_the_account_key() {
         let alice = owner("alice");
-        let bundle = signed_v2_bundle(&alice);
+        let bundle = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
 
-        assert_eq!(verify_bundle(&bundle, None), BundleVerdict::Unknown);
-        assert!(matches!(
-            evaluate_bundle("bob@astermail.org", &bundle, None, None),
-            Err(BridgeError::RecipientKey(_))
-        ));
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+
+        assert!(!evaluation.pin.unwrap().pq_seen);
+        assert_eq!(evaluation.outcome.unwrap(), SendRoute::AccountKey);
     }
 
     #[test]
-    fn a_signature_over_the_post_quantum_key_selects_that_key() {
+    fn a_recipient_without_a_bundle_routes_to_the_account_key() {
         let alice = owner("alice");
-        let mut bundle = signed_v2_bundle(&alice);
-        bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
 
-        let trusted =
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None).unwrap();
+        let evaluation = evaluate_recipient(BOB, None, Some(&alice.public_key), None);
 
-        let target = trusted.pq_target.unwrap();
-        assert_eq!(target.key_id, PQ_IDENTITY_KEY_ID);
-        assert_eq!(target.public_key, vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]);
-        assert!(trusted.pin.pq_seen);
+        assert_eq!(evaluation.outcome.unwrap(), SendRoute::AccountKey);
     }
 
     #[test]
-    fn a_signature_that_omits_the_post_quantum_key_prefers_the_one_time_prekey() {
+    fn a_recipient_without_a_published_account_key_is_refused() {
         let alice = owner("alice");
-        let mut bundle = signed_v1_bundle(&alice, Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
-        bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
+        let signed = signed_v2_bundle(&alice);
+        assert_eq!(verify_bundle(&signed, None), BundleVerdict::Unknown);
 
-        let trusted =
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None).unwrap();
-        let target = trusted.pq_target.unwrap();
-        assert_eq!(target.key_id, 77);
-        assert_eq!(target.public_key, vec![0x33; ML_KEM_768_PUBLIC_KEY_BYTES]);
-
-        bundle.pq_prekey = None;
-        let trusted =
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None).unwrap();
-        assert_eq!(trusted.pq_target.unwrap().key_id, PQ_IDENTITY_KEY_ID);
+        for bundle in [Some(&signed), Some(&unsigned_bundle(None)), None] {
+            let evaluation = evaluate_recipient(BOB, bundle, None, None);
+            assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
+            assert!(evaluation.pin.is_none());
+        }
     }
 
     #[test]
@@ -452,56 +601,99 @@ X1OEWHpsCOAO
         let mut bundle = signed_v1_bundle(&alice, None);
         bundle.pq_prekey = one_time_prekey(0x33, 100);
 
-        assert!(matches!(
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None),
-            Err(BridgeError::RecipientKey(_))
-        ));
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
 
         bundle.pq_prekey = None;
-        let trusted =
-            evaluate_bundle("bob@astermail.org", &bundle, Some(&alice.public_key), None).unwrap();
-        assert!(trusted.pq_target.is_none());
+        assert!(ratchet(evaluate_recipient(
+            BOB,
+            Some(&bundle),
+            Some(&alice.public_key),
+            None
+        ))
+        .pq_target
+        .is_none());
     }
 
     #[test]
-    fn a_changed_account_key_is_refused() {
+    fn a_changed_account_key_is_refused_until_the_pin_is_cleared() {
         let alice = owner("alice");
         let mallory = owner("mallory");
-        let first = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v2_bundle(&alice),
+        let first = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
             Some(&alice.public_key),
             None,
         )
+        .pin
         .unwrap();
 
-        let swapped = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v2_bundle(&mallory),
+        let swapped = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&mallory)),
             Some(&mallory.public_key),
-            Some(&first.pin),
+            Some(&first),
         );
-        assert!(matches!(swapped, Err(BridgeError::RecipientKey(_))));
+        let message = match &swapped.outcome {
+            Err(BridgeError::RecipientKey(message)) => message.clone(),
+            other => panic!("expected a refusal, got {:?}", other),
+        };
+        assert!(message.contains("aster-bridge recipient-key accept bob@astermail.org"));
+        let flagged = swapped.pin.unwrap();
+        assert!(flagged.flagged);
+        assert_eq!(flagged.owner_fingerprint, first.owner_fingerprint);
 
-        let unchanged = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v2_bundle(&alice),
+        let restored = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
             Some(&alice.public_key),
-            Some(&first.pin),
-        )
-        .unwrap();
-        assert_eq!(unchanged.pin, first.pin);
+            Some(&flagged),
+        );
+        assert!(matches!(restored.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(restored.pin.is_none());
+
+        let accepted = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&mallory)),
+            Some(&mallory.public_key),
+            None,
+        );
+        assert!(accepted.outcome.is_ok());
+
+        let unchanged = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
+            Some(&alice.public_key),
+            Some(&first),
+        );
+        assert!(unchanged.outcome.is_ok());
+        assert!(unchanged.pin.is_none());
+    }
+
+    #[test]
+    fn a_changed_account_key_is_refused_on_the_account_key_route() {
+        let alice = owner("alice");
+        let mallory = owner("mallory");
+        let first = evaluate_recipient(BOB, None, Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+
+        let swapped = evaluate_recipient(BOB, None, Some(&mallory.public_key), Some(&first));
+
+        assert!(matches!(swapped.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(swapped.pin.unwrap().flagged);
     }
 
     #[test]
     fn an_identity_key_rotated_under_the_pinned_account_key_is_accepted() {
         let alice = owner("alice");
-        let first = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v2_bundle(&alice),
+        let first = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
             Some(&alice.public_key),
             None,
         )
+        .pin
         .unwrap();
 
         let mut rotated = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
@@ -509,36 +701,76 @@ X1OEWHpsCOAO
         let text = canonical_v2(&rotated).unwrap();
         sign(&mut rotated, &alice, &text);
 
-        let trusted = evaluate_bundle(
-            "bob@astermail.org",
-            &rotated,
-            Some(&alice.public_key),
-            Some(&first.pin),
-        )
-        .unwrap();
-        assert_ne!(trusted.pin.identity_fingerprint, first.pin.identity_fingerprint);
-        assert_eq!(trusted.pin.owner_fingerprint, first.pin.owner_fingerprint);
+        let evaluation =
+            evaluate_recipient(BOB, Some(&rotated), Some(&alice.public_key), Some(&first));
+        let pin = evaluation.pin.clone().unwrap();
+        assert!(evaluation.outcome.is_ok());
+        assert_ne!(pin.identity_fingerprint, first.identity_fingerprint);
+        assert_eq!(pin.owner_fingerprint, first.owner_fingerprint);
     }
 
     #[test]
     fn a_dropped_post_quantum_key_is_refused() {
         let alice = owner("alice");
-        let first = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v2_bundle(&alice),
+        let first = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
             Some(&alice.public_key),
             None,
         )
+        .pin
         .unwrap();
-        assert!(first.pin.pq_seen);
+        assert!(first.pq_seen);
 
-        let downgraded = evaluate_bundle(
-            "bob@astermail.org",
-            &signed_v1_bundle(&alice, None),
-            Some(&alice.public_key),
-            Some(&first.pin),
+        let weaker = [
+            Some(signed_v1_bundle(&alice, None)),
+            Some(unsigned_bundle(None)),
+            Some(unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))),
+            None,
+        ];
+        for bundle in &weaker {
+            let evaluation =
+                evaluate_recipient(BOB, bundle.as_ref(), Some(&alice.public_key), Some(&first));
+            assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
+            assert!(evaluation.pin.is_none());
+        }
+    }
+
+    #[test]
+    fn a_bundle_advertising_the_bound_handshake_selects_it() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        assert!(
+            !ratchet(evaluate_recipient(
+                BOB,
+                Some(&bundle),
+                Some(&alice.public_key),
+                None
+            ))
+            .transcript_bound
         );
-        assert!(matches!(downgraded, Err(BridgeError::RecipientKey(_))));
+
+        bundle.x3dh_max_version = Some(1);
+        assert!(
+            !ratchet(evaluate_recipient(
+                BOB,
+                Some(&bundle),
+                Some(&alice.public_key),
+                None
+            ))
+            .transcript_bound
+        );
+
+        bundle.x3dh_max_version = Some(2);
+        assert!(
+            ratchet(evaluate_recipient(
+                BOB,
+                Some(&bundle),
+                Some(&alice.public_key),
+                None
+            ))
+            .transcript_bound
+        );
     }
 
     #[test]
