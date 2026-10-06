@@ -2100,6 +2100,7 @@ async fn run_sync_pass(
     jmap_broadcaster: Option<&broadcast::Sender<StateChange>>,
     deep: bool,
 ) -> Result<(), String> {
+    let pass_started = std::time::Instant::now();
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
     let mut seen_ids: HashSet<String> = HashSet::new();
@@ -2207,6 +2208,7 @@ async fn run_sync_pass(
             SYSTEM_FOLDER_MAX_ITEMS
         };
         loop {
+            let listed_at = std::time::Instant::now();
             let page: Result<FolderPage, BridgeError> = match (system_query, custom_folder) {
                 (Some(folder_query), _) => {
                     let mut q = folder_query.query.clone();
@@ -2288,15 +2290,22 @@ async fn run_sync_pass(
                                 None => {}
                             }
                         }
-                        let outcome = match prepare_mail_item(
-                            db,
-                            &item_folder,
-                            item,
-                            &passphrase,
-                            identity_key.as_deref(),
-                            &previous_keys,
-                            &inbound_keys,
-                        ) {
+                        let Some(prepared) =
+                            db.unless_listing_predates_append(&item.id, &item_folder, listed_at, || {
+                                prepare_mail_item(
+                                    db,
+                                    &item_folder,
+                                    item,
+                                    &passphrase,
+                                    identity_key.as_deref(),
+                                    &previous_keys,
+                                    &inbound_keys,
+                                )
+                            })
+                        else {
+                            continue;
+                        };
+                        let outcome = match prepared {
                             Prepared::Done(outcome) => outcome,
                             Prepared::Ready(prepared) => {
                                 let mut downloaded: Option<Vec<CachedAttachment>> = None;
@@ -2345,13 +2354,14 @@ async fn run_sync_pass(
                                         }
                                     }
                                 }
-                                let outcome = commit_mail_item(
-                                    db,
+                                let Some(outcome) = db.unless_listing_predates_append(
+                                    &item.id,
                                     &item_folder,
-                                    item,
-                                    prepared,
-                                    downloaded,
-                                );
+                                    listed_at,
+                                    || commit_mail_item(db, &item_folder, item, prepared, downloaded),
+                                ) else {
+                                    continue;
+                                };
                                 if permanently_unavailable {
                                     let _ =
                                         db.set_attachments_state(&item.id, ATTACHMENTS_FAILED);
@@ -2576,7 +2586,10 @@ async fn run_sync_pass(
         if let Ok(local) = db.list_all_cached_id_folder_dates() {
             for (id, folder, _) in local {
                 if !seen_ids.contains(&id)
-                    && db.delete_message_by_aster_id(&id).is_ok() {
+                    && db.unless_appended_since(&id, pass_started, || {
+                        db.delete_message_by_aster_id(&id).is_ok()
+                    }) == Some(true)
+                {
                         tracing::info!("sync: pruned {} from {} (gone on server)", id, folder);
                         destroyed_ids.push(id);
                     }
@@ -4359,6 +4372,198 @@ mod tests {
             db.get_cached_message("stale-2").unwrap().is_some(),
             "shallow sync must never prune"
         );
+    }
+
+    async fn spawn_append_race_backend(
+        db: Arc<Database>,
+        stalled_folder: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        use axum::extract::Query;
+        use axum::routing::{get, patch, post, put};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stored: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stored_writer = stored.clone();
+        let stored_reader = stored.clone();
+        let stored_listing = stored.clone();
+        let listing_started = Arc::new(AtomicBool::new(false));
+        let started = listing_started.clone();
+        let stalled_once = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/mail/v1/email_import/jobs",
+                post(|| async { Json(serde_json::json!({"id": "job-1"})) })
+                    .get(|| async { Json(serde_json::json!({"jobs": []})) }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id",
+                put(|| async { Json(serde_json::json!({"success": true})) }),
+            )
+            .route(
+                "/mail/v1/email_import/jobs/:id/emails",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let stored = stored_writer.clone();
+                    async move {
+                        let email = body["emails"][0].clone();
+                        let mut guard = stored.lock().await;
+                        let id = format!("imported-{}", guard.len() + 1);
+                        guard.push(serde_json::json!({
+                            "id": id,
+                            "item_type": "received",
+                            "encrypted_envelope": email["encrypted_envelope"],
+                            "envelope_nonce": email["envelope_nonce"],
+                            "folder_token": "",
+                            "is_external": true,
+                            "created_at": email["received_at"],
+                            "message_ts": email["received_at"],
+                        }));
+                        Json(serde_json::json!({
+                            "stored_count": 1,
+                            "duplicate_count": 0,
+                            "skipped_quota_count": 0,
+                            "quota_exceeded": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/sync",
+                get(move || {
+                    let stored = stored_reader.clone();
+                    async move {
+                        let items = stored.lock().await.clone();
+                        Json(serde_json::json!({"items": items}))
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id/metadata",
+                patch(|| async { Json(serde_json::json!({"success": true})) }),
+            )
+            .route(
+                "/bridge/v1/messages",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let stored = stored_listing.clone();
+                    let started = started.clone();
+                    let stalled_once = stalled_once.clone();
+                    let db = db.clone();
+                    async move {
+                        started.store(true, Ordering::SeqCst);
+                        let is = |key: &str, value: &str| q.get(key).map(String::as_str) == Some(value);
+                        let folder = if q.contains_key("label_token") {
+                            "custom"
+                        } else if is("is_archived", "true") {
+                            "archive"
+                        } else if is("item_type", "received") {
+                            "inbox"
+                        } else {
+                            "other"
+                        };
+                        let mut items: Vec<serde_json::Value> = Vec::new();
+                        if folder == stalled_folder && !stalled_once.swap(true, Ordering::SeqCst) {
+                            for _ in 0..1000 {
+                                if folder == "inbox" && items.is_empty() {
+                                    items = stored.lock().await.clone();
+                                }
+                                if matches!(db.get_cached_message("imported-1"), Ok(Some(_))) {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                        } else if folder == "archive" {
+                            items = stored.lock().await.clone();
+                        }
+                        let total = items.len();
+                        Json(serde_json::json!({
+                            "items": items,
+                            "total": total,
+                            "has_more": false,
+                            "next_cursor": serde_json::Value::Null
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                get(|| async {
+                    Json(serde_json::json!({"items": [], "has_more": false, "next_cursor": null}))
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), listing_started)
+    }
+
+    async fn append_to_archive_during_a_sync_pass(stalled_folder: &'static str, deep: bool) {
+        use std::sync::atomic::Ordering;
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let (base, listing_started) = spawn_append_race_backend(db.clone(), stalled_folder).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session_with_identity_key("test-ik");
+
+        let pass = {
+            let (session, client, db) = (session.clone(), client.clone(), db.clone());
+            tokio::spawn(async move { run_sync_pass(&session, &client, &db, None, deep).await })
+        };
+        for _ in 0..1000 {
+            if listing_started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(listing_started.load(Ordering::SeqCst), "the sync pass never listed a folder");
+
+        let raw = b"Message-ID: <raced@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nSubject: old archived mail\r\nDate: Fri, 12 Jul 2019 13:04:05 +0000\r\n\r\nbody";
+        let outcome = crate::imap::append::append_imported_message(
+            &db,
+            &client,
+            &session,
+            "archive",
+            raw,
+            &crate::imap::append::AppendFlags::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let crate::imap::append::AppendOutcome::Stored { uid, aster_id } = outcome else {
+            panic!("the append was not stored");
+        };
+        assert_eq!(aster_id, "imported-1");
+        pass.await.unwrap().unwrap();
+
+        let after_pass = db.get_cached_message("imported-1").unwrap();
+        let after_pass = after_pass.expect("the pass dropped a message it had just acknowledged");
+        assert_eq!(after_pass.folder, "archive", "the pass moved the appended message");
+        assert_eq!(after_pass.imap_uid, uid, "the APPENDUID stopped resolving after one pass");
+
+        run_sync_pass(&session, &client, &db, None, deep).await.unwrap();
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        let settled = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(settled.folder, "archive");
+        assert_eq!(settled.imap_uid, uid, "the APPENDUID stopped resolving after later passes");
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "<raced@old.example>"), Some(uid));
+    }
+
+    #[tokio::test]
+    async fn an_inbox_listing_taken_before_an_append_does_not_refile_the_message() {
+        append_to_archive_during_a_sync_pass("inbox", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_deep_pass_does_not_prune_a_message_appended_while_it_ran() {
+        append_to_archive_during_a_sync_pass("archive", true).await;
     }
 
     #[tokio::test]

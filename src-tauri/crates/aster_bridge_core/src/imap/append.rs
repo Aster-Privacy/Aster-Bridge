@@ -95,9 +95,23 @@ impl AppendFlags {
 pub struct AppendCommand {
     pub mailbox: String,
     pub flags: AppendFlags,
+    pub keywords: Vec<String>,
     pub internal_date: Option<DateTime<Utc>>,
     pub literal_len: usize,
     pub non_sync: bool,
+}
+
+fn keywords_from_list(list: &str) -> Vec<String> {
+    let mut keywords: Vec<String> = Vec::new();
+    for token in list.split_whitespace() {
+        if token.starts_with('\\') || !super::server::is_keyword(token) {
+            continue;
+        }
+        if !keywords.iter().any(|k| k.eq_ignore_ascii_case(token)) {
+            keywords.push(token.to_string());
+        }
+    }
+    keywords
 }
 
 pub fn parse_append_command(args: &str) -> Option<AppendCommand> {
@@ -116,10 +130,12 @@ pub fn parse_append_command(args: &str) -> Option<AppendCommand> {
     let literal_len = literal_inner.trim_end_matches('+').trim().parse::<usize>().ok()?;
 
     let head = &rest[..literal_start];
-    let flags = match (head.find('('), head.rfind(')')) {
-        (Some(open), Some(close)) if close > open => AppendFlags::from_list(&head[open + 1..close]),
-        _ => AppendFlags::default(),
+    let flag_list = match (head.find('('), head.rfind(')')) {
+        (Some(open), Some(close)) if close > open => &head[open + 1..close],
+        _ => "",
     };
+    let flags = AppendFlags::from_list(flag_list);
+    let keywords = keywords_from_list(flag_list);
 
     let internal_date = head
         .rfind(')')
@@ -139,6 +155,7 @@ pub fn parse_append_command(args: &str) -> Option<AppendCommand> {
     Some(AppendCommand {
         mailbox,
         flags,
+        keywords,
         internal_date,
         literal_len,
         non_sync,
@@ -935,6 +952,11 @@ async fn import_message(
                         attachment_count: attachment_count.min(i16::MAX as usize) as i16,
                         thread_token: None,
                         folder_token: crate::folders::token_of_label(folder),
+                        is_read: flags.seen,
+                        is_starred: flags.flagged,
+                        is_archived: folder == "archive",
+                        is_spam: folder == "spam",
+                        is_trashed: folder == "trash",
                     }],
                 },
             )
@@ -974,7 +996,12 @@ async fn import_message(
         if response.duplicate_count > 0 {
             record_import_outcome(false);
             crate::sync::poller::try_kick_sync();
-            return Ok(AppendOutcome::Duplicate { uid: None });
+            let uid = if as_copy {
+                None
+            } else {
+                db.find_uid_by_message_id_in_folder(folder, &message.message_id)
+            };
+            return Ok(AppendOutcome::Duplicate { uid });
         }
         return Err("the server rejected the message".to_string());
     }
@@ -997,7 +1024,25 @@ async fn import_message(
         }
     }
 
-    apply_placement(client, &token, &aster_id, folder, flags).await;
+    if let Err(e) = apply_placement(client, &token, &aster_id, folder, flags).await {
+        if !matches!(folder, "archive" | "trash" | "spam") {
+            tracing::warn!("append flag update failed for {}: {}", aster_id, e);
+        } else if let Err(cleanup) = client.delete_mail_item_permanent(&token, &aster_id).await {
+            tracing::warn!(
+                "could not remove {} after a failed placement in {}: {}",
+                aster_id,
+                folder,
+                cleanup
+            );
+            return Err(format!(
+                "could not file the message in {}: {}; a copy is left on the server",
+                folder, e
+            ));
+        } else {
+            return Err(format!("could not file the message in {}: {}", folder, e));
+        }
+    }
+    db.pin_appended(&aster_id, folder);
 
     let item = crate::api_client::MailItem {
         id: aster_id.clone(),
@@ -1152,7 +1197,7 @@ async fn apply_placement(
     aster_id: &str,
     folder: &str,
     flags: &AppendFlags,
-) {
+) -> std::result::Result<(), crate::error::BridgeError> {
     let mut patch = serde_json::Map::new();
     match folder {
         "archive" => {
@@ -1180,14 +1225,27 @@ async fn apply_placement(
     }
 
     if patch.is_empty() {
-        return;
+        return Ok(());
     }
 
-    if let Err(e) = client
-        .set_mailbox_flags(token, aster_id, serde_json::Value::Object(patch))
-        .await
-    {
-        tracing::warn!("append placement update failed for {}: {}", aster_id, e);
+    let patch = serde_json::Value::Object(patch);
+    let mut attempt = 0u32;
+    loop {
+        match client.set_mailbox_flags(token, aster_id, patch.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_retryable(&e) && attempt < RATE_LIMIT_ATTEMPTS => {
+                let wait = rate_limit_backoff(attempt);
+                attempt += 1;
+                tracing::warn!(
+                    error = %e,
+                    seconds = wait,
+                    "the server is temporarily unavailable, waiting before filing the appended message"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                note_import_activity();
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -1207,6 +1265,22 @@ mod tests {
         assert!(!cmd.non_sync);
         assert_eq!(cmd.flags, AppendFlags::default());
         assert!(cmd.internal_date.is_none());
+        assert!(cmd.keywords.is_empty());
+    }
+
+    #[test]
+    fn append_keeps_the_keywords_in_its_flag_list() {
+        let cmd =
+            parse_append_command("Archive (\\Seen Work $label1 work \\Recent $Forwarded) {5}")
+                .unwrap();
+        assert_eq!(cmd.mailbox, "Archive");
+        assert!(cmd.flags.seen);
+        assert!(!cmd.flags.flagged);
+        assert_eq!(cmd.keywords, vec!["Work", "$label1", "$Forwarded"]);
+
+        let cmd = parse_append_command("INBOX (\\Flagged) {5}").unwrap();
+        assert!(cmd.flags.flagged);
+        assert!(cmd.keywords.is_empty());
     }
 
     #[test]

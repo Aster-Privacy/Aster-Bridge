@@ -769,7 +769,7 @@ fn flags_to_str(flags: u32, keywords: &[String]) -> String {
 const MAX_KEYWORDS_PER_MESSAGE: usize = 64;
 const MAX_KEYWORD_LEN: usize = 128;
 
-fn is_keyword(token: &str) -> bool {
+pub(crate) fn is_keyword(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= MAX_KEYWORD_LEN
         && token
@@ -899,6 +899,30 @@ async fn store_tag_keywords(
         label_keywords,
         failure: outcome.error.as_ref().map(|e| e.imap_response()),
     }
+}
+
+async fn store_append_keywords(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    aster_id: &str,
+    keywords: &[String],
+) -> Option<&'static str> {
+    if keywords.is_empty() {
+        return None;
+    }
+    let item_ids = [aster_id.to_string()];
+    let tag_store = store_tag_keywords(db, client, session, &item_ids, 1, Some(keywords)).await;
+    let current = db.message_keywords(aster_id).unwrap_or_default();
+    store_message_keywords(
+        db,
+        aster_id,
+        &current,
+        1,
+        Some(keywords),
+        &tag_store.label_keywords,
+    );
+    tag_store.failure
 }
 
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
@@ -2255,9 +2279,10 @@ where
                                 let import_folder = folder.to_string();
                                 let import_flags = cmd.flags.clone();
                                 let import_date = cmd.internal_date;
+                                let import_keywords = cmd.keywords.clone();
                                 let import_body = std::mem::take(&mut buf);
-                                let outcome = run_with_keepalive(&mut writer, async move {
-                                    crate::imap::append::append_imported_message(
+                                let imported = run_with_keepalive(&mut writer, async move {
+                                    let outcome = crate::imap::append::append_imported_message(
                                         &import_db,
                                         &import_client,
                                         &import_session,
@@ -2266,9 +2291,30 @@ where
                                         &import_flags,
                                         import_date,
                                     )
-                                    .await
+                                    .await;
+                                    let keyword_failure = match &outcome {
+                                        Ok(crate::imap::append::AppendOutcome::Stored {
+                                            aster_id,
+                                            ..
+                                        }) => {
+                                            store_append_keywords(
+                                                &import_db,
+                                                &import_client,
+                                                &import_session,
+                                                aster_id,
+                                                &import_keywords,
+                                            )
+                                            .await
+                                        }
+                                        _ => None,
+                                    };
+                                    (outcome, keyword_failure)
                                 })
                                 .await;
+                                let (outcome, keyword_failure) = match imported {
+                                    Some((outcome, keyword_failure)) => (Some(outcome), keyword_failure),
+                                    None => (None, None),
+                                };
                                 match outcome {
                                     Some(Ok(crate::imap::append::AppendOutcome::Stored {
                                         uid,
@@ -2286,6 +2332,17 @@ where
                                         let _ = broadcaster.send(StateChange { changed });
                                         if conn.selected_folder.as_deref() == Some(folder) {
                                             sync_selected(&mut writer, &db, &mut conn, true).await?;
+                                        }
+                                        if let Some(text) = keyword_failure {
+                                            tracing::warn!(
+                                                "APPEND to {} stored {} without some keywords: {}",
+                                                folder,
+                                                aster_id,
+                                                text
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .await?;
                                         }
                                         write_ok(
                                             &mut writer,
@@ -4214,6 +4271,8 @@ mod tests {
         gateway_blip_job_create: bool,
         slow_metadata_ms: u64,
         fail_store_after: Option<usize>,
+        fail_metadata: bool,
+        fail_tags: bool,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -4225,6 +4284,8 @@ mod tests {
             gateway_blip_job_create,
             slow_metadata_ms,
             fail_store_after,
+            fail_metadata,
+            fail_tags,
         } = opts;
         let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4306,6 +4367,9 @@ mod tests {
                             tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
                         }
                         calls.lock().await.push(("PATCH".to_string(), id.clone()));
+                        if fail_metadata {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
                         if id.starts_with("draft-") {
                             (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
                         } else {
@@ -4445,6 +4509,18 @@ mod tests {
                                 .await
                                 .push(("IMPORT_FOLDER_TOKEN".to_string(), token.to_string()));
                         }
+                        let placed = |key: &str| email.get(key).and_then(|v| v.as_bool());
+                        calls.lock().await.push((
+                            "IMPORT_PLACEMENT".to_string(),
+                            format!(
+                                "archived={:?} spam={:?} trashed={:?} read={:?} starred={:?}",
+                                placed("is_archived"),
+                                placed("is_spam"),
+                                placed("is_trashed"),
+                                placed("is_read"),
+                                placed("is_starred"),
+                            ),
+                        ));
                         if fail {
                             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
                                 .into_response();
@@ -4571,7 +4647,7 @@ mod tests {
                     async move {
                         let token = body.get("tag_token").and_then(|v| v.as_str()).unwrap_or_default();
                         calls.lock().await.push(("CREATE_TAG".to_string(), token.to_string()));
-                        if fail {
+                        if fail || fail_tags {
                             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
                         }
                         let n = tag_ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -7477,6 +7553,213 @@ mod tests {
         assert_eq!(stored.len(), 10, "{:?}", stored);
         let log = calls.lock().await.clone();
         assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 10, "{:?}", log);
+    }
+
+    fn appended_mail(name: &str) -> Vec<u8> {
+        format!(
+            "Message-ID: <{}@old.example>\r\nFrom: alice@old.example\r\nTo: tester@aster.test\r\nSubject: {}\r\nDate: Fri, 12 Jul 2024 13:04:05 +0000\r\n\r\nbody of {}",
+            name, name, name
+        )
+        .into_bytes()
+    }
+
+    fn append_uid(resp: &str) -> Option<(u32, u32)> {
+        let rest = resp.split("[APPENDUID ").nth(1)?;
+        let mut parts = rest.split(']').next()?.split(' ');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    }
+
+    #[tokio::test]
+    async fn append_applies_label_keywords_like_store() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            "INBOX (\\Seen Work Fresh $label1 \\Recent)",
+            &appended_mail("labelled-append"),
+        )
+        .await;
+        assert!(resp.contains("k1 OK [APPENDUID "), "{}", resp);
+        assert!(!resp.contains("* NO"), "{}", resp);
+
+        let stored = db.message_keywords("imported-1").unwrap();
+        for keyword in ["Work", "Fresh", "$label1"] {
+            assert!(stored.contains(&keyword.to_string()), "{:?}", stored);
+        }
+        assert_eq!(stored.len(), 3, "{:?}", stored);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+
+        let (_, uid) = append_uid(&resp).unwrap();
+        imap_cmd_lines(&mut reader, &mut writer, "k2", "NOOP").await;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "k3",
+            &format!("UID FETCH {} (FLAGS)", uid),
+        )
+        .await;
+        assert!(resp.contains("k3 OK"), "{}", resp);
+        for keyword in ["Work", "Fresh", "$label1", "\\Seen"] {
+            assert!(resp.contains(keyword), "{} missing from {}", keyword, resp);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_with_a_failed_label_write_still_stores_the_message() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_tags: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            "INBOX (Work Fresh)",
+            &appended_mail("half-labelled"),
+        )
+        .await;
+        let warned = resp.find("* NO [UNAVAILABLE]").unwrap_or_else(|| panic!("no warning in {}", resp));
+        let done = resp.find("k1 OK [APPENDUID ").unwrap_or_else(|| panic!("not stored: {}", resp));
+        assert!(warned < done, "{}", resp);
+        assert!(!resp.contains("k1 NO"), "{}", resp);
+
+        let (_, uid) = append_uid(&resp).unwrap();
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
+        assert_eq!(cached.imap_uid, uid);
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "DELETE"), "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn one_append_creates_at_most_ten_labels() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let names: Vec<String> = (0..12).map(|n| format!("New{}", n)).collect();
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "k1",
+            &format!("INBOX ({})", names.join(" ")),
+            &appended_mail("many-labels"),
+        )
+        .await;
+        assert!(resp.contains("* NO [LIMIT]"), "{}", resp);
+        assert!(resp.contains("k1 OK [APPENDUID "), "{}", resp);
+
+        assert_eq!(db.list_custom_tags().unwrap().len(), 10);
+        assert_eq!(db.message_keywords("imported-1").unwrap().len(), 10);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 10, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_answers_with_the_uid_of_the_stored_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("sent-twice");
+
+        let first = append_literal(&mut reader, &mut writer, "d1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second = append_literal(&mut reader, &mut writer, "d2", "Archive", &raw).await;
+        assert!(second.contains("d2 OK"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let elsewhere = append_literal(&mut reader, &mut writer, "d3", "INBOX", &raw).await;
+        assert!(elsewhere.contains("d3 OK"), "{}", elsewhere);
+        assert_eq!(append_uid(&elsewhere), None, "{}", elsewhere);
+
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.imap_uid, stored.1);
+    }
+
+    #[tokio::test]
+    async fn append_files_the_message_in_the_import_request_itself() {
+        let (addr, _db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        for (tag, mailbox) in [
+            ("p1", "Archive (\\Seen)"),
+            ("p2", "Junk"),
+            ("p3", "Trash (\\Flagged)"),
+            ("p4", "INBOX"),
+        ] {
+            let resp =
+                append_literal(&mut reader, &mut writer, tag, mailbox, &appended_mail(tag)).await;
+            assert!(resp.contains(&format!("{} OK [APPENDUID ", tag)), "{}", resp);
+        }
+
+        let log = calls.lock().await.clone();
+        let placements: Vec<&str> = log
+            .iter()
+            .filter(|(m, _)| m == "IMPORT_PLACEMENT")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            placements,
+            vec![
+                "archived=Some(true) spam=Some(false) trashed=Some(false) read=Some(true) starred=Some(false)",
+                "archived=Some(false) spam=Some(true) trashed=Some(false) read=Some(false) starred=Some(false)",
+                "archived=Some(false) spam=Some(false) trashed=Some(true) read=Some(false) starred=Some(true)",
+                "archived=Some(false) spam=Some(false) trashed=Some(false) read=Some(false) starred=Some(false)",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_that_cannot_be_filed_answers_no_and_leaves_nothing_behind() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_metadata: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = append_literal(
+            &mut reader,
+            &mut writer,
+            "f1",
+            "Archive",
+            &appended_mail("unfiled"),
+        )
+        .await;
+        assert!(resp.contains("f1 NO"), "{}", resp);
+        assert!(!resp.contains("APPENDUID"), "{}", resp);
+        assert!(db.get_cached_message("imported-1").unwrap().is_none());
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(m, id)| m == "DELETE" && id == "imported-1"),
+            "{:?}",
+            log
+        );
     }
 
     #[tokio::test]

@@ -277,6 +277,11 @@ pub struct ImportedEmail<'a> {
     pub thread_token: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_token: Option<&'a str>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub is_archived: bool,
+    pub is_spam: bool,
+    pub is_trashed: bool,
 }
 
 #[derive(Debug, Serialize)]

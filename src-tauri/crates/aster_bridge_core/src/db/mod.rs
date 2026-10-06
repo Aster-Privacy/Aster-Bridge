@@ -475,7 +475,16 @@ pub struct Database {
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
     pub(crate) tag_writes: std::sync::atomic::AtomicU64,
+    append_pins: Mutex<HashMap<String, AppendPin>>,
 }
+
+struct AppendPin {
+    folder: String,
+    at: std::time::Instant,
+}
+
+const APPEND_PIN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const APPEND_PIN_SWEEP_LEN: usize = 512;
 
 impl Database {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
@@ -506,6 +515,7 @@ impl Database {
             app_password_cache: Default::default(),
             tag_lock: tokio::sync::Mutex::new(()),
             tag_writes: std::sync::atomic::AtomicU64::new(0),
+            append_pins: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1162,6 +1172,51 @@ impl Database {
             }
             Ok(())
         })
+    }
+
+    pub(crate) fn pin_appended(&self, aster_id: &str, folder: &str) {
+        let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if pins.len() >= APPEND_PIN_SWEEP_LEN {
+            pins.retain(|_, pin| now.duration_since(pin.at) < APPEND_PIN_TTL);
+        }
+        pins.insert(
+            aster_id.to_string(),
+            AppendPin {
+                folder: folder.to_string(),
+                at: now,
+            },
+        );
+    }
+
+    pub(crate) fn unless_listing_predates_append<T>(
+        &self,
+        aster_id: &str,
+        folder: &str,
+        listed_at: std::time::Instant,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        if pins
+            .get(aster_id)
+            .is_some_and(|pin| pin.folder != folder && pin.at >= listed_at)
+        {
+            return None;
+        }
+        Some(write())
+    }
+
+    pub(crate) fn unless_appended_since<T>(
+        &self,
+        aster_id: &str,
+        since: std::time::Instant,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+        if pins.get(aster_id).is_some_and(|pin| pin.at >= since) {
+            return None;
+        }
+        Some(write())
     }
 
     pub fn remove_uid_mapping(&self, uid: i64, folder: &str) -> Result<(), String> {
@@ -2091,6 +2146,34 @@ impl Database {
         })
         .ok()
         .flatten()
+    }
+
+    pub fn find_uid_by_message_id_in_folder(&self, folder: &str, message_id: &str) -> Option<u32> {
+        let bare = message_id.trim().trim_matches(&['<', '>'][..]).trim().to_string();
+        if bare.is_empty() {
+            return None;
+        }
+        let angled = format!("<{}>", bare);
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT MIN(u.imap_uid) FROM message_cache m
+                     JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
+                     WHERE m.folder = ?1
+                       AND COALESCE(
+                             m.message_id,
+                             CASE WHEN m.raw_headers IS NOT NULL AND json_valid(m.raw_headers)
+                                  THEN json_extract(m.raw_headers, '$.message_id') END
+                           ) IN (?2, ?3)",
+                    rusqlite::params![folder, bare, angled],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten())
+        })
+        .ok()
+        .flatten()
+        .and_then(|uid| u32::try_from(uid).ok())
     }
 
     pub fn repair_cache(&self) -> Result<(), String> {
@@ -3553,6 +3636,43 @@ mod db_tests {
         assert_eq!(db.find_aster_id_by_message_id("json@x.test").as_deref(), Some("a2"));
         assert_eq!(db.find_aster_id_by_message_id("<json@x.test>").as_deref(), Some("a2"));
         assert!(db.find_aster_id_by_message_id("missing@x.test").is_none());
+    }
+
+    #[test]
+    fn find_uid_by_message_id_only_answers_for_the_folder_holding_the_message() {
+        let (_d, db) = open_db();
+        insert(&db, "a1", "archive");
+        db.update_message_thread_and_msgid("a1", None, Some("col@x.test")).unwrap();
+        let uid = db.assign_uid_if_missing("archive", "a1").unwrap();
+        db.upsert_cached_message("a2", "inbox", Some("s"), None, None, None, 1, None, Some(r#"{"message_id":"<json@x.test>"}"#))
+            .unwrap();
+        let other = db.assign_uid_if_missing("inbox", "a2").unwrap();
+
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "<col@x.test>"), Some(uid));
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "col@x.test"), Some(uid));
+        assert_eq!(db.find_uid_by_message_id_in_folder("inbox", "<col@x.test>"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("inbox", "json@x.test"), Some(other));
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "<json@x.test>"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", "missing@x.test"), None);
+        assert_eq!(db.find_uid_by_message_id_in_folder("archive", " "), None);
+    }
+
+    #[test]
+    fn an_append_pin_blocks_only_writes_decided_before_the_append() {
+        let (_d, db) = open_db();
+        let before = std::time::Instant::now();
+        db.pin_appended("a1", "archive");
+
+        assert_eq!(db.unless_listing_predates_append("a1", "inbox", before, || 1), None);
+        assert_eq!(db.unless_listing_predates_append("a1", "archive", before, || 1), Some(1));
+        assert_eq!(db.unless_listing_predates_append("other", "inbox", before, || 1), Some(1));
+        assert_eq!(db.unless_appended_since("a1", before, || 1), None);
+        assert_eq!(db.unless_appended_since("other", before, || 1), Some(1));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after = std::time::Instant::now();
+        assert_eq!(db.unless_listing_predates_append("a1", "inbox", after, || 1), Some(1));
+        assert_eq!(db.unless_appended_since("a1", after, || 1), Some(1));
     }
 
     #[test]
