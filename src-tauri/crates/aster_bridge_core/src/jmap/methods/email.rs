@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
-use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
+use crate::db::{CachedAttachment, CachedMessage};
 use crate::jmap::dispatcher::MethodError;
 use crate::jmap::state::JmapContext;
 use crate::jmap::store;
@@ -68,7 +68,7 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
     let mut messages = ctx.db.get_cached_messages(&want, with_body).unwrap_or_default();
     let stored: Vec<String> = messages
         .values()
-        .filter(|m| m.attachments_state == ATTACHMENTS_STORED)
+        .filter(|m| crate::db::attachment_parts_known(m.attachments_state))
         .map(|m| m.aster_id.clone())
         .collect();
     let attachment_meta = ctx
@@ -1194,7 +1194,7 @@ pub async fn set(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
-    use crate::db::Database;
+    use crate::db::{Database, ATTACHMENTS_STORED};
     use tokio::sync::{broadcast, RwLock};
     use uuid::Uuid;
 

@@ -36,6 +36,7 @@ use crate::error::BridgeError;
 use crate::jmap::state::StateChange;
 
 mod history;
+pub mod on_demand;
 
 const POLL_INTERVAL_SECS: u64 = 30;
 const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
@@ -1167,6 +1168,64 @@ fn commit_mail_item(
     prepared: PreparedMessage,
     downloaded: Option<Vec<CachedAttachment>>,
 ) -> CacheOutcome {
+    commit_prepared(db, folder, item, prepared, downloaded, false)
+}
+
+fn commit_history_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    prepared: PreparedMessage,
+) -> CacheOutcome {
+    commit_prepared(db, folder, item, prepared, None, true)
+}
+
+fn on_demand_parts(entries: &[EnvelopeAttachment], count: usize) -> Vec<CachedAttachment> {
+    let mut used: HashSet<i64> = HashSet::new();
+    let mut parts: Vec<CachedAttachment> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        let seq = entry.seq.unwrap_or(position as i64);
+        if !used.insert(seq) {
+            continue;
+        }
+        parts.push(CachedAttachment {
+            seq,
+            name: attachment_display_name(entry),
+            content_type: entry.content_type.clone(),
+            content_id: entry.content_id.clone(),
+            is_inline: entry.content_id.is_some(),
+            size: entry.size.unwrap_or(0),
+            data: Vec::new(),
+        });
+    }
+    let mut next = 0i64;
+    while parts.len() < count {
+        while used.contains(&next) {
+            next += 1;
+        }
+        used.insert(next);
+        parts.push(CachedAttachment {
+            seq: next,
+            name: ATTACHMENT_PLACEHOLDER_NAME.to_string(),
+            content_type: DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 0,
+            data: Vec::new(),
+        });
+    }
+    parts.sort_by_key(|a| a.seq);
+    parts
+}
+
+fn commit_prepared(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    prepared: PreparedMessage,
+    downloaded: Option<Vec<CachedAttachment>>,
+    on_demand: bool,
+) -> CacheOutcome {
     let attachment_count = prepared.expected_attachments;
     let size = prepared
         .body_text
@@ -1236,9 +1295,13 @@ fn commit_mail_item(
     };
     if !stored
         && attachment_count > 0
-        && db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE) != ATTACHMENTS_STORED
+        && !crate::db::attachment_parts_known(db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE))
     {
-        let _ = db.set_attachments_state(&item.id, ATTACHMENTS_PENDING);
+        let parts = on_demand.then(|| on_demand_parts(&prepared.attachments, attachment_count));
+        let deferred = parts.is_some_and(|parts| db.store_on_demand_attachments(&item.id, &parts).is_ok());
+        if !deferred {
+            let _ = db.set_attachments_state(&item.id, ATTACHMENTS_PENDING);
+        }
     }
     if let Err(e) = db.assign_uid_if_missing(folder, &item.id) {
         tracing::warn!("uid assign failed for {}: {}", item.id, e);
@@ -1264,6 +1327,21 @@ pub(crate) fn cache_mail_item(
     match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
         Prepared::Done(outcome) => outcome,
         Prepared::Ready(prepared) => commit_mail_item(db, folder, item, prepared, None),
+    }
+}
+
+fn cache_history_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> CacheOutcome {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
+        Prepared::Done(outcome) => outcome,
+        Prepared::Ready(prepared) => commit_history_item(db, folder, item, prepared),
     }
 }
 

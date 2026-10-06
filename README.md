@@ -108,7 +108,7 @@ aster-bridge config set imap_port 2143
 aster-bridge config set smtp_port 2025
 ```
 
-Aster Bridge syncs every message in every folder. It first syncs the newest 2,000 messages in each folder, then indexes older mail in the background. To keep only the newest 2,000 messages per folder and save disk space, run `aster-bridge config set full_mail_history false`. Older mail that was already indexed is removed from this computer the next time the bridge starts. It stays in your Aster account.
+Aster Bridge syncs every message in every folder. It first syncs the newest 2,000 messages in each folder, then indexes older mail in the background. Attachments of older mail are downloaded the first time a mail app opens them. To keep only the newest 2,000 messages per folder and save disk space, run `aster-bridge config set full_mail_history false`. Older mail that was already indexed is removed from this computer the next time the bridge starts. It stays in your Aster account.
 
 ### Run in the background
 

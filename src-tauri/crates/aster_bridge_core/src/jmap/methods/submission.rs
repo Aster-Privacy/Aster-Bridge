@@ -91,7 +91,13 @@ async fn submission_body(
     if let Some(dn) = sender_display_name {
         body["sender_display_name"] = json!(dn);
     }
-    if msg.attachments_state != crate::db::ATTACHMENTS_STORED {
+    if msg.attachments_state == crate::db::ATTACHMENTS_ON_DEMAND {
+        use crate::sync::poller::on_demand::{ensure_attachments, is_on_demand, AttachmentFill};
+        let fill = ensure_attachments(&ctx.db, &ctx.client, &ctx.session, resolved_id, Some(&ctx.broadcaster)).await;
+        if fill == AttachmentFill::Unavailable || is_on_demand(&ctx.db, resolved_id) {
+            return Err("the attachments of this message could not be downloaded; try again later".to_string());
+        }
+    } else if msg.attachments_state != crate::db::ATTACHMENTS_STORED {
         return Ok(body);
     }
     let stored = ctx.db.get_message_attachments(resolved_id).unwrap_or_default();

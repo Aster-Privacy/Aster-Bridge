@@ -93,6 +93,9 @@ pub async fn download(
     }
 
     if let Some((aster_id, seq)) = parse_attachment_blob_id(&blob_id) {
+        if !attachments_ready(&state, aster_id).await {
+            return attachments_unavailable();
+        }
         if let Ok(list) = state.ctx.db.get_message_attachments(aster_id) {
             if let Some(att) = list.into_iter().find(|a| a.seq == seq) {
                 let ct = if att.content_type.contains('/') {
@@ -107,6 +110,12 @@ pub async fn download(
     }
 
     if let Ok(Some(m)) = state.ctx.db.get_cached_message(&blob_id) {
+        if !attachments_ready(&state, &m.aster_id).await {
+            return attachments_unavailable();
+        }
+        let Ok(Some(m)) = state.ctx.db.get_cached_message(&blob_id) else {
+            return (StatusCode::NOT_FOUND, "blob not found").into_response();
+        };
         let attachments = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
             state.ctx.db.get_message_attachments(&m.aster_id).unwrap_or_default()
         } else {
@@ -117,6 +126,25 @@ pub async fn download(
     }
 
     (StatusCode::NOT_FOUND, "blob not found").into_response()
+}
+
+async fn attachments_ready(state: &AppState, aster_id: &str) -> bool {
+    use crate::sync::poller::on_demand::{ensure_attachments, is_on_demand, AttachmentFill};
+    let ctx = &state.ctx;
+    ensure_attachments(&ctx.db, &ctx.client, &ctx.session, aster_id, Some(&ctx.broadcaster)).await
+        != AttachmentFill::Unavailable
+        && !is_on_demand(&ctx.db, aster_id)
+}
+
+fn attachments_unavailable() -> Response {
+    let mut h = HeaderMap::new();
+    h.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        h,
+        "the attachments of this message could not be downloaded; try again later",
+    )
+        .into_response()
 }
 
 pub fn attachment_blob_id(aster_id: &str, seq: i64) -> String {

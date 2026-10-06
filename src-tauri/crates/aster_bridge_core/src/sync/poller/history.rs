@@ -104,16 +104,16 @@ struct Listing {
     token: Option<String>,
 }
 
-struct Keys {
-    access_token: Zeroizing<String>,
-    passphrase: Zeroizing<Vec<u8>>,
-    identity_key: Option<String>,
-    previous_keys: Zeroizing<Vec<String>>,
-    inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
+pub(super) struct Keys {
+    pub(super) access_token: Zeroizing<String>,
+    pub(super) passphrase: Zeroizing<Vec<u8>>,
+    pub(super) identity_key: Option<String>,
+    pub(super) previous_keys: Zeroizing<Vec<String>>,
+    pub(super) inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
 }
 
 impl Keys {
-    async fn of(session: &Arc<RwLock<Session>>) -> Self {
+    pub(super) async fn of(session: &Arc<RwLock<Session>>) -> Self {
         let s = session.read().await;
         Self {
             access_token: s.access_token.clone(),
@@ -333,7 +333,7 @@ async fn retry_undecrypted(db: &Database, client: &ApiClient, keys: &Keys, now: 
         match client.fetch_mail_item(&keys.access_token, &id).await {
             Ok(item) if item.id == id => {
                 let folder = folder_for(listing, &item, &known_tokens);
-                let outcome = cache_mail_item(
+                let outcome = cache_history_item(
                     db,
                     &folder,
                     &item,
@@ -565,7 +565,7 @@ fn index_page(
             &keys.inbound_keys,
         ) {
             Prepared::Done(outcome) => outcome,
-            Prepared::Ready(prepared) => commit_mail_item(db, &folder, item, prepared, None),
+            Prepared::Ready(prepared) => commit_history_item(db, &folder, item, prepared),
         };
         if outcome.decrypt_failed {
             let _ = db.history_retry_note(&item.id, &listing.label, retry_delay_secs, now as i64);
@@ -728,22 +728,72 @@ mod tests {
     }
 
     fn archive_item(n: usize) -> serde_json::Value {
+        archive_item_with(n, None)
+    }
+
+    const ATTACHMENT_KEY: [u8; 32] = [42u8; 32];
+
+    struct Attached<'a> {
+        data: &'a [u8],
+        sized: bool,
+    }
+
+    fn archive_item_with(n: usize, attached: Option<Attached<'_>>) -> serde_json::Value {
         let date = (chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z").unwrap()
             - chrono::Duration::hours(n as i64))
         .to_rfc3339();
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "subject": format!("Message {}", n),
             "body_text": format!("Body of message {}", n),
             "date": date,
         });
-        serde_json::json!({
+        let mut item = serde_json::json!({
             "id": item_id(n),
             "item_type": "received",
-            "encrypted_envelope": STANDARD.encode(envelope.to_string()),
             "envelope_nonce": "",
             "folder_token": "tok",
             "is_external": false,
             "created_at": date,
+        });
+        if let Some(attached) = attached {
+            let mut key = serde_json::json!({
+                "seq": 0,
+                "key": STANDARD.encode(ATTACHMENT_KEY),
+                "filename": format!("report-{}.pdf", n),
+                "content_type": "application/pdf",
+            });
+            if attached.sized {
+                key["size"] = serde_json::json!(attached.data.len());
+            }
+            envelope["attachment_keys"] = serde_json::json!([key]);
+            item["has_attachments"] = serde_json::json!(true);
+            item["attachment_count"] = serde_json::json!(1);
+        }
+        item["encrypted_envelope"] = serde_json::json!(STANDARD.encode(envelope.to_string()));
+        item
+    }
+
+    fn sealed_row(data: &[u8]) -> serde_json::Value {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&ATTACHMENT_KEY).unwrap();
+        let data_nonce = [7u8; 12];
+        let aad = crate::crypto::attachment::attachment_data_aad(0);
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&data_nonce), Payload { msg: data, aad: &aad })
+            .unwrap();
+        let meta_nonce = [9u8; 12];
+        let meta = serde_json::json!({"filename": "server-name.pdf", "content_type": "application/pdf"}).to_string();
+        let sealed_meta = cipher.encrypt(Nonce::from_slice(&meta_nonce), meta.as_bytes()).unwrap();
+        serde_json::json!({
+            "id": "att-0",
+            "mail_item_id": "mail",
+            "encrypted_data": STANDARD.encode(ct),
+            "data_nonce": STANDARD.encode(data_nonce),
+            "encrypted_meta": STANDARD.encode(sealed_meta),
+            "meta_nonce": STANDARD.encode(meta_nonce),
+            "size_bytes": data.len(),
+            "seq_num": 0,
         })
     }
 
@@ -755,6 +805,9 @@ mod tests {
         list_calls: Arc<AtomicUsize>,
         item_calls: Arc<AtomicUsize>,
         fail_with: Arc<StdMutex<Option<u16>>>,
+        attachments: Arc<StdMutex<HashMap<String, Arc<serde_json::Value>>>>,
+        attachment_calls: Arc<AtomicUsize>,
+        fail_attachments_with: Arc<StdMutex<Option<u16>>>,
     }
 
     impl Backend {
@@ -764,12 +817,32 @@ mod tests {
             backend
         }
 
+        fn attach(&self, n: usize, data: &[u8], sized: bool) {
+            let item = archive_item_with(n, Some(Attached { data, sized }));
+            let row = sealed_row(data);
+            self.attach_item(item, row);
+        }
+
+        fn attach_item(&self, item: serde_json::Value, row: serde_json::Value) {
+            let id = item["id"].as_str().unwrap().to_string();
+            let mut items = self.items.lock().unwrap();
+            let slot = items.iter_mut().find(|i| i["id"] == id.as_str()).unwrap();
+            *slot = item;
+            self.attachments.lock().unwrap().insert(id, Arc::new(row));
+        }
+
+        fn attachment_requests(&self) -> usize {
+            self.attachment_calls.load(Ordering::SeqCst)
+        }
+
         fn remove(&self, id: &str) {
             self.items.lock().unwrap().retain(|i| i["id"] != id);
         }
 
         fn requests(&self) -> usize {
-            self.list_calls.load(Ordering::SeqCst) + self.item_calls.load(Ordering::SeqCst)
+            self.list_calls.load(Ordering::SeqCst)
+                + self.item_calls.load(Ordering::SeqCst)
+                + self.attachment_calls.load(Ordering::SeqCst)
         }
 
         async fn serve(&self) -> String {
@@ -779,7 +852,24 @@ mod tests {
             use axum::{routing::get, Json, Router};
             let list = self.clone();
             let single = self.clone();
+            let files = self.clone();
             let app = Router::new()
+                .route(
+                    "/mail/v1/attachments/by-mail/:id",
+                    get(move |Path(id): Path<String>| {
+                        let backend = files.clone();
+                        async move {
+                            backend.attachment_calls.fetch_add(1, Ordering::SeqCst);
+                            if let Some(status) = *backend.fail_attachments_with.lock().unwrap() {
+                                return (StatusCode::from_u16(status).unwrap(), "refused").into_response();
+                            }
+                            let row = backend.attachments.lock().unwrap().get(&id).cloned();
+                            let rows: Vec<serde_json::Value> = row.into_iter().map(|r| (*r).clone()).collect();
+                            let total = rows.len();
+                            Json(serde_json::json!({"attachments": rows, "total": total})).into_response()
+                        }
+                    }),
+                )
                 .route(
                     "/bridge/v1/messages",
                     get(move |Query(q): Query<HashMap<String, String>>| {
@@ -1325,5 +1415,480 @@ mod tests {
         .unwrap();
         let backlog: Vec<String> = db.list_attachment_backlog(10).unwrap().into_iter().map(|(id, _)| id).collect();
         assert_eq!(backlog, vec!["recent".to_string(), "history".to_string()]);
+    }
+
+    struct Imap {
+        reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: tokio::net::tcp::OwnedWriteHalf,
+        next_tag: usize,
+    }
+
+    impl Imap {
+        async fn start(db: &Arc<Database>, client: &Arc<ApiClient>, session: &Arc<RwLock<Session>>) -> Self {
+            use tokio::io::AsyncBufReadExt;
+            let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+            passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (state_tx, _state_rx) = broadcast::channel(16);
+            let (db, client, session) = (db.clone(), client.clone(), session.clone());
+            tokio::spawn(async move {
+                let _ = crate::imap::server::serve(listener, session, db, client, passwords, state_tx, None).await;
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (r, writer) = stream.into_split();
+            let mut imap = Imap {
+                reader: tokio::io::BufReader::new(r),
+                writer,
+                next_tag: 0,
+            };
+            let mut greeting = String::new();
+            imap.reader.read_line(&mut greeting).await.unwrap();
+            let login = imap.command("LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"").await;
+            assert!(login.contains(" OK"), "{}", login);
+            imap
+        }
+
+        async fn command(&mut self, line: &str) -> String {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            self.next_tag += 1;
+            let tag = format!("t{}", self.next_tag);
+            self.writer.write_all(format!("{} {}\r\n", tag, line).as_bytes()).await.unwrap();
+            let mut out = String::new();
+            loop {
+                let mut next = String::new();
+                if self.reader.read_line(&mut next).await.unwrap() == 0 {
+                    break;
+                }
+                if let Some(open) = next.trim_end().strip_suffix('}').and_then(|l| l.rfind('{').map(|i| l[i + 1..].to_string())) {
+                    let mut literal = vec![0u8; open.parse().unwrap()];
+                    self.reader.read_exact(&mut literal).await.unwrap();
+                    next.push_str(&String::from_utf8_lossy(&literal));
+                }
+                out.push_str(&next);
+                if next.starts_with(&format!("{} ", tag)) {
+                    break;
+                }
+            }
+            out
+        }
+    }
+
+    fn uid_of(db: &Database, n: usize) -> u32 {
+        db.get_cached_message(&item_id(n)).unwrap().unwrap().imap_uid
+    }
+
+    fn literal_len(response: &str, key: &str) -> usize {
+        let at = response.find(&format!("{} {{", key)).unwrap_or_else(|| panic!("no {} in {}", key, response));
+        let rest = &response[at + key.len() + 2..];
+        rest[..rest.find('}').unwrap()].parse().unwrap()
+    }
+
+    fn fetch_line(response: &str) -> String {
+        response.lines().find(|l| l.starts_with("* ")).unwrap_or_default().to_string()
+    }
+
+    fn rfc822_size(response: &str) -> usize {
+        let at = response.find("RFC822.SIZE ").unwrap();
+        response[at + 12..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    }
+
+    fn attachment_rows(db: &Database, ids: &[String]) -> i64 {
+        db.with_conn(|conn| {
+            let mut total = 0i64;
+            for id in ids {
+                total += conn.query_row(
+                    "SELECT COUNT(*) FROM message_attachment WHERE aster_id = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            }
+            Ok(total)
+        })
+        .unwrap()
+    }
+
+    fn payload(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    async fn indexed_with_attachments(
+        count: usize,
+        attached: &[(usize, usize, bool)],
+    ) -> (tempfile::TempDir, Arc<Database>, Backend, Arc<ApiClient>, Arc<RwLock<Session>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        apply_mode(&db, true);
+        let backend = Backend::with_archive(count);
+        for (n, len, sized) in attached {
+            backend.attach(*n, &payload(*len, *n as u8), *sized);
+        }
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let session = session();
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+        index_until_idle(&session, &client, &db, NOW).await;
+        (dir, db, backend, client, session)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_attachments_wait_for_a_request_while_recent_mail_uses_the_backlog() {
+        let (_dir, db, backend, _client, _session) =
+            indexed_with_attachments(2100, &[(10, 3000, true), (2050, 4000, true), (2060, 5000, true)]).await;
+
+        let recent = db.get_cached_message(&item_id(10)).unwrap().unwrap();
+        assert_eq!(recent.attachments_state, ATTACHMENTS_STORED, "recent mail keeps today's download path");
+        assert_eq!(db.get_message_attachments(&item_id(10)).unwrap()[0].data, payload(3000, 10));
+        assert_eq!(backend.attachment_requests(), 1, "only the recent message was downloaded");
+
+        for (n, len) in [(2050usize, 4000i64), (2060, 5000)] {
+            let old = db.get_cached_message(&item_id(n)).unwrap().unwrap();
+            assert_eq!(old.attachments_state, crate::db::ATTACHMENTS_ON_DEMAND);
+            let parts = db.get_message_attachments(&item_id(n)).unwrap();
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].name, format!("report-{}.pdf", n));
+            assert_eq!(parts[0].content_type, "application/pdf");
+            assert_eq!(parts[0].size, len);
+            assert!(parts[0].data.is_empty());
+        }
+        assert!(db.list_attachment_backlog(100).unwrap().is_empty(), "history mail is not queued");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_full_fetch_downloads_once_and_keeps_uid_size_and_structure() {
+        let (_dir, db, backend, client, session) =
+            indexed_with_attachments(2100, &[(2050, 300_001, true), (2060, 7000, true)]).await;
+        let mut imap = Imap::start(&db, &client, &session).await;
+        assert!(imap.command("SELECT Archive").await.contains("* 2100 EXISTS"));
+        let uid = uid_of(&db, 2050);
+        let before = backend.attachment_requests();
+
+        let summary = imap.command(&format!("UID FETCH {} (RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])", uid)).await;
+        assert!(summary.contains(" OK"), "{}", summary);
+        assert!(summary.contains("multipart/mixed"), "{}", summary);
+        assert!(summary.contains("\"FILENAME\" \"report-2050.pdf\""), "{}", summary);
+        let advertised = rfc822_size(&summary);
+        let structure = fetch_line(&imap.command(&format!("UID FETCH {} (RFC822.SIZE BODYSTRUCTURE)", uid)).await);
+        assert_eq!(backend.attachment_requests(), before, "headers and structure come from the metadata");
+
+        let text_only = imap.command(&format!("UID FETCH {} (BODY.PEEK[1])", uid)).await;
+        assert!(text_only.contains("Body of message 2050"), "{}", text_only);
+        assert_eq!(backend.attachment_requests(), before, "the text part needs no download");
+
+        let full = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", uid)).await;
+        assert!(full.contains(" OK"), "{}", full);
+        assert_eq!(backend.attachment_requests(), before + 1);
+        assert_eq!(literal_len(&full, "BODY[]"), advertised, "the advertised size was exact");
+        let encoded = STANDARD.encode(payload(300_001, 2050usize as u8));
+        assert!(full.replace("\r\n", "").contains(&encoded), "the attachment is complete");
+
+        let again = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", uid)).await;
+        assert!(again.contains(" OK"), "{}", again);
+        assert_eq!(backend.attachment_requests(), before + 1, "the second fetch reads the cache");
+        assert_eq!(literal_len(&again, "BODY[]"), advertised);
+        assert_eq!(uid_of(&db, 2050), uid, "the UID does not change");
+        assert_eq!(fetch_line(&imap.command(&format!("UID FETCH {} (RFC822.SIZE BODYSTRUCTURE)", uid)).await), structure);
+        assert_eq!(db.get_cached_message(&item_id(2050)).unwrap().unwrap().attachments_state, ATTACHMENTS_STORED);
+
+        let other = uid_of(&db, 2060);
+        let part = imap.command(&format!("UID FETCH {} (BODY.PEEK[2])", other)).await;
+        assert!(part.contains(" OK"), "{}", part);
+        assert_eq!(backend.attachment_requests(), before + 2, "asking for the attachment part downloads it");
+        assert_eq!(uid_of(&db, 2060), other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_download_answers_no_caches_nothing_and_succeeds_on_retry() {
+        let (_dir, db, backend, client, session) = indexed_with_attachments(2100, &[(2050, 9000, true)]).await;
+        let mut imap = Imap::start(&db, &client, &session).await;
+        imap.command("SELECT Archive").await;
+        let uid = uid_of(&db, 2050);
+        let size = rfc822_size(&imap.command(&format!("UID FETCH {} (RFC822.SIZE)", uid)).await);
+
+        *backend.fail_attachments_with.lock().unwrap() = Some(503);
+        let refused = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", uid)).await;
+        assert!(refused.contains(" NO [UNAVAILABLE]"), "{}", refused);
+        assert!(!refused.contains("BODY[]"), "nothing partial is served: {}", refused);
+        let cached = db.get_cached_message(&item_id(2050)).unwrap().unwrap();
+        assert_eq!(cached.attachments_state, crate::db::ATTACHMENTS_ON_DEMAND);
+        assert!(db.get_message_attachments(&item_id(2050)).unwrap()[0].data.is_empty());
+        assert_eq!(cached.imap_uid, uid);
+
+        *backend.fail_attachments_with.lock().unwrap() = None;
+        let served = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", uid)).await;
+        assert!(served.contains(" OK"), "{}", served);
+        assert_eq!(literal_len(&served, "BODY[]"), size);
+        assert_eq!(backend.attachment_requests(), 2);
+        assert_eq!(uid_of(&db, 2050), uid);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_envelope_without_sizes_is_rebuilt_once_under_a_new_uid() {
+        let (_dir, db, backend, client, session) = indexed_with_attachments(2100, &[(2050, 6000, false)]).await;
+        let mut imap = Imap::start(&db, &client, &session).await;
+        imap.command("SELECT Archive").await;
+        let uid = uid_of(&db, 2050);
+
+        let refused = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", uid)).await;
+        assert!(refused.contains(" NO [UNAVAILABLE]"), "{}", refused);
+        let new_uid = uid_of(&db, 2050);
+        assert!(new_uid > uid, "a message whose size was not known is replaced, never changed in place");
+        let noop = imap.command("NOOP").await;
+        assert!(noop.contains("EXPUNGE") && noop.contains("EXISTS"), "{}", noop);
+
+        let served = imap.command(&format!("UID FETCH {} (RFC822.SIZE BODY.PEEK[])", new_uid)).await;
+        assert!(served.contains(" OK"), "{}", served);
+        assert_eq!(literal_len(&served, "BODY[]"), rfc822_size(&served));
+        assert!(served.contains("server-name.pdf") || served.contains("report-2050.pdf"));
+        assert_eq!(backend.attachment_requests(), 1, "the rebuilt message reads the cache");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_jmap_blob_download_fetches_on_demand_once() {
+        let (_dir, db, backend, client, session) = indexed_with_attachments(2100, &[(2050, 5000, true)]).await;
+        let _ = db.seed_jmap_mailboxes();
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, _rx) = broadcast::channel(8);
+        let (s, d, c) = (session.clone(), db.clone(), client.clone());
+        tokio::spawn(async move {
+            let _ = crate::jmap::server::serve(listener, s, d, c, passwords, tx).await;
+        });
+        let auth = format!("Basic {}", STANDARD.encode(b"tester@aster.test:abcd-efgh-ijkl-mnop"));
+        let http = reqwest::Client::new();
+        let mut account = None;
+        for _ in 0..200 {
+            if let Ok(r) = http.get(format!("{}/jmap/session", base)).header("authorization", &auth).send().await {
+                let v: serde_json::Value = r.json().await.unwrap();
+                account = v["primaryAccounts"]["urn:ietf:params:jmap:mail"].as_str().map(str::to_string);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let account = account.unwrap();
+        let blob = crate::jmap::blob::attachment_blob_id(&item_id(2050), 0);
+        let url = format!("{}/jmap/download/{}/{}/report.pdf", base, account, blob);
+
+        *backend.fail_attachments_with.lock().unwrap() = Some(502);
+        let refused = http.get(&url).header("authorization", &auth).send().await.unwrap();
+        assert_eq!(refused.status(), 503);
+        assert!(refused.headers().contains_key("retry-after"));
+        *backend.fail_attachments_with.lock().unwrap() = None;
+
+        let first = http.get(&url).header("authorization", &auth).send().await.unwrap();
+        assert_eq!(first.status(), 200);
+        assert_eq!(first.bytes().await.unwrap().to_vec(), payload(5000, 2050usize as u8));
+        let second = http.get(&url).header("authorization", &auth).send().await.unwrap();
+        assert_eq!(second.status(), 200);
+        assert_eq!(backend.attachment_requests(), 2, "one refused try, then one download for both requests");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_demand_attachments_leave_with_their_messages() {
+        let attached: Vec<(usize, usize, bool)> = (2010..2020).map(|n| (n, 2000, true)).collect();
+        let (_dir, db, _backend, _client, _session) = indexed_with_attachments(2100, &attached).await;
+        let ids: Vec<String> = (2010..2020).map(item_id).collect();
+        assert_eq!(attachment_rows(&db, &ids), 10);
+
+        db.delete_message_by_aster_id(&ids[0]).unwrap();
+        assert_eq!(attachment_rows(&db, &ids[..1]), 0, "pruning removes the stored parts");
+
+        apply_mode(&db, false);
+        assert_eq!(attachment_rows(&db, &ids), 0, "turning the setting off removes them");
+
+        let (_dir, db, _backend, _client, _session) = indexed_with_attachments(2100, &attached).await;
+        assert_eq!(attachment_rows(&db, &ids), 10);
+        db.clear_user_data().unwrap();
+        assert_eq!(attachment_rows(&db, &ids), 0, "signing out wipes them");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_mail_that_enters_the_recent_window_stays_on_demand() {
+        let (_dir, db, backend, client, session) = indexed_with_attachments(2100, &[(2050, 4000, true)]).await;
+        for n in 0..120 {
+            backend.remove(&item_id(n));
+        }
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+        let cached = db.get_cached_message(&item_id(2050)).unwrap().unwrap();
+        assert_eq!(cached.attachments_state, crate::db::ATTACHMENTS_ON_DEMAND);
+        assert_eq!(backend.attachment_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pop3_downloads_on_demand_attachments_before_it_answers() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let backend = Backend::default();
+        let data = payload(5000, 1);
+        backend.attachments.lock().unwrap().insert("pop-old".to_string(), Arc::new(sealed_row(&data)));
+        let meta = serde_json::json!({
+            "is_html": false,
+            "attachment_count": 1,
+            "attachments": [{"seq": 0, "name": "a.pdf", "type": "application/pdf", "size": 5000, "key": STANDARD.encode(ATTACHMENT_KEY)}],
+        })
+        .to_string();
+        db.upsert_cached_message("pop-old", "inbox", Some("old"), Some("a@b.c"), Some("d@e.f"), Some("2019-01-01T00:00:00Z"), 8, Some("old body"), Some(&meta))
+            .unwrap();
+        db.store_on_demand_attachments(
+            "pop-old",
+            &[CachedAttachment {
+                seq: 0,
+                name: "a.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                content_id: None,
+                is_inline: false,
+                size: 5000,
+                data: Vec::new(),
+            }],
+        )
+        .unwrap();
+        db.assign_uid_if_missing("inbox", "pop-old").unwrap();
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let passwords = Arc::new(crate::auth::app_passwords::AppPasswords::new(db.clone()));
+        passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = db.clone();
+        tokio::spawn(async move {
+            let _ = crate::pop3::server::serve_with_tls(listener, session(), served, client, passwords, None).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(r);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        for cmd in ["USER tester@aster.test", "PASS abcd-efgh-ijkl-mnop"] {
+            w.write_all(format!("{}\r\n", cmd).as_bytes()).await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("+OK"), "{}", line);
+        }
+        w.write_all(b"LIST 1\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let listed: usize = line.trim_end().rsplit(' ').next().unwrap().parse().unwrap();
+
+        *backend.fail_attachments_with.lock().unwrap() = Some(503);
+        w.write_all(b"RETR 1\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("-ERR [SYS/TEMP]"), "{}", line);
+        *backend.fail_attachments_with.lock().unwrap() = None;
+
+        w.write_all(b"RETR 1\r\n").await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, format!("+OK {} octets\r\n", listed));
+        let mut message = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == ".\r\n" {
+                break;
+            }
+            message.push_str(&line);
+        }
+        assert_eq!(message.len(), listed);
+        assert!(message.replace("\r\n", "").contains(&STANDARD.encode(&data)));
+        assert_eq!(backend.attachment_requests(), 2);
+    }
+
+    fn database_bytes(db: &Database, dir: &std::path::Path) -> (u64, u64) {
+        let live = db
+            .with_conn(|conn| {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+                let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                Ok(((pages - free) * size) as u64)
+            })
+            .unwrap();
+        let on_disk = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("bridge.db"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        (on_disk, live)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn measure_on_demand_against_the_backlog() {
+        const MESSAGES: usize = 20_000;
+        const CLASSES: [usize; 5] = [100_000, 200_000, 300_000, 400_000, 500_000];
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        apply_mode(&db, true);
+        let backend = Backend::with_archive(MESSAGES);
+        let rows: Vec<Arc<serde_json::Value>> = CLASSES
+            .iter()
+            .map(|len| Arc::new(sealed_row(&payload(*len, *len as u8))))
+            .collect();
+        let mut attached = 0usize;
+        for n in (0..MESSAGES).filter(|n| n % 10 < 3) {
+            let class = (n / 10) % CLASSES.len();
+            let data = payload(CLASSES[class], CLASSES[class] as u8);
+            let item = archive_item_with(n, Some(Attached { data: &data, sized: true }));
+            let id = item["id"].as_str().unwrap().to_string();
+            let mut items = backend.items.lock().unwrap();
+            *items.iter_mut().find(|i| i["id"] == id.as_str()).unwrap() = item;
+            backend.attachments.lock().unwrap().insert(id, rows[class].clone());
+            attached += 1;
+        }
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let session = session();
+        let keys = Keys::of(&session).await;
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+        while !db.list_attachment_backlog(1).unwrap().is_empty() {
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, None, &[], &[], &HashSet::new()).await;
+        }
+        let (recent_disk, recent_live) = database_bytes(&db, dir.path());
+        let lists_before = backend.list_calls.load(Ordering::SeqCst);
+        let files_before = backend.attachment_requests();
+        let started = std::time::Instant::now();
+        index_until_idle(&session, &client, &db, NOW).await;
+        let indexed_in = started.elapsed();
+        let history_lists = backend.list_calls.load(Ordering::SeqCst) - lists_before;
+        let history_files = backend.attachment_requests() - files_before;
+        let (lazy_disk, lazy_live) = database_bytes(&db, dir.path());
+        let on_demand: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_cache WHERE attachments_state = ?1",
+                    [crate::db::ATTACHMENTS_ON_DEMAND],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET attachments_state = ?1 WHERE attachments_state = ?2",
+                rusqlite::params![ATTACHMENTS_PENDING, crate::db::ATTACHMENTS_ON_DEMAND],
+            )
+        })
+        .unwrap();
+        let backlog_started = std::time::Instant::now();
+        while !db.list_attachment_backlog(1).unwrap().is_empty() {
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, None, &[], &[], &HashSet::new()).await;
+        }
+        let backlog_in = backlog_started.elapsed();
+        let backlog_files = backend.attachment_requests() - files_before - history_files;
+        let (backlog_disk, backlog_live) = database_bytes(&db, dir.path());
+
+        println!("messages={} with_attachments={} history_on_demand={}", MESSAGES, attached, on_demand);
+        println!("after recent window: disk={} live={}", recent_disk, recent_live);
+        println!(
+            "lazy: index took {:?}, list requests={}, attachment requests={}, disk={} live={}",
+            indexed_in, history_lists, history_files, lazy_disk, lazy_live
+        );
+        println!(
+            "backlog: extra attachment requests={}, took {:?}, disk={} live={}",
+            backlog_files, backlog_in, backlog_disk, backlog_live
+        );
     }
 }

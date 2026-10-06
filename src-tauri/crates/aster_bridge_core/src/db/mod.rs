@@ -19,7 +19,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 use rand_core::{OsRng, RngCore};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -2539,6 +2539,122 @@ impl Database {
         })
     }
 
+    pub fn store_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        parts: &[CachedAttachment],
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                for a in parts {
+                    conn.execute(
+                        "INSERT INTO message_attachment (aster_id, seq, name, content_type, content_id, is_inline, size, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'')",
+                        rusqlite::params![
+                            aster_id,
+                            a.seq,
+                            a.name,
+                            a.content_type,
+                            a.content_id,
+                            a.is_inline as i32,
+                            a.size,
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_ON_DEMAND],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn fill_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        contents: &[(i64, Vec<u8>)],
+    ) -> Result<bool, String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let state: Option<i64> = conn
+                    .query_row(
+                        "SELECT attachments_state FROM message_cache WHERE aster_id = ?1",
+                        [aster_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if state != Some(ATTACHMENTS_ON_DEMAND) {
+                    return Ok(false);
+                }
+                for (seq, data) in contents {
+                    conn.execute(
+                        "UPDATE message_attachment SET data = ?3 WHERE aster_id = ?1 AND seq = ?2",
+                        rusqlite::params![aster_id, seq, data],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_STORED],
+                )?;
+                Ok::<bool, rusqlite::Error>(true)
+            })();
+            match result {
+                Ok(filled) => {
+                    conn.execute_batch(if filled { "COMMIT" } else { "ROLLBACK" })?;
+                    Ok(filled)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn drop_attachment_parts(&self, aster_id: &str, state: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, state],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     pub fn set_attachments_state(&self, aster_id: &str, state: i64) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
@@ -2806,6 +2922,11 @@ pub const ATTACHMENTS_NONE: i64 = 0;
 pub const ATTACHMENTS_PENDING: i64 = 1;
 pub const ATTACHMENTS_STORED: i64 = 2;
 pub const ATTACHMENTS_FAILED: i64 = 3;
+pub const ATTACHMENTS_ON_DEMAND: i64 = 4;
+
+pub fn attachment_parts_known(state: i64) -> bool {
+    state == ATTACHMENTS_STORED || state == ATTACHMENTS_ON_DEMAND
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedAttachment {
