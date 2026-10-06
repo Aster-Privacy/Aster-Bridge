@@ -36,6 +36,7 @@ use crate::sync::poller::{self, PollExit, PollTuning, SyncTrigger, SyncTriggerTx
 pub const LOOPBACK_HOST: &str = "127.0.0.1";
 const PLAN_CHECK_ATTEMPTS: u8 = 3;
 const SESSION_EXPIRED_AFTER_FAILURES: u32 = 5;
+const DEVICE_REVOKED_AFTER_FAILURES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +241,10 @@ fn should_refresh_early(
     now: tokio::time::Instant,
 ) -> bool {
     consecutive_failures == 0 && now.duration_since(last_attempt) >= EARLY_REFRESH_MIN_GAP
+}
+
+fn device_revocation_confirmed(definitive_failures: u32) -> bool {
+    definitive_failures >= DEVICE_REVOKED_AFTER_FAILURES
 }
 
 pub fn is_definitive_device_failure(error: &BridgeError) -> bool {
@@ -733,7 +738,9 @@ impl BridgeRuntime {
             handles.push((
                 Service::TokenRefresh,
                 tokio::spawn(async move {
+                    crate::auth::session::set_session_rejected(false);
                     let mut consecutive_failures: u32 = 0;
+                    let mut definitive_failures: u32 = 0;
                     let mut last_attempt = tokio::time::Instant::now();
                     let mut due =
                         last_attempt + token_refresh_wait(&tuning, consecutive_failures, false);
@@ -762,6 +769,8 @@ impl BridgeRuntime {
                                     tracing::info!("access token refresh recovered");
                                 }
                                 consecutive_failures = 0;
+                                definitive_failures = 0;
+                                crate::auth::session::set_session_rejected(false);
                                 false
                             }
                             Err(e @ BridgeError::Network(_)) => {
@@ -778,8 +787,14 @@ impl BridgeRuntime {
                                     consecutive_failures,
                                     e
                                 );
+                                if is_definitive_device_failure(&e) {
+                                    definitive_failures = definitive_failures.saturating_add(1);
+                                    crate::auth::session::set_session_rejected(true);
+                                } else {
+                                    definitive_failures = 0;
+                                }
                                 if profile == ClientProfile::Cli
-                                    && is_definitive_device_failure(&e)
+                                    && device_revocation_confirmed(definitive_failures)
                                 {
                                     poller::emit_session_expired();
                                     let _ = stop.send(StopReason::DeviceRevoked);
@@ -866,6 +881,14 @@ mod token_refresh_wait_tests {
         assert!(should_refresh_early(0, start, later));
         assert!(!should_refresh_early(0, start, start + Duration::from_secs(5)));
         assert!(!should_refresh_early(2, start, later));
+    }
+
+    #[test]
+    fn one_rejected_sign_in_does_not_confirm_a_revoked_device() {
+        assert!(!device_revocation_confirmed(0));
+        assert!(!device_revocation_confirmed(1));
+        assert!(!device_revocation_confirmed(DEVICE_REVOKED_AFTER_FAILURES - 1));
+        assert!(device_revocation_confirmed(DEVICE_REVOKED_AFTER_FAILURES));
     }
 }
 
