@@ -1073,11 +1073,9 @@ fn prepare_mail_item(
         });
     }
 
-    if !item.envelope_nonce.is_empty() {
-        if let Ok(false) = db.replay_check_and_record(&item.id, &item.envelope_nonce) {
-            tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
-            return Prepared::Done(CacheOutcome::default());
-        }
+    if let Ok(false) = db.replay_check_and_record(&item.id, &replay_marker(item)) {
+        tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
+        return Prepared::Done(CacheOutcome::default());
     }
 
     let plaintext_result = decrypt_envelope_with_previous_keys(
@@ -1527,6 +1525,17 @@ async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Optio
         &entry.encrypted_plaintext,
         &entry.plaintext_nonce,
     )
+}
+
+fn replay_marker(item: &MailItem) -> String {
+    use sha2::Digest;
+
+    if !item.envelope_nonce.is_empty() {
+        return item.envelope_nonce.clone();
+    }
+    let digest = sha2::Sha256::digest(item.encrypted_envelope.as_bytes());
+    let marker: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
+    format!("sealed:{}", marker)
 }
 
 async fn try_decrypt_internal_mail(
@@ -2864,20 +2873,44 @@ mod tests {
     }
 
     #[test]
+    fn an_unencrypted_envelope_is_never_cached() {
+        let (_dir, db) = temp_db();
+        let mut item = item_with_envelope("forged", &serde_json::json!({"subject": "forged", "body_text": "b"}));
+        item.encrypted_envelope =
+            STANDARD.encode(serde_json::json!({"subject": "forged", "body_text": "b"}).to_string());
+        item.envelope_nonce = String::new();
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+        assert!(db.get_cached_message("forged").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_sealed_envelope_without_a_nonce_is_still_recorded_for_replay() {
+        let mut item = item_with_envelope("m", &serde_json::json!({"subject": "s"}));
+        item.envelope_nonce = String::new();
+        let first = replay_marker(&item);
+        assert!(first.starts_with("sealed:"));
+        item.encrypted_envelope.push('A');
+        assert_ne!(first, replay_marker(&item));
+    }
+
+    #[test]
     fn idle_http_connections_outlive_the_poll_interval() {
         assert!(crate::tls_pinning::POOL_IDLE_TIMEOUT.as_secs() > POLL_INTERVAL_SECS);
     }
 
-    fn envelope_b64(json: &serde_json::Value) -> String {
-        STANDARD.encode(json.to_string().as_bytes())
+    const IK: Option<&str> = Some(crate::crypto::envelope::FIXTURE_IDENTITY_KEY);
+
+    fn sealed(json: &serde_json::Value) -> (String, String) {
+        crate::crypto::envelope::sealed_fixture(&json.to_string())
     }
 
     fn item_with_envelope(id: &str, json: &serde_json::Value) -> MailItem {
+        let (encrypted_envelope, envelope_nonce) = sealed(json);
         MailItem {
             id: id.to_string(),
             item_type: "received".to_string(),
-            encrypted_envelope: envelope_b64(json),
-            envelope_nonce: String::new(),
+            encrypted_envelope,
+            envelope_nonce,
             ephemeral_key: None,
             ephemeral_pq_key: None,
             sender_sealed: None,
@@ -3046,7 +3079,7 @@ mod tests {
             &client,
             "tok",
             b"pass",
-            None,
+            IK,
             &[],
             &[],
             &HashSet::new(),
@@ -3184,7 +3217,7 @@ mod tests {
         let json = serde_json::json!({"subject": "x", "body_text": "y"});
         let mut item = item_with_envelope("good", &json);
         item.id = "bad id".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert!(db.get_cached_message("bad id").unwrap().is_none());
     }
 
@@ -3200,7 +3233,7 @@ mod tests {
             "message_id": "mid-1@test"
         });
         let item = item_with_envelope("msg-new", &json);
-        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new;
+        let was_new = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new;
         assert!(was_new);
 
         let cached = db.get_cached_message("msg-new").unwrap().unwrap();
@@ -3231,7 +3264,7 @@ mod tests {
             "raw_headers": [{"name": "Reply-To", "value": "Team <team@example.com>"}]
         });
         let item = item_with_envelope("msg-cc", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let meta: serde_json::Value =
             serde_json::from_str(&db.get_cached_message("msg-cc").unwrap().unwrap().raw_headers.unwrap()).unwrap();
         assert_eq!(meta["cc"], "Carol <carol@example.com>, dan@example.com");
@@ -3252,7 +3285,7 @@ mod tests {
             "body_text": "attached"
         });
         let item = item_with_envelope("msg-imported", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let meta: serde_json::Value = serde_json::from_str(
             &db.get_cached_message("msg-imported").unwrap().unwrap().raw_headers.unwrap(),
         )
@@ -3267,7 +3300,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "plain words"});
         let item = item_with_envelope("msg-plain", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-plain").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain words"));
         let raw = cached.raw_headers.unwrap();
@@ -3283,7 +3316,7 @@ mod tests {
             "body_text": "ciphertext-blob"
         });
         let item = item_with_envelope("msg-ratchet", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-ratchet").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.contains("end-to-end encrypted"));
@@ -3296,12 +3329,12 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-move", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let first = db.get_cached_message("msg-move").unwrap().unwrap();
         assert_eq!(first.folder, "inbox");
         let inbox_uid = first.imap_uid;
 
-        let was_new = cache_mail_item(&db, "archive", &item, b"pass", None, &[], &[]).was_new;
+        let was_new = cache_mail_item(&db, "archive", &item, b"pass", IK, &[], &[]).was_new;
         assert!(!was_new, "already-body-cached item must not count as new");
 
         let moved = db.get_cached_message("msg-move").unwrap().unwrap();
@@ -3318,8 +3351,8 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-dedup", &json);
 
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
@@ -3328,7 +3361,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let mut item = item_with_envelope("msg-bad-env", &serde_json::json!({"subject": "x"}));
         item.encrypted_envelope = "!!!not-base64!!!".to_string();
-        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(!cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert!(db.get_cached_message("msg-bad-env").unwrap().is_none());
     }
 
@@ -3338,7 +3371,7 @@ mod tests {
         let big = "a".repeat(6 * 1024 * 1024);
         let json = serde_json::json!({"subject": "s", "body_text": big});
         let item = item_with_envelope("msg-big", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-big").unwrap().unwrap();
         let body = cached.body_text.unwrap();
         assert!(body.len() < 6 * 1024 * 1024);
@@ -3353,7 +3386,7 @@ mod tests {
 
         let mut first = item_with_envelope("msg-replay", &json);
         first.envelope_nonce = nonce_pbkdf2.clone();
-        let _ = cache_mail_item(&db, "inbox", &first, b"pass", None, &[], &[]);
+        let _ = cache_mail_item(&db, "inbox", &first, b"pass", IK, &[], &[]);
         assert!(
             db.replay_check_and_record("msg-replay", &nonce_pbkdf2).unwrap(),
             "same nonce must be accepted"
@@ -3372,13 +3405,13 @@ mod tests {
         let mut undecryptable = item_with_envelope("msg-rotate", &json);
         undecryptable.envelope_nonce = STANDARD.encode([0x09u8]);
         undecryptable.encrypted_envelope = STANDARD.encode(b"not decryptable");
-        let first = cache_mail_item(&db, "inbox", &undecryptable, b"pass", None, &[], &[]);
+        let first = cache_mail_item(&db, "inbox", &undecryptable, b"pass", IK, &[], &[]);
         assert!(!first.was_new, "an undecryptable item must not be cached");
         assert!(!db.body_cached("msg-rotate"));
 
         let re_encrypted = item_with_envelope("msg-rotate", &json);
         assert!(
-            cache_mail_item(&db, "inbox", &re_encrypted, b"pass", None, &[], &[]).was_new,
+            cache_mail_item(&db, "inbox", &re_encrypted, b"pass", IK, &[], &[]).was_new,
             "the re-encrypted copy must still be accepted after the nonce changed"
         );
         assert!(db.body_cached("msg-rotate"));
@@ -3401,7 +3434,7 @@ mod tests {
             "the fixture must be recognized as inbound so the no-keys branch is reached"
         );
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
 
         assert!(!outcome.was_new, "inbound mail must not be cached without keys");
         assert!(
@@ -3479,7 +3512,7 @@ mod tests {
         let item = inbound_item("msg-heal", &json, &recipient);
 
         let stale_keys = [inbound_candidate(&wrong)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &stale_keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &stale_keys);
         assert!(!outcome.was_new);
         assert!(outcome.inbound_decrypt_failed);
         assert!(!db.body_cached("msg-heal"));
@@ -3487,7 +3520,7 @@ mod tests {
         let fresh_keys = [inbound_candidate(&recipient)];
         let failed = vec![("inbox".to_string(), item.clone())];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &fresh_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &fresh_keys);
         assert_eq!(new_ids, vec!["msg-heal".to_string()]);
         assert!(updated_ids.is_empty());
         let cached = db.get_cached_message("msg-heal").unwrap().unwrap();
@@ -3504,12 +3537,12 @@ mod tests {
         let item = inbound_item("msg-unhealable", &json, &recipient);
 
         let stale_keys = [inbound_candidate(&wrong)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &stale_keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &stale_keys);
         assert!(outcome.inbound_decrypt_failed);
 
         let failed = vec![("inbox".to_string(), item)];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &stale_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &stale_keys);
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         assert!(!db.body_cached("msg-unhealable"));
@@ -3522,7 +3555,7 @@ mod tests {
         let json = serde_json::json!({"subject": "ok", "body_text": "b"});
         let item = inbound_item("msg-inbound-ok", &json, &recipient);
         let keys = [inbound_candidate(&recipient)];
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &keys);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys);
         assert!(outcome.was_new);
         assert!(!outcome.inbound_decrypt_failed);
     }
@@ -3544,7 +3577,7 @@ mod tests {
             "date": "Wed, 21 May 2026 10:00:00 +0000"
         });
         let item = item_with_envelope("msg-date-norm", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-date-norm").unwrap().unwrap();
         let stored = cached.date.unwrap();
         assert!(
@@ -3601,7 +3634,7 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-new", &json);
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(outcome.was_new);
         assert!(!outcome.flags_changed);
         let cached = db.get_cached_message("msg-read-new").unwrap().unwrap();
@@ -3614,14 +3647,14 @@ mod tests {
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-read-sync", &json);
         item.is_read = Some(false);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert_eq!(
             db.get_cached_message("msg-read-sync").unwrap().unwrap().flags & 1,
             0
         );
 
         item.is_read = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!outcome.was_new);
         assert!(outcome.flags_changed);
         assert_eq!(
@@ -3629,7 +3662,7 @@ mod tests {
             1
         );
 
-        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let repeat = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!repeat.flags_changed, "no-op flag sync must not report change");
     }
 
@@ -3638,10 +3671,10 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let mut item = item_with_envelope("msg-star-sync", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
 
         item.is_starred = Some(true);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -3649,7 +3682,7 @@ mod tests {
         );
 
         item.is_starred = Some(false);
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(outcome.flags_changed);
         assert_eq!(
             db.get_cached_message("msg-star-sync").unwrap().unwrap().flags & 4,
@@ -3662,11 +3695,11 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b"});
         let item = item_with_envelope("msg-noflags", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let uid = db.get_cached_message("msg-noflags").unwrap().unwrap().imap_uid;
         db.update_message_flags(uid as i64, "inbox", 5).unwrap();
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!outcome.flags_changed);
         assert_eq!(db.get_cached_message("msg-noflags").unwrap().unwrap().flags, 5);
     }
@@ -3684,7 +3717,7 @@ mod tests {
             "raw_headers": [{"name": "Reply-To", "value": "Help Desk <desk@x.test>"}]
         });
         let item = item_with_envelope("msg-cc", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-cc").unwrap().unwrap();
         let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(meta["cc"], "Carol <carol@x.test>, \"Doe, John\" <john@x.test>");
@@ -3708,7 +3741,7 @@ mod tests {
             "reply_to": "list@old.example"
         });
         let item = item_with_envelope("msg-append-cc", &json);
-        assert!(cache_mail_item(&db, "sent", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "sent", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("msg-append-cc").unwrap().unwrap();
         let rendered = crate::message_render::render_text(&cached, &[]);
         assert!(rendered.contains("Cc: bob@old.example, eve@old.example\r\n"));
@@ -3740,7 +3773,7 @@ mod tests {
         });
         let item = item_with_envelope("msg-legacy-cc", &json);
 
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!outcome.was_new);
         assert!(outcome.flags_changed, "backfill must be reported so JMAP clients refetch");
         let cached = db.get_cached_message("msg-legacy-cc").unwrap().unwrap();
@@ -3751,7 +3784,7 @@ mod tests {
         assert_eq!(meta["message_id"], "<m@x.test>");
         assert_eq!(meta[ADDRESS_META_VERSION_KEY], 1);
 
-        let again = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let again = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!again.flags_changed);
         assert_eq!(db.get_cached_message("msg-legacy-cc").unwrap().unwrap().imap_uid, cached.imap_uid);
     }
@@ -3764,7 +3797,7 @@ mod tests {
         db.upsert_cached_message("msg-no-cc", "inbox", Some("s"), None, None, None, 1, Some("b"), Some("{\"is_html\":false}"))
             .unwrap();
         let uid = db.assign_uid_if_missing("inbox", "msg-no-cc").unwrap();
-        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+        let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         assert!(!outcome.flags_changed);
         let cached = db.get_cached_message("msg-no-cc").unwrap().unwrap();
         assert_eq!(cached.imap_uid, uid);
@@ -3781,7 +3814,7 @@ mod tests {
             access_token: zeroize::Zeroizing::new("stub".to_string()),
             refresh_token: None,
             vault_passphrase: b"pass".to_vec(),
-            identity_key: None,
+            identity_key: IK.map(str::to_string),
             ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
@@ -3791,6 +3824,23 @@ mod tests {
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
         }))
+    }
+
+    fn with_empty_drafts(app: axum::Router) -> axum::Router {
+        app.route(
+            "/mail/v1/drafts",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "items": [],
+                    "has_more": false,
+                    "next_cursor": serde_json::Value::Null
+                }))
+            }),
+        )
+        .route(
+            "/mail/v1/labels",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"labels": [], "has_more": false})) }),
+        )
     }
 
     async fn spawn_mock_list_server(items: Vec<serde_json::Value>) -> String {
@@ -3817,18 +3867,18 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         format!("http://127.0.0.1:{}", port)
     }
 
     fn server_item_json(id: &str, subject: &str) -> serde_json::Value {
-        let env = envelope_b64(&serde_json::json!({"subject": subject, "body_text": "b"}));
+        let (env, nonce) = sealed(&serde_json::json!({"subject": subject, "body_text": "b"}));
         serde_json::json!({
             "id": id,
             "item_type": "received",
             "encrypted_envelope": env,
-            "envelope_nonce": "",
+            "envelope_nonce": nonce,
             "folder_token": "tok",
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z"
@@ -4218,7 +4268,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
         let ids: Vec<String> = ["alive", "gone", "flaky", "gone-later"]
@@ -4273,14 +4323,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         format!("http://127.0.0.1:{}", port)
     }
 
     fn cache_dated(db: &Database, id: &str, date: &str) {
         let item = item_with_envelope(id, &serde_json::json!({"subject": id, "body_text": "b", "date": date}));
-        assert!(cache_mail_item(db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
     }
 
     #[tokio::test]
@@ -4327,7 +4377,7 @@ mod tests {
             "stale-1",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", IK, &[], &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-1", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -4367,7 +4417,7 @@ mod tests {
             "stale-2",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", IK, &[], &[]).was_new);
 
         let base = spawn_mock_list_server(vec![server_item_json("keep-2", "kept")]).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
@@ -4391,7 +4441,7 @@ mod tests {
             "stale-3",
             &serde_json::json!({"subject": "old", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &stale, b"pass", IK, &[], &[]).was_new);
 
         use axum::{routing::get, Router};
         let app = Router::new().route(
@@ -4401,7 +4451,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         let client = Arc::new(ApiClient::new_with_base_url(&format!(
             "http://127.0.0.1:{}",
@@ -4425,7 +4475,7 @@ mod tests {
             "read-on-web",
             &serde_json::json!({"subject": "s", "body_text": "b"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &unread, b"pass", IK, &[], &[]).was_new);
 
         let mut item = server_item_json("read-on-web", "s");
         item["is_read"] = serde_json::json!(true);
@@ -4452,7 +4502,7 @@ mod tests {
         let (_dir, db) = temp_db();
         let json = serde_json::json!({"subject": "s", "body_text": "b", "from": "a@b.c"});
         let item = item_with_envelope("shortcut-1", &json);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let states = db.cached_sync_states(&["shortcut-1", "missing"]).unwrap();
         assert_eq!(states.len(), 1);
         let state = states.get("shortcut-1").unwrap();
@@ -4489,7 +4539,7 @@ mod tests {
         let (_dir, db) = temp_db();
         for id in ["batch-a", "batch-b"] {
             let item = item_with_envelope(id, &serde_json::json!({"subject": "s", "body_text": "b"}));
-            cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]);
+            cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
         }
         let a = db.get_message_flags_by_id("batch-a").unwrap();
         let b = db.get_message_flags_by_id("batch-b").unwrap();
@@ -4512,7 +4562,7 @@ mod tests {
         let db = Arc::new(db);
         for id in ["same-1", "same-2", "starred-3"] {
             let item = item_with_envelope(id, &serde_json::json!({"subject": "s", "body_text": "b"}));
-            assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         }
         let before: Vec<_> = ["same-1", "same-2"]
             .iter()
@@ -4702,7 +4752,7 @@ mod tests {
                 ]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
 
         let cached = db.get_cached_message("described-attachments").unwrap().unwrap();
         let meta: serde_json::Value =
@@ -4724,7 +4774,7 @@ mod tests {
             "no-attachment-list",
             &serde_json::json!({"subject": "hi", "body_text": "plain"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("no-attachment-list").unwrap().unwrap();
         let meta: serde_json::Value =
             serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
@@ -4738,7 +4788,7 @@ mod tests {
             "no-attachments",
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
 
         let cached = db.get_cached_message("no-attachments").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("plain body"));
@@ -4886,7 +4936,7 @@ mod tests {
                 ]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
 
         let cached = db.get_cached_message("with-attachments").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("see attached"));
@@ -4917,7 +4967,7 @@ mod tests {
                 }]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("html-injection").unwrap().unwrap();
         assert_eq!(cached.body_text.as_deref(), Some("<p>hello</p>"));
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
@@ -4933,7 +4983,7 @@ mod tests {
                 "attachment_keys": [{"seq": 0, "key": "k0"}]
             }),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("only-attachments").unwrap().unwrap();
         assert!(cached.body_text.as_deref().unwrap_or("").is_empty());
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
@@ -4947,7 +4997,7 @@ mod tests {
             "no-attachments-state",
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("no-attachments-state").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
         assert!(db.list_attachment_backlog(10).unwrap().is_empty());
@@ -4961,7 +5011,7 @@ mod tests {
             &serde_json::json!({"subject": "hi", "body_text": "plain body"}),
         );
         item.attachment_count = Some(1);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         let cached = db.get_cached_message("count-only").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_PENDING);
         let meta: serde_json::Value =
@@ -5071,11 +5121,12 @@ mod tests {
     }
 
     fn server_item_with_envelope(id: &str, envelope: &serde_json::Value) -> serde_json::Value {
+        let (env, nonce) = sealed(envelope);
         serde_json::json!({
             "id": id,
             "item_type": "received",
-            "encrypted_envelope": envelope_b64(envelope),
-            "envelope_nonce": "",
+            "encrypted_envelope": env,
+            "envelope_nonce": nonce,
             "folder_token": "tok",
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z",
@@ -5127,7 +5178,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         (format!("http://127.0.0.1:{}", port), hits)
     }
@@ -5299,7 +5350,7 @@ mod tests {
             &client,
             "tok",
             b"pass",
-            None,
+            IK,
             &[],
             &[],
             &HashSet::new(),
@@ -5335,7 +5386,7 @@ mod tests {
             &client,
             "tok",
             b"pass",
-            None,
+            IK,
             &[],
             &[],
             &HashSet::new(),
@@ -5372,7 +5423,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, with_empty_drafts(app)).await;
         });
         let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
         let head = db.list_attachment_backlog(1).unwrap()[0].0.clone();
@@ -5382,7 +5433,7 @@ mod tests {
             &client,
             "tok",
             b"pass",
-            None,
+            IK,
             &[],
             &[],
             &HashSet::new(),

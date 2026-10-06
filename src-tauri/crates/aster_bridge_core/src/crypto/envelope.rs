@@ -73,7 +73,7 @@ pub fn decrypt_envelope_with_previous_keys(
     };
 
     if nonce_bytes.is_empty() {
-        return decrypt_pgp_or_plaintext(encrypted_data_b64, identity_key, previous_keys, passphrase);
+        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase);
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
@@ -202,7 +202,7 @@ fn decrypt_identity_key_envelope(
     ))
 }
 
-fn decrypt_pgp_or_plaintext(
+fn decrypt_pgp_envelope(
     encrypted_data_b64: &str,
     identity_key: Option<&str>,
     previous_keys: &[String],
@@ -218,11 +218,26 @@ fn decrypt_pgp_or_plaintext(
             return String::from_utf8(decrypted.to_vec())
                 .map_err(|e| BridgeError::Crypto(format!("PGP utf8: {}", e)));
         }
-
-        return Ok(text);
     }
 
-    Err(BridgeError::Crypto("cannot decrypt envelope".to_string()))
+    Err(BridgeError::Crypto("envelope is not encrypted".to_string()))
+}
+
+#[cfg(test)]
+pub(crate) const FIXTURE_IDENTITY_KEY: &str = "test-ik";
+
+#[cfg(test)]
+pub(crate) fn sealed_fixture(plaintext: &str) -> (String, String) {
+    use sha2::Digest;
+
+    let key = derive_envelope_key(FIXTURE_IDENTITY_KEY.as_bytes(), ENVELOPE_VERSION_DEFAULT.as_bytes()).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let digest = Sha256::digest(plaintext.as_bytes());
+    let nonce_bytes = &digest[..NONCE_LEN];
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(nonce_bytes), plaintext.as_bytes())
+        .unwrap();
+    (STANDARD.encode(ciphertext), STANDARD.encode(nonce_bytes))
 }
 
 pub(crate) fn decrypt_own_pgp(
@@ -306,19 +321,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_nonce_plaintext_json_envelope_returns_as_is() {
-        let json = r#"{"subject":"hello","body_text":"world"}"#;
+    fn an_unencrypted_envelope_is_refused() {
+        let json = r#"{"subject":"hello","body_text":"world","attachment_keys":[{"seq":0,"key":"AAAA"}]}"#;
         let b64 = STANDARD.encode(json.as_bytes());
-        let out = decrypt_envelope(&b64, Some(""), b"unused-pass", None, &[]).unwrap();
-        assert_eq!(out, json);
+        assert!(decrypt_envelope(&b64, Some(""), b"unused-pass", None, &[]).is_err());
+        assert!(decrypt_envelope(&b64, None, b"p", Some("ignored-ik"), &[]).is_err());
     }
 
     #[test]
-    fn empty_nonce_non_pgp_with_identity_key_still_returns_plaintext() {
+    fn a_sealed_fixture_opens_with_its_identity_key() {
         let json = r#"{"subject":"x"}"#;
-        let b64 = STANDARD.encode(json.as_bytes());
-        let out = decrypt_envelope(&b64, None, b"p", Some("ignored-ik"), &[]).unwrap();
+        let (data, nonce) = sealed_fixture(json);
+        let out = decrypt_envelope(&data, Some(&nonce), b"p", Some(FIXTURE_IDENTITY_KEY), &[]).unwrap();
         assert_eq!(out, json);
+        assert!(decrypt_envelope(&data, Some(&nonce), b"p", Some("another-key"), &[]).is_err());
     }
 
     fn build_pbkdf2_envelope(plaintext: &[u8], passphrase: &[u8]) -> String {
