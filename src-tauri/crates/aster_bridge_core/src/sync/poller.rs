@@ -563,36 +563,58 @@ async fn fetch_and_decrypt_attachments(
     let identity_key = identity_key.map(str::to_string);
     let previous_keys = Zeroizing::new(previous_keys.to_vec());
     tokio::task::spawn_blocking(move || {
-        let mut out: Vec<CachedAttachment> = Vec::with_capacity(rows.len());
-        for (position, row) in rows.iter().enumerate() {
-            let seq = row.seq_num as i64;
-            if out.iter().any(|a| a.seq == seq) {
-                continue;
-            }
-            let entry = entry_for_row(&entries, seq, position).map(key_entry);
-            let att = decrypt_attachment(
-                row,
-                entry.as_ref(),
-                &passphrase,
-                identity_key.as_deref(),
-                &previous_keys,
-            )
-                .map_err(classify_decrypt_error)?;
-            out.push(CachedAttachment {
-                seq: att.seq,
-                name: att.filename,
-                is_inline: att.is_inline || att.content_id.is_some(),
-                content_type: att.content_type,
-                content_id: att.content_id,
-                size: att.data.len() as i64,
-                data: att.data,
-            });
-        }
-        out.sort_by_key(|a| a.seq);
-        Ok::<Vec<CachedAttachment>, AttachmentFetchError>(out)
+        decrypt_listed_rows(
+            &rows,
+            &entries,
+            &passphrase,
+            identity_key.as_deref(),
+            &previous_keys,
+        )
     })
     .await
     .map_err(|e| AttachmentFetchError::Content(format!("attachment decrypt task: {}", e)))?
+}
+
+fn decrypt_listed_rows(
+    rows: &[crate::api_client::AttachmentResponse],
+    entries: &[EnvelopeAttachment],
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
+    let mut out: Vec<CachedAttachment> = Vec::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        let seq = row.seq_num as i64;
+        if out.iter().any(|a| a.seq == seq) {
+            continue;
+        }
+        let entry = entry_for_row(entries, seq, position).map(key_entry);
+        if entry.is_none() && !entries.is_empty() {
+            tracing::warn!(
+                "attachment row {} is not listed in the message envelope, skipping it",
+                seq
+            );
+            continue;
+        }
+        let att = decrypt_attachment(row, entry.as_ref(), passphrase, identity_key, previous_keys)
+            .map_err(classify_decrypt_error)?;
+        out.push(CachedAttachment {
+            seq: att.seq,
+            name: att.filename,
+            is_inline: att.is_inline || att.content_id.is_some(),
+            content_type: att.content_type,
+            content_id: att.content_id,
+            size: att.data.len() as i64,
+            data: att.data,
+        });
+    }
+    if out.is_empty() {
+        return Err(AttachmentFetchError::Permanent(
+            "no attachment row is listed in the message envelope".to_string(),
+        ));
+    }
+    out.sort_by_key(|a| a.seq);
+    Ok(out)
 }
 
 async fn refresh_attachment_keys(
@@ -4561,6 +4583,64 @@ mod tests {
             parsed.iter().map(|a| a.seq).collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(2)]
         );
+    }
+
+    fn sealed_row(seq: i16, key: &[u8; 32], plain: &[u8]) -> crate::api_client::AttachmentResponse {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+        let nonce = [seq as u8 + 1; 12];
+        let data = Aes256Gcm::new_from_slice(key)
+            .unwrap()
+            .encrypt(Nonce::from_slice(&nonce), plain)
+            .unwrap();
+        let meta = serde_json::json!({
+            "filename": format!("row-{}.bin", seq),
+            "content_type": "application/octet-stream",
+            "session_key": STANDARD.encode(key),
+        })
+        .to_string();
+        crate::api_client::AttachmentResponse {
+            id: format!("att-{}", seq),
+            mail_item_id: "mail-1".to_string(),
+            encrypted_data: STANDARD.encode(&data),
+            data_nonce: STANDARD.encode(nonce),
+            encrypted_meta: STANDARD.encode(meta.as_bytes()),
+            meta_nonce: STANDARD.encode([0u8; 12]),
+            size_bytes: data.len() as i64,
+            seq_num: seq,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn a_row_the_envelope_does_not_list_is_dropped() {
+        let listed_key = [7u8; 32];
+        let injected_key = [9u8; 32];
+        let rows = vec![
+            sealed_row(0, &listed_key, b"listed"),
+            sealed_row(1, &injected_key, b"injected by the server"),
+        ];
+        let entries = parse_envelope_attachments(&serde_json::json!({"attachment_keys": [
+            {"seq": 0, "key": STANDARD.encode(listed_key), "filename": "listed.txt", "size": 6}
+        ]}));
+        let out = decrypt_listed_rows(&rows, &entries, b"pass", None, &[])
+            .unwrap_or_else(|_| panic!("listed row must decrypt"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, 0);
+        assert_eq!(out[0].name, "listed.txt");
+        assert_eq!(out[0].data, b"listed");
+
+        let only_injected = vec![sealed_row(1, &injected_key, b"injected by the server")];
+        assert!(decrypt_listed_rows(&only_injected, &entries, b"pass", None, &[]).is_err());
+    }
+
+    #[test]
+    fn rows_are_all_read_when_the_envelope_lists_no_attachments() {
+        let rows = vec![sealed_row(0, &[1u8; 32], b"a"), sealed_row(1, &[2u8; 32], b"b")];
+        let out = decrypt_listed_rows(&rows, &[], b"pass", None, &[])
+            .unwrap_or_else(|_| panic!("legacy rows must decrypt"));
+        assert_eq!(out.len(), 2);
     }
 
     #[test]

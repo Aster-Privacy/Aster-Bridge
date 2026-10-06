@@ -246,10 +246,10 @@ pub fn decrypt_attachment(
     }
     let row_meta = row_meta.unwrap_or_default();
 
-    let session_key = row_meta
-        .session_key
-        .clone()
-        .or_else(|| entry_key.map(str::to_string));
+    let session_key = match entry_key {
+        Some(key) => Some(key.to_string()),
+        None => row_meta.session_key.clone(),
+    };
 
     let content_type = normalize_content_type(
         entry
@@ -288,6 +288,13 @@ pub fn decrypt_attachment(
         return Err(BridgeError::Crypto(
             "attachment payload is empty".to_string(),
         ));
+    }
+    if let Some(expected) = entry.and_then(|e| e.size) {
+        if expected != data.len() as i64 {
+            return Err(BridgeError::Crypto(
+                "attachment size does not match the envelope".to_string(),
+            ));
+        }
     }
 
     Ok(DecryptedAttachment {
@@ -717,6 +724,56 @@ mod tests {
         assert_eq!(out.filename, "from-envelope.bin");
         assert_eq!(out.content_type, "application/octet-stream");
         assert_eq!(out.data, plain);
+    }
+
+    #[test]
+    fn a_row_key_never_overrides_the_envelope_key() {
+        let envelope_key = random_key();
+        let server_key = random_key();
+        let nonce = random_nonce();
+        let forged = seal(&server_key, &nonce, b"swapped bytes", b"");
+        let meta = serde_json::json!({
+            "filename": "invoice.pdf",
+            "content_type": "application/pdf",
+            "session_key": STANDARD.encode(server_key)
+        })
+        .to_string();
+        let entry = AttachmentKeyEntry {
+            key: Some(STANDARD.encode(envelope_key)),
+            ..Default::default()
+        };
+        let r = row(0, &forged, &nonce, meta.as_bytes(), &[0u8; 12]);
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
+
+        let genuine = seal(&envelope_key, &nonce, b"real bytes", b"");
+        let r = row(0, &genuine, &nonce, meta.as_bytes(), &[0u8; 12]);
+        let out = decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).unwrap();
+        assert_eq!(out.data, b"real bytes");
+    }
+
+    #[test]
+    fn stored_plaintext_is_refused_when_the_envelope_carries_a_key() {
+        let entry = AttachmentKeyEntry {
+            key: Some(STANDARD.encode(random_key())),
+            ..Default::default()
+        };
+        let r = row(0, b"raw stored bytes plus a tag", &[0u8; 12], b"", &[0u8; 12]);
+        assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
+    }
+
+    #[test]
+    fn a_size_that_differs_from_the_envelope_is_refused() {
+        let key = random_key();
+        let nonce = random_nonce();
+        let ct = seal(&key, &nonce, b"12345", b"");
+        let r = row(0, &ct, &nonce, b"", &[0u8; 12]);
+        let entry = |size| AttachmentKeyEntry {
+            key: Some(STANDARD.encode(key)),
+            size: Some(size),
+            ..Default::default()
+        };
+        assert!(decrypt_attachment(&r, Some(&entry(4)), b"pass", None, &[]).is_err());
+        assert!(decrypt_attachment(&r, Some(&entry(5)), b"pass", None, &[]).is_ok());
     }
 
     #[test]
