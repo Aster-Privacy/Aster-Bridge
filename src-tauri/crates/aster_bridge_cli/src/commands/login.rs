@@ -95,7 +95,7 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
         }
     };
 
-    show_code(&out, &pending, no_wait);
+    show_code(&out, &pending, &device_identity::device_fingerprint(&identity), no_wait);
     if no_wait {
         return Ok(EXIT_OK);
     }
@@ -118,13 +118,14 @@ fn format_remaining(expires_at: i64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-fn show_code(out: &Output, pending: &PendingLogin, no_wait: bool) {
+fn show_code(out: &Output, pending: &PendingLogin, fingerprint: &str, no_wait: bool) {
     if out.json {
         out.json(json!({
             "status": "pending",
             "code": pending.code,
             "url": LINK_DEVICE_URL,
             "expires_at": pending.expires_at,
+            "device_fingerprint": fingerprint,
         }));
         return;
     }
@@ -138,6 +139,9 @@ fn show_code(out: &Output, pending: &PendingLogin, no_wait: bool) {
     out.line(format!("  {} Enter this code:", out.accent("2.")));
     out.blank();
     out.line(format!("      {}", out.heading(&pending.code)));
+    out.blank();
+    out.line(format!("  Device fingerprint: {}", out.bold(fingerprint)));
+    out.line("  If Aster Mail shows a device fingerprint when you enter the code, make sure that it matches this one before you approve the device.");
     out.blank();
     if no_wait {
         out.line(format!(

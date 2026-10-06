@@ -136,6 +136,7 @@ export async function get_user_preferences(): Promise<UserPreferences> {
 export interface SetupCode {
   code: string;
   expires_in: number;
+  device_fingerprint: string;
 }
 
 export async function get_setup_code(): Promise<SetupCode> {
@@ -244,6 +245,11 @@ export async function open_data_directory(): Promise<void> {
 export interface ServiceSettings {
   service_mode: boolean;
   autostart: boolean;
+  require_post_quantum: boolean;
+}
+
+export async function set_require_post_quantum(enabled: boolean): Promise<void> {
+  return tauri_invoke("set_require_post_quantum", { enabled });
 }
 
 export async function get_service_settings(): Promise<ServiceSettings> {
@@ -320,6 +326,10 @@ export async function open_url(url: string): Promise<void> {
 
 export async function trigger_sync(): Promise<void> {
   return tauri_invoke("trigger_sync");
+}
+
+export async function accept_recipient_key(address: string): Promise<boolean> {
+  return tauri_invoke("accept_recipient_key", { address });
 }
 
 export async function repair_cache(): Promise<void> {

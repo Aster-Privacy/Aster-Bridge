@@ -350,6 +350,12 @@ mod tests {
     fn values_are_parsed_by_type() {
         assert_eq!(parse_value("tls_enabled", &json!(true), "off").unwrap(), json!(false));
         assert!(parse_value("tls_enabled", &json!(true), "maybe").is_err());
+        let settings = visible_settings(&BridgeConfig::default()).unwrap();
+        assert_eq!(settings.get("require_post_quantum"), Some(&json!(false)));
+        assert_eq!(
+            parse_value("require_post_quantum", &json!(false), "on").unwrap(),
+            json!(true)
+        );
         assert_eq!(parse_value("imap_port", &json!(1143), " 2143 ").unwrap(), json!(2143));
         assert!(parse_value("imap_port", &json!(1143), "143").is_err());
         assert!(parse_value("imap_port", &json!(1143), "5432").is_err());

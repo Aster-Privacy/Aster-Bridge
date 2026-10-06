@@ -696,6 +696,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NOW: u64 = 1_790_000_000;
+    const IK: Option<&str> = Some(crate::crypto::envelope::FIXTURE_IDENTITY_KEY);
     const DB_KEY: [u8; 32] = [9u8; 32];
 
     fn open_db(dir: &std::path::Path) -> Arc<Database> {
@@ -711,7 +712,7 @@ mod tests {
             access_token: Zeroizing::new("stub".to_string()),
             refresh_token: None,
             vault_passphrase: b"pass".to_vec(),
-            identity_key: None,
+            identity_key: IK.map(str::to_string),
             ratchet_identity_public: None,
             ratchet_keys: Vec::new(),
             inbound_keys: Vec::new(),
@@ -750,7 +751,6 @@ mod tests {
         let mut item = serde_json::json!({
             "id": item_id(n),
             "item_type": "received",
-            "envelope_nonce": "",
             "folder_token": "tok",
             "is_external": false,
             "created_at": date,
@@ -769,7 +769,9 @@ mod tests {
             item["has_attachments"] = serde_json::json!(true);
             item["attachment_count"] = serde_json::json!(1);
         }
-        item["encrypted_envelope"] = serde_json::json!(STANDARD.encode(envelope.to_string()));
+        let (encrypted_envelope, envelope_nonce) = crate::crypto::envelope::sealed_fixture(&envelope.to_string());
+        item["encrypted_envelope"] = serde_json::json!(encrypted_envelope);
+        item["envelope_nonce"] = serde_json::json!(envelope_nonce);
         item
     }
 
@@ -854,6 +856,14 @@ mod tests {
             let single = self.clone();
             let files = self.clone();
             let app = Router::new()
+                .route(
+                    "/mail/v1/drafts",
+                    get(|| async { Json(serde_json::json!({"items": [], "has_more": false, "next_cursor": serde_json::Value::Null})) }),
+                )
+                .route(
+                    "/mail/v1/labels",
+                    get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+                )
                 .route(
                     "/mail/v1/attachments/by-mail/:id",
                     get(move |Path(id): Path<String>| {
@@ -1125,9 +1135,9 @@ mod tests {
         backend.items.lock().unwrap().push(alive);
         let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
         let item: MailItem = serde_json::from_value(archive_item(7)).unwrap();
-        assert!(cache_mail_item(&db, "archive", &item, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "archive", &item, b"pass", IK, &[], &[]).was_new);
         let gone: MailItem = serde_json::from_value(archive_item(8)).unwrap();
-        assert!(cache_mail_item(&db, "archive", &gone, b"pass", None, &[], &[]).was_new);
+        assert!(cache_mail_item(&db, "archive", &gone, b"pass", IK, &[], &[]).was_new);
         db.stamp_listing_members("archive", &[queued.as_str(), gone.id.as_str()], 1).unwrap();
         assert_eq!(db.finish_listing_sweep("archive", 2).unwrap(), 2);
 
@@ -1148,7 +1158,7 @@ mod tests {
         let session = session();
         let gone: MailItem = serde_json::from_value(archive_item(99)).unwrap();
         for item in [serde_json::from_value::<MailItem>(archive_item(7)).unwrap(), gone.clone()] {
-            assert!(cache_mail_item(&db, "custom-gone", &item, b"pass", None, &[], &[]).was_new);
+            assert!(cache_mail_item(&db, "custom-gone", &item, b"pass", IK, &[], &[]).was_new);
         }
         db.stamp_listing_members("custom-gone", &[item_id(7).as_str(), gone.id.as_str()], 1)
             .unwrap();
@@ -1485,7 +1495,11 @@ mod tests {
     }
 
     fn fetch_line(response: &str) -> String {
-        response.lines().find(|l| l.starts_with("* ")).unwrap_or_default().to_string()
+        response
+            .lines()
+            .find(|l| l.starts_with("* ") && !l.starts_with("* OK "))
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn rfc822_size(response: &str) -> usize {
@@ -1844,7 +1858,7 @@ mod tests {
 
         run_sync_pass(&session, &client, &db, None, true).await.unwrap();
         while !db.list_attachment_backlog(1).unwrap().is_empty() {
-            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, None, &[], &[], &HashSet::new()).await;
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], &HashSet::new()).await;
         }
         let (recent_disk, recent_live) = database_bytes(&db, dir.path());
         let lists_before = backend.list_calls.load(Ordering::SeqCst);
@@ -1874,7 +1888,7 @@ mod tests {
         .unwrap();
         let backlog_started = std::time::Instant::now();
         while !db.list_attachment_backlog(1).unwrap().is_empty() {
-            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, None, &[], &[], &HashSet::new()).await;
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], &HashSet::new()).await;
         }
         let backlog_in = backlog_started.elapsed();
         let backlog_files = backend.attachment_requests() - files_before - history_files;

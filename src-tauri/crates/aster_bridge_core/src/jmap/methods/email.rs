@@ -170,7 +170,7 @@ fn serialize_email(
                     "value": format!(
                         "{}{}",
                         body,
-                        crate::message_render::sender_unverified_suffix(&meta, is_html)
+                        crate::message_render::trust_note_suffix(&meta, is_html)
                     ),
                     "isEncodingProblem": false,
                     "isTruncated": false,
@@ -1447,6 +1447,16 @@ mod tests {
         let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
         assert!(value.starts_with("this is the body text here\r\n\r\n"));
         assert!(value.ends_with(crate::message_render::SENDER_UNVERIFIED_NOTE));
+    }
+
+    #[test]
+    fn serialize_email_marks_a_message_stored_without_encryption() {
+        let mut m = cached("e8", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "not_end_to_end_encrypted": true}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
+        let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
+        assert!(value.starts_with("this is the body text here\r\n\r\n"));
+        assert!(value.ends_with(crate::message_render::NOT_END_TO_END_ENCRYPTED_NOTE));
     }
 
     #[tokio::test]

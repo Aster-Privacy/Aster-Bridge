@@ -194,7 +194,18 @@ pub struct PrekeyBundle {
     pub kem_identity_key: String,
     pub signed_prekey: String,
     #[serde(default)]
+    pub signed_prekey_signature: Option<String>,
+    #[serde(default)]
     pub pq_prekey: Option<BundlePqPrekey>,
+    #[serde(default)]
+    pub pq_kem_public_key: Option<String>,
+    #[serde(default)]
+    pub x3dh_max_version: Option<i16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecipientPublicKey {
+    pub public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -988,6 +999,54 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn find_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<PrekeyBundle>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_recipient_public_key(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<String>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/keys/public/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: RecipientPublicKey = resp.json().await.map_err(BridgeError::from)?;
+        let key = body.public_key.trim().to_string();
+        Ok(if key.is_empty() { None } else { Some(key) })
     }
 
     pub async fn report_envelope_capability(

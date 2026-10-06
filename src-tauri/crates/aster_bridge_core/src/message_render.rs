@@ -381,8 +381,24 @@ pub fn sender_unverified(meta: &serde_json::Value) -> bool {
     meta.get("sender_unverified").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-pub fn sender_unverified_suffix(meta: &serde_json::Value, is_html: bool) -> String {
-    note_suffix(sender_unverified(meta).then_some(SENDER_UNVERIFIED_NOTE), is_html)
+pub const NOT_END_TO_END_ENCRYPTED_NOTE: &str = "[Aster stored this message without end-to-end encryption, so Aster Bridge could not confirm that its content is unchanged. Before you act on it, check with the sender another way.]";
+pub const NOT_END_TO_END_ENCRYPTED_FLAG: &str = "not_end_to_end_encrypted";
+
+pub fn not_end_to_end_encrypted(meta: &serde_json::Value) -> bool {
+    meta.get(NOT_END_TO_END_ENCRYPTED_FLAG)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn trust_note_suffix(meta: &serde_json::Value, is_html: bool) -> String {
+    format!(
+        "{}{}",
+        note_suffix(
+            not_end_to_end_encrypted(meta).then_some(NOT_END_TO_END_ENCRYPTED_NOTE),
+            is_html
+        ),
+        note_suffix(sender_unverified(meta).then_some(SENDER_UNVERIFIED_NOTE), is_html)
+    )
 }
 
 pub fn strip_legacy_note(body: &str) -> Option<String> {
@@ -705,7 +721,7 @@ pub fn render(
         body_len_hint: msg.size.max(0) as usize,
         suffix: format!(
             "{}{}",
-            sender_unverified_suffix(&meta, is_html),
+            trust_note_suffix(&meta, is_html),
             note_suffix(note.as_deref(), is_html)
         ),
         is_html,
@@ -880,6 +896,21 @@ mod tests {
         }
         assert!(matches!(to_crlf("a\r\nb"), std::borrow::Cow::Borrowed(_)));
         assert_eq!(to_crlf("a\nb\rc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn a_message_stored_without_encryption_shows_a_note_in_text_and_html() {
+        let plain = msg(Some("hello"), Some("{\"is_html\":false,\"not_end_to_end_encrypted\":true}"), 0);
+        let r = render(&plain, &[], true);
+        assert!(r.text.ends_with(&format!("hello\r\n\r\n{}", NOT_END_TO_END_ENCRYPTED_NOTE)));
+        assert_eq!(rendered_size(&plain, &[]), r.text.len());
+
+        let html = msg(Some("<p>hi</p>"), Some("{\"is_html\":true,\"not_end_to_end_encrypted\":true}"), 0);
+        let r = render(&html, &[], true);
+        assert!(r.text.contains("<p>hi</p>\r\n<p>[Aster stored this message without end-to-end encryption"));
+
+        let sealed = msg(Some("hello"), Some("{\"is_html\":false}"), 0);
+        assert!(!render(&sealed, &[], true).text.contains("without end-to-end encryption"));
     }
 
     #[test]

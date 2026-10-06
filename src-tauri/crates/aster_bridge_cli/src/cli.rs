@@ -125,6 +125,8 @@ pub enum Command {
     Config(ConfigCommand),
     #[command(about = "Rebuild the local mail cache")]
     RepairCache,
+    #[command(subcommand, about = "Accept a recipient's changed encryption key")]
+    RecipientKey(RecipientKeyCommand),
     #[command(subcommand, about = "Run Aster Bridge in the background at sign-in")]
     Service(ServiceCommand),
     #[command(about = "Explain an error code")]
@@ -155,6 +157,15 @@ pub enum OutboxCommand {
     List,
     #[command(about = "Try sending queued messages again")]
     Retry { id: Option<i64> },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecipientKeyCommand {
+    #[command(about = "Trust the key a recipient publishes now, after you confirm the change with them")]
+    Accept {
+        #[arg(value_name = "ADDRESS", help = "The recipient's email address")]
+        address: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -195,6 +206,16 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn recipient_key_accept_takes_one_address() {
+        let cli = Cli::try_parse_from(["aster-bridge", "recipient-key", "accept", "bob@astermail.org"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RecipientKey(RecipientKeyCommand::Accept { ref address }) if address == "bob@astermail.org"
+        ));
+        assert!(Cli::try_parse_from(["aster-bridge", "recipient-key", "accept"]).is_err());
     }
 
     #[test]

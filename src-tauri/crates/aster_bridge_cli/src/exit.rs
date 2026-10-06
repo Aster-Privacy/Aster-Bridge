@@ -38,6 +38,7 @@ pub const CODE_SETTINGS_READ: &str = "settings_read_failed";
 pub const CODE_SETTINGS_WRITE: &str = "settings_write_failed";
 pub const CODE_CACHE_REBUILD: &str = "cache_rebuild_failed";
 pub const CODE_SYNC: &str = "sync_failed";
+pub const CODE_RECIPIENT_KEY: &str = "recipient_key_update_failed";
 pub const CODE_OUTBOX_READ: &str = "outbox_read_failed";
 pub const CODE_OUTBOX_NOT_FOUND: &str = "outbox_message_not_found";
 pub const CODE_OUTBOX_RETRY: &str = "outbox_retry_failed";
@@ -268,6 +269,13 @@ pub const CATALOG: &[ErrorDoc] = &[
         exit_code: EXIT_ERROR,
         summary: "Aster Bridge is taking longer than expected to finish the request.",
         resolution: "The work keeps going in the background. To check on it, run: aster-bridge status",
+    },
+    ErrorDoc {
+        reference: "ASTER-1027",
+        code: CODE_RECIPIENT_KEY,
+        exit_code: EXIT_ERROR,
+        summary: "Aster Bridge can't update the saved encryption key for that recipient.",
+        resolution: "Check the free space on the disk that holds the data folder, then run the command again.",
     },
     ErrorDoc {
         reference: "ASTER-2000",

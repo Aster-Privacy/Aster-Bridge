@@ -628,6 +628,11 @@ impl Shared {
                     .map_err(|e| CliError::coded(CODE_SYNC, format!("The cache was rebuilt, but sync didn't finish: {}", e)))?;
                 Ok(json!({ "repaired": true, "synced": true }))
             }
+            "recipient_key_accept" => common::recipient_key_accept(
+                &self.db,
+                &state::load(&self.data_dir),
+                args.get("address").and_then(Value::as_str).unwrap_or_default(),
+            ),
             "app_password_create" => common::app_password_create(
                 &self.passwords,
                 &state::load(&self.data_dir),

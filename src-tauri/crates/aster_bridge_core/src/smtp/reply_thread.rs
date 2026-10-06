@@ -368,7 +368,7 @@ pub fn sent_envelope(payload: &Value, from_email: &str, plain_text: Option<&str>
         .get("sender_display_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    json!({
+    let mut envelope = json!({
         "version": 1,
         "subject": payload.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
         "body_text": body_text,
@@ -378,7 +378,12 @@ pub fn sent_envelope(payload: &Value, from_email: &str, plain_text: Option<&str>
         "cc": address_objects(payload, "cc"),
         "bcc": address_objects(payload, "bcc"),
         "sent_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-    })
+    });
+    let manifest = crate::crypto::attachment::send_attachment_manifest(payload);
+    if !manifest.is_empty() {
+        envelope[crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD] = Value::Array(manifest);
+    }
+    envelope
 }
 
 pub fn attach_sent_copy(
@@ -656,6 +661,34 @@ mod tests {
     fn html_to_text_drops_tags_scripts_and_entities() {
         let text = html_to_text("<html><head><style>p{}</style></head><body><p>One &amp; two</p><script>x()</script><div>Three<br>Four</div></body></html>");
         assert_eq!(text, "One & two\nThree\nFour");
+    }
+
+    #[test]
+    fn the_sent_copy_envelope_lists_the_attachments_it_was_sent_with() {
+        let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
+        assert!(sent_envelope(&payload, "me@aster.test", None)
+            .get("attachment_manifest")
+            .is_none());
+        let sealed = crate::crypto::attachment::seal_send_attachments(
+            &[crate::crypto::attachment::OutgoingAttachment {
+                name: "notes.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                content_id: None,
+                is_inline: false,
+                data: b"notes".to_vec(),
+            }],
+            b"vault-pass",
+        )
+        .unwrap();
+        payload["attachments"] = Value::Array(sealed);
+        let envelope = sent_envelope(&payload, "me@aster.test", None);
+        let manifest = envelope["attachment_manifest"].as_array().expect("manifest");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0]["seq"], 0);
+        assert_eq!(manifest[0]["filename"], "notes.txt");
+        assert_eq!(manifest[0]["size"], 5);
+        assert_eq!(manifest[0]["sha256"], crate::crypto::attachment::sha256_hex(b"notes"));
+        assert!(envelope.get("attachment_keys").is_none());
     }
 
     #[test]

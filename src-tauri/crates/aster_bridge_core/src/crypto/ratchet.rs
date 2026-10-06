@@ -118,6 +118,52 @@ fn identity_public_sec1(secret_d: &[u8]) -> Result<Vec<u8>, String> {
     Ok(sk.public_key().to_encoded_point(false).as_bytes().to_vec())
 }
 
+struct PqContribution<'a> {
+    shared_secret: &'a [u8],
+    ciphertext: &'a [u8],
+    from_identity: bool,
+}
+
+struct Transcript<'a> {
+    initiator_identity: &'a [u8],
+    responder_identity: &'a [u8],
+}
+
+fn x3dh_shared_secret(
+    dh: [&[u8]; 3],
+    pq: Option<PqContribution<'_>>,
+    transcript: Option<Transcript<'_>>,
+) -> Result<Vec<u8>, String> {
+    let bound = transcript.is_some();
+    let mut ikm = Vec::with_capacity(128);
+    for part in dh {
+        ikm.extend_from_slice(part);
+    }
+    let info = match &pq {
+        Some(pq) => {
+            ikm.extend_from_slice(pq.shared_secret);
+            match (pq.from_identity, bound) {
+                (true, true) => X3DH_INFO_PQ_IDENTITY_V2,
+                (true, false) => X3DH_INFO_PQ_IDENTITY,
+                (false, true) => X3DH_INFO_PQ_V2,
+                (false, false) => X3DH_INFO_PQ,
+            }
+        }
+        None if bound => X3DH_INFO_CLASSICAL_V2,
+        None => X3DH_INFO_CLASSICAL,
+    };
+    if let Some(transcript) = transcript {
+        ikm.extend_from_slice(transcript.initiator_identity);
+        ikm.extend_from_slice(transcript.responder_identity);
+        if let Some(pq) = &pq {
+            ikm.extend_from_slice(pq.ciphertext);
+        }
+    }
+    let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32);
+    ikm.zeroize();
+    shared_secret
+}
+
 pub(crate) fn derive_x3dh_shared_secret(
     keys: &RatchetReceiverKeys,
     msg: &RatchetMessage,
@@ -132,39 +178,28 @@ pub(crate) fn derive_x3dh_shared_secret(
     let dh2 = ecdh_p256(&keys.identity_secret_d, &msg.ephemeral_public)?;
     let dh3 = ecdh_p256(&keys.signed_prekey_secret_d, &msg.ephemeral_public)?;
 
-    let mut ikm = Vec::with_capacity(128);
-    ikm.extend_from_slice(&dh1);
-    ikm.extend_from_slice(&dh2);
-    ikm.extend_from_slice(&dh3);
-
-    let (info, bound_ciphertext): (&[u8], Option<&[u8]>) = match (&msg.pq_ciphertext, &msg.pq_secret) {
-        (Some(ct), Some(sk)) => {
-            let mut pq_ss = ml_kem768_decapsulate(ct, sk)?;
-            ikm.extend_from_slice(&pq_ss);
-            pq_ss.zeroize();
-            let from_identity = msg.pq_key_id == Some(PQ_IDENTITY_KEY_ID);
-            let info = match (from_identity, transcript_bound) {
-                (true, true) => X3DH_INFO_PQ_IDENTITY_V2,
-                (true, false) => X3DH_INFO_PQ_IDENTITY,
-                (false, true) => X3DH_INFO_PQ_V2,
-                (false, false) => X3DH_INFO_PQ,
-            };
-            (info, Some(ct.as_slice()))
-        }
-        _ if transcript_bound => (X3DH_INFO_CLASSICAL_V2, None),
-        _ => (X3DH_INFO_CLASSICAL, None),
+    let mut pq_ss = match (&msg.pq_ciphertext, &msg.pq_secret) {
+        (Some(ct), Some(sk)) => Some(ml_kem768_decapsulate(ct, sk)?),
+        _ => None,
     };
+    let pq = match (&pq_ss, &msg.pq_ciphertext) {
+        (Some(shared_secret), Some(ciphertext)) => Some(PqContribution {
+            shared_secret,
+            ciphertext,
+            from_identity: msg.pq_key_id == Some(PQ_IDENTITY_KEY_ID),
+        }),
+        _ => None,
+    };
+    let responder_identity = identity_public_sec1(&keys.identity_secret_d)?;
+    let transcript = transcript_bound.then_some(Transcript {
+        initiator_identity: &msg.sender_identity_public,
+        responder_identity: &responder_identity,
+    });
 
-    if transcript_bound {
-        ikm.extend_from_slice(&msg.sender_identity_public);
-        ikm.extend_from_slice(&identity_public_sec1(&keys.identity_secret_d)?);
-        if let Some(ct) = bound_ciphertext {
-            ikm.extend_from_slice(ct);
-        }
+    let shared_secret = x3dh_shared_secret([&dh1, &dh2, &dh3], pq, transcript);
+    if let Some(secret) = pq_ss.as_mut() {
+        secret.zeroize();
     }
-
-    let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32);
-    ikm.zeroize();
     shared_secret
 }
 
@@ -406,6 +441,26 @@ pub fn encrypt_bootstrap(
     pq_key_id: Option<i32>,
     plaintext: &str,
 ) -> Result<RatchetMessage, String> {
+    encrypt_bootstrap_versioned(
+        sender_identity_secret_d,
+        recipient_identity_public,
+        recipient_signed_prekey_public,
+        recipient_pq_public,
+        pq_key_id,
+        false,
+        plaintext,
+    )
+}
+
+pub fn encrypt_bootstrap_versioned(
+    sender_identity_secret_d: &[u8],
+    recipient_identity_public: &[u8],
+    recipient_signed_prekey_public: &[u8],
+    recipient_pq_public: Option<&[u8]>,
+    pq_key_id: Option<i32>,
+    transcript_bound: bool,
+    plaintext: &str,
+) -> Result<RatchetMessage, String> {
     use ml_kem::kem::Encapsulate;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand_core::{OsRng, RngCore};
@@ -431,12 +486,7 @@ pub fn encrypt_bootstrap(
     let dh2 = ecdh_p256(ephemeral_d.as_slice(), recipient_identity_public)?;
     let dh3 = ecdh_p256(ephemeral_d.as_slice(), recipient_signed_prekey_public)?;
 
-    let mut ikm = Vec::with_capacity(128);
-    ikm.extend_from_slice(&dh1);
-    ikm.extend_from_slice(&dh2);
-    ikm.extend_from_slice(&dh3);
-
-    let (pq_ciphertext, out_key_id, info): (Option<Vec<u8>>, Option<i32>, &[u8]) =
+    let (pq_ciphertext, out_key_id, mut pq_ss): (Option<Vec<u8>>, Option<i32>, Option<Vec<u8>>) =
         match (recipient_pq_public, pq_key_id) {
             (Some(pq_pub), Some(kid)) => {
                 let encoded = ml_kem::Encoded::<EncapKey>::try_from(pq_pub)
@@ -445,19 +495,28 @@ pub fn encrypt_bootstrap(
                 let (ct, ss) = ek
                     .encapsulate(&mut OsRng)
                     .map_err(|e| format!("encapsulate: {:?}", e))?;
-                ikm.extend_from_slice(ss.as_slice());
-                let selected = if kid == PQ_IDENTITY_KEY_ID {
-                    X3DH_INFO_PQ_IDENTITY
-                } else {
-                    X3DH_INFO_PQ
-                };
-                (Some(ct.as_slice().to_vec()), Some(kid), selected)
+                (Some(ct.as_slice().to_vec()), Some(kid), Some(ss.as_slice().to_vec()))
             }
-            _ => (None, None, X3DH_INFO_CLASSICAL),
+            _ => (None, None, None),
         };
+    let pq = match (&pq_ss, &pq_ciphertext) {
+        (Some(shared_secret), Some(ciphertext)) => Some(PqContribution {
+            shared_secret,
+            ciphertext,
+            from_identity: out_key_id == Some(PQ_IDENTITY_KEY_ID),
+        }),
+        _ => None,
+    };
+    let transcript = transcript_bound.then_some(Transcript {
+        initiator_identity: &sender_identity_public,
+        responder_identity: recipient_identity_public,
+    });
 
-    let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32)?;
-    ikm.zeroize();
+    let shared_secret = x3dh_shared_secret([&dh1, &dh2, &dh3], pq, transcript);
+    if let Some(secret) = pq_ss.as_mut() {
+        secret.zeroize();
+    }
+    let shared_secret = shared_secret?;
 
     let sender_ratchet = SecretKey::random(&mut OsRng);
     let sender_ratchet_d = sender_ratchet.to_bytes();
@@ -491,7 +550,7 @@ pub fn encrypt_bootstrap(
         pq_ciphertext,
         pq_key_id: out_key_id,
         pq_secret: None,
-        x3dh_version: None,
+        x3dh_version: transcript_bound.then_some(X3DH_VERSION_TRANSCRIPT_BOUND),
     })
 }
 
@@ -670,6 +729,79 @@ mod tests {
             vector_secret(Some(2), true, true).unwrap(),
             "1ffb50c01be8f1aa988305dc1152a159a7ab59ad9f845e2f3f7544bf272af88a"
         );
+    }
+
+    struct Peer {
+        keys: RatchetReceiverKeys,
+        identity_public: Vec<u8>,
+        pq_public: Vec<u8>,
+        pq_secret: Vec<u8>,
+    }
+
+    fn peer() -> Peer {
+        let identity = SecretKey::random(&mut OsRng);
+        let prekey = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let prekey_public = prekey.public_key().to_encoded_point(false).as_bytes().to_vec();
+        Peer {
+            identity_public: identity.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            keys: RatchetReceiverKeys {
+                identity_secret_d: identity.to_bytes().to_vec(),
+                signed_prekey_secret_d: prekey.to_bytes().to_vec(),
+                signed_prekey_public: prekey_public,
+            },
+            pq_public: ek.as_bytes().to_vec(),
+            pq_secret: dk.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_bound_bootstrap_round_trips_on_every_lane() {
+        let sender = SecretKey::random(&mut OsRng);
+        for pq_key_id in [None, Some(7), Some(PQ_IDENTITY_KEY_ID)] {
+            let recipient = peer();
+            let mut message = encrypt_bootstrap_versioned(
+                sender.to_bytes().as_slice(),
+                &recipient.identity_public,
+                &recipient.keys.signed_prekey_public,
+                pq_key_id.map(|_| recipient.pq_public.as_slice()),
+                pq_key_id,
+                true,
+                "bound",
+            )
+            .unwrap();
+            assert_eq!(message.x3dh_version, Some(X3DH_VERSION_TRANSCRIPT_BOUND));
+            if pq_key_id.is_some() {
+                message.pq_secret = Some(recipient.pq_secret.clone());
+            }
+
+            assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "bound");
+
+            message.x3dh_version = None;
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unbound_bootstrap_stays_on_the_first_handshake_version() {
+        let sender = SecretKey::random(&mut OsRng);
+        let recipient = peer();
+        let mut message = encrypt_bootstrap(
+            sender.to_bytes().as_slice(),
+            &recipient.identity_public,
+            &recipient.keys.signed_prekey_public,
+            Some(recipient.pq_public.as_slice()),
+            Some(7),
+            "unbound",
+        )
+        .unwrap();
+        assert_eq!(message.x3dh_version, None);
+        message.pq_secret = Some(recipient.pq_secret.clone());
+
+        assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "unbound");
+
+        message.x3dh_version = Some(X3DH_VERSION_TRANSCRIPT_BOUND);
+        assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
     }
 
     #[test]

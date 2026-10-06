@@ -151,6 +151,7 @@ struct UserPreferencesResponse {
 struct SetupCodeResponse {
     code: String,
     expires_in: u64,
+    device_fingerprint: String,
 }
 
 #[derive(serde::Serialize)]
@@ -575,6 +576,7 @@ async fn get_setup_code(state: State<'_, AppState>) -> Result<SetupCodeResponse,
     Ok(SetupCodeResponse {
         code: code.code,
         expires_in: code.expires_in,
+        device_fingerprint: code.device_fingerprint,
     })
 }
 
@@ -1075,6 +1077,7 @@ async fn provision_bundle(
 struct ServiceSettingsResponse {
     service_mode: bool,
     autostart: bool,
+    require_post_quantum: bool,
 }
 
 #[tauri::command]
@@ -1085,6 +1088,7 @@ async fn get_service_settings(
     Ok(ServiceSettingsResponse {
         service_mode: guard.config.service_mode,
         autostart: guard.config.autostart,
+        require_post_quantum: guard.config.require_post_quantum,
     })
 }
 
@@ -1098,6 +1102,13 @@ async fn get_full_mail_history(state: State<'_, AppState>) -> Result<bool, Strin
 async fn set_full_mail_history(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
     guard.config.full_mail_history = enabled;
+    config::save_config(&guard.config)
+}
+
+#[tauri::command]
+async fn set_require_post_quantum(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    guard.config.require_post_quantum = enabled;
     config::save_config(&guard.config)
 }
 
@@ -1143,6 +1154,28 @@ async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
         Ok(Err(e)) => Err(e),
         Err(_) => Err("sync worker dropped completion channel".to_string()),
     }
+}
+
+#[tauri::command]
+async fn accept_recipient_key(state: State<'_, AppState>, address: String) -> Result<bool, String> {
+    let address = address.trim().to_lowercase();
+    let well_formed = !address.contains(char::is_whitespace)
+        && address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !well_formed {
+        return Err("invalid address".to_string());
+    }
+    let (db, account_id) = {
+        let guard = state.0.lock().await;
+        let session = guard
+            .session
+            .as_ref()
+            .ok_or_else(|| "not authenticated".to_string())?;
+        let account_id = session.read().await.user_id.to_string();
+        (guard.db.clone(), account_id)
+    };
+    aster_bridge_core::crypto::recipient_trust::accept_recipient_key(&db, &account_id, &address)
 }
 
 #[tauri::command]
@@ -1464,11 +1497,13 @@ fn main() {
             get_full_mail_history,
             set_full_mail_history,
             set_service_mode,
+            set_require_post_quantum,
             set_autostart,
             provision_bundle,
             take_pending_deep_link,
             trigger_sync,
             repair_cache,
+            accept_recipient_key,
             get_recent_logs,
             copy_diagnostic_bundle,
             outbox_list,

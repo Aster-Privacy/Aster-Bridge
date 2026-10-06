@@ -793,6 +793,7 @@ function SetupView({
   const { t } = useTranslation();
   const [state, set_state] = useState<SetupState>("idle");
   const [code, set_code] = useState<string | null>(null);
+  const [device_fingerprint, set_device_fingerprint] = useState("");
   const [time_left, set_time_left] = useState(0);
 
   const poll_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -818,6 +819,7 @@ function SetupView({
     try {
       const result = await api.get_setup_code();
       set_code(result.code);
+      set_device_fingerprint(result.device_fingerprint ?? "");
       const lifetime =
         result.expires_in > 0 ? result.expires_in : DEFAULT_CODE_LIFETIME;
       const expiry = Date.now() + lifetime * 1000;
@@ -927,6 +929,13 @@ function SetupView({
                   ))}
                 </div>
               </div>
+              {device_fingerprint && (
+                <div className="w-full mt-4 text-center">
+                  <span className="text-xs font-medium text-txt-muted">{t("setup_device_fingerprint")}</span>
+                  <p className="mt-1 text-sm font-mono font-semibold text-txt-primary select-text">{device_fingerprint}</p>
+                  <p className="mt-1 text-xs leading-relaxed text-txt-muted">{t("setup_device_fingerprint_hint")}</p>
+                </div>
+              )}
               <div className="flex items-center gap-3 w-full mt-6">
                 <Button className="flex-1" size="xl" variant="secondary" onClick={handle_copy_code}>{t("setup_copy_code")}</Button>
                 <Button className="flex-1" size="xl" variant="depth" onClick={() => api.open_url(LINK_DEVICE_URL)}>{t("setup_open_browser")}</Button>
@@ -1776,6 +1785,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [service_mode_loading, set_service_mode_loading] = useState(true);
   const [full_history, set_full_history] = useState(true);
   const [full_history_loading, set_full_history_loading] = useState(true);
+  const [require_post_quantum, set_require_post_quantum] = useState(false);
   const [update_info, set_update_info] = useState<UpdateInfo | null>(null);
   const [update_checking, set_update_checking] = useState(false);
   const [update_installing, set_update_installing] = useState(false);
@@ -1791,6 +1801,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const setup_display = use_frozen(setup_client);
   const [show_repair_modal, set_show_repair_modal] = useState(false);
   const [repairing, set_repairing] = useState(false);
+  const [show_recipient_key_modal, set_show_recipient_key_modal] = useState(false);
+  const [recipient_key_address, set_recipient_key_address] = useState("");
+  const [accepting_recipient_key, set_accepting_recipient_key] = useState(false);
   const [logs_open, set_logs_open] = useState(false);
   const [log_lines, set_log_lines] = useState<string[]>([]);
   const [logs_loading, set_logs_loading] = useState(false);
@@ -1847,6 +1860,24 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       show_toast(typeof e === "string" ? e : t("toast_repair_failed"), "error");
     }
     set_repairing(false);
+  };
+
+  const handle_accept_recipient_key = async () => {
+    const address = recipient_key_address.trim();
+    if (!/^[^\s@]+@[^\s@]+$/.test(address)) {
+      show_toast(t("toast_recipient_key_invalid"), "error");
+      return;
+    }
+    set_accepting_recipient_key(true);
+    try {
+      const accepted = await api.accept_recipient_key(address);
+      show_toast(t(accepted ? "toast_recipient_key_accepted" : "toast_recipient_key_none"), "success");
+      set_show_recipient_key_modal(false);
+      set_recipient_key_address("");
+    } catch {
+      show_toast(t("toast_recipient_key_failed"), "error");
+    }
+    set_accepting_recipient_key(false);
   };
 
   const handle_toggle_logs = async () => {
@@ -1907,6 +1938,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     api.get_service_settings().then((s) => {
       set_autostart(s.autostart);
       set_service_mode(s.service_mode);
+      set_require_post_quantum(s.require_post_quantum);
       set_autostart_loading(false);
       set_service_mode_loading(false);
     }).catch(() => {
@@ -1950,6 +1982,18 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_service_mode(!new_value);
       show_toast(t("toast_background_mode_failed"), "error");
+    }
+  };
+
+  const handle_toggle_require_post_quantum = async () => {
+    const new_value = !require_post_quantum;
+    set_require_post_quantum(new_value);
+    try {
+      await api.set_require_post_quantum(new_value);
+      show_toast(new_value ? t("toast_require_post_quantum_on") : t("toast_require_post_quantum_off"), "success");
+    } catch {
+      set_require_post_quantum(!new_value);
+      show_toast(t("toast_require_post_quantum_failed"), "error");
     }
   };
 
@@ -2048,6 +2092,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
         <SettingRow label={t("full_mail_history")} sublabel={t("full_mail_history_hint")}>
           <Toggle checked={full_history} disabled={full_history_loading} on_click={handle_toggle_full_history} />
+        </SettingRow>
+        <SettingRow label={t("require_post_quantum")} sublabel={t("require_post_quantum_hint")}>
+          <Toggle checked={require_post_quantum} disabled={service_mode_loading} on_click={handle_toggle_require_post_quantum} />
         </SettingRow>
       </SettingsGroup>
 
@@ -2239,6 +2286,19 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         <SettingRow
+          label={t("recipient_key")}
+          sublabel={t("recipient_key_sub")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          }
+        >
+          <Button variant="secondary" size="sm" onClick={() => set_show_recipient_key_modal(true)}>
+            {t("recipient_key_accept")}
+          </Button>
+        </SettingRow>
+        <SettingRow
           danger
           label={t("reset_bridge")}
           sublabel={t("reset_bridge_sub")}
@@ -2263,6 +2323,25 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalActions>
       </Modal>
 
+
+      <Modal open={show_recipient_key_modal} on_close={() => !accepting_recipient_key && set_show_recipient_key_modal(false)}>
+        <p className="text-base font-semibold text-txt-primary">{t("recipient_key_title")}</p>
+        <ModalBody>{t("recipient_key_body")}</ModalBody>
+        <input
+          type="email"
+          autoComplete="off"
+          spellCheck={false}
+          aria-label={t("recipient_key_address")}
+          placeholder={t("recipient_key_placeholder")}
+          value={recipient_key_address}
+          onChange={(e) => set_recipient_key_address(e.target.value)}
+          className="bridge_field w-full h-9 px-2.5 text-sm text-txt-primary"
+        />
+        <ModalActions>
+          <Button variant="ghost" size="md" disabled={accepting_recipient_key} onClick={() => set_show_recipient_key_modal(false)}>{t("cancel")}</Button>
+          <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_accept_recipient_key}>{t("recipient_key_accept")}</Button>
+        </ModalActions>
+      </Modal>
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>

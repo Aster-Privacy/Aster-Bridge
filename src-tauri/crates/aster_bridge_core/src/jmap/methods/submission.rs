@@ -314,6 +314,7 @@ pub async fn set(
                     &mut b,
                     &ctx.session,
                     &ctx.client,
+                    &ctx.db,
                     &access_token,
                 )
                 .await
