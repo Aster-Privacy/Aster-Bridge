@@ -26,7 +26,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, ImportProgress, PortConflict } from "@/api";
+import type { ConnectionInfo, HistoryProgress, ImportProgress, PortConflict } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -66,7 +66,13 @@ type SyncProgress = {
   total: number;
   folder_done?: number;
   folder_total?: number;
+  history?: boolean;
 };
+
+function history_as_sync_progress(p: HistoryProgress | null): SyncProgress | null {
+  if (!p || !p.active || p.total <= 0) return null;
+  return { folder: "", done: 0, total: 1, folder_done: p.indexed, folder_total: p.total, history: true };
+}
 
 function sync_bar_fraction(p: SyncProgress): number {
   if (p.total <= 0) return 0;
@@ -1362,7 +1368,7 @@ function ConfigPanel({
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
                 <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z" />
               </svg>
-              <span className="truncate">{t("syncing_folder", { folder: sync_progress.folder })}</span>
+              <span className="truncate">{sync_progress.history ? t("indexing_history") : t("syncing_folder", { folder: sync_progress.folder })}</span>
             </span>
             <span className="text-xs font-normal text-txt-muted tabular-nums flex-shrink-0 leading-none">
               {sync_progress.folder_total && sync_progress.folder_total > 0
@@ -1768,6 +1774,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [autostart_loading, set_autostart_loading] = useState(true);
   const [service_mode, set_service_mode] = useState(false);
   const [service_mode_loading, set_service_mode_loading] = useState(true);
+  const [full_history, set_full_history] = useState(true);
+  const [full_history_loading, set_full_history_loading] = useState(true);
   const [update_info, set_update_info] = useState<UpdateInfo | null>(null);
   const [update_checking, set_update_checking] = useState(false);
   const [update_installing, set_update_installing] = useState(false);
@@ -1911,6 +1919,28 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     import("@tauri-apps/api/app").then(({ getVersion }) => getVersion()).then(set_app_version).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    api.get_full_mail_history().then((enabled) => {
+      set_full_history(enabled);
+      set_full_history_loading(false);
+    }).catch(() => set_full_history_loading(false));
+  }, []);
+
+  const handle_toggle_full_history = async () => {
+    const new_value = !full_history;
+    set_full_history(new_value);
+    set_full_history_loading(true);
+    try {
+      await api.set_full_mail_history(new_value);
+      if (bridge_running) await api.restart_bridge();
+      show_toast(new_value ? t("toast_full_history_on") : t("toast_full_history_off"), "success");
+    } catch {
+      set_full_history(!new_value);
+      show_toast(t("toast_full_history_failed"), "error");
+    }
+    set_full_history_loading(false);
+  };
+
   const handle_toggle_service_mode = async () => {
     const new_value = !service_mode;
     set_service_mode(new_value);
@@ -2015,6 +2045,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
         <SettingRow label={t("run_in_background")} sublabel={t("run_in_background_hint")}>
           <Toggle checked={service_mode} disabled={service_mode_loading} on_click={handle_toggle_service_mode} />
+        </SettingRow>
+        <SettingRow label={t("full_mail_history")} sublabel={t("full_mail_history_hint")}>
+          <Toggle checked={full_history} disabled={full_history_loading} on_click={handle_toggle_full_history} />
         </SettingRow>
       </SettingsGroup>
 
@@ -2514,6 +2547,7 @@ export function BridgeApp() {
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
   const [sync_progress, set_sync_progress] = useState<SyncProgress | null>(null);
+  const [history_progress, set_history_progress] = useState<HistoryProgress | null>(null);
   const [import_progress, set_import_progress] = useState<ImportProgress | null>(null);
   const import_dismissed = useRef<number | null>(null);
   const apply_import_progress = useCallback((p: ImportProgress | null) => {
@@ -2615,6 +2649,9 @@ export function BridgeApp() {
           sync_visible.current = false;
           set_sync_progress(null);
         }, e.payload.failed ? 0 : 1200);
+      }),
+      listen_tauri<HistoryProgress>("history_progress", (e) => {
+        set_history_progress(e.payload.active ? e.payload : null);
       }),
       listen_tauri<ImportProgress>("import_progress", (e) => {
         apply_import_progress(e.payload);
@@ -2851,7 +2888,7 @@ export function BridgeApp() {
         on_sign_out={handle_sign_out} on_reset={handle_reset} on_retry_plan={load_state}
         has_bridge_access={has_bridge_access}
         plan_info_loaded={plan_info_loaded} outbox_count={outbox_count}
-        connected_since={connected_since} sync_progress={sync_progress} is_online={is_online}
+        connected_since={connected_since} sync_progress={sync_progress ?? history_as_sync_progress(history_progress)} is_online={is_online}
         import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
         port_conflict={port_conflict} on_use_alternate_ports={handle_use_alternate_ports}
       />

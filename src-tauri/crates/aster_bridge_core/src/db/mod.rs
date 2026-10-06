@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroize;
 
+mod history;
+
 const KEYRING_DB_USER: &str = "db-encryption-key-v1";
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -691,6 +693,11 @@ impl Database {
             [],
         );
         conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_folder_meta ON message_cache(
+                folder, aster_id, subject, sender, recipients, date, size, flags, raw_headers, thread_id, attachments_state
+             );",
+        ).map_err(|e| e.to_string())?;
+        conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_message_cache_attachments_state ON message_cache(attachments_state);
              UPDATE message_cache SET attachments_state = 1
               WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
@@ -698,6 +705,7 @@ impl Database {
 
         conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
         repair_outbox_table(conn)?;
+        conn.execute_batch(history::HISTORY_SCHEMA_SQL).map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
         ).map_err(|e| e.to_string())?;
@@ -1179,6 +1187,9 @@ impl Database {
             conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
             conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
             conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM listing_member WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM history_retry WHERE aster_id = ?1", [aster_id])?;
             Ok(())
         })
     }
@@ -2106,6 +2117,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM sync_state;",
             )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
             Ok(())
         })
     }
@@ -2128,6 +2140,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM outbox;",
             )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
             Ok(())
         });
         self.app_password_cache.clear();
@@ -2685,7 +2698,7 @@ impl Database {
             let mut stmt = conn.prepare(
                 "SELECT aster_id, folder FROM message_cache
                  WHERE attachments_state = ?1
-                 ORDER BY attachment_attempts ASC, created_at DESC LIMIT ?2",
+                 ORDER BY attachment_attempts ASC, date DESC, created_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(rusqlite::params![ATTACHMENTS_PENDING, limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2752,6 +2765,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM outbox;",
             )?;
+            tx.execute_batch(history::HISTORY_CLEAR_SQL)?;
             tx.commit()
         });
         self.app_password_cache.clear();
@@ -4099,6 +4113,22 @@ mod db_tests {
             .with_conn(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(revision, WIRE_SIZE_REVISION);
+    }
+
+    #[test]
+    fn folder_metadata_is_read_without_touching_message_bodies() {
+        let (_d, db) = open_db();
+        let plan: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "EXPLAIN QUERY PLAN SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.raw_headers, m.thread_id, m.attachments_state
+                     FROM message_cache m WHERE m.folder = 'archive'",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("COVERING INDEX idx_message_cache_folder_meta")), "{:?}", plan);
     }
 
     #[test]

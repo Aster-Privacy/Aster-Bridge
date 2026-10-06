@@ -35,6 +35,8 @@ use crate::db::{
 use crate::error::BridgeError;
 use crate::jmap::state::StateChange;
 
+mod history;
+
 const POLL_INTERVAL_SECS: u64 = 30;
 const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
 const TRIGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
@@ -921,6 +923,7 @@ pub(crate) struct CacheOutcome {
     was_new: bool,
     flags_changed: bool,
     inbound_decrypt_failed: bool,
+    decrypt_failed: bool,
 }
 
 fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
@@ -1048,6 +1051,7 @@ fn prepare_mail_item(
             was_new: false,
             flags_changed: flags_changed || addresses_added,
             inbound_decrypt_failed: false,
+            decrypt_failed: false,
         });
     }
 
@@ -1087,6 +1091,7 @@ fn prepare_mail_item(
             }
             return Prepared::Done(CacheOutcome {
                 inbound_decrypt_failed: inbound,
+                decrypt_failed: true,
                 ..CacheOutcome::default()
             });
         }
@@ -1243,6 +1248,7 @@ fn commit_mail_item(
         was_new,
         flags_changed: flags_changed && !was_new,
         inbound_decrypt_failed: false,
+        decrypt_failed: false,
     }
 }
 
@@ -2070,6 +2076,7 @@ fn target_folder(system_label: &str, item: &MailItem, known: &HashSet<String>) -
 
 struct FolderPage {
     label: String,
+    raw_ids: Vec<String>,
     items: Vec<MailItem>,
     total: usize,
     has_more: bool,
@@ -2112,6 +2119,8 @@ async fn run_sync_pass(
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
     let mut rate_limited = false;
+    let indexing_history = history::is_enabled(db);
+    let mut listing_totals: Vec<(String, usize)> = Vec::new();
 
     let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
@@ -2213,6 +2222,7 @@ async fn run_sync_pass(
                     q.cursor = cursor.clone();
                     client.list_mail(&access_token, &q).await.map(|resp| FolderPage {
                         label: folder_query.label.to_string(),
+                        raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
                         total: resp.total.max(0) as usize,
                         has_more: resp.has_more,
                         next_cursor: resp.next_cursor,
@@ -2226,6 +2236,7 @@ async fn run_sync_pass(
                         let fetched = resp.items.len();
                         FolderPage {
                             label: crate::folders::folder_label(&folder.label_token),
+                            raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
                             total: resp.total.max(0) as usize,
                             has_more: resp.has_more && fetched > 0,
                             next_cursor: (resp.has_more && fetched > 0).then(String::new),
@@ -2241,6 +2252,12 @@ async fn run_sync_pass(
             match page {
                 Ok(resp) => {
                     let folder_total = resp.total.min(max_per_folder);
+                    if indexing_history {
+                        if total_fetched == 0 {
+                            listing_totals.push((resp.label.clone(), resp.total));
+                        }
+                        history::stamp_listed(db, &resp.label, &resp.raw_ids);
+                    }
                     tracing::debug!(
                         "Synced {} page - {} items (total: {}, has_more: {})",
                         progress_label,
@@ -2277,6 +2294,11 @@ async fn run_sync_pass(
                         } else {
                             target_folder(&resp.label, item, &known_tokens)
                         };
+                        if indexing_history {
+                            if let Some(moved_from) = snapshot.get(&item.id).map(|s| &s.folder).filter(|f| **f != item_folder) {
+                                let _ = db.forget_listing_member(moved_from, &item.id);
+                            }
+                        }
                         if id_counts.get(item.id.as_str()) == Some(&1) {
                             let state = snapshot.get(&item.id);
                             match cached_shortcut(state, &item_folder, item) {
@@ -2597,6 +2619,11 @@ async fn run_sync_pass(
         let refs: Vec<&str> = destroyed_ids.iter().map(|s| s.as_str()).collect();
         let _ = db.jmap_record_destroyed_batch("Email", &refs);
     }
+    if indexing_history && deep && last_err.is_none() {
+        for (label, total) in &listing_totals {
+            history::note_listing_total(db, label, *total);
+        }
+    }
     if !updated_ids.is_empty() {
         let refs: Vec<&str> = updated_ids.iter().map(|s| s.as_str()).collect();
         let _ = db.jmap_record_updated_batch("Email", &refs);
@@ -2688,6 +2715,7 @@ pub enum PollExit {
 pub struct PollTuning {
     pub interval: std::time::Duration,
     pub plan_check_every: u32,
+    pub full_history: bool,
 }
 
 impl PollTuning {
@@ -2696,6 +2724,7 @@ impl PollTuning {
         Self {
             interval: std::time::Duration::from_secs(secs),
             plan_check_every: PLAN_CHECK_INTERVAL,
+            full_history: false,
         }
     }
 }
@@ -2728,6 +2757,13 @@ pub async fn run_poll_loop_tuned(
     tuning: PollTuning,
 ) -> PollExit {
     migrate_legacy_dates(&db);
+    let trimmed = history::apply_mode(&db, tuning.full_history);
+    if !trimmed.is_empty() {
+        let refs: Vec<&str> = trimmed.iter().map(String::as_str).collect();
+        let _ = db.jmap_record_destroyed_batch("Email", &refs);
+        history::broadcast(&db, jmap_broadcaster.as_ref());
+    }
+    let mut history_pacer = history::Pacer::new();
     report_envelope_capability(&session, &client).await;
     let interval_dur = tuning.interval;
     let plan_check_every = tuning.plan_check_every.max(1);
@@ -2745,7 +2781,9 @@ pub async fn run_poll_loop_tuned(
     };
 
     loop {
+        let history_at = history_pacer.next_at();
         tokio::select! {
+            biased;
             _ = interval.tick() => {
                 let now = tokio::time::Instant::now();
                 let elapsed = now.duration_since(last_tick);
@@ -2773,6 +2811,9 @@ pub async fn run_poll_loop_tuned(
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
                 paused_until = pause_after(&result, tokio::time::Instant::now());
+                if result.is_ok() {
+                    history_pacer.open();
+                }
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                     report_envelope_capability(&session, &client).await;
@@ -2806,6 +2847,9 @@ pub async fn run_poll_loop_tuned(
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
                 paused_until = pause_after(&result, tokio::time::Instant::now());
+                if result.is_ok() {
+                    history_pacer.open();
+                }
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                 }
@@ -2823,6 +2867,22 @@ pub async fn run_poll_loop_tuned(
                 interval.reset();
                 for done in waiting {
                     let _ = done.send(result.clone());
+                }
+            }
+            _ = tokio::time::sleep_until(history_at), if tuning.full_history && history_pacer.is_open() => {
+                if crate::auth::session::session_rejected()
+                    || sync_is_paused(paused_until, tokio::time::Instant::now())
+                {
+                    history_pacer.defer();
+                    continue;
+                }
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let outcome = history::step(&session, &client, &db, now_secs).await;
+                if let Some(until) = history_pacer.finish(outcome, &db, jmap_broadcaster.as_ref()) {
+                    paused_until = Some(until);
                 }
             }
         }
