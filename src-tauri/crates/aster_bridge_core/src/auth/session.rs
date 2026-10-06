@@ -506,6 +506,16 @@ pub async fn token_refresh_requested() {
     REFRESH_REQUESTED.notified().await;
 }
 
+static SESSION_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_session_rejected(rejected: bool) {
+    SESSION_REJECTED.store(rejected, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn session_rejected() -> bool {
+    SESSION_REJECTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn is_transient_refresh_error(error: &BridgeError) -> bool {
     match error {
         BridgeError::Network(_) => true,
