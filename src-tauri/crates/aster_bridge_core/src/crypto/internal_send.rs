@@ -274,6 +274,22 @@ async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
     })
 }
 
+fn sealed_plaintext(payload: &Value) -> String {
+    let body = payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let manifest = crate::crypto::attachment::send_attachment_manifest(payload);
+    if manifest.is_empty() {
+        return body.to_string();
+    }
+    let subject = payload
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    crate::crypto::ratchet_recovery::wrap_subject_bundle(subject, body, &manifest)
+}
+
 pub async fn seal_internal_body(
     payload: &mut Value,
     session: &Arc<RwLock<Session>>,
@@ -286,11 +302,7 @@ pub async fn seal_internal_body(
         return Ok(());
     }
 
-    let plaintext = payload
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let plaintext = sealed_plaintext(payload);
 
     let sender = sender_keys(session).await?;
     let mut routed: Vec<RoutedRecipient> = Vec::with_capacity(split.internal.len());
@@ -372,6 +384,32 @@ mod tests {
             "is_e2e_encrypted": false,
             "client_source": "bridge",
         })
+    }
+
+    #[test]
+    fn the_sealed_plaintext_lists_attachments_only_when_there_are_some() {
+        let mut payload = payload_with(vec!["user@astermail.org"]);
+        assert_eq!(sealed_plaintext(&payload), "<p>hello</p>");
+
+        let sealed = crate::crypto::attachment::seal_send_attachments(
+            &[crate::crypto::attachment::OutgoingAttachment {
+                name: "notes.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                content_id: None,
+                is_inline: false,
+                data: b"notes".to_vec(),
+            }],
+            b"pass",
+        )
+        .unwrap();
+        payload["attachments"] = Value::Array(sealed);
+        let opened = crate::crypto::ratchet_recovery::extract_subject_bundle(&sealed_plaintext(&payload));
+        assert_eq!(opened.subject.as_deref(), Some("Hi"));
+        assert_eq!(opened.body, "<p>hello</p>");
+        let manifest = opened.attachment_manifest.expect("manifest");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0]["filename"], "notes.txt");
+        assert_eq!(manifest[0]["sha256"], crate::crypto::attachment::sha256_hex(b"notes"));
     }
 
     #[test]

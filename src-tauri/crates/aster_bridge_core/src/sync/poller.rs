@@ -249,7 +249,7 @@ pub fn envelope_header(v: &serde_json::Value, name: &str) -> Option<String> {
 const DEFAULT_ATTACHMENT_CONTENT_TYPE: &str = "application/octet-stream";
 const ATTACHMENT_PLACEHOLDER_NAME: &str = "Attachment";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct EnvelopeAttachment {
     seq: Option<i64>,
     filename: Option<String>,
@@ -257,6 +257,9 @@ struct EnvelopeAttachment {
     content_id: Option<String>,
     size: Option<i64>,
     key: Option<String>,
+    sha256: Option<String>,
+    is_inline: Option<bool>,
+    from_manifest: bool,
 }
 
 fn json_trimmed_string(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -274,7 +277,44 @@ fn normalize_content_type(raw: Option<String>) -> String {
     }
 }
 
+fn parse_attachment_manifest(entries: &[serde_json::Value]) -> Vec<EnvelopeAttachment> {
+    let mut listed: Vec<EnvelopeAttachment> = Vec::new();
+    for entry in entries {
+        let Some(seq) = entry.get("seq").and_then(|x| x.as_i64()).filter(|n| *n >= 0) else {
+            continue;
+        };
+        let Some(key) = json_trimmed_string(entry, "key") else {
+            continue;
+        };
+        if listed.iter().any(|a| a.seq == Some(seq)) {
+            continue;
+        }
+        listed.push(EnvelopeAttachment {
+            seq: Some(seq),
+            filename: json_trimmed_string(entry, "filename"),
+            content_type: normalize_content_type(json_trimmed_string(entry, "content_type")),
+            content_id: json_trimmed_string(entry, "content_id"),
+            size: entry.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
+            key: Some(key),
+            sha256: json_trimmed_string(entry, "sha256").map(|h| h.to_ascii_lowercase()),
+            is_inline: Some(entry.get("is_inline").and_then(|x| x.as_bool()).unwrap_or(false)),
+            from_manifest: true,
+        });
+    }
+    listed.sort_by_key(|a| a.seq.unwrap_or(0));
+    listed
+}
+
 fn parse_envelope_attachments(v: &serde_json::Value) -> Vec<EnvelopeAttachment> {
+    if let Some(manifest) = v
+        .get(crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD)
+        .and_then(|x| x.as_array())
+    {
+        let listed = parse_attachment_manifest(manifest);
+        if !listed.is_empty() {
+            return listed;
+        }
+    }
     let Some(entries) = v.get("attachment_keys").and_then(|x| x.as_array()) else {
         return Vec::new();
     };
@@ -293,6 +333,7 @@ fn parse_envelope_attachments(v: &serde_json::Value) -> Vec<EnvelopeAttachment> 
             content_id: json_trimmed_string(entry, "content_id"),
             size: entry.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
             key: json_trimmed_string(entry, "key"),
+            ..Default::default()
         };
         match seq {
             Some(s) => {
@@ -378,6 +419,9 @@ fn key_entry(a: &EnvelopeAttachment) -> AttachmentKeyEntry {
         content_type: Some(a.content_type.clone()),
         content_id: a.content_id.clone(),
         size: a.size,
+        sha256: a.sha256.clone(),
+        is_inline: a.is_inline,
+        from_manifest: a.from_manifest,
     }
 }
 
@@ -400,6 +444,9 @@ fn cached_attachment_entries(raw_headers: Option<&str>) -> Vec<EnvelopeAttachmen
             content_id: json_trimmed_string(e, "cid"),
             size: e.get("size").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
             key: json_trimmed_string(e, "key"),
+            sha256: json_trimmed_string(e, "sha256"),
+            is_inline: e.get("inline").and_then(|x| x.as_bool()),
+            from_manifest: e.get("listed").and_then(|x| x.as_bool()).unwrap_or(false),
         })
         .collect()
 }
@@ -883,6 +930,15 @@ fn attachment_meta_json(attachments: &[EnvelopeAttachment]) -> serde_json::Value
                 }
                 if let Some(key) = &a.key {
                     map.insert("key".to_string(), serde_json::json!(key));
+                }
+                if let Some(sha256) = &a.sha256 {
+                    map.insert("sha256".to_string(), serde_json::json!(sha256));
+                }
+                if let Some(is_inline) = a.is_inline {
+                    map.insert("inline".to_string(), serde_json::json!(is_inline));
+                }
+                if a.from_manifest {
+                    map.insert("listed".to_string(), serde_json::json!(true));
                 }
                 serde_json::Value::Object(map)
             })
@@ -1669,12 +1725,83 @@ fn db_body_is_placeholder(db: &Database, aster_id: &str) -> bool {
     )
 }
 
+fn stored_attachment_matches(stored: &CachedAttachment, listed: &EnvelopeAttachment) -> bool {
+    let Some(expected) = listed.sha256.as_deref() else {
+        return false;
+    };
+    listed.size.is_none_or(|size| size == stored.data.len() as i64)
+        && expected.eq_ignore_ascii_case(&crate::crypto::attachment::sha256_hex(&stored.data))
+}
+
+fn relabeled_attachment(stored: &CachedAttachment, listed: &EnvelopeAttachment) -> CachedAttachment {
+    CachedAttachment {
+        seq: stored.seq,
+        name: listed.filename.clone().unwrap_or_else(|| {
+            crate::crypto::attachment::placeholder_filename(stored.seq, &listed.content_type)
+        }),
+        content_type: listed.content_type.clone(),
+        content_id: listed.content_id.clone(),
+        is_inline: listed.is_inline.unwrap_or(false) || listed.content_id.is_some(),
+        size: stored.data.len() as i64,
+        data: stored.data.clone(),
+    }
+}
+
+fn reconcile_listed_attachments(db: &Database, aster_id: &str, listed: &[EnvelopeAttachment]) {
+    let stored = db.get_message_attachments(aster_id).unwrap_or_default();
+    let verified: Option<Vec<CachedAttachment>> = if stored.len() == listed.len() {
+        listed
+            .iter()
+            .map(|entry| {
+                stored
+                    .iter()
+                    .find(|s| Some(s.seq) == entry.seq)
+                    .filter(|s| stored_attachment_matches(s, entry))
+                    .map(|s| relabeled_attachment(s, entry))
+            })
+            .collect()
+    } else {
+        None
+    };
+    match verified {
+        Some(list) => {
+            if let Err(e) = db.replace_message_attachments(aster_id, &list) {
+                tracing::warn!("attachment relabel for {} failed: {}", aster_id, e);
+            }
+        }
+        None => {
+            if !stored.is_empty() {
+                tracing::warn!(
+                    "stored attachments for {} do not match the sender's list; downloading them again",
+                    aster_id
+                );
+            }
+            if let Err(e) = db.replace_message_attachments(aster_id, &[]) {
+                tracing::warn!("attachment reset for {} failed: {}", aster_id, e);
+            }
+            let _ = db.set_attachments_state(aster_id, ATTACHMENTS_PENDING);
+        }
+    }
+}
+
 fn store_unsealed_message(
     db: &Database,
     aster_id: &str,
     bundle: &crate::crypto::ratchet_recovery::SubjectBundle,
 ) -> bool {
     let mut meta_map = cached_meta_map(db, aster_id).unwrap_or_default();
+    let listed = bundle
+        .attachment_manifest
+        .as_deref()
+        .map(parse_attachment_manifest)
+        .unwrap_or_default();
+    if !listed.is_empty() {
+        meta_map.insert(
+            "attachment_count".to_string(),
+            serde_json::json!(listed.len()),
+        );
+        meta_map.insert("attachments".to_string(), attachment_meta_json(&listed));
+    }
     meta_map.insert(
         "is_html".to_string(),
         serde_json::json!(looks_like_html(&bundle.body)),
@@ -1689,6 +1816,9 @@ fn store_unsealed_message(
     if let Err(e) = db.update_cached_body(aster_id, &bundle.body, Some(&meta)) {
         tracing::warn!("storing decrypted ratchet body for {} failed: {}", aster_id, e);
         return false;
+    }
+    if !listed.is_empty() {
+        reconcile_listed_attachments(db, aster_id, &listed);
     }
     if let Some(subject) = bundle.subject.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Err(e) = db.update_cached_subject(aster_id, subject) {
@@ -5668,6 +5798,119 @@ mod sealed_retry_tests {
         assert!(repair_cached_bundles(&db).is_empty());
     }
 
+    fn row_trusted_attachment(seq: i64, name: &str, data: &[u8]) -> CachedAttachment {
+        CachedAttachment {
+            seq,
+            name: name.to_string(),
+            content_type: "application/x-msdownload".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: data.len() as i64,
+            data: data.to_vec(),
+        }
+    }
+
+    fn manifest_bundle(data: &[u8]) -> SubjectBundle {
+        SubjectBundle {
+            subject: Some("Invoice".to_string()),
+            body: "see attached".to_string(),
+            sender_unverified: false,
+            attachment_manifest: Some(vec![serde_json::json!({
+                "seq": 0,
+                "key": "a2V5",
+                "size": data.len(),
+                "sha256": crate::crypto::attachment::sha256_hex(data),
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "is_inline": false,
+            })]),
+        }
+    }
+
+    #[test]
+    fn the_envelope_manifest_wins_over_attachment_keys() {
+        let envelope = serde_json::json!({
+            "attachment_keys": [{"seq": 0, "key": "b2xk", "filename": "old.bin"}],
+            "attachment_manifest": [
+                {"seq": 1, "key": "c2Vjb25k", "filename": "b.txt", "content_type": "text/plain", "sha256": "AB12", "size": 2},
+                {"seq": 0, "key": "Zmlyc3Q=", "filename": "a.txt", "content_type": "text/plain", "is_inline": true},
+                {"seq": 0, "key": "ZHVw"},
+                {"seq": 2},
+                {"key": "bm8gc2Vx"},
+            ],
+        });
+        let listed = parse_envelope_attachments(&envelope);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].filename.as_deref(), Some("a.txt"));
+        assert_eq!(listed[0].key.as_deref(), Some("Zmlyc3Q="));
+        assert_eq!(listed[0].is_inline, Some(true));
+        assert!(listed[0].from_manifest);
+        assert_eq!(listed[1].sha256.as_deref(), Some("ab12"));
+        assert_eq!(listed[1].is_inline, Some(false));
+
+        let cached = attachment_meta_json(&listed);
+        let raw = serde_json::json!({ "attachments": cached }).to_string();
+        assert_eq!(cached_attachment_entries(Some(&raw)), listed);
+
+        let keys_only = serde_json::json!({
+            "attachment_keys": [{"seq": 0, "key": "b2xk", "filename": "old.bin"}],
+            "attachment_manifest": [],
+        });
+        let fallback = parse_envelope_attachments(&keys_only);
+        assert_eq!(fallback.len(), 1);
+        assert!(!fallback[0].from_manifest);
+    }
+
+    #[test]
+    fn unsealing_relabels_stored_attachments_that_match_the_sender_list() {
+        let (_dir, db) = temp_db();
+        cache_sealed(&db, "sealed-ok");
+        db.replace_message_attachments(
+            "sealed-ok",
+            &[row_trusted_attachment(0, "invoice.pdf.exe", b"real invoice")],
+        )
+        .unwrap();
+        assert!(store_unsealed_message(&db, "sealed-ok", &manifest_bundle(b"real invoice")));
+        let stored = db.get_message_attachments("sealed-ok").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "invoice.pdf");
+        assert_eq!(stored[0].content_type, "application/pdf");
+        assert_eq!(stored[0].data, b"real invoice");
+        assert_eq!(db.attachments_state("sealed-ok").unwrap(), ATTACHMENTS_STORED);
+        let cached = db.get_cached_message("sealed-ok").unwrap().unwrap();
+        let entries = cached_attachment_entries(cached.raw_headers.as_deref());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].from_manifest);
+        assert_eq!(entries[0].key.as_deref(), Some("a2V5"));
+    }
+
+    #[test]
+    fn unsealing_drops_stored_attachments_the_sender_did_not_list() {
+        let (_dir, db) = temp_db();
+        cache_sealed(&db, "sealed-swapped");
+        db.replace_message_attachments(
+            "sealed-swapped",
+            &[row_trusted_attachment(0, "invoice.pdf", b"fake invoice")],
+        )
+        .unwrap();
+        assert!(store_unsealed_message(&db, "sealed-swapped", &manifest_bundle(b"real invoice")));
+        assert!(db.get_message_attachments("sealed-swapped").unwrap().is_empty());
+        assert_eq!(db.attachments_state("sealed-swapped").unwrap(), ATTACHMENTS_PENDING);
+
+        cache_sealed(&db, "sealed-extra");
+        db.replace_message_attachments(
+            "sealed-extra",
+            &[
+                row_trusted_attachment(0, "invoice.pdf", b"real invoice"),
+                row_trusted_attachment(1, "added.exe", b"added by the server"),
+            ],
+        )
+        .unwrap();
+        assert!(store_unsealed_message(&db, "sealed-extra", &manifest_bundle(b"real invoice")));
+        assert!(db.get_message_attachments("sealed-extra").unwrap().is_empty());
+        assert_eq!(db.attachments_state("sealed-extra").unwrap(), ATTACHMENTS_PENDING);
+    }
+
     #[test]
     fn unsealing_replaces_body_subject_and_keeps_meta() {
         let (_dir, db) = temp_db();
@@ -5687,6 +5930,7 @@ mod sealed_retry_tests {
             subject: Some("Refund\r\nBcc: injected\tplease".to_string()),
             body: "<p>Hi there</p>".to_string(),
             sender_unverified: false,
+            attachment_manifest: None,
         };
         assert!(store_unsealed_message(&db, "sealed-1", &bundle));
         let cached = db.get_cached_message("sealed-1").unwrap().unwrap();
@@ -5703,6 +5947,7 @@ mod sealed_retry_tests {
             subject: Some("   ".to_string()),
             body: "text".to_string(),
             sender_unverified: true,
+            attachment_manifest: None,
         };
         assert!(store_unsealed_message(&db, "sealed-2", &no_subject));
         let kept = db.get_cached_message("sealed-2").unwrap().unwrap();

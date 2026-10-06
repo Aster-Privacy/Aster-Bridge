@@ -22,6 +22,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::api_client::AttachmentResponse;
@@ -31,6 +32,7 @@ use crate::error::{BridgeError, Result};
 const SESSION_KEY_LEN: usize = 32;
 const DATA_NONCE_LEN: usize = 12;
 pub const DEFAULT_ATTACHMENT_CONTENT_TYPE: &str = "application/octet-stream";
+pub const ATTACHMENT_MANIFEST_FIELD: &str = "attachment_manifest";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AttachmentKeyEntry {
@@ -39,6 +41,9 @@ pub struct AttachmentKeyEntry {
     pub content_type: Option<String>,
     pub content_id: Option<String>,
     pub size: Option<i64>,
+    pub sha256: Option<String>,
+    pub is_inline: Option<bool>,
+    pub from_manifest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +74,76 @@ pub fn normalize_content_type(raw: Option<&str>) -> String {
         Some(s) if s.contains('/') => s.to_ascii_lowercase(),
         _ => DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
     }
+}
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+fn manifest_entry(seq: usize, sealed: &serde_json::Value) -> Option<serde_json::Value> {
+    let field = |name: &str| sealed.get(name).and_then(|v| v.as_str());
+    let meta_bytes = Zeroizing::new(STANDARD.decode(field("recipient_encrypted_meta")?).ok()?);
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).ok()?;
+    let key = meta.get("session_key").and_then(|v| v.as_str())?;
+    let encrypted_data = STANDARD.decode(field("encrypted_data")?).ok()?;
+    let data_nonce = STANDARD.decode(field("data_nonce")?).ok()?;
+    if data_nonce.len() != DATA_NONCE_LEN {
+        return None;
+    }
+    let key_bytes = decode_session_key(key).ok()?;
+    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_slice()).ok()?;
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(Nonce::from_slice(&data_nonce), encrypted_data.as_ref())
+            .ok()?,
+    );
+    let mut entry = serde_json::Map::new();
+    entry.insert("seq".to_string(), serde_json::json!(seq));
+    entry.insert("key".to_string(), serde_json::json!(key));
+    entry.insert("size".to_string(), serde_json::json!(plain.len()));
+    entry.insert("sha256".to_string(), serde_json::json!(sha256_hex(&plain)));
+    entry.insert(
+        "filename".to_string(),
+        serde_json::json!(meta.get("filename").and_then(|v| v.as_str()).unwrap_or("")),
+    );
+    entry.insert(
+        "content_type".to_string(),
+        serde_json::json!(normalize_content_type(
+            meta.get("content_type").and_then(|v| v.as_str())
+        )),
+    );
+    if let Some(content_id) = meta
+        .get("content_id")
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.trim().is_empty())
+    {
+        entry.insert("content_id".to_string(), serde_json::json!(content_id));
+    }
+    entry.insert(
+        "is_inline".to_string(),
+        serde_json::json!(meta.get("is_inline").and_then(|v| v.as_bool()).unwrap_or(false)),
+    );
+    Some(serde_json::Value::Object(entry))
+}
+
+pub fn send_attachment_manifest(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(list) = payload.get("attachments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut manifest = Vec::with_capacity(list.len());
+    for (seq, sealed) in list.iter().enumerate() {
+        match manifest_entry(seq, sealed) {
+            Some(entry) => manifest.push(entry),
+            None => {
+                tracing::warn!("attachment {} could not be listed in the message envelope", seq);
+                return Vec::new();
+            }
+        }
+    }
+    manifest
 }
 
 pub fn placeholder_filename(seq: i64, content_type: &str) -> String {
@@ -251,22 +326,28 @@ pub fn decrypt_attachment(
         None => row_meta.session_key.clone(),
     };
 
+    let from_manifest = entry.is_some_and(|e| e.from_manifest);
     let content_type = normalize_content_type(
         entry
             .and_then(|e| e.content_type.as_deref())
             .filter(|s| s.contains('/'))
-            .or(row_meta.content_type.as_deref()),
+            .or(row_meta.content_type.as_deref().filter(|_| !from_manifest)),
     );
     let filename = entry
         .and_then(|e| e.filename.clone())
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty())
-        .or_else(|| row_meta.filename.clone())
+        .or_else(|| row_meta.filename.clone().filter(|_| !from_manifest))
         .unwrap_or_else(|| placeholder_filename(seq, &content_type));
     let content_id = entry
         .and_then(|e| e.content_id.clone())
         .filter(|c| !c.trim().is_empty())
-        .or_else(|| row_meta.content_id.clone());
+        .or_else(|| row_meta.content_id.clone().filter(|_| !from_manifest));
+    let is_inline = match entry.and_then(|e| e.is_inline) {
+        Some(listed) => listed,
+        None if from_manifest => false,
+        None => row_meta.is_inline.unwrap_or(false),
+    };
 
     let encrypted_data = STANDARD
         .decode(row.encrypted_data.trim())
@@ -296,13 +377,20 @@ pub fn decrypt_attachment(
             ));
         }
     }
+    if let Some(expected) = entry.and_then(|e| e.sha256.as_deref()) {
+        if !expected.trim().eq_ignore_ascii_case(&sha256_hex(&data)) {
+            return Err(BridgeError::Crypto(
+                "attachment content does not match the envelope".to_string(),
+            ));
+        }
+    }
 
     Ok(DecryptedAttachment {
         seq,
         filename,
         content_type,
         content_id,
-        is_inline: row_meta.is_inline.unwrap_or(false),
+        is_inline,
         data,
     })
 }
@@ -719,6 +807,7 @@ mod tests {
             content_type: Some("Application/Octet-Stream".to_string()),
             content_id: None,
             size: Some(4),
+            ..Default::default()
         };
         let out = decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).unwrap();
         assert_eq!(out.filename, "from-envelope.bin");
@@ -979,6 +1068,125 @@ mod tests {
         let opened =
             decrypt_attachment(&sender_row(&sealed), None, b"not the key pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"wrong pass");
+    }
+
+    fn manifest_key_entry(entry: &serde_json::Value) -> AttachmentKeyEntry {
+        let text = |name: &str| entry.get(name).and_then(|v| v.as_str()).map(str::to_string);
+        AttachmentKeyEntry {
+            key: text("key"),
+            filename: text("filename"),
+            content_type: text("content_type"),
+            content_id: text("content_id"),
+            size: entry.get("size").and_then(|v| v.as_i64()),
+            sha256: text("sha256"),
+            is_inline: entry.get("is_inline").and_then(|v| v.as_bool()),
+            from_manifest: true,
+        }
+    }
+
+    fn recipient_row(seq: i16, value: &serde_json::Value, meta: &serde_json::Value) -> AttachmentResponse {
+        AttachmentResponse {
+            encrypted_meta: STANDARD.encode(meta.to_string().as_bytes()),
+            ..row(
+                seq,
+                &STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap(),
+                &STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap(),
+                b"",
+                &[0u8; 12],
+            )
+        }
+    }
+
+    #[test]
+    fn the_send_manifest_lists_every_sealed_part_with_its_hash() {
+        let list = seal_send_attachments(
+            &[
+                outgoing("report.pdf", "application/pdf", None, b"%PDF-1.7 body"),
+                outgoing("logo.png", "image/png", Some("cid-1"), b"PNG bytes"),
+            ],
+            b"pass",
+        )
+        .unwrap();
+        let manifest = send_attachment_manifest(&serde_json::json!({ "attachments": list }));
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0]["seq"], 0);
+        assert_eq!(manifest[0]["filename"], "report.pdf");
+        assert_eq!(manifest[0]["content_type"], "application/pdf");
+        assert_eq!(manifest[0]["size"], 13);
+        assert_eq!(manifest[0]["sha256"], sha256_hex(b"%PDF-1.7 body"));
+        assert_eq!(manifest[0]["is_inline"], false);
+        assert!(manifest[0].get("content_id").is_none());
+        assert_eq!(manifest[1]["seq"], 1);
+        assert_eq!(manifest[1]["content_id"], "cid-1");
+        assert_eq!(manifest[1]["is_inline"], true);
+        let (_, meta) = server_decrypt(&list[0]);
+        assert_eq!(manifest[0]["key"], meta["session_key"]);
+
+        assert!(send_attachment_manifest(&serde_json::json!({})).is_empty());
+        let broken = serde_json::json!({ "attachments": [list[0].clone(), {"encrypted_data": "AAAA"}] });
+        assert!(send_attachment_manifest(&broken).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_entry_rejects_swapped_content_and_ignores_row_names() {
+        let list = seal_send_attachments(
+            &[outgoing("invoice.pdf", "application/pdf", None, b"real invoice")],
+            b"pass",
+        )
+        .unwrap();
+        let manifest = send_attachment_manifest(&serde_json::json!({ "attachments": list }));
+        let entry = manifest_key_entry(&manifest[0]);
+        let (_, sender_meta) = server_decrypt(&list[0]);
+        let hostile_meta = serde_json::json!({
+            "filename": "invoice.pdf.exe",
+            "content_type": "application/x-msdownload",
+            "session_key": sender_meta["session_key"],
+            "content_id": "cid-forged",
+            "is_inline": true,
+        });
+        let opened = decrypt_attachment(
+            &recipient_row(0, &list[0], &hostile_meta),
+            Some(&entry),
+            b"other",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(opened.filename, "invoice.pdf");
+        assert_eq!(opened.content_type, "application/pdf");
+        assert_eq!(opened.content_id, None);
+        assert!(!opened.is_inline);
+        assert_eq!(opened.data, b"real invoice");
+
+        let unnamed = AttachmentKeyEntry {
+            filename: None,
+            content_type: None,
+            ..entry.clone()
+        };
+        let fallback = decrypt_attachment(
+            &recipient_row(0, &list[0], &hostile_meta),
+            Some(&unnamed),
+            b"other",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(fallback.content_type, DEFAULT_ATTACHMENT_CONTENT_TYPE);
+        assert!(!fallback.filename.contains("exe"));
+
+        let key: [u8; 32] = STANDARD
+            .decode(entry.key.as_deref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let nonce = random_nonce();
+        let swapped = seal(&key, &nonce, b"fake invoice", b"");
+        let forged = AttachmentResponse {
+            encrypted_meta: STANDARD.encode(hostile_meta.to_string().as_bytes()),
+            ..row(0, &swapped, &nonce, b"", &[0u8; 12])
+        };
+        let error = decrypt_attachment(&forged, Some(&entry), b"other", None, &[]).unwrap_err();
+        assert!(error.to_string().contains("does not match the envelope"));
     }
 
     #[test]
