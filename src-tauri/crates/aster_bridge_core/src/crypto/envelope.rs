@@ -223,6 +223,22 @@ fn decrypt_pgp_envelope(
     Err(BridgeError::Crypto("envelope is not encrypted".to_string()))
 }
 
+pub fn unencrypted_envelope_json(encrypted_data_b64: &str, nonce_b64: &str) -> Option<String> {
+    if !nonce_b64.trim().is_empty() {
+        return None;
+    }
+    let data = STANDARD.decode(encrypted_data_b64.trim()).ok()?;
+    let text = String::from_utf8(data).ok()?;
+    if text.trim_start().starts_with("-----BEGIN PGP") {
+        return None;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(&text),
+        Ok(serde_json::Value::Object(_))
+    )
+    .then_some(text)
+}
+
 #[cfg(test)]
 pub(crate) const FIXTURE_IDENTITY_KEY: &str = "test-ik";
 
@@ -326,6 +342,23 @@ mod tests {
         let b64 = STANDARD.encode(json.as_bytes());
         assert!(decrypt_envelope(&b64, Some(""), b"unused-pass", None, &[]).is_err());
         assert!(decrypt_envelope(&b64, None, b"p", Some("ignored-ik"), &[]).is_err());
+    }
+
+    #[test]
+    fn only_a_bare_json_object_counts_as_an_unencrypted_envelope() {
+        let json = r#"{"subject":"hello","body_text":"world"}"#;
+        let b64 = STANDARD.encode(json.as_bytes());
+        assert_eq!(unencrypted_envelope_json(&b64, "").as_deref(), Some(json));
+        assert_eq!(unencrypted_envelope_json(&b64, "AAAAAAAAAAAAAAAA"), None);
+        assert_eq!(unencrypted_envelope_json(&STANDARD.encode(b"[1,2]"), ""), None);
+        assert_eq!(unencrypted_envelope_json(&STANDARD.encode(b"plain words"), ""), None);
+        assert_eq!(
+            unencrypted_envelope_json(&STANDARD.encode(b"-----BEGIN PGP MESSAGE-----\n{}"), ""),
+            None
+        );
+        let (sealed, nonce) = sealed_fixture(json);
+        assert_eq!(unencrypted_envelope_json(&sealed, &nonce), None);
+        assert_eq!(unencrypted_envelope_json(&sealed, ""), None);
     }
 
     #[test]

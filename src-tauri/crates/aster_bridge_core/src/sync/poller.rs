@@ -691,6 +691,12 @@ async fn refresh_attachment_keys(
     Ok(parse_envelope_attachments(&parsed))
 }
 
+fn cached_without_encryption(raw_headers: Option<&str>) -> bool {
+    raw_headers
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .is_some_and(|meta| crate::message_render::not_end_to_end_encrypted(&meta))
+}
+
 struct BacklogDownload {
     aster_id: String,
     folder: String,
@@ -713,6 +719,17 @@ async fn download_backlog_item(
 ) -> BacklogDownload {
     let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
     let mut meta_json = msg.raw_headers.clone();
+    if cached_without_encryption(msg.raw_headers.as_deref()) {
+        return BacklogDownload {
+            aster_id,
+            folder,
+            msg,
+            meta_json,
+            result: Err(AttachmentFetchError::Permanent(
+                "the message was stored without end-to-end encryption".to_string(),
+            )),
+        };
+    }
     if entries.iter().all(|e| e.key.is_none()) {
         match refresh_attachment_keys(
             client,
@@ -1085,6 +1102,7 @@ struct PreparedMessage {
     addresses: EnvelopeAddresses,
     attachments: Vec<EnvelopeAttachment>,
     expected_attachments: usize,
+    unencrypted: bool,
 }
 
 enum Prepared {
@@ -1143,6 +1161,7 @@ fn prepare_mail_item(
         inbound_keys,
     );
 
+    let mut unencrypted = false;
     let plaintext = match plaintext_result {
         Ok(p) => p,
         Err(_) => {
@@ -1150,6 +1169,19 @@ fn prepare_mail_item(
                 &item.encrypted_envelope,
                 &item.envelope_nonce,
             );
+            let stored_in_the_clear = if inbound {
+                None
+            } else {
+                crate::crypto::envelope::unencrypted_envelope_json(
+                    &item.encrypted_envelope,
+                    &item.envelope_nonce,
+                )
+            };
+            if let Some(text) = stored_in_the_clear {
+                tracing::warn!("message stored without end-to-end encryption; caching it marked");
+                unencrypted = true;
+                text
+            } else {
             if inbound {
                 if inbound_keys.is_empty() {
                     tracing::error!(
@@ -1165,6 +1197,7 @@ fn prepare_mail_item(
                 inbound_decrypt_failed: inbound,
                 ..CacheOutcome::default()
             });
+            }
         }
     };
 
@@ -1174,6 +1207,10 @@ fn prepare_mail_item(
     };
 
     let is_ratchet_envelope = crate::crypto::ratchet::find_ratchet_object(&parsed).is_some();
+    if unencrypted && is_ratchet_envelope {
+        tracing::debug!("envelope decrypt skipped");
+        return Prepared::Done(CacheOutcome::default());
+    }
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -1194,7 +1231,11 @@ fn prepare_mail_item(
         body_text = Some(RATCHET_PLACEHOLDER.to_string());
         is_html = false;
     }
-    let attachments = parse_envelope_attachments(&parsed);
+    let attachments = if unencrypted {
+        Vec::new()
+    } else {
+        parse_envelope_attachments(&parsed)
+    };
     let expected_attachments = expected_attachment_count(item, &attachments);
     const MAX_CACHED_BODY_BYTES: usize = 5 * 1024 * 1024;
     if let Some(b) = body_text.as_mut() {
@@ -1228,6 +1269,7 @@ fn prepare_mail_item(
         addresses,
         attachments,
         expected_attachments,
+        unencrypted,
     })
 }
 
@@ -1261,6 +1303,12 @@ fn commit_mail_item(
         raw_headers_map.insert("references".to_string(), serde_json::json!(value));
     }
     prepared.addresses.write_to(&mut raw_headers_map);
+    if prepared.unencrypted {
+        raw_headers_map.insert(
+            crate::message_render::NOT_END_TO_END_ENCRYPTED_FLAG.to_string(),
+            serde_json::json!(true),
+        );
+    }
     if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
             "attachments".to_string(),
@@ -1296,7 +1344,7 @@ fn commit_mail_item(
         }
     }
     let stored = match downloaded {
-        Some(list) if !list.is_empty() => match db.replace_message_attachments(&item.id, &list) {
+        Some(list) if !list.is_empty() && !prepared.unencrypted => match db.replace_message_attachments(&item.id, &list) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!("attachment store for {} failed: {}", item.id, e);
@@ -1309,7 +1357,12 @@ fn commit_mail_item(
         && attachment_count > 0
         && db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE) != ATTACHMENTS_STORED
     {
-        let _ = db.set_attachments_state(&item.id, ATTACHMENTS_PENDING);
+        let state = if prepared.unencrypted {
+            ATTACHMENTS_FAILED
+        } else {
+            ATTACHMENTS_PENDING
+        };
+        let _ = db.set_attachments_state(&item.id, state);
     }
     if let Err(e) = db.assign_uid_if_missing(folder, &item.id) {
         tracing::warn!("uid assign failed for {}: {}", item.id, e);
@@ -2464,6 +2517,7 @@ async fn run_sync_pass(
                                 let mut content_failed = false;
                                 let mut permanently_unavailable = false;
                                 if prepared.expected_attachments > 0
+                                    && !prepared.unencrypted
                                     && inline_downloads < ATTACHMENT_INLINE_DOWNLOADS_PER_PASS
                                 {
                                     inline_downloads += 1;
@@ -3002,13 +3056,51 @@ mod tests {
         (dir, db)
     }
 
-    #[test]
-    fn an_unencrypted_envelope_is_never_cached() {
-        let (_dir, db) = temp_db();
-        let mut item = item_with_envelope("forged", &serde_json::json!({"subject": "forged", "body_text": "b"}));
-        item.encrypted_envelope =
-            STANDARD.encode(serde_json::json!({"subject": "forged", "body_text": "b"}).to_string());
+    fn unencrypted_item(id: &str, envelope: &serde_json::Value) -> MailItem {
+        let mut item = item_with_envelope(id, envelope);
+        item.encrypted_envelope = STANDARD.encode(envelope.to_string());
         item.envelope_nonce = String::new();
+        item
+    }
+
+    #[test]
+    fn an_unencrypted_envelope_is_cached_marked_and_never_as_encrypted() {
+        let (_dir, db) = temp_db();
+        let envelope = serde_json::json!({
+            "subject": "legacy",
+            "body_text": "b",
+            "attachment_keys": [{"seq": 0, "key": "AAAA", "filename": "a.pdf"}],
+            "attachment_manifest": [{"seq": 0, "key": "AAAA", "filename": "a.pdf"}],
+        });
+        let mut item = unencrypted_item("legacy", &envelope);
+        item.has_attachments = Some(true);
+        item.attachment_count = Some(1);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+        let cached = db.get_cached_message("legacy").unwrap().unwrap();
+        assert_eq!(cached.body_text.as_deref(), Some("b"));
+        let raw = cached.raw_headers.as_deref().unwrap();
+        let meta: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(meta["not_end_to_end_encrypted"], true);
+        assert!(meta.get("attachments").is_none());
+        assert!(cached_attachment_entries(Some(raw)).is_empty());
+        assert!(cached_without_encryption(Some(raw)));
+        assert_eq!(db.attachments_state("legacy").unwrap(), ATTACHMENTS_FAILED);
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+
+        let sealed = item_with_envelope("sealed", &serde_json::json!({"subject": "s", "body_text": "b"}));
+        assert!(cache_mail_item(&db, "inbox", &sealed, b"pass", IK, &[], &[]).was_new);
+        let sealed_raw = db.get_cached_message("sealed").unwrap().unwrap().raw_headers;
+        assert!(!cached_without_encryption(sealed_raw.as_deref()));
+    }
+
+    #[test]
+    fn an_unencrypted_envelope_cannot_carry_a_sealed_body() {
+        let (_dir, db) = temp_db();
+        let envelope = serde_json::json!({
+            "subject": "forged",
+            "body_text": serde_json::json!({"type": "double_ratchet_v2", "recipients": {}}).to_string(),
+        });
+        let item = unencrypted_item("forged", &envelope);
         assert!(!cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert!(db.get_cached_message("forged").unwrap().is_none());
     }
