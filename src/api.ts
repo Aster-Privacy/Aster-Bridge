@@ -136,6 +136,7 @@ export async function get_user_preferences(): Promise<UserPreferences> {
 export interface SetupCode {
   code: string;
   expires_in: number;
+  device_fingerprint: string;
 }
 
 export async function get_setup_code(): Promise<SetupCode> {

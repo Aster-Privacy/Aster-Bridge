@@ -787,6 +787,7 @@ function SetupView({
   const { t } = useTranslation();
   const [state, set_state] = useState<SetupState>("idle");
   const [code, set_code] = useState<string | null>(null);
+  const [device_fingerprint, set_device_fingerprint] = useState("");
   const [time_left, set_time_left] = useState(0);
 
   const poll_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -812,6 +813,7 @@ function SetupView({
     try {
       const result = await api.get_setup_code();
       set_code(result.code);
+      set_device_fingerprint(result.device_fingerprint ?? "");
       const lifetime =
         result.expires_in > 0 ? result.expires_in : DEFAULT_CODE_LIFETIME;
       const expiry = Date.now() + lifetime * 1000;
@@ -921,6 +923,13 @@ function SetupView({
                   ))}
                 </div>
               </div>
+              {device_fingerprint && (
+                <div className="w-full mt-4 text-center">
+                  <span className="text-xs font-medium text-txt-muted">{t("setup_device_fingerprint")}</span>
+                  <p className="mt-1 text-sm font-mono font-semibold text-txt-primary select-text">{device_fingerprint}</p>
+                  <p className="mt-1 text-xs leading-relaxed text-txt-muted">{t("setup_device_fingerprint_hint")}</p>
+                </div>
+              )}
               <div className="flex items-center gap-3 w-full mt-6">
                 <Button className="flex-1" size="xl" variant="secondary" onClick={handle_copy_code}>{t("setup_copy_code")}</Button>
                 <Button className="flex-1" size="xl" variant="depth" onClick={() => api.open_url(LINK_DEVICE_URL)}>{t("setup_open_browser")}</Button>

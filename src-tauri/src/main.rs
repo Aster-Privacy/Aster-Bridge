@@ -151,6 +151,7 @@ struct UserPreferencesResponse {
 struct SetupCodeResponse {
     code: String,
     expires_in: u64,
+    device_fingerprint: String,
 }
 
 #[derive(serde::Serialize)]
@@ -575,6 +576,7 @@ async fn get_setup_code(state: State<'_, AppState>) -> Result<SetupCodeResponse,
     Ok(SetupCodeResponse {
         code: code.code,
         expires_in: code.expires_in,
+        device_fingerprint: code.device_fingerprint,
     })
 }
 

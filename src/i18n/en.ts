@@ -42,6 +42,8 @@ const en = {
   setup_back_to_dashboard: "Back to dashboard",
   setup_code_subtitle: "Enter this code at app.astermail.org/link-device to link your account.",
   setup_expires_in: "Expires in {{time}}",
+  setup_device_fingerprint: "Device fingerprint",
+  setup_device_fingerprint_hint: "If Aster Mail shows a device fingerprint when you enter the code, make sure that it matches this one before you approve the device.",
   setup_copy_code: "Copy code",
   setup_open_browser: "Open browser",
   setup_listening: "Listening for confirmation",
