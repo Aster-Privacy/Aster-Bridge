@@ -38,6 +38,23 @@ use crate::jmap::state::StateChange;
 const POLL_INTERVAL_SECS: u64 = 30;
 const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
 const TRIGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+const RATE_LIMIT_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+const RATE_LIMIT_MESSAGE: &str = "sync paused: the server asked Aster Bridge to slow down";
+
+fn is_rate_limit_message(message: &str) -> bool {
+    message.contains("API error: 429")
+}
+
+fn sync_is_paused(paused_until: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    paused_until.is_some_and(|until| now < until)
+}
+
+fn pause_after(result: &Result<(), String>, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+    match result {
+        Err(e) if e == RATE_LIMIT_MESSAGE => Some(now + RATE_LIMIT_PAUSE),
+        _ => None,
+    }
+}
 
 pub struct SyncTrigger {
     pub done: oneshot::Sender<Result<(), String>>,
@@ -2094,6 +2111,7 @@ async fn run_sync_pass(
     let mut mailboxes_changed = false;
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
+    let mut rate_limited = false;
 
     let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
@@ -2131,7 +2149,10 @@ async fn run_sync_pass(
     match sync_custom_folders(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
         Ok(changed) => mailboxes_changed = changed,
         Err(msg) => {
-            tracing::warn!("{}", msg);
+            rate_limited = is_rate_limit_message(&msg);
+            if !rate_limited {
+                tracing::warn!("{}", msg);
+            }
             last_err = Some(msg);
             all_folders_complete = false;
         }
@@ -2140,15 +2161,18 @@ async fn run_sync_pass(
     let known_tokens: HashSet<String> = custom_folders.iter().map(|f| f.label_token.clone()).collect();
 
     let tag_writes_at_start = db.tag_writes.load(std::sync::atomic::Ordering::SeqCst);
-    match sync_custom_tags(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
-        Ok(affected) => {
-            updated_ids.extend(affected);
-            updated_ids.extend(
-                crate::tag_ops::migrate_local_keywords(db, client, &access_token, identity_key.as_deref())
-                    .await,
-            );
+    if !rate_limited {
+        match sync_custom_tags(db, client, &access_token, identity_key.as_deref(), &previous_keys).await {
+            Ok(affected) => {
+                updated_ids.extend(affected);
+                updated_ids.extend(
+                    crate::tag_ops::migrate_local_keywords(db, client, &access_token, identity_key.as_deref())
+                        .await,
+                );
+            }
+            Err(msg) if is_rate_limit_message(&msg) => rate_limited = true,
+            Err(msg) => tracing::warn!("{}", msg),
         }
-        Err(msg) => tracing::warn!("{}", msg),
     }
     let known_tags: HashSet<String> = db
         .list_custom_tags()
@@ -2160,6 +2184,10 @@ async fn run_sync_pass(
     let queries = build_folder_queries();
     let total_folders = queries.len() + custom_folders.len();
     for folder_idx in 0..total_folders {
+        if rate_limited {
+            all_folders_complete = false;
+            break;
+        }
         let system_query = queries.get(folder_idx);
         let custom_folder = folder_idx
             .checked_sub(queries.len())
@@ -2402,7 +2430,10 @@ async fn run_sync_pass(
                 }
                 Err(e) => {
                     let msg = format!("failed to sync {}: {}", progress_label, e);
-                    tracing::warn!("{}", msg);
+                    rate_limited = is_rate_limit_message(&msg);
+                    if !rate_limited {
+                        tracing::warn!("{}", msg);
+                    }
                     last_err = Some(msg);
                     all_folders_complete = false;
                     break;
@@ -2442,24 +2473,26 @@ async fn run_sync_pass(
         }
     }
 
-    let backfilled = backfill_pending_attachments(
-        db,
-        client,
-        &access_token,
-        &passphrase,
-        identity_key.as_deref(),
-        &previous_keys,
-        &inbound_keys,
-        &attachments_handled,
-    )
-    .await;
-    updated_ids.extend(backfilled);
+    if !rate_limited {
+        let backfilled = backfill_pending_attachments(
+            db,
+            client,
+            &access_token,
+            &passphrase,
+            identity_key.as_deref(),
+            &previous_keys,
+            &inbound_keys,
+            &attachments_handled,
+        )
+        .await;
+        updated_ids.extend(backfilled);
 
-    let unsealed = retry_sealed_messages(db, &ratchet_ctx).await;
-    updated_ids.extend(unsealed);
+        let unsealed = retry_sealed_messages(db, &ratchet_ctx).await;
+        updated_ids.extend(unsealed);
+    }
 
     let account_keys = session.read().await.account_keys.clone();
-    match identity_key.as_deref() {
+    match identity_key.as_deref().filter(|_| !rate_limited) {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
             let mut cursor: Option<String> = None;
@@ -2515,7 +2548,10 @@ async fn run_sync_pass(
                     }
                     Err(e) => {
                         let msg = format!("failed to sync web drafts: {}", e);
-                        tracing::warn!("{}", msg);
+                        rate_limited = is_rate_limit_message(&msg);
+                        if !rate_limited {
+                            tracing::warn!("{}", msg);
+                        }
                         last_err = Some(msg);
                         all_folders_complete = false;
                         break;
@@ -2584,6 +2620,14 @@ async fn run_sync_pass(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let _ = db.set_sync_state("last_sync_ts", &now.to_string());
+
+    if rate_limited {
+        tracing::warn!(
+            "sync: the server is limiting requests for this account, so sync pauses for {} seconds",
+            RATE_LIMIT_PAUSE.as_secs()
+        );
+        last_err = Some(RATE_LIMIT_MESSAGE.to_string());
+    }
 
     emit_sync_done(last_err.is_some());
 
@@ -2693,6 +2737,7 @@ pub async fn run_poll_loop_tuned(
     let mut last_deep_at: Option<tokio::time::Instant> = None;
     let mut last_triggered_at: Option<tokio::time::Instant> = None;
     let mut last_triggered_result: Result<(), String> = Ok(());
+    let mut paused_until: Option<tokio::time::Instant> = None;
     let deep_due = |last: &Option<tokio::time::Instant>| {
         last.is_none_or(|t| {
             t.elapsed() >= std::time::Duration::from_secs(DEEP_SYNC_INTERVAL_SECS)
@@ -2709,6 +2754,14 @@ pub async fn run_poll_loop_tuned(
                     tracing::info!("sync: detected sleep/wake gap ({:.0}s); running immediate sync pass", elapsed.as_secs_f64());
                     crate::auth::session::request_token_refresh();
                 }
+                if crate::auth::session::session_rejected() {
+                    tracing::debug!("sync: skipping the scheduled pass until sign-in succeeds");
+                    continue;
+                }
+                if sync_is_paused(paused_until, now) {
+                    tracing::debug!("sync: skipping the scheduled pass while the server limits requests");
+                    continue;
+                }
                 sync_count += 1;
                 if sync_count.is_multiple_of(plan_check_every)
                     && !check_plan_access(&session, &client).await {
@@ -2719,6 +2772,7 @@ pub async fn run_poll_loop_tuned(
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
+                paused_until = pause_after(&result, tokio::time::Instant::now());
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                     report_envelope_capability(&session, &client).await;
@@ -2739,7 +2793,7 @@ pub async fn run_poll_loop_tuned(
                 }
                 let cooling = last_triggered_at
                     .is_some_and(|at| at.elapsed() < TRIGGER_COOLDOWN);
-                if cooling {
+                if cooling || sync_is_paused(paused_until, tokio::time::Instant::now()) {
                     let replay = last_triggered_result.clone();
                     for done in waiting {
                         let _ = done.send(replay.clone());
@@ -2751,6 +2805,7 @@ pub async fn run_poll_loop_tuned(
                 let deep = deep_due(&last_deep_at);
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
+                paused_until = pause_after(&result, tokio::time::Instant::now());
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                 }
@@ -4661,6 +4716,67 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rate_limited_pass_stops_at_the_first_refusal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = "rate limit exceeded";
+                    let reply = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 60\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let (_dir, db) = temp_db();
+        let session = mock_session();
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let result = run_sync_pass(&session, &client, &Arc::new(db), None, true).await;
+
+        assert_eq!(result, Err(RATE_LIMIT_MESSAGE.to_string()));
+        let seen = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen <= 2,
+            "a refused pass made {} requests, so it kept asking after the server said to slow down",
+            seen
+        );
+    }
+
+    #[test]
+    fn only_a_rate_limited_pass_pauses_sync() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(pause_after(&Ok(()), now), None);
+        assert_eq!(pause_after(&Err("failed to sync trash: network error".to_string()), now), None);
+        let until = pause_after(&Err(RATE_LIMIT_MESSAGE.to_string()), now);
+        assert_eq!(until, Some(now + RATE_LIMIT_PAUSE));
+        assert!(sync_is_paused(until, now));
+        assert!(sync_is_paused(until, now + RATE_LIMIT_PAUSE / 2));
+        assert!(!sync_is_paused(until, now + RATE_LIMIT_PAUSE));
+        assert!(!sync_is_paused(None, now));
+    }
+
+    #[test]
+    fn rate_limit_refusals_are_told_apart_from_other_failures() {
+        assert!(is_rate_limit_message(
+            "failed to sync trash: API error: 429 Too Many Requests: rate limit exceeded"
+        ));
+        assert!(!is_rate_limit_message("failed to sync trash: API error: 500 Internal Server Error: "));
+        assert!(!is_rate_limit_message("failed to sync labels: timed out"));
+    }
 
     #[test]
     fn a_missing_or_negative_size_is_dropped() {
