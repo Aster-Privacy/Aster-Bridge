@@ -2,6 +2,13 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.4 - 2026-10-06
+
+### Fixed
+- When the server limits how often your account can sync, Aster Bridge pauses for a minute and then continues. Previously, it logged a warning for Drafts, Trash, and other folders on every sync.
+- The command-line app keeps running after a single rejected sign-in. It stops and asks you to sign in again only after it confirms that the device was removed from your account.
+- After a device is removed from your account, Aster Bridge stops sending sync requests until you sign in again.
+
 ## 1.0.3 - 2026-10-05
 
 ### Fixed
