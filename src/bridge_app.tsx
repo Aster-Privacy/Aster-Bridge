@@ -1792,6 +1792,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const setup_display = use_frozen(setup_client);
   const [show_repair_modal, set_show_repair_modal] = useState(false);
   const [repairing, set_repairing] = useState(false);
+  const [show_recipient_key_modal, set_show_recipient_key_modal] = useState(false);
+  const [recipient_key_address, set_recipient_key_address] = useState("");
+  const [accepting_recipient_key, set_accepting_recipient_key] = useState(false);
   const [logs_open, set_logs_open] = useState(false);
   const [log_lines, set_log_lines] = useState<string[]>([]);
   const [logs_loading, set_logs_loading] = useState(false);
@@ -1848,6 +1851,24 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       show_toast(typeof e === "string" ? e : t("toast_repair_failed"), "error");
     }
     set_repairing(false);
+  };
+
+  const handle_accept_recipient_key = async () => {
+    const address = recipient_key_address.trim();
+    if (!/^[^\s@]+@[^\s@]+$/.test(address)) {
+      show_toast(t("toast_recipient_key_invalid"), "error");
+      return;
+    }
+    set_accepting_recipient_key(true);
+    try {
+      const accepted = await api.accept_recipient_key(address);
+      show_toast(t(accepted ? "toast_recipient_key_accepted" : "toast_recipient_key_none"), "success");
+      set_show_recipient_key_modal(false);
+      set_recipient_key_address("");
+    } catch {
+      show_toast(t("toast_recipient_key_failed"), "error");
+    }
+    set_accepting_recipient_key(false);
   };
 
   const handle_toggle_logs = async () => {
@@ -2215,6 +2236,19 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         <SettingRow
+          label={t("recipient_key")}
+          sublabel={t("recipient_key_sub")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          }
+        >
+          <Button variant="secondary" size="sm" onClick={() => set_show_recipient_key_modal(true)}>
+            {t("recipient_key_accept")}
+          </Button>
+        </SettingRow>
+        <SettingRow
           danger
           label={t("reset_bridge")}
           sublabel={t("reset_bridge_sub")}
@@ -2239,6 +2273,25 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalActions>
       </Modal>
 
+
+      <Modal open={show_recipient_key_modal} on_close={() => !accepting_recipient_key && set_show_recipient_key_modal(false)}>
+        <p className="text-base font-semibold text-txt-primary">{t("recipient_key_title")}</p>
+        <ModalBody>{t("recipient_key_body")}</ModalBody>
+        <input
+          type="email"
+          autoComplete="off"
+          spellCheck={false}
+          aria-label={t("recipient_key_address")}
+          placeholder={t("recipient_key_placeholder")}
+          value={recipient_key_address}
+          onChange={(e) => set_recipient_key_address(e.target.value)}
+          className="bridge_field w-full h-9 px-2.5 text-sm text-txt-primary"
+        />
+        <ModalActions>
+          <Button variant="ghost" size="md" disabled={accepting_recipient_key} onClick={() => set_show_recipient_key_modal(false)}>{t("cancel")}</Button>
+          <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_accept_recipient_key}>{t("recipient_key_accept")}</Button>
+        </ModalActions>
+      </Modal>
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>

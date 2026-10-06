@@ -1135,6 +1135,28 @@ async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn accept_recipient_key(state: State<'_, AppState>, address: String) -> Result<bool, String> {
+    let address = address.trim().to_lowercase();
+    let well_formed = !address.contains(char::is_whitespace)
+        && address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !well_formed {
+        return Err("invalid address".to_string());
+    }
+    let (db, account_id) = {
+        let guard = state.0.lock().await;
+        let session = guard
+            .session
+            .as_ref()
+            .ok_or_else(|| "not authenticated".to_string())?;
+        let account_id = session.read().await.user_id.to_string();
+        (guard.db.clone(), account_id)
+    };
+    aster_bridge_core::crypto::recipient_trust::accept_recipient_key(&db, &account_id, &address)
+}
+
+#[tauri::command]
 async fn repair_cache(state: State<'_, AppState>) -> Result<(), String> {
     let (db, trigger) = {
         let guard = state.0.lock().await;
@@ -1452,6 +1474,7 @@ fn main() {
             take_pending_deep_link,
             trigger_sync,
             repair_cache,
+            accept_recipient_key,
             get_recent_logs,
             copy_diagnostic_bundle,
             outbox_list,

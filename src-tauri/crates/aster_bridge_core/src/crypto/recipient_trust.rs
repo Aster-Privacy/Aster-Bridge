@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api_client::PrekeyBundle;
 use crate::crypto::ratchet::{PQ_IDENTITY_KEY_ID, X3DH_VERSION_TRANSCRIPT_BOUND};
+use crate::db::Database;
 use crate::error::BridgeError;
 
 const CLEARTEXT_SIGNATURE_HEADER: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
@@ -140,6 +141,14 @@ pub fn pin_id(account_id: &str, address: &str) -> String {
     hasher.update([0u8]);
     hasher.update(address.trim().to_lowercase().as_bytes());
     hex(&hasher.finalize())
+}
+
+pub fn accept_recipient_key(
+    db: &Database,
+    account_id: &str,
+    address: &str,
+) -> Result<bool, String> {
+    db.recipient_pin_delete(&pin_id(account_id, address))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -342,6 +351,40 @@ pub fn evaluate_recipient(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn accepting_a_changed_key_lets_the_next_send_pin_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let first = owner("bob");
+        let replaced = owner("bob");
+        let id = pin_id("account", BOB);
+
+        let pinned = evaluate_recipient(BOB, None, Some(&first.public_key), None);
+        db.recipient_pin_put(&id, &pinned.pin.unwrap()).unwrap();
+
+        let existing = db.recipient_pin_get(&id).unwrap();
+        let refused = evaluate_recipient(BOB, None, Some(&replaced.public_key), existing.as_ref());
+        assert!(refused.outcome.is_err());
+        db.recipient_pin_put(&id, &refused.pin.unwrap()).unwrap();
+
+        let existing = db.recipient_pin_get(&id).unwrap();
+        assert!(
+            evaluate_recipient(BOB, None, Some(&first.public_key), existing.as_ref())
+                .outcome
+                .is_err(),
+            "a flagged recipient stays refused even when the old key comes back"
+        );
+
+        assert!(!accept_recipient_key(&db, "other-account", BOB).unwrap());
+        assert!(accept_recipient_key(&db, "account", " Bob@AsterMail.org ").unwrap());
+        assert!(!accept_recipient_key(&db, "account", BOB).unwrap());
+
+        let existing = db.recipient_pin_get(&id).unwrap();
+        let accepted = evaluate_recipient(BOB, None, Some(&replaced.public_key), existing.as_ref());
+        assert!(accepted.outcome.is_ok());
+        assert!(!accepted.pin.unwrap().flagged);
+    }
     use crate::api_client::BundlePqPrekey;
 
     const INTEROP_PUBLIC_KEY: &str = r####"-----BEGIN PGP PUBLIC KEY BLOCK-----

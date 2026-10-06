@@ -309,6 +309,10 @@ export async function trigger_sync(): Promise<void> {
   return tauri_invoke("trigger_sync");
 }
 
+export async function accept_recipient_key(address: string): Promise<boolean> {
+  return tauri_invoke("accept_recipient_key", { address });
+}
+
 export async function repair_cache(): Promise<void> {
   return tauri_invoke("repair_cache");
 }
