@@ -137,7 +137,7 @@ const en = {
   run_in_background: "Run silently in background",
   run_in_background_hint: "Tucks itself away with no tray icon and no window, quietly keeping the local mail bridge running for you.",
   full_mail_history: "Sync all mail",
-  full_mail_history_hint: "Your mail app sees every message in every folder. Older mail is indexed gradually in the background. Turn this off to keep only the newest 2,000 messages per folder and save disk space.",
+  full_mail_history_hint: "Your mail app sees every message in every folder. Older mail is indexed gradually in the background and stored on this computer, attachments included. Turn this off to keep only the newest 2,000 messages per folder and save disk space. Older mail stays in your Aster account.",
   section_email_client_setup: "Email Client Setup",
   setup_with_client: "Setup with {{client}}",
   section_support: "Support",

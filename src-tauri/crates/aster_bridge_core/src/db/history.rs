@@ -124,6 +124,15 @@ impl Database {
         })
     }
 
+    pub fn prune_queue_drop_listed(&self) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM history_prune_queue WHERE aster_id IN (SELECT aster_id FROM listing_member)",
+                [],
+            )
+        })
+    }
+
     pub fn prune_queue_remove(&self, aster_id: &str) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;

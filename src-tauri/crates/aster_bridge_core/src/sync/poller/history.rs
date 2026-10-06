@@ -30,10 +30,14 @@ const PAGE_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const PAGE_INTERVAL: Duration = Duration::from_millis(20);
 const IDLE_RECHECK: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const START_JITTER_MAX: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const START_JITTER_MAX: Duration = Duration::ZERO;
 const BROADCAST_EVERY: Duration = Duration::from_secs(10);
 const BACKOFF_BASE: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
-const RESWEEP_AFTER_SECS: u64 = 24 * 60 * 60;
+const RESWEEP_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 const DRIFT_RESWEEP_AFTER_SECS: u64 = 15 * 60;
 const PRUNE_CHECKS_PER_STEP: usize = 25;
 const RETRIES_PER_STEP: usize = 10;
@@ -195,18 +199,19 @@ pub(super) fn note_listing_total(db: &Database, label: &str, total: usize) {
     save(db, label, &state);
 }
 
-fn listings(db: &Database) -> Vec<Listing> {
+fn listings(db: &Database) -> Result<Vec<Listing>, String> {
+    let custom_folders = db.list_custom_folders()?;
     let system = build_folder_queries().into_iter().map(|q| Listing {
         label: q.label.to_string(),
         query: Some(q.query),
         token: None,
     });
-    let custom = db.list_custom_folders().unwrap_or_default().into_iter().map(|f| Listing {
+    let custom = custom_folders.into_iter().map(|f| Listing {
         label: crate::folders::folder_label(&f.label_token),
         query: None,
         token: Some(f.label_token),
     });
-    system.chain(custom).collect()
+    Ok(system.chain(custom).collect())
 }
 
 fn folder_for(listing: &Listing, item: &MailItem, known_tokens: &HashSet<String>) -> String {
@@ -260,17 +265,21 @@ pub(super) async fn step(
     db: &Database,
     now: u64,
 ) -> Step {
-    let keys = Keys::of(session).await;
-    if let Some(step) = prune_departed(db, client, &keys).await {
-        return step;
+    if !is_enabled(db) {
+        let _ = db.set_sync_state(HISTORY_MODE_KEY, "all");
     }
+    let keys = Keys::of(session).await;
     if let Some(step) = retry_undecrypted(db, client, &keys, now).await {
         return step;
     }
-    sweep_page(db, client, &keys, now).await
+    match sweep_page(db, client, &keys, now).await {
+        Step::Idle => prune_departed(db, client, &keys).await.unwrap_or(Step::Idle),
+        step => step,
+    }
 }
 
 async fn prune_departed(db: &Database, client: &ApiClient, keys: &Keys) -> Option<Step> {
+    let _ = db.prune_queue_drop_listed();
     let queued = db.prune_queue_batch(PRUNE_CHECKS_PER_STEP).ok()?;
     if queued.is_empty() {
         return None;
@@ -312,7 +321,7 @@ async fn retry_undecrypted(db: &Database, client: &ApiClient, keys: &Keys, now: 
     if due.is_empty() {
         return None;
     }
-    let listings = listings(db);
+    let listings = listings(db).ok()?;
     let known_tokens: HashSet<String> = listings.iter().filter_map(|l| l.token.clone()).collect();
     let mut created: Vec<String> = Vec::new();
     let mut failure = None;
@@ -378,7 +387,10 @@ fn emit_progress(states: &[(Listing, ListingState)], finished_first_pass: bool) 
 }
 
 async fn sweep_page(db: &Database, client: &ApiClient, keys: &Keys, now: u64) -> Step {
-    let listings = listings(db);
+    let listings = match listings(db) {
+        Ok(listings) => listings,
+        Err(e) => return Step::Failed(format!("history: reading folders failed: {}", e)),
+    };
     let labels: Vec<String> = listings.iter().map(|l| l.label.clone()).collect();
     if matches!(db.forget_listings_except(&labels), Ok(n) if n > 0) {
         return Step::Worked { changed: false };
@@ -611,7 +623,7 @@ impl Pacer {
     pub(super) fn open(&mut self) {
         if !self.open {
             self.open = true;
-            self.next = tokio::time::Instant::now();
+            self.next = tokio::time::Instant::now() + start_delay(START_JITTER_MAX);
         }
     }
 
@@ -660,6 +672,15 @@ impl Pacer {
         }
         pause
     }
+}
+
+fn start_delay(max: Duration) -> Duration {
+    use rand::Rng;
+    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand::thread_rng().gen_range(0..max_ms))
 }
 
 fn backoff(base: Duration, failures: u32) -> Duration {
@@ -1020,10 +1041,57 @@ mod tests {
         db.stamp_listing_members("archive", &[queued.as_str(), gone.id.as_str()], 1).unwrap();
         assert_eq!(db.finish_listing_sweep("archive", 2).unwrap(), 2);
 
-        assert_eq!(step(&session(), &client, &db, NOW).await, Step::Worked { changed: true });
+        let keys = Keys::of(&session()).await;
+        assert_eq!(prune_departed(&db, &client, &keys).await, Some(Step::Worked { changed: true }));
         assert!(db.get_cached_message(&queued).unwrap().is_some());
         assert!(db.get_cached_message(&gone.id).unwrap().is_none());
         assert!(db.prune_queue_batch(10).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_sweeps_run_before_queued_messages_are_checked_one_by_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        apply_mode(&db, true);
+        let backend = Backend::with_archive(30);
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let session = session();
+        let gone: MailItem = serde_json::from_value(archive_item(99)).unwrap();
+        for item in [serde_json::from_value::<MailItem>(archive_item(7)).unwrap(), gone.clone()] {
+            assert!(cache_mail_item(&db, "custom-gone", &item, b"pass", None, &[], &[]).was_new);
+        }
+        db.stamp_listing_members("custom-gone", &[item_id(7).as_str(), gone.id.as_str()], 1)
+            .unwrap();
+        assert_eq!(db.forget_listings_except(&[]).unwrap(), 2);
+
+        index_until_idle(&session, &client, &db, NOW).await;
+
+        assert_eq!(
+            backend.item_calls.load(Ordering::SeqCst),
+            1,
+            "a message listed by the sweep needs no single-message check"
+        );
+        assert!(db.get_cached_message(&item_id(7)).unwrap().is_some());
+        assert!(db.get_cached_message(&gone.id).unwrap().is_none());
+        assert!(db.prune_queue_batch(10).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_repair_while_running_keeps_the_regular_pass_recording_listings() {
+        let (_dir, db, _backend, client, session) = indexed_archive(10).await;
+        db.repair_cache().unwrap();
+        assert!(!is_enabled(&db));
+        step(&session, &client, &db, NOW).await;
+        assert!(is_enabled(&db));
+    }
+
+    #[test]
+    fn the_first_history_step_starts_at_a_random_point_within_the_window() {
+        assert_eq!(start_delay(Duration::ZERO), Duration::ZERO);
+        let window = Duration::from_secs(600);
+        let delays: Vec<Duration> = (0..64).map(|_| start_delay(window)).collect();
+        assert!(delays.iter().all(|d| *d < window));
+        assert!(delays.iter().any(|d| *d != delays[0]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1140,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_is_swept_again_only_when_counts_drift_or_a_day_passes() {
+    fn a_listing_is_swept_again_only_when_counts_drift_or_a_week_passes() {
         let swept = ListingState {
             swept_at: NOW,
             total_offset: 2,
