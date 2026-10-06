@@ -2149,6 +2149,10 @@ impl Database {
     }
 
     pub fn find_uid_by_message_id_in_folder(&self, folder: &str, message_id: &str) -> Option<u32> {
+        self.find_in_folder_by_message_id(folder, message_id).map(|(_, uid)| uid)
+    }
+
+    pub fn find_in_folder_by_message_id(&self, folder: &str, message_id: &str) -> Option<(String, u32)> {
         let bare = message_id.trim().trim_matches(&['<', '>'][..]).trim().to_string();
         if bare.is_empty() {
             return None;
@@ -2157,23 +2161,23 @@ impl Database {
         self.with_conn(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT MIN(u.imap_uid) FROM message_cache m
+                    "SELECT m.aster_id, u.imap_uid FROM message_cache m
                      JOIN uid_map u ON u.aster_id = m.aster_id AND u.folder = m.folder
                      WHERE m.folder = ?1
                        AND COALESCE(
                              m.message_id,
                              CASE WHEN m.raw_headers IS NOT NULL AND json_valid(m.raw_headers)
                                   THEN json_extract(m.raw_headers, '$.message_id') END
-                           ) IN (?2, ?3)",
+                           ) IN (?2, ?3)
+                     ORDER BY u.imap_uid LIMIT 1",
                     rusqlite::params![folder, bare, angled],
-                    |row| row.get::<_, Option<i64>>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .ok()
-                .flatten())
+                .ok())
         })
         .ok()
         .flatten()
-        .and_then(|uid| u32::try_from(uid).ok())
+        .and_then(|(aster_id, uid)| Some((aster_id, u32::try_from(uid).ok()?)))
     }
 
     pub fn repair_cache(&self) -> Result<(), String> {

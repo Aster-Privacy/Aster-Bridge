@@ -1840,11 +1840,16 @@ fn retry_failed_inbound_items(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    listed_since: std::time::Instant,
 ) -> (Vec<String>, Vec<String>) {
     let mut new_ids = Vec::new();
     let mut updated_ids = Vec::new();
     for (folder, item) in failed {
-        let outcome = cache_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys);
+        let Some(outcome) = db.unless_listing_predates_append(&item.id, folder, listed_since, || {
+            cache_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys)
+        }) else {
+            continue;
+        };
         if outcome.was_new {
             new_ids.push(item.id.clone());
         } else if outcome.flags_changed {
@@ -2469,6 +2474,7 @@ async fn run_sync_pass(
                 fresh_identity_key.as_deref(),
                 &fresh_previous_keys,
                 &fresh_inbound_keys,
+                pass_started,
             );
             if !healed_new.is_empty() {
                 tracing::info!(
@@ -3478,12 +3484,48 @@ mod tests {
         let fresh_keys = [inbound_candidate(&recipient)];
         let failed = vec![("inbox".to_string(), item.clone())];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &fresh_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &fresh_keys, std::time::Instant::now());
         assert_eq!(new_ids, vec!["msg-heal".to_string()]);
         assert!(updated_ids.is_empty());
         let cached = db.get_cached_message("msg-heal").unwrap().unwrap();
         assert_eq!(cached.subject.as_deref(), Some("sealed"));
         assert_eq!(cached.body_text.as_deref(), Some("inbound body"));
+    }
+
+    #[test]
+    fn a_healed_item_listed_before_an_append_does_not_refile_the_message() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let json = serde_json::json!({"subject": "sealed", "body_text": "inbound body"});
+        let item = inbound_item("msg-appended", &json, &recipient);
+        let keys = [inbound_candidate(&recipient)];
+        let listed_at = std::time::Instant::now();
+
+        assert!(cache_mail_item(&db, "archive", &item, b"pass", None, &[], &keys).was_new);
+        let uid = db.get_cached_message("msg-appended").unwrap().unwrap().imap_uid;
+        db.pin_appended("msg-appended", "archive");
+
+        let failed = vec![("inbox".to_string(), item.clone())];
+        let (new_ids, updated_ids) =
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &keys, listed_at);
+        assert!(new_ids.is_empty());
+        assert!(updated_ids.is_empty());
+        let cached = db.get_cached_message("msg-appended").unwrap().unwrap();
+        assert_eq!(cached.folder, "archive");
+        assert_eq!(cached.imap_uid, uid);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+
+        retry_failed_inbound_items(
+            &db,
+            &failed,
+            b"pass",
+            None,
+            &[],
+            &keys,
+            std::time::Instant::now(),
+        );
+        let cached = db.get_cached_message("msg-appended").unwrap().unwrap();
+        assert_eq!(cached.folder, "inbox");
     }
 
     #[test]
@@ -3500,7 +3542,7 @@ mod tests {
 
         let failed = vec![("inbox".to_string(), item)];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &stale_keys);
+            retry_failed_inbound_items(&db, &failed, b"pass", None, &[], &stale_keys, std::time::Instant::now());
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         assert!(!db.body_cached("msg-unhealable"));

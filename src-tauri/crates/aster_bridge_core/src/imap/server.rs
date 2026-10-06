@@ -2265,6 +2265,41 @@ where
                                     continue;
                                 }
                                 if let Some(uid) = existing {
+                                    let sent_copy = if cmd.keywords.is_empty() {
+                                        None
+                                    } else {
+                                        db.list_cached_message_meta("sent")
+                                            .ok()
+                                            .and_then(|all| all.into_iter().find(|m| m.imap_uid == uid))
+                                            .map(|m| m.aster_id)
+                                    };
+                                    if let Some(aster_id) = sent_copy {
+                                        let failure = store_append_keywords(
+                                            &db,
+                                            &client,
+                                            &session,
+                                            &aster_id,
+                                            &cmd.keywords,
+                                        )
+                                        .await;
+                                        let _ = db.jmap_record_sync_batch("Email", &[aster_id.as_str()]);
+                                        let mut changed = std::collections::HashMap::new();
+                                        changed.insert(
+                                            "Email".to_string(),
+                                            db.jmap_state_get("Email").unwrap_or(0).to_string(),
+                                        );
+                                        let _ = broadcaster.send(StateChange { changed });
+                                        if let Some(text) = failure {
+                                            tracing::warn!(
+                                                "APPEND to {} could not label the existing message: {}",
+                                                folder,
+                                                text
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .await?;
+                                        }
+                                    }
                                     write_ok(
                                         &mut writer,
                                         &tag,
@@ -2295,6 +2330,10 @@ where
                                     let keyword_failure = match &outcome {
                                         Ok(crate::imap::append::AppendOutcome::Stored {
                                             aster_id,
+                                            ..
+                                        })
+                                        | Ok(crate::imap::append::AppendOutcome::Duplicate {
+                                            aster_id: Some(aster_id),
                                             ..
                                         }) => {
                                             store_append_keywords(
@@ -2353,8 +2392,35 @@ where
                                     }
                                     Some(Ok(crate::imap::append::AppendOutcome::Duplicate {
                                         uid,
+                                        aster_id,
                                     })) => {
                                         crate::sync::poller::try_kick_sync();
+                                        match aster_id.as_deref() {
+                                            Some(aster_id) if !cmd.keywords.is_empty() => {
+                                                let _ = db.jmap_record_sync_batch("Email", &[aster_id]);
+                                                let mut changed = std::collections::HashMap::new();
+                                                changed.insert(
+                                                    "Email".to_string(),
+                                                    db.jmap_state_get("Email").unwrap_or(0).to_string(),
+                                                );
+                                                let _ = broadcaster.send(StateChange { changed });
+                                            }
+                                            None if !cmd.keywords.is_empty() => tracing::warn!(
+                                                "APPEND to {} repeated a message that is not cached yet, its keywords were not applied",
+                                                folder
+                                            ),
+                                            _ => {}
+                                        }
+                                        if let Some(text) = keyword_failure {
+                                            tracing::warn!(
+                                                "APPEND to {} could not label the existing message: {}",
+                                                folder,
+                                                text
+                                            );
+                                            writer
+                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .await?;
+                                        }
                                         match uid {
                                             Some(uid) => {
                                                 write_ok(
@@ -7694,6 +7760,145 @@ mod tests {
         assert!(db.list_cached_messages("inbox").unwrap().is_empty());
         let cached = db.get_cached_message("imported-1").unwrap().unwrap();
         assert_eq!(cached.imap_uid, stored.1);
+    }
+
+    fn label_calls(log: &[(String, String)]) -> usize {
+        log.iter()
+            .filter(|(m, _)| m == "CREATE_TAG" || m == "ADD_TAG")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_adds_its_keywords_to_the_stored_message() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("two-labels");
+
+        let first = append_literal(&mut reader, &mut writer, "r1", "Archive (Work)", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+
+        let second =
+            append_literal(&mut reader, &mut writer, "r2", "Archive (\\Seen Fresh)", &raw).await;
+        assert!(second.contains("r2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert_eq!(db.list_cached_messages("archive").unwrap().len(), 1);
+        let log = calls.lock().await.clone();
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+        assert_eq!(log.iter().filter(|(m, _)| m == "ADD_TAG").count(), 2, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_labels_the_copy_held_in_another_mailbox() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("filed-elsewhere");
+
+        let first = append_literal(&mut reader, &mut writer, "x1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second =
+            append_literal(&mut reader, &mut writer, "x2", "INBOX (Work Fresh)", &raw).await;
+        assert!(second.contains("x2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), None, "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+        let cached = db.get_cached_message("imported-1").unwrap().unwrap();
+        assert_eq!(cached.folder, "archive");
+        assert_eq!(cached.imap_uid, stored.1);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-work|1"), "{:?}", log);
+        assert_eq!(log.iter().filter(|(m, _)| m == "CREATE_TAG").count(), 1, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_without_a_local_copy_drops_its_keywords() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("not-cached");
+
+        let first = append_literal(&mut reader, &mut writer, "n1", "Archive", &raw).await;
+        assert!(first.contains("n1 OK [APPENDUID "), "{}", first);
+        db.delete_message_by_aster_id("imported-1").unwrap();
+
+        let second =
+            append_literal(&mut reader, &mut writer, "n2", "Archive (Work Fresh)", &raw).await;
+        assert!(second.contains("n2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), None, "{}", second);
+
+        assert!(db.message_keywords("imported-1").unwrap().is_empty());
+        assert_eq!(db.list_custom_tags().unwrap().len(), 1);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert_eq!(label_calls(&log), 0, "{:?}", log);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_with_a_failed_label_write_warns_and_completes() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail_tags: true,
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("half-labelled-twice");
+
+        let first = append_literal(&mut reader, &mut writer, "w1", "Archive", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second =
+            append_literal(&mut reader, &mut writer, "w2", "Archive (Work Fresh)", &raw).await;
+        let warned = second
+            .find("* NO [UNAVAILABLE]")
+            .unwrap_or_else(|| panic!("no warning in {}", second));
+        let done = second
+            .find("w2 OK [APPENDUID ")
+            .unwrap_or_else(|| panic!("not completed: {}", second));
+        assert!(warned < done, "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+        assert_eq!(db.message_keywords("imported-1").unwrap(), vec!["Work".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_append_to_sent_adds_its_keywords_to_the_stored_message() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let raw = appended_mail("sent-under-two-labels");
+
+        let first = append_literal(&mut reader, &mut writer, "s1", "Sent (Work)", &raw).await;
+        let stored = append_uid(&first).unwrap_or_else(|| panic!("no APPENDUID in {}", first));
+
+        let second = append_literal(&mut reader, &mut writer, "s2", "Sent (Fresh)", &raw).await;
+        assert!(second.contains("s2 OK"), "{}", second);
+        assert!(!second.contains("* NO"), "{}", second);
+        assert_eq!(append_uid(&second), Some(stored), "{}", second);
+
+        let mut keywords = db.message_keywords("imported-1").unwrap();
+        keywords.sort();
+        assert_eq!(keywords, vec!["Fresh".to_string(), "Work".to_string()]);
+        assert_eq!(db.list_cached_messages("sent").unwrap().len(), 1);
     }
 
     #[tokio::test]

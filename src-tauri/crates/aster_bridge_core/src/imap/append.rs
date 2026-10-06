@@ -517,7 +517,7 @@ pub fn was_recently_sent(raw_message: &[u8]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendOutcome {
     Stored { uid: u32, aster_id: String },
-    Duplicate { uid: Option<u32> },
+    Duplicate { uid: Option<u32>, aster_id: Option<String> },
 }
 
 static IMPORT_JOB: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -996,12 +996,15 @@ async fn import_message(
         if response.duplicate_count > 0 {
             record_import_outcome(false);
             crate::sync::poller::try_kick_sync();
-            let uid = if as_copy {
-                None
-            } else {
-                db.find_uid_by_message_id_in_folder(folder, &message.message_id)
-            };
-            return Ok(AppendOutcome::Duplicate { uid });
+            if as_copy {
+                return Ok(AppendOutcome::Duplicate { uid: None, aster_id: None });
+            }
+            let (uid, aster_id) =
+                match db.find_in_folder_by_message_id(folder, &message.message_id) {
+                    Some((aster_id, uid)) => (Some(uid), Some(aster_id)),
+                    None => (None, find_labelable_copy(db, &message.message_id)),
+                };
+            return Ok(AppendOutcome::Duplicate { uid, aster_id });
         }
         return Err("the server rejected the message".to_string());
     }
@@ -1189,6 +1192,12 @@ async fn locate_stored_item(
     lookup_stored_item(client, token, encrypted_envelope, SYNC_LOOKUP_LIMIT, None)
         .await?
         .ok_or_else(|| "the stored message was not found on the server".to_string())
+}
+
+fn find_labelable_copy(db: &Database, message_id: &str) -> Option<String> {
+    let aster_id = db.find_aster_id_by_message_id(message_id)?;
+    let cached = db.get_cached_message(&aster_id).ok().flatten()?;
+    (cached.folder != "drafts").then_some(aster_id)
 }
 
 async fn apply_placement(
