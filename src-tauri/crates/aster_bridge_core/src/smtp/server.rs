@@ -372,6 +372,10 @@ where
                                     "552 5.3.4 {}\r\n",
                                     msg.replace(['\r', '\n'], " ")
                                 ),
+                                BridgeError::RecipientKey(msg) => format!(
+                                    "550 5.7.5 {}\r\n",
+                                    msg.replace(['\r', '\n'], " ")
+                                ),
                                 _ => "550 Send rejected\r\n".to_string(),
                             };
                             tracing::error!("Failed to send mail via API: {}", e);
@@ -958,7 +962,7 @@ pub async fn build_threaded_send_payload(
     )
     .await?;
     crate::smtp::reply_thread::apply_reply_thread(&mut payload, client, &access_token, &reply).await;
-    crate::crypto::internal_send::seal_internal_body(&mut payload, session, client, &access_token)
+    crate::crypto::internal_send::seal_internal_body(&mut payload, session, client, db, &access_token)
         .await?;
     Ok((payload, access_token))
 }

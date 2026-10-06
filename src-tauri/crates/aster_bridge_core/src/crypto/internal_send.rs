@@ -28,6 +28,8 @@ use tokio::sync::RwLock;
 use crate::api_client::ApiClient;
 use crate::auth::session::Session;
 use crate::crypto::ratchet::{encrypt_bootstrap, RatchetMessage};
+use crate::crypto::recipient_trust::{evaluate_bundle, pin_id, TrustedBundle};
+use crate::db::Database;
 use crate::error::{BridgeError, Result};
 
 const INTERNAL_DOMAINS: [&str; 6] = [
@@ -147,6 +149,23 @@ pub fn apply_envelope(payload: &mut Value, envelope: String, has_external: bool)
 struct SenderKeys {
     identity_secret_d: Vec<u8>,
     username: String,
+    account_id: String,
+}
+
+fn seal_for_recipient(
+    sender_identity_secret_d: &[u8],
+    trusted: &TrustedBundle,
+    plaintext: &str,
+) -> Result<RatchetMessage> {
+    encrypt_bootstrap(
+        sender_identity_secret_d,
+        &trusted.identity_public,
+        &trusted.signed_prekey,
+        trusted.pq_target.as_ref().map(|target| target.public_key.as_slice()),
+        trusted.pq_target.as_ref().map(|target| target.key_id),
+        plaintext,
+    )
+    .map_err(BridgeError::Crypto)
 }
 
 async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
@@ -159,6 +178,7 @@ async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
     Ok(SenderKeys {
         identity_secret_d: keys.identity_secret_d.clone(),
         username: guard.username.clone(),
+        account_id: guard.user_id.to_string(),
     })
 }
 
@@ -166,6 +186,7 @@ pub async fn seal_internal_body(
     payload: &mut Value,
     session: &Arc<RwLock<Session>>,
     client: &ApiClient,
+    db: &Database,
     access_token: &str,
 ) -> Result<()> {
     let split = split_recipients(payload);
@@ -182,6 +203,7 @@ pub async fn seal_internal_body(
     let sender = sender_keys(session).await?;
     let mut sealed: Vec<(String, Value)> = Vec::with_capacity(split.internal.len());
     let mut sender_identity_key: Option<String> = None;
+    let mut pending_pins = Vec::new();
 
     for address in &split.internal {
         let username = key_lookup_username(address, &sender.username).ok_or_else(|| {
@@ -190,35 +212,27 @@ pub async fn seal_internal_body(
         let bundle = client
             .get_prekey_bundle(access_token, &username, address)
             .await?;
-        let identity_public = STANDARD
-            .decode(bundle.kem_identity_key.trim())
-            .map_err(|_| {
-                BridgeError::Crypto("recipient identity key is not valid base64".to_string())
-            })?;
-        let signed_prekey = STANDARD.decode(bundle.signed_prekey.trim()).map_err(|_| {
-            BridgeError::Crypto("recipient signed prekey is not valid base64".to_string())
+        let owner_public_key = client
+            .get_recipient_public_key(access_token, &username, address)
+            .await?;
+        let pin_key = pin_id(&sender.account_id, address);
+        let existing = db.recipient_pin_get(&pin_key).map_err(|_| {
+            BridgeError::RecipientKey(format!(
+                "the saved key record for {} could not be read; the message was not sent",
+                address
+            ))
         })?;
-        let pq = match &bundle.pq_prekey {
-            Some(prekey) => {
-                let decoded = STANDARD.decode(prekey.public_key.trim()).map_err(|_| {
-                    BridgeError::Crypto(
-                        "recipient post-quantum prekey is not valid base64".to_string(),
-                    )
-                })?;
-                Some((decoded, prekey.key_id as i32))
-            }
-            None => None,
-        };
+        let trusted = evaluate_bundle(
+            address,
+            &bundle,
+            owner_public_key.as_deref(),
+            existing.as_ref(),
+        )?;
+        if existing.as_ref() != Some(&trusted.pin) {
+            pending_pins.push((pin_key, trusted.pin.clone()));
+        }
 
-        let message = encrypt_bootstrap(
-            &sender.identity_secret_d,
-            &identity_public,
-            &signed_prekey,
-            pq.as_ref().map(|(key, _)| key.as_slice()),
-            pq.as_ref().map(|(_, key_id)| *key_id),
-            &plaintext,
-        )
-        .map_err(BridgeError::Crypto)?;
+        let message = seal_for_recipient(&sender.identity_secret_d, &trusted, &plaintext)?;
 
         if sender_identity_key.is_none() {
             sender_identity_key = Some(STANDARD.encode(&message.sender_identity_public));
@@ -228,6 +242,13 @@ pub async fn seal_internal_body(
 
     let sender_identity_key = sender_identity_key
         .ok_or_else(|| BridgeError::Crypto("no Aster recipient could be sealed".to_string()))?;
+    for (pin_key, pin) in &pending_pins {
+        db.recipient_pin_put(pin_key, pin).map_err(|_| {
+            BridgeError::RecipientKey(
+                "the recipient key record could not be saved; the message was not sent".to_string(),
+            )
+        })?;
+    }
     let envelope = build_envelope(&sender_identity_key, sealed);
     apply_envelope(payload, envelope, split.has_external);
     Ok(())
@@ -390,6 +411,81 @@ mod tests {
 
         let mut recipient_message =
             parse_recipient_message(&parsed, "USER@astermail.org").expect("parsed");
+        recipient_message.pq_secret = Some(decap.as_bytes().to_vec());
+
+        let keys = RatchetReceiverKeys {
+            identity_secret_d: recipient_identity.to_bytes().to_vec(),
+            signed_prekey_secret_d: recipient_prekey.to_bytes().to_vec(),
+            signed_prekey_public: prekey_public,
+        };
+        assert_eq!(
+            decrypt_bootstrap(&keys, &recipient_message).expect("decrypted"),
+            plaintext
+        );
+    }
+    #[test]
+    fn a_verified_bundle_seals_to_the_signed_post_quantum_key() {
+        use crate::crypto::ratchet::PQ_IDENTITY_KEY_ID;
+        use crate::crypto::recipient_trust::tests::{owner, sign};
+
+        let plaintext = "sealed only after the bundle signature verified";
+        let recipient_identity = SecretKey::random(&mut OsRng);
+        let recipient_prekey = SecretKey::random(&mut OsRng);
+        let sender_identity = SecretKey::random(&mut OsRng);
+        let (decap, encap) = MlKem768::generate(&mut OsRng);
+        let (_, unsigned_encap) = MlKem768::generate(&mut OsRng);
+        let prekey_public = recipient_prekey
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+
+        let mut bundle = crate::api_client::PrekeyBundle {
+            kem_identity_key: STANDARD.encode(
+                recipient_identity
+                    .public_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            ),
+            signed_prekey: STANDARD.encode(&prekey_public),
+            signed_prekey_signature: None,
+            pq_prekey: Some(crate::api_client::BundlePqPrekey {
+                key_id: 9,
+                public_key: STANDARD.encode(unsigned_encap.as_bytes()),
+            }),
+            pq_kem_public_key: Some(STANDARD.encode(encap.as_bytes())),
+            x3dh_max_version: Some(2),
+        };
+
+        assert!(matches!(
+            evaluate_bundle("user@astermail.org", &bundle, None, None),
+            Err(BridgeError::RecipientKey(_))
+        ));
+
+        let account = owner("user");
+        let text = format!(
+            "aster-ratchet-prekey-v2:{}.{}.{}",
+            bundle.kem_identity_key,
+            bundle.signed_prekey,
+            bundle.pq_kem_public_key.as_deref().unwrap()
+        );
+        sign(&mut bundle, &account, &text);
+
+        let trusted =
+            evaluate_bundle("user@astermail.org", &bundle, Some(&account.public_key), None)
+                .expect("trusted");
+        let message =
+            seal_for_recipient(sender_identity.to_bytes().as_slice(), &trusted, plaintext)
+                .expect("sealed");
+        assert_eq!(message.pq_key_id, Some(PQ_IDENTITY_KEY_ID));
+
+        let envelope = build_envelope(
+            &STANDARD.encode(&message.sender_identity_public),
+            vec![("user@astermail.org".to_string(), recipient_entry(&message))],
+        );
+        let parsed: Value = serde_json::from_str(&envelope).expect("envelope json");
+        let mut recipient_message =
+            parse_recipient_message(&parsed, "user@astermail.org").expect("parsed");
         recipient_message.pq_secret = Some(decap.as_bytes().to_vec());
 
         let keys = RatchetReceiverKeys {

@@ -670,6 +670,16 @@ impl Database {
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS recipient_key_pin (
+                pin_id TEXT PRIMARY KEY,
+                identity_fingerprint TEXT NOT NULL,
+                owner_fingerprint TEXT NOT NULL,
+                pq_seen INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+             );",
+        ).map_err(|e| e.to_string())?;
+
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_attachment (
                 aster_id TEXT NOT NULL,
                 seq INTEGER NOT NULL,
@@ -1881,6 +1891,60 @@ impl Database {
                 [],
             );
             Ok(true)
+        })
+    }
+
+    pub fn recipient_pin_get(
+        &self,
+        pin_id: &str,
+    ) -> Result<Option<crate::crypto::recipient_trust::RecipientPin>, String> {
+        use rusqlite::OptionalExtension;
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT identity_fingerprint, owner_fingerprint, pq_seen
+                 FROM recipient_key_pin WHERE pin_id = ?1",
+                [pin_id],
+                |r| {
+                    Ok(crate::crypto::recipient_trust::RecipientPin {
+                        identity_fingerprint: r.get(0)?,
+                        owner_fingerprint: r.get(1)?,
+                        pq_seen: r.get::<_, i64>(2)? != 0,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    pub fn recipient_pin_put(
+        &self,
+        pin_id: &str,
+        pin: &crate::crypto::recipient_trust::RecipientPin,
+    ) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO recipient_key_pin
+                    (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(pin_id) DO UPDATE SET
+                    identity_fingerprint = excluded.identity_fingerprint,
+                    owner_fingerprint = excluded.owner_fingerprint,
+                    pq_seen = excluded.pq_seen,
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    pin_id,
+                    pin.identity_fingerprint,
+                    pin.owner_fingerprint,
+                    pin.pq_seen as i64,
+                    now
+                ],
+            )?;
+            Ok(())
         })
     }
 
@@ -3992,6 +4056,32 @@ mod db_tests {
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
         assert_eq!(db.max_uid("inbox").unwrap(), 0);
         assert!(db.get_sync_state("k").unwrap().is_none());
+    }
+
+    #[test]
+    fn recipient_pins_are_updated_in_place_and_outlive_a_cache_repair() {
+        use crate::crypto::recipient_trust::RecipientPin;
+
+        let (_d, db) = open_db();
+        assert!(db.recipient_pin_get("pin").unwrap().is_none());
+
+        let first = RecipientPin {
+            identity_fingerprint: "aa".to_string(),
+            owner_fingerprint: "BB".to_string(),
+            pq_seen: false,
+        };
+        db.recipient_pin_put("pin", &first).unwrap();
+        assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(first.clone()));
+
+        let rotated = RecipientPin {
+            identity_fingerprint: "cc".to_string(),
+            pq_seen: true,
+            ..first
+        };
+        db.recipient_pin_put("pin", &rotated).unwrap();
+        db.repair_cache().unwrap();
+        db.clear_user_data().unwrap();
+        assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(rotated));
     }
 
     #[test]
