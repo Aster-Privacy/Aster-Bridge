@@ -1093,6 +1093,19 @@ async fn get_service_settings(
 }
 
 #[tauri::command]
+async fn get_full_mail_history(state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.0.lock().await;
+    Ok(guard.config.full_mail_history)
+}
+
+#[tauri::command]
+async fn set_full_mail_history(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    guard.config.full_mail_history = enabled;
+    config::save_config(&guard.config)
+}
+
+#[tauri::command]
 async fn set_require_post_quantum(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
     guard.config.require_post_quantum = enabled;
@@ -1335,6 +1348,10 @@ impl aster_bridge_core::events::BridgeEvents for TauriEvents {
         let _ = self.0.emit("sync_done", serde_json::json!({ "failed": failed }));
     }
 
+    fn history_progress(&self, progress: &aster_bridge_core::events::HistoryProgress) {
+        let _ = self.0.emit("history_progress", progress);
+    }
+
     fn import_progress(&self, progress: &imap::append::ImportProgress) {
         let _ = self.0.emit("import_progress", progress.clone());
     }
@@ -1477,6 +1494,8 @@ fn main() {
             get_data_directory,
             open_data_directory,
             get_service_settings,
+            get_full_mail_history,
+            set_full_mail_history,
             set_service_mode,
             set_require_post_quantum,
             set_autostart,

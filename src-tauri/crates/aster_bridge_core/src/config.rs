@@ -52,6 +52,8 @@ pub struct BridgeConfig {
     #[serde(default = "default_carddav_https_enabled")]
     pub carddav_https_enabled: bool,
     pub poll_interval_secs: u64,
+    #[serde(default = "default_full_mail_history")]
+    pub full_mail_history: bool,
     #[serde(default)]
     pub require_post_quantum: bool,
     #[serde(skip)]
@@ -102,6 +104,10 @@ fn default_carddav_https_enabled() -> bool {
     true
 }
 
+fn default_full_mail_history() -> bool {
+    true
+}
+
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
@@ -121,6 +127,7 @@ impl Default for BridgeConfig {
             carddav_enabled: default_carddav_enabled(),
             carddav_https_enabled: default_carddav_https_enabled(),
             poll_interval_secs: 30,
+            full_mail_history: default_full_mail_history(),
             require_post_quantum: false,
             data_dir: PathBuf::new(),
         }

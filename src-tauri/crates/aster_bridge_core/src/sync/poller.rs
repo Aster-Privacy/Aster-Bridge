@@ -35,6 +35,9 @@ use crate::db::{
 use crate::error::BridgeError;
 use crate::jmap::state::StateChange;
 
+mod history;
+pub mod on_demand;
+
 const POLL_INTERVAL_SECS: u64 = 30;
 const DEEP_SYNC_INTERVAL_SECS: u64 = 300;
 const TRIGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1016,6 +1019,7 @@ pub(crate) struct CacheOutcome {
     was_new: bool,
     flags_changed: bool,
     inbound_decrypt_failed: bool,
+    decrypt_failed: bool,
 }
 
 fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
@@ -1144,6 +1148,7 @@ fn prepare_mail_item(
             was_new: false,
             flags_changed: flags_changed || addresses_added,
             inbound_decrypt_failed: false,
+            decrypt_failed: false,
         });
     }
 
@@ -1195,6 +1200,7 @@ fn prepare_mail_item(
             }
             return Prepared::Done(CacheOutcome {
                 inbound_decrypt_failed: inbound,
+                decrypt_failed: true,
                 ..CacheOutcome::default()
             });
             }
@@ -1280,6 +1286,64 @@ fn commit_mail_item(
     prepared: PreparedMessage,
     downloaded: Option<Vec<CachedAttachment>>,
 ) -> CacheOutcome {
+    commit_prepared(db, folder, item, prepared, downloaded, false)
+}
+
+fn commit_history_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    prepared: PreparedMessage,
+) -> CacheOutcome {
+    commit_prepared(db, folder, item, prepared, None, true)
+}
+
+fn on_demand_parts(entries: &[EnvelopeAttachment], count: usize) -> Vec<CachedAttachment> {
+    let mut used: HashSet<i64> = HashSet::new();
+    let mut parts: Vec<CachedAttachment> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        let seq = entry.seq.unwrap_or(position as i64);
+        if !used.insert(seq) {
+            continue;
+        }
+        parts.push(CachedAttachment {
+            seq,
+            name: attachment_display_name(entry),
+            content_type: entry.content_type.clone(),
+            content_id: entry.content_id.clone(),
+            is_inline: entry.is_inline.unwrap_or(false) || entry.content_id.is_some(),
+            size: entry.size.unwrap_or(0),
+            data: Vec::new(),
+        });
+    }
+    let mut next = 0i64;
+    while parts.len() < count {
+        while used.contains(&next) {
+            next += 1;
+        }
+        used.insert(next);
+        parts.push(CachedAttachment {
+            seq: next,
+            name: ATTACHMENT_PLACEHOLDER_NAME.to_string(),
+            content_type: DEFAULT_ATTACHMENT_CONTENT_TYPE.to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 0,
+            data: Vec::new(),
+        });
+    }
+    parts.sort_by_key(|a| a.seq);
+    parts
+}
+
+fn commit_prepared(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    prepared: PreparedMessage,
+    downloaded: Option<Vec<CachedAttachment>>,
+    on_demand: bool,
+) -> CacheOutcome {
     let attachment_count = prepared.expected_attachments;
     let size = prepared
         .body_text
@@ -1355,14 +1419,17 @@ fn commit_mail_item(
     };
     if !stored
         && attachment_count > 0
-        && db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE) != ATTACHMENTS_STORED
+        && !crate::db::attachment_parts_known(db.attachments_state(&item.id).unwrap_or(ATTACHMENTS_NONE))
     {
-        let state = if prepared.unencrypted {
-            ATTACHMENTS_FAILED
+        if prepared.unencrypted {
+            let _ = db.set_attachments_state(&item.id, ATTACHMENTS_FAILED);
         } else {
-            ATTACHMENTS_PENDING
-        };
-        let _ = db.set_attachments_state(&item.id, state);
+            let parts = on_demand.then(|| on_demand_parts(&prepared.attachments, attachment_count));
+            let deferred = parts.is_some_and(|parts| db.store_on_demand_attachments(&item.id, &parts).is_ok());
+            if !deferred {
+                let _ = db.set_attachments_state(&item.id, ATTACHMENTS_PENDING);
+            }
+        }
     }
     if let Err(e) = db.assign_uid_if_missing(folder, &item.id) {
         tracing::warn!("uid assign failed for {}: {}", item.id, e);
@@ -1372,6 +1439,7 @@ fn commit_mail_item(
         was_new,
         flags_changed: flags_changed && !was_new,
         inbound_decrypt_failed: false,
+        decrypt_failed: false,
     }
 }
 
@@ -1387,6 +1455,21 @@ pub(crate) fn cache_mail_item(
     match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
         Prepared::Done(outcome) => outcome,
         Prepared::Ready(prepared) => commit_mail_item(db, folder, item, prepared, None),
+    }
+}
+
+fn cache_history_item(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> CacheOutcome {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
+        Prepared::Done(outcome) => outcome,
+        Prepared::Ready(prepared) => commit_history_item(db, folder, item, prepared),
     }
 }
 
@@ -1801,6 +1884,14 @@ fn relabeled_attachment(stored: &CachedAttachment, listed: &EnvelopeAttachment) 
 }
 
 fn reconcile_listed_attachments(db: &Database, aster_id: &str, listed: &[EnvelopeAttachment]) {
+    if db.attachments_state(aster_id).ok() == Some(crate::db::ATTACHMENTS_ON_DEMAND) {
+        let parts = on_demand_parts(listed, listed.len());
+        if let Err(e) = db.store_on_demand_attachments(aster_id, &parts) {
+            tracing::warn!("attachment relabel for {} failed: {}", aster_id, e);
+            let _ = db.drop_attachment_parts(aster_id, ATTACHMENTS_PENDING);
+        }
+        return;
+    }
     let stored = db.get_message_attachments(aster_id).unwrap_or_default();
     let verified: Option<Vec<CachedAttachment>> = if stored.len() == listed.len() {
         listed
@@ -2284,6 +2375,7 @@ fn target_folder(system_label: &str, item: &MailItem, known: &HashSet<String>) -
 
 struct FolderPage {
     label: String,
+    raw_ids: Vec<String>,
     items: Vec<MailItem>,
     total: usize,
     has_more: bool,
@@ -2326,6 +2418,8 @@ async fn run_sync_pass(
     let mut inline_downloads = 0usize;
     let mut attachments_handled: HashSet<String> = HashSet::new();
     let mut rate_limited = false;
+    let indexing_history = history::is_enabled(db);
+    let mut listing_totals: Vec<(String, usize)> = Vec::new();
 
     let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
@@ -2427,6 +2521,7 @@ async fn run_sync_pass(
                     q.cursor = cursor.clone();
                     client.list_mail(&access_token, &q).await.map(|resp| FolderPage {
                         label: folder_query.label.to_string(),
+                        raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
                         total: resp.total.max(0) as usize,
                         has_more: resp.has_more,
                         next_cursor: resp.next_cursor,
@@ -2440,6 +2535,7 @@ async fn run_sync_pass(
                         let fetched = resp.items.len();
                         FolderPage {
                             label: crate::folders::folder_label(&folder.label_token),
+                            raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
                             total: resp.total.max(0) as usize,
                             has_more: resp.has_more && fetched > 0,
                             next_cursor: (resp.has_more && fetched > 0).then(String::new),
@@ -2455,6 +2551,12 @@ async fn run_sync_pass(
             match page {
                 Ok(resp) => {
                     let folder_total = resp.total.min(max_per_folder);
+                    if indexing_history {
+                        if total_fetched == 0 {
+                            listing_totals.push((resp.label.clone(), resp.total));
+                        }
+                        history::stamp_listed(db, &resp.label, &resp.raw_ids);
+                    }
                     tracing::debug!(
                         "Synced {} page - {} items (total: {}, has_more: {})",
                         progress_label,
@@ -2491,6 +2593,11 @@ async fn run_sync_pass(
                         } else {
                             target_folder(&resp.label, item, &known_tokens)
                         };
+                        if indexing_history {
+                            if let Some(moved_from) = snapshot.get(&item.id).map(|s| &s.folder).filter(|f| **f != item_folder) {
+                                let _ = db.forget_listing_member(moved_from, &item.id);
+                            }
+                        }
                         if id_counts.get(item.id.as_str()) == Some(&1) {
                             let state = snapshot.get(&item.id);
                             match cached_shortcut(state, &item_folder, item) {
@@ -2812,6 +2919,11 @@ async fn run_sync_pass(
         let refs: Vec<&str> = destroyed_ids.iter().map(|s| s.as_str()).collect();
         let _ = db.jmap_record_destroyed_batch("Email", &refs);
     }
+    if indexing_history && deep && last_err.is_none() {
+        for (label, total) in &listing_totals {
+            history::note_listing_total(db, label, *total);
+        }
+    }
     if !updated_ids.is_empty() {
         let refs: Vec<&str> = updated_ids.iter().map(|s| s.as_str()).collect();
         let _ = db.jmap_record_updated_batch("Email", &refs);
@@ -2903,6 +3015,7 @@ pub enum PollExit {
 pub struct PollTuning {
     pub interval: std::time::Duration,
     pub plan_check_every: u32,
+    pub full_history: bool,
 }
 
 impl PollTuning {
@@ -2911,6 +3024,7 @@ impl PollTuning {
         Self {
             interval: std::time::Duration::from_secs(secs),
             plan_check_every: PLAN_CHECK_INTERVAL,
+            full_history: false,
         }
     }
 }
@@ -2943,6 +3057,13 @@ pub async fn run_poll_loop_tuned(
     tuning: PollTuning,
 ) -> PollExit {
     migrate_legacy_dates(&db);
+    let trimmed = history::apply_mode(&db, tuning.full_history);
+    if !trimmed.is_empty() {
+        let refs: Vec<&str> = trimmed.iter().map(String::as_str).collect();
+        let _ = db.jmap_record_destroyed_batch("Email", &refs);
+        history::broadcast(&db, jmap_broadcaster.as_ref());
+    }
+    let mut history_pacer = history::Pacer::new();
     report_envelope_capability(&session, &client).await;
     let interval_dur = tuning.interval;
     let plan_check_every = tuning.plan_check_every.max(1);
@@ -2960,7 +3081,9 @@ pub async fn run_poll_loop_tuned(
     };
 
     loop {
+        let history_at = history_pacer.next_at();
         tokio::select! {
+            biased;
             _ = interval.tick() => {
                 let now = tokio::time::Instant::now();
                 let elapsed = now.duration_since(last_tick);
@@ -2988,6 +3111,9 @@ pub async fn run_poll_loop_tuned(
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
                 paused_until = pause_after(&result, tokio::time::Instant::now());
+                if result.is_ok() {
+                    history_pacer.open();
+                }
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                     report_envelope_capability(&session, &client).await;
@@ -3021,6 +3147,9 @@ pub async fn run_poll_loop_tuned(
                 let result = run_sync_pass(&session, &client, &db, jmap_broadcaster.as_ref(), deep).await;
                 crate::account_state::observe(&result);
                 paused_until = pause_after(&result, tokio::time::Instant::now());
+                if result.is_ok() {
+                    history_pacer.open();
+                }
                 if deep && result.is_ok() {
                     last_deep_at = Some(tokio::time::Instant::now());
                 }
@@ -3038,6 +3167,22 @@ pub async fn run_poll_loop_tuned(
                 interval.reset();
                 for done in waiting {
                     let _ = done.send(result.clone());
+                }
+            }
+            _ = tokio::time::sleep_until(history_at), if tuning.full_history && history_pacer.is_open() => {
+                if crate::auth::session::session_rejected()
+                    || sync_is_paused(paused_until, tokio::time::Instant::now())
+                {
+                    history_pacer.defer();
+                    continue;
+                }
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let outcome = history::step(&session, &client, &db, now_secs).await;
+                if let Some(until) = history_pacer.finish(outcome, &db, jmap_broadcaster.as_ref()) {
+                    paused_until = Some(until);
                 }
             }
         }
@@ -5974,6 +6119,33 @@ mod sealed_retry_tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].from_manifest);
         assert_eq!(entries[0].key.as_deref(), Some("a2V5"));
+    }
+
+    #[test]
+    fn unsealing_keeps_lazily_indexed_attachments_on_demand() {
+        let (_dir, db) = temp_db();
+        cache_sealed(&db, "sealed-lazy");
+        db.store_on_demand_attachments(
+            "sealed-lazy",
+            &[CachedAttachment {
+                data: Vec::new(),
+                size: 0,
+                ..row_trusted_attachment(0, "Attachment", b"")
+            }],
+        )
+        .unwrap();
+        assert!(store_unsealed_message(&db, "sealed-lazy", &manifest_bundle(b"real invoice")));
+        assert_eq!(db.attachments_state("sealed-lazy").unwrap(), crate::db::ATTACHMENTS_ON_DEMAND);
+        let parts = db.get_message_attachment_meta("sealed-lazy").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].name, "invoice.pdf");
+        assert_eq!(parts[0].content_type, "application/pdf");
+        assert_eq!(parts[0].size, b"real invoice".len() as i64);
+        assert!(db.list_attachment_backlog(10).unwrap().is_empty());
+        let cached = db.get_cached_message("sealed-lazy").unwrap().unwrap();
+        let entries = cached_attachment_entries(cached.raw_headers.as_deref());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].from_manifest);
     }
 
     #[test]
