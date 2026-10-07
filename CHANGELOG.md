@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.5 - 2026-10-07
+
+### What's new
+- Aster Bridge syncs every message in every folder, not only the newest 2,000. Older mail is indexed in the background, and its attachments download the first time you open them. To keep only recent mail and save disk space, turn off **Sync all mail** in **General**.
+- When a recipient's encryption key changes, Aster Bridge refuses to send and tells you. After you confirm the change with the recipient, you can accept the new key in the app or the command-line app.
+- A new setting, **Require post-quantum protection for Aster recipients**, stops a send to an Aster recipient whose keys don't support post-quantum protection.
+- The pairing screen and the command-line app show a device fingerprint, so you can confirm that you're approving the right device.
+
+### Fixed
+- When one message's attachments can't be downloaded, your mail app still receives the other messages it asked for.
+- When you turn off **Sync all mail**, Aster Bridge returns the freed space to your disk.
+- Aster Bridge checks attachments and recipient keys against the signed message and refuses anything that was changed.
+- Background indexing sends fewer requests, so your sync is less likely to pause.
+
 ## 1.0.4 - 2026-10-06
 
 ### Fixed
