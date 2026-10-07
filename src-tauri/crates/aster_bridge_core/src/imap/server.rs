@@ -4006,6 +4006,7 @@ async fn handle_fetch(
 
     let mut out: Vec<u8> = Vec::new();
     let mut refusal: Option<String> = None;
+    let mut skipped = 0usize;
     for n in &selected {
         let found = if uid_command {
             view.by_uid(*n)
@@ -4060,7 +4061,7 @@ async fn handle_fetch(
                 out.clear();
             }
             use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
-            match ensure_attachments(db, client, session, &msg.aster_id, Some(broadcaster)).await {
+            let reason = match ensure_attachments(db, client, session, &msg.aster_id, Some(broadcaster)).await {
                 AttachmentFill::Ready => {
                     let filled = CachedMessage {
                         attachments_state: db
@@ -4070,28 +4071,23 @@ async fn handle_fetch(
                     };
                     let attachments = db.get_message_attachments(&msg.aster_id).unwrap_or_default();
                     rendered = crate::message_render::render(&filled, &attachments, true);
-                    if !rendered.is_complete() {
-                        refusal = Some(format!(
-                            "[UNAVAILABLE] the attachments of UID {} are not downloaded yet; try again",
-                            uid
-                        ));
-                        break;
-                    }
+                    (!rendered.is_complete()).then(|| {
+                        format!("the attachments of UID {} are not downloaded yet; try again", uid)
+                    })
                 }
-                AttachmentFill::Replaced => {
-                    refusal = Some(format!(
-                        "[UNAVAILABLE] UID {} changed when its attachments were downloaded and arrives again as a new message",
-                        uid
-                    ));
-                    break;
-                }
-                AttachmentFill::Unavailable => {
-                    refusal = Some(format!(
-                        "[UNAVAILABLE] the attachments of UID {} could not be downloaded; try again later",
-                        uid
-                    ));
-                    break;
-                }
+                AttachmentFill::Replaced => Some(format!(
+                    "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                    uid
+                )),
+                AttachmentFill::Unavailable => Some(format!(
+                    "the attachments of UID {} could not be downloaded; try again later",
+                    uid
+                )),
+            };
+            if let Some(reason) = reason {
+                skipped += 1;
+                refusal.get_or_insert(reason);
+                continue;
             }
         }
         let mut items: Vec<Vec<u8>> = Vec::new();
@@ -4273,7 +4269,17 @@ async fn handle_fetch(
         });
     }
     match refusal {
-        Some(reason) => write_no(writer, tag, &reason).await,
+        Some(reason) if skipped > 1 => {
+            let others = skipped - 1;
+            let noun = if others == 1 { "message" } else { "messages" };
+            write_no(
+                writer,
+                tag,
+                &format!("[UNAVAILABLE] {} ({} other {} also skipped)", reason, others, noun),
+            )
+            .await
+        }
+        Some(reason) => write_no(writer, tag, &format!("[UNAVAILABLE] {}", reason)).await,
         None => write_ok(writer, tag, "FETCH completed").await,
     }
 }

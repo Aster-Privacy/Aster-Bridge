@@ -1636,6 +1636,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_unavailable_message_does_not_hold_back_the_rest_of_a_fetch() {
+        let (_dir, db, backend, client, session) = indexed_with_attachments(
+            2100,
+            &[(2050, 6000, false), (2060, 7000, true), (2070, 8000, true), (2080, 4000, true), (2090, 4000, true)],
+        )
+        .await;
+        let mut imap = Imap::start(&db, &client, &session).await;
+        imap.command("SELECT Archive").await;
+        let uids = [uid_of(&db, 2050), uid_of(&db, 2060), uid_of(&db, 2070)];
+        let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+
+        let response = imap.command(&format!("UID FETCH {} (BODY.PEEK[])", set)).await;
+        assert!(response.contains("Body of message 2060"), "{}", response);
+        assert!(response.contains("Body of message 2070"), "{}", response);
+        assert!(!response.contains("Body of message 2050"), "{}", response);
+        assert_eq!(response.matches("BODY[] {").count(), 2, "{}", response);
+        let last = response.lines().last().unwrap_or_default();
+        assert!(last.contains(" NO [UNAVAILABLE]"), "{}", last);
+        assert!(!last.contains("other"), "{}", last);
+        assert_eq!(backend.attachment_requests(), 3);
+        let cached = db.get_cached_message(&item_id(2060)).unwrap().unwrap();
+        assert_eq!(cached.attachments_state, ATTACHMENTS_STORED);
+
+        *backend.fail_attachments_with.lock().unwrap() = Some(503);
+        let set = format!("{},{},{}", uid_of(&db, 2060), uid_of(&db, 2080), uid_of(&db, 2090));
+        let response = imap.command(&format!("UID FETCH {} (BODY[])", set)).await;
+        assert!(response.contains("Body of message 2060"), "{}", response);
+        let last = response.lines().last().unwrap_or_default();
+        assert!(last.contains(" NO [UNAVAILABLE]"), "{}", last);
+        assert!(last.contains("(1 other message also skipped)"), "{}", last);
+        let flags = imap.command(&format!("UID FETCH {} (FLAGS)", uid_of(&db, 2080))).await;
+        assert!(!flags.contains("\\Seen"), "a skipped message is not marked read: {}", flags);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_envelope_without_sizes_is_rebuilt_once_under_a_new_uid() {
         let (_dir, db, backend, client, session) = indexed_with_attachments(2100, &[(2050, 6000, false)]).await;
         let mut imap = Imap::start(&db, &client, &session).await;
