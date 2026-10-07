@@ -72,20 +72,53 @@ pub fn payload_recipients(payload: &Value) -> Vec<String> {
 
 pub struct RecipientSplit {
     pub internal: Vec<String>,
+    pub hidden: Vec<String>,
     pub has_external: bool,
+}
+
+fn listed_in(payload: &Value, fields: &[&str], address: &str) -> bool {
+    fields.iter().any(|field| {
+        payload
+            .get(*field)
+            .and_then(|v| v.as_array())
+            .is_some_and(|list| {
+                list.iter()
+                    .filter_map(|value| value.as_str())
+                    .any(|listed| listed.trim().eq_ignore_ascii_case(address.trim()))
+            })
+    })
 }
 
 pub fn split_recipients(payload: &Value) -> RecipientSplit {
     let all = payload_recipients(payload);
     let has_external = all.iter().any(|address| !is_internal_address(address));
-    let internal = all
+    let internal: Vec<String> = all
         .into_iter()
         .filter(|address| is_internal_address(address))
         .collect();
+    let hidden = internal
+        .iter()
+        .filter(|address| {
+            listed_in(payload, &["bcc"], address) && !listed_in(payload, &["to", "cc"], address)
+        })
+        .cloned()
+        .collect();
     RecipientSplit {
         internal,
+        hidden,
         has_external,
     }
+}
+
+pub fn apply_hidden_bodies(payload: &mut Value, hidden_bodies: Vec<(String, String)>) {
+    if hidden_bodies.is_empty() {
+        return;
+    }
+    let mut map = serde_json::Map::new();
+    for (address, body) in hidden_bodies {
+        map.insert(address.trim().to_lowercase(), json!(body));
+    }
+    payload["recipient_bodies"] = Value::Object(map);
 }
 
 pub fn key_lookup_username(address: &str, own_username: &str) -> Option<String> {
@@ -371,7 +404,7 @@ pub async fn seal_internal_body(
     }
 
     enforce_post_quantum(&routed, crate::config::require_post_quantum())?;
-    let envelope = seal_routed(&sender, &routed, &plaintext)?;
+    let (envelope, hidden_bodies) = seal_shared_and_hidden(&sender, routed, &split.hidden, &plaintext)?;
     for (pin_key, pin) in &pending_pins {
         db.recipient_pin_put(pin_key, pin).map_err(|_| {
             BridgeError::RecipientKey(
@@ -381,7 +414,33 @@ pub async fn seal_internal_body(
         })?;
     }
     apply_envelope(payload, envelope, split.has_external);
+    apply_hidden_bodies(payload, hidden_bodies);
     Ok(())
+}
+
+fn seal_shared_and_hidden(
+    sender: &SenderKeys,
+    routed: Vec<RoutedRecipient>,
+    hidden: &[String],
+    plaintext: &str,
+) -> Result<(String, Vec<(String, String)>)> {
+    if hidden.is_empty() {
+        return Ok((seal_routed(sender, &routed, plaintext)?, Vec::new()));
+    }
+    let (hidden_routed, shared_routed): (Vec<RoutedRecipient>, Vec<RoutedRecipient>) =
+        routed.into_iter().partition(|recipient| {
+            hidden
+                .iter()
+                .any(|address| address.eq_ignore_ascii_case(&recipient.address))
+        });
+    let shared = seal_routed(sender, &shared_routed, plaintext)?;
+    let mut hidden_bodies = Vec::with_capacity(hidden_routed.len());
+    for recipient in hidden_routed {
+        let address = recipient.address.clone();
+        let body = seal_routed(sender, std::slice::from_ref(&recipient), plaintext)?;
+        hidden_bodies.push((address, body));
+    }
+    Ok((shared, hidden_bodies))
 }
 
 #[cfg(test)]
@@ -840,6 +899,150 @@ mod tests {
         assert!(sealed.starts_with("-----BEGIN PGP MESSAGE-----"));
         assert_eq!(open_with_account_key(&sealed, &verified_account, &me), "everyone");
         assert_eq!(open_with_account_key(&sealed, &legacy_account, &me), "everyone");
+    }
+
+    #[test]
+    fn hidden_recipients_are_internal_bcc_addresses_not_also_visible() {
+        let payload = json!({
+            "to": ["a@astermail.org", "out@example.com"],
+            "cc": ["B@aster.cx"],
+            "bcc": ["hidden@astermail.org", "b@aster.cx", "secret@example.com", " Other@Aster.cx "],
+        });
+        let split = split_recipients(&payload);
+        assert!(split.has_external);
+        assert_eq!(
+            split.internal,
+            vec![
+                "a@astermail.org".to_string(),
+                "B@aster.cx".to_string(),
+                "hidden@astermail.org".to_string(),
+                "Other@Aster.cx".to_string(),
+            ]
+        );
+        assert_eq!(
+            split.hidden,
+            vec!["hidden@astermail.org".to_string(), "Other@Aster.cx".to_string()]
+        );
+    }
+
+    #[test]
+    fn hidden_bodies_are_keyed_by_lowercase_address_and_skipped_when_empty() {
+        let mut payload = payload_with(vec!["a@astermail.org"]);
+        apply_hidden_bodies(&mut payload, Vec::new());
+        assert!(payload.get("recipient_bodies").is_none());
+
+        apply_hidden_bodies(&mut payload, vec![("Hidden@Aster.cx".to_string(), "SEALED".to_string())]);
+        assert_eq!(payload["recipient_bodies"], json!({"hidden@aster.cx": "SEALED"}));
+    }
+
+    #[test]
+    fn a_hidden_bcc_gets_its_own_copy_that_the_visible_recipients_cannot_open() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let visible_account = owner("visible");
+        let hidden_account = owner("hidden");
+        let me = owner("sender");
+
+        let (shared, hidden_bodies) = seal_shared_and_hidden(
+            &sender(&me),
+            vec![
+                routed("visible@astermail.org", None, &visible_account),
+                routed("hidden@astermail.org", None, &hidden_account),
+            ],
+            &["hidden@astermail.org".to_string()],
+            "for everyone",
+        )
+        .expect("sealed");
+
+        assert_eq!(open_with_account_key(&shared, &visible_account, &me), "for everyone");
+        assert!(aster_crypto::decrypt_and_verify_with_passphrase(
+            shared.as_bytes(),
+            &[&hidden_account.keypair],
+            &[&me.keypair.public_key()],
+            "",
+        )
+        .is_err());
+
+        assert_eq!(hidden_bodies.len(), 1);
+        let (address, hidden) = &hidden_bodies[0];
+        assert_eq!(address, "hidden@astermail.org");
+        assert_eq!(open_with_account_key(hidden, &hidden_account, &me), "for everyone");
+        assert!(aster_crypto::decrypt_and_verify_with_passphrase(
+            hidden.as_bytes(),
+            &[&visible_account.keypair],
+            &[&me.keypair.public_key()],
+            "",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_ratchet_envelope_never_names_a_hidden_bcc() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let visible_account = owner("visible");
+        let hidden_account = owner("hidden");
+        let me = owner("sender");
+        let mut visible = recipient();
+        sign_v2(&mut visible.bundle, &visible_account);
+        let mut hidden = recipient();
+        sign_v2(&mut hidden.bundle, &hidden_account);
+
+        let (shared, hidden_bodies) = seal_shared_and_hidden(
+            &sender(&me),
+            vec![
+                routed("visible@astermail.org", Some(&visible.bundle), &visible_account),
+                routed("hidden@astermail.org", Some(&hidden.bundle), &hidden_account),
+            ],
+            &["hidden@astermail.org".to_string()],
+            "ratchet",
+        )
+        .expect("sealed");
+
+        let parsed: Value = serde_json::from_str(&shared).expect("shared envelope");
+        let names: Vec<&String> = parsed["recipients"].as_object().unwrap().keys().collect();
+        assert_eq!(names, vec!["visible@astermail.org"]);
+        assert!(!shared.contains("hidden@astermail.org"));
+
+        let (_, hidden_copy) = &hidden_bodies[0];
+        let hidden_parsed: Value = serde_json::from_str(hidden_copy).expect("hidden envelope");
+        let hidden_names: Vec<&String> =
+            hidden_parsed["recipients"].as_object().unwrap().keys().collect();
+        assert_eq!(hidden_names, vec!["hidden@astermail.org"]);
+        let mut message = parse_recipient_message(&hidden_parsed, "hidden@astermail.org").expect("parsed");
+        message.pq_secret = Some(hidden.pq_secret.clone());
+        let keys = RatchetReceiverKeys {
+            identity_secret_d: hidden.identity.to_bytes().to_vec(),
+            signed_prekey_secret_d: hidden.prekey.to_bytes().to_vec(),
+            signed_prekey_public: hidden.prekey_public.clone(),
+        };
+        assert_eq!(decrypt_bootstrap(&keys, &message).expect("decrypted"), "ratchet");
+    }
+
+    #[test]
+    fn only_hidden_aster_recipients_seal_the_shared_copy_to_the_sender_alone() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let hidden_account = owner("hidden");
+        let me = owner("sender");
+
+        let (shared, hidden_bodies) = seal_shared_and_hidden(
+            &sender(&me),
+            vec![routed("hidden@astermail.org", None, &hidden_account)],
+            &["hidden@astermail.org".to_string()],
+            "bcc only",
+        )
+        .expect("sealed");
+
+        assert_eq!(open_with_account_key(&shared, &me, &me), "bcc only");
+        assert!(aster_crypto::decrypt_and_verify_with_passphrase(
+            shared.as_bytes(),
+            &[&hidden_account.keypair],
+            &[&me.keypair.public_key()],
+            "",
+        )
+        .is_err());
+        assert_eq!(open_with_account_key(&hidden_bodies[0].1, &hidden_account, &me), "bcc only");
     }
 
     #[test]
