@@ -22,7 +22,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_FAILED, ATTACHMENTS_PENDING};
+use crate::db::{
+    CachedAttachment, CachedMessage, ATTACHMENTS_FAILED, ATTACHMENTS_ON_DEMAND, ATTACHMENTS_PENDING,
+};
 use crate::imap::server::date_header_rfc2822;
 
 const BASE64_LINE: usize = 76;
@@ -44,6 +46,7 @@ pub struct Rendered {
     pub header_end: usize,
     pub parts: Vec<RenderedPart>,
     pub bodystructure: String,
+    pub missing_from: Option<usize>,
 }
 
 impl Rendered {
@@ -61,12 +64,28 @@ impl Rendered {
 
     pub fn part_body(&self, section: &str) -> Option<&str> {
         self.part(section)
-            .map(|p| &self.text[p.body_start..p.body_end])
+            .and_then(|p| self.text.get(p.body_start..p.body_end))
     }
 
     pub fn part_header(&self, section: &str) -> Option<&str> {
         self.part(section)
-            .map(|p| &self.text[p.header_start..p.header_end])
+            .and_then(|p| self.text.get(p.header_start..p.header_end))
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.missing_from.is_none()
+    }
+
+    pub fn has_bytes(&self, end: usize) -> bool {
+        self.missing_from.is_none_or(|gap| end <= gap)
+    }
+
+    pub fn has_part_body(&self, section: &str) -> bool {
+        self.part(section).is_none_or(|p| self.has_bytes(p.body_end))
+    }
+
+    pub fn has_part_header(&self, section: &str) -> bool {
+        self.part(section).is_none_or(|p| self.has_bytes(p.header_end))
     }
 }
 
@@ -74,18 +93,23 @@ struct Out {
     buf: String,
     len: usize,
     materialize: bool,
+    on_demand: bool,
+    gap: Option<usize>,
 }
 
 impl Out {
     fn push(&mut self, s: &str) {
-        self.len += s.len();
-        if self.materialize {
+        if self.materialize && self.gap.is_none() {
             self.buf.push_str(s);
         }
+        self.len += s.len();
     }
 
     fn push_base64(&mut self, data: &[u8], size_hint: usize) {
-        if self.materialize {
+        if self.materialize && self.on_demand && data.is_empty() {
+            self.gap.get_or_insert(self.len);
+            self.len += base64_encoded_len(size_hint);
+        } else if self.materialize && self.gap.is_none() {
             let encoded = STANDARD.encode(data);
             let bytes = encoded.as_bytes();
             let mut i = 0;
@@ -708,6 +732,8 @@ pub fn render(
             buf: String::new(),
             len: 0,
             materialize,
+            on_demand: msg.attachments_state == ATTACHMENTS_ON_DEMAND,
+            gap: None,
         },
         parts: Vec::new(),
         text: &text,
@@ -727,6 +753,7 @@ pub fn render(
             header_end,
             parts: ctx.parts,
             bodystructure: structure,
+            missing_from: ctx.out.gap,
         };
     }
 
@@ -781,6 +808,7 @@ pub fn render(
         header_end,
         parts: ctx.parts,
         bodystructure: structure,
+        missing_from: ctx.out.gap,
     }
 }
 
@@ -1024,6 +1052,38 @@ mod tests {
     }
 
     #[test]
+    fn an_on_demand_message_has_the_same_size_and_structure_before_and_after_download() {
+        let mut logo = att(0, "logo.png", "image/png", &[3u8; 4097]);
+        logo.is_inline = true;
+        logo.content_id = Some("<logo@x>".to_string());
+        let pdf = att(1, "doc.pdf", "application/pdf", &[5u8; 100_003]);
+        let full = vec![logo, pdf];
+        let advertised: Vec<CachedAttachment> = full
+            .iter()
+            .map(|a| CachedAttachment { data: Vec::new(), ..a.clone() })
+            .collect();
+        let raw = Some("{\"is_html\":true}");
+        let body = Some("<p>hi<img src=\"cid:logo@x\"></p>");
+        let before = render(&msg(body, raw, crate::db::ATTACHMENTS_ON_DEMAND), &advertised, true);
+        let after = render(&msg(body, raw, ATTACHMENTS_STORED), &full, true);
+        assert!(after.is_complete());
+        assert!(!before.is_complete());
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.size, after.text.len());
+        assert_eq!(before.bodystructure, after.bodystructure);
+        assert_eq!(before.header(), after.header());
+        assert_eq!(before.part_body("1.1"), after.part_body("1.1"));
+        assert!(before.has_part_body("1.1"));
+        assert!(!before.has_part_body("1.2"));
+        assert!(!before.has_part_body("2"));
+        assert_eq!(before.part_body("2"), None);
+        assert_eq!(before.parts, after.parts);
+        let mut meta_only = msg(body, raw, crate::db::ATTACHMENTS_ON_DEMAND);
+        meta_only.body_text = None;
+        assert_eq!(render(&meta_only, &advertised, false).size, after.size);
+    }
+
+    #[test]
     fn multipart_structure_ends_with_the_boundary_parameter() {
         let atts = vec![att(0, "a.txt", "text/plain", b"x")];
         let m = msg(Some("b"), None, ATTACHMENTS_STORED);
@@ -1128,6 +1188,8 @@ X-Evil"
                 buf: String::new(),
                 len: 0,
                 materialize: true,
+                on_demand: false,
+                gap: None,
             };
             out.push_base64(&data, n);
             assert_eq!(out.buf.len(), base64_encoded_len(n), "n={}", n);

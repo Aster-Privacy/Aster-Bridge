@@ -31,8 +31,16 @@ pub struct SyncProgress {
     pub folder_total: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryProgress {
+    pub indexed: usize,
+    pub total: usize,
+    pub active: bool,
+}
+
 pub trait BridgeEvents: Send + Sync {
     fn sync_progress(&self, _progress: &SyncProgress) {}
+    fn history_progress(&self, _progress: &HistoryProgress) {}
     fn sync_done(&self, _failed: bool) {}
     fn import_progress(&self, _progress: &ImportProgress) {}
     fn send_failed(&self) {}

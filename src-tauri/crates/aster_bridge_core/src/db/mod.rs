@@ -19,11 +19,13 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 use rand_core::{OsRng, RngCore};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroize;
+
+mod history;
 
 const KEYRING_DB_USER: &str = "db-encryption-key-v1";
 
@@ -702,6 +704,11 @@ impl Database {
             [],
         );
         conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_folder_meta ON message_cache(
+                folder, aster_id, subject, sender, recipients, date, size, flags, raw_headers, thread_id, attachments_state
+             );",
+        ).map_err(|e| e.to_string())?;
+        conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_message_cache_attachments_state ON message_cache(attachments_state);
              UPDATE message_cache SET attachments_state = 1
               WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
@@ -709,6 +716,7 @@ impl Database {
 
         conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
         repair_outbox_table(conn)?;
+        conn.execute_batch(history::HISTORY_SCHEMA_SQL).map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
         ).map_err(|e| e.to_string())?;
@@ -1190,6 +1198,9 @@ impl Database {
             conn.execute("DELETE FROM message_cache WHERE aster_id = ?1", [aster_id])?;
             conn.execute("DELETE FROM message_attachment WHERE aster_id = ?1", [aster_id])?;
             conn.execute("DELETE FROM uid_map WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM listing_member WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM history_prune_queue WHERE aster_id = ?1", [aster_id])?;
+            conn.execute("DELETE FROM history_retry WHERE aster_id = ?1", [aster_id])?;
             Ok(())
         })
     }
@@ -2182,6 +2193,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM sync_state;",
             )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
             Ok(())
         })
     }
@@ -2204,6 +2216,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM outbox;",
             )?;
+            conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
             Ok(())
         });
         self.app_password_cache.clear();
@@ -2602,6 +2615,122 @@ impl Database {
         })
     }
 
+    pub fn store_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        parts: &[CachedAttachment],
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                for a in parts {
+                    conn.execute(
+                        "INSERT INTO message_attachment (aster_id, seq, name, content_type, content_id, is_inline, size, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'')",
+                        rusqlite::params![
+                            aster_id,
+                            a.seq,
+                            a.name,
+                            a.content_type,
+                            a.content_id,
+                            a.is_inline as i32,
+                            a.size,
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_ON_DEMAND],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn fill_on_demand_attachments(
+        &self,
+        aster_id: &str,
+        contents: &[(i64, Vec<u8>)],
+    ) -> Result<bool, String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                let state: Option<i64> = conn
+                    .query_row(
+                        "SELECT attachments_state FROM message_cache WHERE aster_id = ?1",
+                        [aster_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if state != Some(ATTACHMENTS_ON_DEMAND) {
+                    return Ok(false);
+                }
+                for (seq, data) in contents {
+                    conn.execute(
+                        "UPDATE message_attachment SET data = ?3 WHERE aster_id = ?1 AND seq = ?2",
+                        rusqlite::params![aster_id, seq, data],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2, attachment_attempts = 0 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, ATTACHMENTS_STORED],
+                )?;
+                Ok::<bool, rusqlite::Error>(true)
+            })();
+            match result {
+                Ok(filled) => {
+                    conn.execute_batch(if filled { "COMMIT" } else { "ROLLBACK" })?;
+                    Ok(filled)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn drop_attachment_parts(&self, aster_id: &str, state: i64) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                conn.execute(
+                    "DELETE FROM message_attachment WHERE aster_id = ?1",
+                    [aster_id],
+                )?;
+                conn.execute(
+                    "UPDATE message_cache SET attachments_state = ?2 WHERE aster_id = ?1",
+                    rusqlite::params![aster_id, state],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     pub fn set_attachments_state(&self, aster_id: &str, state: i64) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
@@ -2761,7 +2890,7 @@ impl Database {
             let mut stmt = conn.prepare(
                 "SELECT aster_id, folder FROM message_cache
                  WHERE attachments_state = ?1
-                 ORDER BY attachment_attempts ASC, created_at DESC LIMIT ?2",
+                 ORDER BY attachment_attempts ASC, date DESC, created_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(rusqlite::params![ATTACHMENTS_PENDING, limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2828,6 +2957,7 @@ impl Database {
                  DELETE FROM envelope_nonces;
                  DELETE FROM outbox;",
             )?;
+            tx.execute_batch(history::HISTORY_CLEAR_SQL)?;
             tx.commit()
         });
         self.app_password_cache.clear();
@@ -2868,6 +2998,11 @@ pub const ATTACHMENTS_NONE: i64 = 0;
 pub const ATTACHMENTS_PENDING: i64 = 1;
 pub const ATTACHMENTS_STORED: i64 = 2;
 pub const ATTACHMENTS_FAILED: i64 = 3;
+pub const ATTACHMENTS_ON_DEMAND: i64 = 4;
+
+pub fn attachment_parts_known(state: i64) -> bool {
+    state == ATTACHMENTS_STORED || state == ATTACHMENTS_ON_DEMAND
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedAttachment {
@@ -4207,6 +4342,22 @@ mod db_tests {
             .with_conn(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(revision, WIRE_SIZE_REVISION);
+    }
+
+    #[test]
+    fn folder_metadata_is_read_without_touching_message_bodies() {
+        let (_d, db) = open_db();
+        let plan: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "EXPLAIN QUERY PLAN SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, m.raw_headers, m.thread_id, m.attachments_state
+                     FROM message_cache m WHERE m.folder = 'archive'",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("COVERING INDEX idx_message_cache_folder_meta")), "{:?}", plan);
     }
 
     #[test]

@@ -1531,7 +1531,7 @@ where
             }
             "FETCH" => {
                 require_selected!(conn, writer, tag);
-                handle_fetch(&mut writer, &db, &client, &session, &conn, &tag, &args, false).await?;
+                handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, &args, false).await?;
             }
             "UID" => {
                 require_auth!(conn, writer, tag);
@@ -1554,7 +1554,7 @@ where
                             write_no(&mut writer, &tag, "No mailbox selected").await?;
                             continue;
                         }
-                        handle_fetch(&mut writer, &db, &client, &session, &conn, &tag, subargs, true).await?;
+                        handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, subargs, true).await?;
                     }
                     "SEARCH" => {
                         if conn.state != ImapState::Selected {
@@ -3353,7 +3353,7 @@ fn copy_refusal(db: &Database, messages: &[CachedMessage]) -> Option<String> {
                 format!("[CANNOT] the attachments of UID {} could not be downloaded", m.imap_uid)
             });
         }
-        let too_big = m.attachments_state == crate::db::ATTACHMENTS_STORED
+        let too_big = crate::db::attachment_parts_known(m.attachments_state)
             && db
                 .get_message_attachment_meta(&m.aster_id)
                 .unwrap_or_default()
@@ -3420,6 +3420,28 @@ async fn handle_copy(
     }
     if let Some(reason) = copy_refusal(db, &selected) {
         return write_no(writer, tag, &reason).await;
+    }
+    let mut selected = selected;
+    for m in selected.iter_mut() {
+        if m.attachments_state != crate::db::ATTACHMENTS_ON_DEMAND {
+            continue;
+        }
+        use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
+        let filled = match ensure_attachments(db, client, session, &m.aster_id, Some(broadcaster)).await {
+            AttachmentFill::Ready => db.attachments_state(&m.aster_id).ok(),
+            AttachmentFill::Replaced | AttachmentFill::Unavailable => None,
+        };
+        match filled {
+            Some(state) if state != crate::db::ATTACHMENTS_ON_DEMAND => m.attachments_state = state,
+            _ => {
+                return write_no(
+                    writer,
+                    tag,
+                    &format!("[UNAVAILABLE] the attachments of UID {} could not be downloaded; try again later", m.imap_uid),
+                )
+                .await;
+            }
+        }
     }
 
     // (source UID, new UID, new Aster id, keywords)
@@ -3905,11 +3927,13 @@ fn literal(key: &str, data: impl AsRef<[u8]>) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_fetch(
     writer: &mut (impl AsyncWrite + Unpin),
     db: &Arc<Database>,
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
+    broadcaster: &broadcast::Sender<StateChange>,
     conn: &ImapConnection,
     tag: &str,
     args: &str,
@@ -3974,8 +3998,15 @@ async fn handle_fetch(
     let view = MailboxView::new(&conn.uids, &messages);
     let range_cap = if uid_command { view.max_uid } else { view.len() };
     let selected = parse_set(range_spec, range_cap);
+    let body_partial = parse_body_partial(&upper_parts);
+    let needs_every_byte = (wants_body && !matches!(body_partial, Some((_, Some(_)))))
+        || wants_rfc822
+        || wants_body_text
+        || wants_rfc822_text;
 
     let mut out: Vec<u8> = Vec::new();
+    let mut refusal: Option<String> = None;
+    let mut skipped = 0usize;
     for n in &selected {
         let found = if uid_command {
             view.by_uid(*n)
@@ -4000,7 +4031,7 @@ async fn handle_fetch(
         let uid = msg.imap_uid;
         let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
         let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
-            if msg.attachments_state == crate::db::ATTACHMENTS_STORED {
+            if crate::db::attachment_parts_known(msg.attachments_state) {
                 db.get_message_attachments(&msg.aster_id).unwrap_or_default()
             } else {
                 Vec::new()
@@ -4011,7 +4042,58 @@ async fn handle_fetch(
                 .cloned()
                 .unwrap_or_default()
         };
-        let rendered = crate::message_render::render(msg, &attachments, needs_body);
+        let mut rendered = crate::message_render::render(msg, &attachments, needs_body);
+        let missing_bytes = needs_body
+            && !rendered.is_complete()
+            && (needs_every_byte
+                || body_partial
+                    .is_some_and(|(off, len)| wants_body && !rendered.has_bytes(off.saturating_add(len.unwrap_or(0))))
+                || section_requests.iter().any(|req| {
+                    if req.mime {
+                        !rendered.has_part_header(&req.section)
+                    } else {
+                        !rendered.has_part_body(&req.section)
+                    }
+                }));
+        if missing_bytes {
+            if !out.is_empty() {
+                writer.write_all(&out).await?;
+                out.clear();
+            }
+            use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
+            let reason = match ensure_attachments(db, client, session, &msg.aster_id, Some(broadcaster)).await {
+                AttachmentFill::Ready => match db.get_cached_message(&msg.aster_id) {
+                    Ok(Some(current)) if current.imap_uid == uid => {
+                        let filled = CachedMessage {
+                            attachments_state: current.attachments_state,
+                            ..msg.clone()
+                        };
+                        let attachments = db.get_message_attachments(&msg.aster_id).unwrap_or_default();
+                        rendered = crate::message_render::render(&filled, &attachments, true);
+                        (!rendered.is_complete()).then(|| {
+                            format!("the attachments of UID {} are not downloaded yet; try again", uid)
+                        })
+                    }
+                    _ => Some(format!(
+                        "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                        uid
+                    )),
+                },
+                AttachmentFill::Replaced => Some(format!(
+                    "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                    uid
+                )),
+                AttachmentFill::Unavailable => Some(format!(
+                    "the attachments of UID {} could not be downloaded; try again later",
+                    uid
+                )),
+            };
+            if let Some(reason) = reason {
+                skipped += 1;
+                refusal.get_or_insert(reason);
+                continue;
+            }
+        }
         let mut items: Vec<Vec<u8>> = Vec::new();
 
         let mut flags = msg.flags as u32;
@@ -4190,7 +4272,20 @@ async fn handle_fetch(
             }
         });
     }
-    write_ok(writer, tag, "FETCH completed").await
+    match refusal {
+        Some(reason) if skipped > 1 => {
+            let others = skipped - 1;
+            let noun = if others == 1 { "message" } else { "messages" };
+            write_no(
+                writer,
+                tag,
+                &format!("[UNAVAILABLE] {} ({} other {} also skipped)", reason, others, noun),
+            )
+            .await
+        }
+        Some(reason) => write_no(writer, tag, &format!("[UNAVAILABLE] {}", reason)).await,
+        None => write_ok(writer, tag, "FETCH completed").await,
+    }
 }
 
 #[cfg(test)]

@@ -260,6 +260,20 @@ export async function set_service_mode(enabled: boolean): Promise<void> {
   return tauri_invoke("set_service_mode", { enabled });
 }
 
+export async function get_full_mail_history(): Promise<boolean> {
+  return tauri_invoke<boolean>("get_full_mail_history");
+}
+
+export async function set_full_mail_history(enabled: boolean): Promise<void> {
+  return tauri_invoke("set_full_mail_history", { enabled });
+}
+
+export interface HistoryProgress {
+  indexed: number;
+  total: number;
+  active: boolean;
+}
+
 export async function get_autostart_enabled(): Promise<boolean> {
   const s = await get_service_settings();
   return s.autostart;
