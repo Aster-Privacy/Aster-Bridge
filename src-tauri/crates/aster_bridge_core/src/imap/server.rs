@@ -4062,19 +4062,23 @@ async fn handle_fetch(
             }
             use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
             let reason = match ensure_attachments(db, client, session, &msg.aster_id, Some(broadcaster)).await {
-                AttachmentFill::Ready => {
-                    let filled = CachedMessage {
-                        attachments_state: db
-                            .attachments_state(&msg.aster_id)
-                            .unwrap_or(msg.attachments_state),
-                        ..msg.clone()
-                    };
-                    let attachments = db.get_message_attachments(&msg.aster_id).unwrap_or_default();
-                    rendered = crate::message_render::render(&filled, &attachments, true);
-                    (!rendered.is_complete()).then(|| {
-                        format!("the attachments of UID {} are not downloaded yet; try again", uid)
-                    })
-                }
+                AttachmentFill::Ready => match db.get_cached_message(&msg.aster_id) {
+                    Ok(Some(current)) if current.imap_uid == uid => {
+                        let filled = CachedMessage {
+                            attachments_state: current.attachments_state,
+                            ..msg.clone()
+                        };
+                        let attachments = db.get_message_attachments(&msg.aster_id).unwrap_or_default();
+                        rendered = crate::message_render::render(&filled, &attachments, true);
+                        (!rendered.is_complete()).then(|| {
+                            format!("the attachments of UID {} are not downloaded yet; try again", uid)
+                        })
+                    }
+                    _ => Some(format!(
+                        "UID {} changed when its attachments were downloaded and arrives again as a new message",
+                        uid
+                    )),
+                },
                 AttachmentFill::Replaced => Some(format!(
                     "UID {} changed when its attachments were downloaded and arrives again as a new message",
                     uid
