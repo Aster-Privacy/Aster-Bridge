@@ -44,6 +44,11 @@ const RETRIES_PER_STEP: usize = 10;
 const RETRY_BASE_SECS: i64 = 15 * 60;
 const RETRY_MAX_SECS: i64 = 24 * 60 * 60;
 const RETRY_MAX_ATTEMPTS: i64 = 8;
+#[cfg(not(test))]
+const RECLAIM_MIN_BYTES: i64 = 4 * 1024 * 1024;
+#[cfg(test)]
+const RECLAIM_MIN_BYTES: i64 = 1;
+const RECLAIM_PAGES_PER_STEP: i64 = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ListingState {
@@ -152,6 +157,11 @@ pub(super) fn apply_mode(db: &Database, full_history: bool) -> Vec<String> {
             SYSTEM_FOLDER_MAX_ITEMS,
             trimmed.len()
         );
+        match db.reclaim_free_space(RECLAIM_MIN_BYTES, RECLAIM_PAGES_PER_STEP) {
+            Ok(0) => {}
+            Ok(bytes) => tracing::info!("history: returned {} KB of freed space to the disk", bytes / 1024),
+            Err(e) => tracing::warn!("history: returning freed space to the disk failed: {}", e),
+        }
     }
     let mode = if full_history { "all" } else { "recent" };
     if let Err(e) = db.set_sync_state(HISTORY_MODE_KEY, mode) {
@@ -1328,6 +1338,37 @@ mod tests {
         };
         assert!(!drifted.needs_sweep(NOW + 60));
         assert!(drifted.needs_sweep(NOW + DRIFT_RESWEEP_AFTER_SECS));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turning_full_sync_off_returns_the_space_to_the_disk() {
+        let (dir, db, _backend, _client, _session) = indexed_archive(3500).await;
+        let (before, _) = database_bytes(&db, dir.path());
+
+        let trimmed = apply_mode(&db, false);
+        assert_eq!(trimmed.len(), 1500);
+
+        let (after, live) = database_bytes(&db, dir.path());
+        let free: i64 = db
+            .with_conn(|conn| conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(free, 0, "no freed pages are left inside the file");
+        assert!(after < before, "the file shrank from {} to {}", before, after);
+        assert!(after <= live + 64 * 1024, "{} on disk for {} live", after, live);
+        let mode: i64 = db
+            .with_conn(|conn| conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(mode, 2, "later trims reclaim in small steps");
+
+        apply_mode(&db, true);
+        for n in 0..500 {
+            db.delete_message_by_aster_id(&item_id(n)).unwrap();
+        }
+        apply_mode(&db, false);
+        let free: i64 = db
+            .with_conn(|conn| conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(free, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -186,6 +186,39 @@ impl Database {
         })
     }
 
+    pub fn reclaim_free_space(&self, min_bytes: i64, pages_per_step: i64) -> Result<i64, String> {
+        let (free_pages, page_size, auto_vacuum) = self.with_conn(|conn| {
+            let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+            Ok((free, size, mode))
+        })?;
+        let free_bytes = free_pages.saturating_mul(page_size);
+        if free_pages == 0 || free_bytes < min_bytes {
+            return Ok(0);
+        }
+        if auto_vacuum == 2 {
+            let mut left = free_pages;
+            while left > 0 {
+                let next = self.with_conn(|conn| {
+                    let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({})", pages_per_step.max(1)))?;
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {}
+                    drop(rows);
+                    conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+                })?;
+                if next >= left {
+                    break;
+                }
+                left = next;
+            }
+        } else {
+            self.with_conn(|conn| conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;"))?;
+        }
+        self.with_conn(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))?;
+        Ok(free_bytes)
+    }
+
     pub fn trim_folders_to_newest(&self, keep: usize) -> Result<Vec<String>, String> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
