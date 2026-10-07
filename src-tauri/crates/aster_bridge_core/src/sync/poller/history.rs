@@ -264,6 +264,16 @@ fn is_gone(e: &BridgeError) -> bool {
     matches!(e, BridgeError::Api(msg) if api_status_code(msg).is_some_and(is_permanent_status))
 }
 
+fn is_refused_item(e: &BridgeError) -> bool {
+    match e {
+        BridgeError::Api(msg) => {
+            api_status_code(msg).is_some_and(|s| s != 401 && !is_transient_status(s) && !is_permanent_status(s))
+        }
+        BridgeError::Network(err) => err.is_decode(),
+        _ => false,
+    }
+}
+
 fn record_changes(db: &Database, created: &[String], updated: &[String], destroyed: &[String]) -> bool {
     for (ids, op) in [(created, "created"), (updated, "updated"), (destroyed, "destroyed")] {
         if ids.is_empty() {
@@ -334,6 +344,10 @@ async fn prune_departed(db: &Database, client: &ApiClient, keys: &Keys) -> Optio
                     destroyed.push(id);
                 }
             }
+            Err(e) if is_refused_item(&e) => {
+                tracing::warn!("history: dropped the deletion check for {}: {}", id, e);
+                let _ = db.prune_queue_remove(&id);
+            }
             Err(e) => {
                 failure = Some(format!("history: checking for deleted messages failed: {}", e));
                 break;
@@ -389,6 +403,10 @@ async fn retry_undecrypted(db: &Database, client: &ApiClient, keys: &Keys, now: 
             }
             Err(e) if is_gone(&e) => {
                 let _ = db.history_retry_clear(&id);
+            }
+            Err(e) if is_refused_item(&e) => {
+                tracing::warn!("history: retrying {} was refused: {}", id, e);
+                let _ = db.history_retry_note(&id, &label, retry_delay_secs, now as i64);
             }
             Err(e) => {
                 failure = Some(format!("history: retrying a message failed: {}", e));
@@ -916,6 +934,7 @@ mod tests {
         fail_attachments_with: Arc<StdMutex<Option<u16>>>,
         envelopes_listed: Arc<AtomicUsize>,
         stall_at: Arc<StdMutex<Option<usize>>>,
+        refuse_items: Arc<StdMutex<HashMap<String, u16>>>,
     }
 
     impl Backend {
@@ -1045,6 +1064,9 @@ mod tests {
                         async move {
                             backend.item_calls.fetch_add(1, Ordering::SeqCst);
                             if let Some(status) = *backend.fail_with.lock().unwrap() {
+                                return (StatusCode::from_u16(status).unwrap(), "refused").into_response();
+                            }
+                            if let Some(status) = backend.refuse_items.lock().unwrap().get(&id).copied() {
                                 return (StatusCode::from_u16(status).unwrap(), "refused").into_response();
                             }
                             let found = backend.items.lock().unwrap().iter().find(|i| i["id"] == id).cloned();
@@ -1352,6 +1374,62 @@ mod tests {
         assert_eq!(step(&session, &client, &db, fixed_at).await, Step::Worked { changed: true });
         assert!(db.get_cached_message(&broken).unwrap().is_some());
         assert!(db.history_retry_due(i64::MAX, RETRY_MAX_ATTEMPTS, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_the_server_refuses_backs_off_instead_of_blocking_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let backend = Backend::with_archive(3);
+        let refused = item_id(1);
+        backend.refuse_items.lock().unwrap().insert(refused.clone(), 403);
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let keys = Keys::of(&session()).await;
+        db.history_retry_note(&refused, "archive", |_| 0, NOW as i64).unwrap();
+
+        assert_eq!(
+            retry_undecrypted(&db, &client, &keys, NOW).await,
+            Some(Step::Worked { changed: false })
+        );
+        assert!(
+            db.history_retry_due(NOW as i64 + 60, RETRY_MAX_ATTEMPTS, 10).unwrap().is_empty(),
+            "the refused message waits for its backoff"
+        );
+        assert_eq!(db.history_retry_due(i64::MAX, RETRY_MAX_ATTEMPTS, 10).unwrap().len(), 1);
+
+        backend.refuse_items.lock().unwrap().insert(refused.clone(), 503);
+        assert!(matches!(
+            retry_undecrypted(&db, &client, &keys, NOW + 2 * 24 * 60 * 60).await,
+            Some(Step::Failed(_))
+        ));
+        assert_eq!(
+            db.history_retry_due(i64::MAX, RETRY_MAX_ATTEMPTS, 10).unwrap().len(),
+            1,
+            "a server outage keeps the retry without spending an attempt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deletion_check_the_server_refuses_keeps_the_message_and_moves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let backend = Backend::default();
+        let refused: MailItem = serde_json::from_value(archive_item(7)).unwrap();
+        let gone: MailItem = serde_json::from_value(archive_item(8)).unwrap();
+        backend.items.lock().unwrap().push(archive_item(7));
+        backend.refuse_items.lock().unwrap().insert(refused.id.clone(), 403);
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        for item in [&refused, &gone] {
+            assert!(cache_mail_item(&db, "archive", item, b"pass", IK, &[], &[]).was_new);
+        }
+        db.stamp_listing_members("archive", &[refused.id.as_str(), gone.id.as_str()], 1).unwrap();
+        assert_eq!(db.finish_listing_sweep("archive", 2).unwrap(), 2);
+
+        let keys = Keys::of(&session()).await;
+        assert_eq!(prune_departed(&db, &client, &keys).await, Some(Step::Worked { changed: true }));
+        assert!(db.get_cached_message(&refused.id).unwrap().is_some(), "a refused check never deletes");
+        assert!(db.get_cached_message(&gone.id).unwrap().is_none());
+        assert!(db.prune_queue_batch(10).unwrap().is_empty());
     }
 
     #[test]
