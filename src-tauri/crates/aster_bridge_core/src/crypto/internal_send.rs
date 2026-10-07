@@ -404,6 +404,9 @@ pub async fn seal_internal_body(
     }
 
     enforce_post_quantum(&routed, crate::config::require_post_quantum())?;
+    if split.has_external {
+        seal_attachment_metas(payload, &sender, &routed)?;
+    }
     let (envelope, hidden_bodies) = seal_shared_and_hidden(&sender, routed, &split.hidden, &plaintext)?;
     for (pin_key, pin) in &pending_pins {
         db.recipient_pin_put(pin_key, pin).map_err(|_| {
@@ -415,6 +418,59 @@ pub async fn seal_internal_body(
     }
     apply_envelope(payload, envelope, split.has_external);
     apply_hidden_bodies(payload, hidden_bodies);
+    Ok(())
+}
+
+fn seal_attachment_metas(
+    payload: &mut Value,
+    sender: &SenderKeys,
+    routed: &[RoutedRecipient],
+) -> Result<()> {
+    let Some(attachments) = payload
+        .get_mut("attachments")
+        .and_then(|value| value.as_array_mut())
+        .filter(|list| !list.is_empty())
+    else {
+        return Ok(());
+    };
+    if routed.is_empty() {
+        return Ok(());
+    }
+    let account_key = sender.account_key.as_ref().ok_or_else(|| {
+        BridgeError::Crypto(
+            "no account key in the vault; cannot encrypt attachments for Aster recipients"
+                .to_string(),
+        )
+    })?;
+    let unreadable = || {
+        BridgeError::Crypto("an attachment could not be prepared for Aster recipients".to_string())
+    };
+    for attachment in attachments.iter_mut() {
+        let decoded = Zeroizing::new(
+            attachment
+                .get("recipient_encrypted_meta")
+                .and_then(|value| value.as_str())
+                .and_then(|encoded| STANDARD.decode(encoded).ok())
+                .ok_or_else(unreadable)?,
+        );
+        let meta = std::str::from_utf8(&decoded).map_err(|_| unreadable())?;
+        let mut metas = serde_json::Map::new();
+        for recipient in routed {
+            let recipient_key = recipient.account_key.as_deref().ok_or_else(|| {
+                BridgeError::RecipientKey(format!(
+                    "{} has no published encryption keys, so the message was not sent.",
+                    recipient.address
+                ))
+            })?;
+            let sealed =
+                seal_with_account_keys(meta, &[recipient_key], account_key, &sender.passphrase)?;
+            metas.insert(
+                recipient.address.trim().to_lowercase(),
+                json!(STANDARD.encode(sealed.as_bytes())),
+            );
+        }
+        attachment["recipient_metas"] = Value::Object(metas);
+    }
     Ok(())
 }
 
@@ -1043,6 +1099,142 @@ mod tests {
         )
         .is_err());
         assert_eq!(open_with_account_key(&hidden_bodies[0].1, &hidden_account, &me), "bcc only");
+    }
+
+    fn payload_with_attachment(to: Vec<&str>) -> Value {
+        let mut payload = payload_with(to);
+        let sealed = crate::crypto::attachment::seal_send_attachments(
+            &[crate::crypto::attachment::OutgoingAttachment {
+                name: "plan.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                content_id: None,
+                is_inline: false,
+                data: b"plan".to_vec(),
+            }],
+            b"pass",
+        )
+        .unwrap();
+        payload["attachments"] = Value::Array(sealed);
+        payload
+    }
+
+    fn opened_meta(
+        encoded: &Value,
+        reader: &crate::crypto::recipient_trust::tests::Owner,
+        signer: &crate::crypto::recipient_trust::tests::Owner,
+    ) -> Option<Value> {
+        let armored = String::from_utf8(STANDARD.decode(encoded.as_str()?).ok()?).ok()?;
+        let opened = aster_crypto::decrypt_and_verify_with_passphrase(
+            armored.as_bytes(),
+            &[&reader.keypair],
+            &[&signer.keypair.public_key()],
+            "",
+        )
+        .ok()?;
+        serde_json::from_slice(&opened).ok()
+    }
+
+    #[test]
+    fn mixed_attachments_get_a_sealed_key_copy_for_each_aster_recipient_alone() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let visible_account = owner("visible");
+        let hidden_account = owner("hidden");
+        let me = owner("sender");
+        let mut payload = payload_with_attachment(vec!["Visible@AsterMail.org", "out@example.com"]);
+        payload["bcc"] = json!(["hidden@aster.cx"]);
+        let outside_before = payload["attachments"][0]["recipient_encrypted_meta"].clone();
+        let manifest_before = sealed_plaintext(&payload);
+
+        seal_attachment_metas(
+            &mut payload,
+            &sender(&me),
+            &[
+                routed("Visible@AsterMail.org", None, &visible_account),
+                routed("hidden@aster.cx", None, &hidden_account),
+            ],
+        )
+        .expect("sealed metas");
+
+        let attachment = &payload["attachments"][0];
+        assert_eq!(attachment["recipient_encrypted_meta"], outside_before);
+        let outside: Value = serde_json::from_slice(
+            &STANDARD.decode(outside_before.as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let metas = attachment["recipient_metas"].as_object().expect("metas");
+        let mut names: Vec<&String> = metas.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["hidden@aster.cx", "visible@astermail.org"]);
+        assert!(!metas.contains_key("out@example.com"));
+
+        for (address, owner_key, other) in [
+            ("visible@astermail.org", &visible_account, &hidden_account),
+            ("hidden@aster.cx", &hidden_account, &visible_account),
+        ] {
+            let encoded = &metas[address];
+            let raw = STANDARD.decode(encoded.as_str().unwrap()).unwrap();
+            assert!(raw.starts_with(b"-----BEGIN PGP MESSAGE"));
+            assert!(!String::from_utf8_lossy(&raw).contains("session_key"));
+            let opened = opened_meta(encoded, owner_key, &me).expect("own copy opens");
+            assert_eq!(opened["session_key"], outside["session_key"]);
+            assert_eq!(opened["filename"], json!("plan.pdf"));
+            assert!(opened_meta(encoded, other, &me).is_none());
+        }
+
+        assert_eq!(sealed_plaintext(&payload), manifest_before);
+    }
+
+    #[test]
+    fn sealing_attachment_metas_skips_sends_without_attachments() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let account = owner("user");
+        let me = owner("sender");
+        let mut payload = payload_with(vec!["user@astermail.org", "out@example.com"]);
+        let before = payload.clone();
+        seal_attachment_metas(&mut payload, &sender(&me), &[routed("user@astermail.org", None, &account)])
+            .expect("no-op");
+        assert_eq!(payload, before);
+
+        payload["attachments"] = json!([]);
+        let before = payload.clone();
+        seal_attachment_metas(&mut payload, &sender(&me), &[routed("user@astermail.org", None, &account)])
+            .expect("no-op");
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn sealing_attachment_metas_refuses_instead_of_sending_a_readable_key_copy() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let account = owner("user");
+        let me = owner("sender");
+
+        let mut keyless = routed("user@astermail.org", None, &account);
+        keyless.account_key = None;
+        let mut payload = payload_with_attachment(vec!["user@astermail.org", "out@example.com"]);
+        assert!(matches!(
+            seal_attachment_metas(&mut payload, &sender(&me), &[keyless]),
+            Err(BridgeError::RecipientKey(message)) if message.starts_with("user@astermail.org")
+        ));
+        assert!(payload["attachments"][0].get("recipient_metas").is_none());
+
+        let mut no_sender_key = sender(&me);
+        no_sender_key.account_key = None;
+        let mut payload = payload_with_attachment(vec!["user@astermail.org", "out@example.com"]);
+        assert!(matches!(
+            seal_attachment_metas(&mut payload, &no_sender_key, &[routed("user@astermail.org", None, &account)]),
+            Err(BridgeError::Crypto(_))
+        ));
+
+        let mut payload = payload_with_attachment(vec!["user@astermail.org", "out@example.com"]);
+        payload["attachments"][0]["recipient_encrypted_meta"] = json!("not base64 !!");
+        assert!(matches!(
+            seal_attachment_metas(&mut payload, &sender(&me), &[routed("user@astermail.org", None, &account)]),
+            Err(BridgeError::Crypto(_))
+        ));
     }
 
     #[test]
