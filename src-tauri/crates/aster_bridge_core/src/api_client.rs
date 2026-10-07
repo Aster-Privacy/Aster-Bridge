@@ -1358,7 +1358,19 @@ impl ApiClient {
         access_token: &str,
         query: &MailListQuery,
     ) -> Result<MailListResponse> {
+        self.list_mail_with(access_token, query, true).await
+    }
+
+    pub async fn list_mail_with(
+        &self,
+        access_token: &str,
+        query: &MailListQuery,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
         let mut params: Vec<(&str, String)> = Vec::new();
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
 
         if let Some(ref item_type) = query.item_type {
             params.push(("item_type", item_type.clone()));
@@ -1727,15 +1739,31 @@ impl ApiClient {
         limit: i64,
         offset: i64,
     ) -> Result<MailListResponse> {
+        self.list_folder_mail_with(access_token, label_token, limit, offset, true)
+            .await
+    }
+
+    pub async fn list_folder_mail_with(
+        &self,
+        access_token: &str,
+        label_token: &str,
+        limit: i64,
+        offset: i64,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
+        let mut params = vec![
+            ("label_token", label_token.to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
         let resp = self
             .client
             .get(format!("{}/bridge/v1/messages", self.base_url))
             .bearer_auth(access_token)
-            .query(&[
-                ("label_token", label_token.to_string()),
-                ("limit", limit.to_string()),
-                ("offset", offset.to_string()),
-            ])
+            .query(&params)
             .send()
             .await?;
         if !resp.status().is_success() {

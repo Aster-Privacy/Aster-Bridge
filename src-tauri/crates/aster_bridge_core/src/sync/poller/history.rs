@@ -21,6 +21,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::api_client::MailListResponse;
 
 pub(super) const HISTORY_MODE_KEY: &str = "history_mode";
 const STATE_PREFIX: &str = "history:";
@@ -37,8 +38,9 @@ const START_JITTER_MAX: Duration = Duration::ZERO;
 const BROADCAST_EVERY: Duration = Duration::from_secs(10);
 const BACKOFF_BASE: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
-const RESWEEP_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+const RESWEEP_AFTER_SECS: u64 = 30 * 24 * 60 * 60;
 const DRIFT_RESWEEP_AFTER_SECS: u64 = 15 * 60;
+const DRIFT_RESWEEP_MAX_SECS: u64 = 24 * 60 * 60;
 const PRUNE_CHECKS_PER_STEP: usize = 25;
 const RETRIES_PER_STEP: usize = 10;
 const RETRY_BASE_SECS: i64 = 15 * 60;
@@ -70,17 +72,35 @@ struct ListingState {
     total_offset: i64,
     #[serde(default)]
     observed: Option<(usize, usize)>,
+    #[serde(default)]
+    drift_streak: u32,
+    #[serde(default)]
+    incomplete: bool,
+    #[serde(default)]
+    eager: bool,
 }
 
 impl ListingState {
+    fn drift_wait(&self) -> u64 {
+        let shift = self.drift_streak.min(16);
+        DRIFT_RESWEEP_AFTER_SECS
+            .saturating_mul(1u64 << shift)
+            .min(DRIFT_RESWEEP_MAX_SECS)
+    }
+
+    fn drifted(&self) -> bool {
+        self.incomplete
+            || self
+                .observed
+                .is_some_and(|(total, members)| total as i64 - members as i64 != self.total_offset)
+    }
+
     fn needs_sweep(&self, now: u64) -> bool {
-        if self.swept_at == 0 || now.saturating_sub(self.swept_at) >= RESWEEP_AFTER_SECS {
+        let age = now.saturating_sub(self.swept_at);
+        if self.swept_at == 0 || age >= RESWEEP_AFTER_SECS {
             return true;
         }
-        self.observed.is_some_and(|(total, members)| {
-            total as i64 - members as i64 != self.total_offset
-                && now.saturating_sub(self.swept_at) >= DRIFT_RESWEEP_AFTER_SECS
-        })
+        self.drifted() && age >= self.drift_wait()
     }
 
     fn known_total(&self) -> usize {
@@ -92,9 +112,9 @@ impl ListingState {
     }
 
     fn indexed(&self) -> usize {
-        if self.swept_at > 0 {
+        if self.swept_at > 0 && !self.incomplete {
             self.known_total()
-        } else if self.sweeping {
+        } else if self.sweeping || self.incomplete {
             self.walked.min(self.total)
         } else {
             0
@@ -206,6 +226,9 @@ pub(super) fn note_listing_total(db: &Database, label: &str, total: usize) {
     }
     let members = db.listing_member_count(label).unwrap_or(0);
     state.observed = Some((total, members));
+    if !state.drifted() {
+        state.drift_streak = 0;
+    }
     save(db, label, &state);
 }
 
@@ -423,58 +446,70 @@ async fn sweep_page(db: &Database, client: &ApiClient, keys: &Keys, now: u64) ->
     let mut state = states[index].1.clone();
     let first_pass = state.swept_at == 0;
     if !state.sweeping {
+        let drift_round = state.swept_at > 0 && now.saturating_sub(state.swept_at) < RESWEEP_AFTER_SECS;
         state = ListingState {
             round: state.round + 1,
             sweeping: true,
             swept_at: state.swept_at,
             total: state.known_total(),
             total_offset: state.total_offset,
+            drift_streak: state.drift_streak.saturating_add(u32::from(drift_round)),
+            incomplete: state.incomplete,
             ..ListingState::default()
         };
         save(db, &listing.label, &state);
     }
 
-    let page = match (&listing.query, &listing.token) {
-        (Some(query), _) => {
-            let mut q = query.clone();
-            q.limit = Some(PAGE_SIZE);
-            q.cursor = state.cursor.clone();
-            client.list_mail(&keys.access_token, &q).await
-        }
-        (None, Some(token)) => {
-            client
-                .list_folder_mail(&keys.access_token, token, PAGE_SIZE, state.offset)
-                .await
-        }
-        (None, None) => return Step::Idle,
+    let light = !state.eager;
+    let mut resp = match list_page(client, keys, &listing, &state, !light).await {
+        Some(Ok(resp)) => resp,
+        Some(Err(e)) => return page_failed(db, &listing, &mut state, e),
+        None => return Step::Idle,
     };
-    let resp = match page {
-        Ok(resp) => resp,
-        Err(e) => {
-            let stale_position = matches!(
-                &e,
-                BridgeError::Api(msg) if api_status_code(msg).is_some_and(|s| matches!(s, 400 | 404 | 410 | 422))
-            );
-            if stale_position && (state.cursor.is_some() || state.offset > 0) {
-                state.cursor = None;
-                state.offset = 0;
-                state.walked = 0;
-                save(db, &listing.label, &state);
+    let mut outcome = index_page(db, &listing, &resp.items, keys, state.round, now, light);
+    if light && outcome.missing > 0 {
+        resp = match list_page(client, keys, &listing, &state, true).await {
+            Some(Ok(resp)) => resp,
+            Some(Err(e)) => {
+                record_changes(db, &outcome.created, &outcome.updated, &[]);
+                return page_failed(db, &listing, &mut state, e);
             }
-            return Step::Failed(format!("history: indexing {} failed: {}", listing.label, e));
-        }
-    };
+            None => return Step::Idle,
+        };
+        let full = index_page(db, &listing, &resp.items, keys, state.round, now, false);
+        outcome.created.extend(full.created);
+        outcome.updated.extend(full.updated);
+        state.eager = true;
+    } else if !light && outcome.prepared == 0 {
+        state.eager = false;
+    }
 
-    let (created, updated) = index_page(db, &listing, &resp.items, keys, state.round, now);
     let fetched = resp.items.len();
     state.walked += fetched;
     state.total = resp.total.max(0) as usize;
+    let stalled = resp.has_more
+        && match listing.token {
+            None => fetched == 0 || (resp.next_cursor.is_some() && resp.next_cursor == state.cursor),
+            Some(_) => fetched == 0,
+        };
     let reached_end = match listing.token {
         None => !resp.has_more || resp.next_cursor.is_none(),
-        Some(_) => !resp.has_more || fetched == 0,
+        Some(_) => !resp.has_more,
     };
     let runaway = state.walked > state.total + 50 * PAGE_SIZE as usize;
-    if reached_end || runaway {
+    if stalled {
+        state.sweeping = false;
+        state.swept_at = now.max(1);
+        state.cursor = None;
+        state.offset = 0;
+        state.observed = None;
+        state.incomplete = true;
+        tracing::warn!(
+            "history: the server stopped advancing while indexing {} after {} messages, so indexing tries again later",
+            listing.label,
+            state.walked
+        );
+    } else if reached_end || runaway {
         let queued = db.finish_listing_sweep(&listing.label, state.round).unwrap_or(0);
         let members = db.listing_member_count(&listing.label).unwrap_or(0);
         state.sweeping = false;
@@ -483,6 +518,7 @@ async fn sweep_page(db: &Database, client: &ApiClient, keys: &Keys, now: u64) ->
         state.offset = 0;
         state.total_offset = state.total as i64 - members as i64;
         state.observed = None;
+        state.incomplete = false;
         tracing::info!(
             "history: indexed {} ({} listed, {} to re-check)",
             listing.label,
@@ -497,8 +533,53 @@ async fn sweep_page(db: &Database, client: &ApiClient, keys: &Keys, now: u64) ->
     states[index].1 = state.clone();
     emit_progress(&states, first_pass && !state.sweeping);
     Step::Worked {
-        changed: record_changes(db, &created, &updated, &[]),
+        changed: record_changes(db, &outcome.created, &outcome.updated, &[]),
     }
+}
+
+async fn list_page(
+    client: &ApiClient,
+    keys: &Keys,
+    listing: &Listing,
+    state: &ListingState,
+    include_envelope: bool,
+) -> Option<Result<MailListResponse, BridgeError>> {
+    match (&listing.query, &listing.token) {
+        (Some(query), _) => {
+            let mut q = query.clone();
+            q.limit = Some(PAGE_SIZE);
+            q.cursor = state.cursor.clone();
+            Some(client.list_mail_with(&keys.access_token, &q, include_envelope).await)
+        }
+        (None, Some(token)) => Some(
+            client
+                .list_folder_mail_with(&keys.access_token, token, PAGE_SIZE, state.offset, include_envelope)
+                .await,
+        ),
+        (None, None) => None,
+    }
+}
+
+fn page_failed(db: &Database, listing: &Listing, state: &mut ListingState, e: BridgeError) -> Step {
+    let stale_position = matches!(
+        &e,
+        BridgeError::Api(msg) if api_status_code(msg).is_some_and(|s| matches!(s, 400 | 404 | 410 | 422))
+    );
+    if stale_position && (state.cursor.is_some() || state.offset > 0) {
+        state.cursor = None;
+        state.offset = 0;
+        state.walked = 0;
+    }
+    save(db, &listing.label, state);
+    Step::Failed(format!("history: indexing {} failed: {}", listing.label, e))
+}
+
+#[derive(Default)]
+struct PageOutcome {
+    created: Vec<String>,
+    updated: Vec<String>,
+    prepared: usize,
+    missing: usize,
 }
 
 fn index_page(
@@ -508,9 +589,12 @@ fn index_page(
     keys: &Keys,
     round: i64,
     now: u64,
-) -> (Vec<String>, Vec<String>) {
+    light: bool,
+) -> PageOutcome {
     let mut created: Vec<String> = Vec::new();
     let mut updated: Vec<String> = Vec::new();
+    let mut prepared = 0usize;
+    let mut missing = 0usize;
     let mut unique: HashSet<&str> = HashSet::new();
     let page: Vec<&MailItem> = items
         .iter()
@@ -565,6 +649,11 @@ fn index_page(
             }
             None => {}
         }
+        if light && item.encrypted_envelope.is_empty() {
+            missing += 1;
+            continue;
+        }
+        prepared += 1;
         let outcome = match prepare_mail_item(
             db,
             &folder,
@@ -599,7 +688,12 @@ fn index_page(
             updated.push(item.id.clone());
         }
     }
-    (created, updated)
+    PageOutcome {
+        created,
+        updated,
+        prepared,
+        missing,
+    }
 }
 
 pub(super) struct Pacer {
@@ -820,6 +914,8 @@ mod tests {
         attachments: Arc<StdMutex<HashMap<String, Arc<serde_json::Value>>>>,
         attachment_calls: Arc<AtomicUsize>,
         fail_attachments_with: Arc<StdMutex<Option<u16>>>,
+        envelopes_listed: Arc<AtomicUsize>,
+        stall_at: Arc<StdMutex<Option<usize>>>,
     }
 
     impl Backend {
@@ -911,9 +1007,26 @@ mod tests {
                                 Vec::new()
                             };
                             let start: usize = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
+                            if archive && *backend.stall_at.lock().unwrap() == Some(start) {
+                                return Json(serde_json::json!({
+                                    "items": [],
+                                    "total": all.len(),
+                                    "has_more": true,
+                                    "next_cursor": start.to_string(),
+                                }))
+                                .into_response();
+                            }
                             let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
                             let end = (start + limit).min(all.len());
-                            let page: Vec<serde_json::Value> = all.get(start..end).unwrap_or(&[]).to_vec();
+                            let mut page: Vec<serde_json::Value> = all.get(start..end).unwrap_or(&[]).to_vec();
+                            if q.get("include_envelope").map(String::as_str) == Some("false") {
+                                for item in &mut page {
+                                    item["encrypted_envelope"] = serde_json::json!("");
+                                    item["envelope_nonce"] = serde_json::json!("");
+                                }
+                            } else {
+                                backend.envelopes_listed.fetch_add(page.len(), Ordering::SeqCst);
+                            }
                             let has_more = end < all.len();
                             Json(serde_json::json!({
                                 "items": page,
@@ -1318,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_is_swept_again_only_when_counts_drift_or_a_week_passes() {
+    fn a_listing_is_swept_again_only_when_counts_drift_or_a_month_passes() {
         let swept = ListingState {
             swept_at: NOW,
             total_offset: 2,
@@ -1327,6 +1440,7 @@ mod tests {
         assert!(ListingState::default().needs_sweep(NOW));
         assert!(!swept.needs_sweep(NOW + 60));
         assert!(swept.needs_sweep(NOW + RESWEEP_AFTER_SECS));
+        assert!(!swept.needs_sweep(NOW + 7 * 24 * 60 * 60), "a week is no longer enough");
         let steady = ListingState {
             observed: Some((502, 500)),
             ..swept.clone()
@@ -1338,6 +1452,127 @@ mod tests {
         };
         assert!(!drifted.needs_sweep(NOW + 60));
         assert!(drifted.needs_sweep(NOW + DRIFT_RESWEEP_AFTER_SECS));
+    }
+
+    #[test]
+    fn repeated_drift_waits_twice_as_long_each_time_up_to_a_day() {
+        let drifted = |streak: u32| ListingState {
+            swept_at: NOW,
+            observed: Some((501, 500)),
+            drift_streak: streak,
+            ..ListingState::default()
+        };
+        assert_eq!(drifted(0).drift_wait(), DRIFT_RESWEEP_AFTER_SECS);
+        assert_eq!(drifted(1).drift_wait(), DRIFT_RESWEEP_AFTER_SECS * 2);
+        assert_eq!(drifted(3).drift_wait(), DRIFT_RESWEEP_AFTER_SECS * 8);
+        assert_eq!(drifted(40).drift_wait(), DRIFT_RESWEEP_MAX_SECS);
+        assert!(!drifted(2).needs_sweep(NOW + DRIFT_RESWEEP_AFTER_SECS * 4 - 1));
+        assert!(drifted(2).needs_sweep(NOW + DRIFT_RESWEEP_AFTER_SECS * 4));
+        assert!(!drifted(40).needs_sweep(NOW + DRIFT_RESWEEP_MAX_SECS - 1));
+        let incomplete = ListingState {
+            swept_at: NOW,
+            incomplete: true,
+            ..ListingState::default()
+        };
+        assert!(incomplete.needs_sweep(NOW + DRIFT_RESWEEP_AFTER_SECS));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_that_never_settles_backs_off_and_survives_a_restart() {
+        let (dir, db, backend, client, session) = indexed_archive(150).await;
+        let mut now = NOW;
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            let state = archive_state(&db);
+            let members = db.listing_member_count("archive").unwrap();
+            let mut drifted = state.clone();
+            drifted.observed = Some(((members as i64 + state.total_offset + 1) as usize, members));
+            save(&db, "archive", &drifted);
+            let wait = drifted.drift_wait();
+            waits.push(wait);
+            let listed = backend.list_calls.load(Ordering::SeqCst);
+            assert_eq!(step(&session, &client, &db, now + wait - 1).await, Step::Idle);
+            assert_eq!(backend.list_calls.load(Ordering::SeqCst), listed, "not walked before the wait");
+            now += wait;
+            index_until_idle(&session, &client, &db, now).await;
+        }
+        assert_eq!(
+            waits,
+            vec![
+                DRIFT_RESWEEP_AFTER_SECS,
+                DRIFT_RESWEEP_AFTER_SECS * 2,
+                DRIFT_RESWEEP_AFTER_SECS * 4,
+                DRIFT_RESWEEP_AFTER_SECS * 8
+            ]
+        );
+        drop(db);
+        let db = open_db(dir.path());
+        assert_eq!(archive_state(&db).drift_streak, 4, "the backoff is kept across a restart");
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+        let state = archive_state(&db);
+        assert!(!state.drifted());
+        assert_eq!(state.drift_streak, 0, "matching counts reset the backoff");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_walk_over_stored_mail_lists_without_envelopes() {
+        let (_dir, db, backend, client, session) = indexed_archive(2500).await;
+        let full_first_pass = backend.envelopes_listed.load(Ordering::SeqCst);
+        assert!(full_first_pass >= 500, "new mail still arrives with its envelope");
+
+        backend.envelopes_listed.store(0, Ordering::SeqCst);
+        backend.cursors.lock().unwrap().clear();
+        let later = NOW + RESWEEP_AFTER_SECS;
+        index_until_idle(&session, &client, &db, later).await;
+        assert_eq!(archive_state(&db).swept_at, later);
+        assert_eq!(
+            backend.envelopes_listed.load(Ordering::SeqCst),
+            0,
+            "a periodic walk over stored mail downloads no message bodies"
+        );
+        assert_eq!(backend.cursors.lock().unwrap().len(), 25, "one request per page");
+
+        let mut fresh = archive_item(0);
+        fresh["id"] = serde_json::json!("fresh-old-mail");
+        backend.items.lock().unwrap().insert(2400, fresh);
+        index_until_idle(&session, &client, &db, later + RESWEEP_AFTER_SECS).await;
+        assert!(db.get_cached_message("fresh-old-mail").unwrap().is_some());
+        assert!(
+            backend.envelopes_listed.load(Ordering::SeqCst) <= 2 * PAGE_SIZE as usize,
+            "only the page with the new message is listed again with envelopes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_page_that_claims_more_ends_the_walk_and_retries_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        apply_mode(&db, true);
+        let backend = Backend::with_archive(2400);
+        *backend.stall_at.lock().unwrap() = Some(2200);
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let session = session();
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+        let steps = index_until_idle(&session, &client, &db, NOW).await;
+        assert!(steps < 100, "the walk ended instead of looping ({} steps)", steps);
+
+        let state = archive_state(&db);
+        assert!(!state.sweeping);
+        assert!(state.incomplete);
+        assert_eq!(state.indexed(), 2200);
+        assert_eq!(db.count_cached_messages("archive").unwrap(), 2200);
+        assert!(db.prune_queue_batch(10).unwrap().is_empty(), "an unfinished walk queues nothing for pruning");
+
+        let listed = backend.list_calls.load(Ordering::SeqCst);
+        assert_eq!(step(&session, &client, &db, NOW + 60).await, Step::Idle);
+        assert_eq!(backend.list_calls.load(Ordering::SeqCst), listed);
+
+        *backend.stall_at.lock().unwrap() = None;
+        index_until_idle(&session, &client, &db, NOW + DRIFT_RESWEEP_AFTER_SECS * 2).await;
+        let state = archive_state(&db);
+        assert!(!state.incomplete);
+        assert_eq!(db.count_cached_messages("archive").unwrap(), 2400);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
