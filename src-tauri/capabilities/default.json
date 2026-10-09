@@ -11,6 +11,8 @@
     "autostart:allow-is-enabled",
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-read-text",
-    "notification:default"
+    "notification:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

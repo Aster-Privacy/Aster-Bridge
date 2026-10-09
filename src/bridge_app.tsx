@@ -2043,10 +2043,14 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
   const handle_check_updates = async () => {
     set_update_checking(true);
-    const info = await check_for_update().catch(() => null);
-    set_update_info(info);
+    try {
+      const info = await check_for_update();
+      set_update_info(info);
+      if (!info) show_toast(t("toast_up_to_date"), "success");
+    } catch {
+      show_toast(t("toast_update_check_failed"), "error");
+    }
     set_update_checking(false);
-    if (!info) show_toast(t("toast_up_to_date"), "success");
   };
 
   useEffect(() => {
