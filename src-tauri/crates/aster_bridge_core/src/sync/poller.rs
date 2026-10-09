@@ -1695,7 +1695,43 @@ async fn try_bootstrap(
     None
 }
 
-async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
+async fn sender_identity_confirmed(
+    ctx: &InternalDecryptContext<'_>,
+    sender_email: &str,
+    sender_identity: &str,
+) -> bool {
+    if sender_identity.is_empty() {
+        return false;
+    }
+    let Some(username) = crate::crypto::internal_send::key_lookup_username(sender_email, "") else {
+        return false;
+    };
+    if let Ok(Some(bundle)) = ctx
+        .client
+        .find_prekey_bundle(ctx.access_token, &username, sender_email)
+        .await
+    {
+        if bundle.kem_identity_key == sender_identity {
+            return true;
+        }
+    }
+    match ctx
+        .client
+        .find_identity_history(ctx.access_token, &username, sender_email)
+        .await
+    {
+        Ok(Some(history)) => history
+            .entries
+            .iter()
+            .any(|entry| !entry.kem_identity_key.is_empty() && entry.kem_identity_key == sender_identity),
+        _ => false,
+    }
+}
+
+async fn try_escrow(
+    ctx: &InternalDecryptContext<'_>,
+    dedupe_key: &str,
+) -> Option<crate::crypto::ratchet_recovery::EscrowPlaintext> {
     if ctx.escrow_keys.is_empty() {
         return None;
     }
@@ -1756,11 +1792,14 @@ async fn try_decrypt_internal_mail(
         crate::crypto::ratchet_recovery::recipient_attempts(&ratchet_obj, ctx.our_email, &sender_email);
     let mut opened: Option<String> = None;
     let mut via_recovery_lane = false;
+    let mut via_bootstrap = false;
+    let mut escrow_unbound = false;
     let mut failed_steps: Vec<&str> = Vec::new();
     for attempt in &attempts {
         if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
             opened = try_bootstrap(ctx, &ratchet_obj, &attempt.address).await;
             if opened.is_some() {
+                via_bootstrap = true;
                 break;
             }
             failed_steps.push("bootstrap");
@@ -1781,21 +1820,27 @@ async fn try_decrypt_internal_mail(
             failed_steps.push("recovery_lane");
         }
         if let Some(dedupe_key) = crate::crypto::ratchet_recovery::escrow_dedupe_key(&item.id, attempt.data) {
-            opened = try_escrow(ctx, &dedupe_key).await;
-            if opened.is_some() {
+            if let Some(escrowed) = try_escrow(ctx, &dedupe_key).await {
+                escrow_unbound = !escrowed.bound;
+                opened = Some(escrowed.text);
                 break;
             }
             failed_steps.push("escrow");
         }
     }
     if opened.is_none() && attempts.is_empty() {
-        opened = try_escrow(ctx, &item.id).await;
+        if let Some(escrowed) = try_escrow(ctx, &item.id).await {
+            escrow_unbound = !escrowed.bound;
+            opened = Some(escrowed.text);
+        }
         failed_steps.push("no_recipient_entry");
     }
     match opened {
         Some(plaintext) => {
             let mut bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&plaintext);
-            bundle.sender_unverified = via_recovery_lane;
+            let identity_unconfirmed = via_bootstrap
+                && !sender_identity_confirmed(ctx, &sender_email, sender_identity).await;
+            bundle.sender_unverified = via_recovery_lane || escrow_unbound || identity_unconfirmed;
             Some(bundle)
         }
         None => {

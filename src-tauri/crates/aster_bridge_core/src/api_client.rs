@@ -190,6 +190,18 @@ pub struct BundlePqPrekey {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RatchetIdentityHistoryEntry {
+    #[serde(default)]
+    pub kem_identity_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RatchetIdentityHistory {
+    #[serde(default)]
+    pub entries: Vec<RatchetIdentityHistoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PrekeyBundle {
     pub kem_identity_key: String,
     pub signed_prekey: String,
@@ -1009,6 +1021,29 @@ impl ApiClient {
     ) -> Result<Option<PrekeyBundle>> {
         let resp = self.client
             .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn find_identity_history(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<RatchetIdentityHistory>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}/history", self.base_url, username))
             .query(&[("email", email)])
             .bearer_auth(access_token)
             .send()
