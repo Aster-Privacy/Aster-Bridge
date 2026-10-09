@@ -195,6 +195,7 @@ const en = {
   update_dismiss: "Later",
   toast_up_to_date: "Aster Bridge is up to date",
   toast_update_failed: "Update failed - please try again",
+  toast_update_check_failed: "Couldn't check for updates - please try again",
 
   section_advanced: "Advanced",
   open_data_folder: "Open data folder",
