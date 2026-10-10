@@ -2,6 +2,16 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.6 - 2026-10-10
+
+### Fixed
+- **Check for updates** works. In version 1.0.5 and earlier, Aster Bridge reported that it was up to date even when a newer version was available. To get this fix, download and install version 1.0.6 yourself. Later versions install from **Updates** in the app.
+- When a check for updates fails, Aster Bridge tells you instead of reporting that it is up to date.
+- Aster recipients can open the attachments on a message that you send through Aster Bridge, including a message that also goes to recipients outside Aster.
+- Each hidden Bcc recipient gets a separately protected copy of a message that you send through Aster Bridge.
+- When the server refuses a request for one older message, Aster Bridge continues to index the rest of your mailbox.
+- When a message moves while its attachments download, your mail app receives it as a new message instead of the wrong content.
+
 ## 1.0.5 - 2026-10-07
 
 ### What's new
