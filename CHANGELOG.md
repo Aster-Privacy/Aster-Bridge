@@ -2,6 +2,13 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.7 - 2026-10-11
+
+### Fixed
+- When you turn off **Aster Mail watermark** in Aster Mail settings, messages that you send through Aster Bridge no longer end with "Secured by Aster Mail".
+- You can sign in to your mail app with any of your sending addresses as the username, including an address on your own domain.
+- The command-line app shows your default sending address instead of always showing your Aster address.
+
 ## 1.0.6 - 2026-10-10
 
 ### Fixed
