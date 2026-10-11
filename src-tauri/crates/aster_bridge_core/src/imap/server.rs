@@ -1449,10 +1449,11 @@ where
                         if null_parts.len() >= 3 {
                             let authcid = String::from_utf8_lossy(null_parts[1]);
                             let password = String::from_utf8_lossy(null_parts[2]);
-                            let expected_email = session.read().await.email.clone();
-                            let username_ok = !expected_email.is_empty()
-                                && (authcid.is_empty()
-                                    || authcid.eq_ignore_ascii_case(&expected_email));
+                            let username_ok = {
+                                let s = session.read().await;
+                                !s.email.is_empty()
+                                    && (authcid.is_empty() || s.accepts_login_name(&authcid))
+                            };
                             if username_ok {
                                 if let Some(pw_id) = passwords.verify_and_id_async(&password).await {
                                     conn.state = ImapState::Authenticated;
@@ -2710,8 +2711,7 @@ async fn handle_login(
     let username = login_parts[0].trim_matches('"');
     let password = login_parts[1].trim_matches('"');
 
-    let expected_email = session.read().await.email.clone();
-    if expected_email.is_empty() || !username.eq_ignore_ascii_case(&expected_email) {
+    if !session.read().await.accepts_login_name(username) {
         write_no(writer, tag, "[AUTHENTICATIONFAILED] Invalid credentials").await?;
         return Ok(false);
     }
@@ -8545,5 +8545,84 @@ mod tests {
         let after = reader.read_line(&mut line).await.unwrap_or(0);
         assert_eq!(after, 0, "the closed session still answered {:?}", line);
         drop(dir);
+    }
+
+    async fn login_reply(username: &str) -> String {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let _ = passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let identity = |address: &str, kind: SendIdentityKind, enabled: bool, sender_id: &str| {
+            SendIdentity {
+                address: address.to_string(),
+                auth_hash_b64: None,
+                display_name: None,
+                kind,
+                enabled,
+                sender_id: sender_id.to_string(),
+            }
+        };
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: vec![
+                identity("tester@aster.test", SendIdentityKind::Primary, true, "primary"),
+                identity("me@custom.test", SendIdentityKind::CustomDomain, true, "domain-1"),
+                identity("old@custom.test", SendIdentityKind::CustomDomain, false, "domain-2"),
+            ],
+            default_sender_id: Some("domain-1".to_string()),
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
+        let (state_tx, _state_rx) = broadcast::channel(16);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener_task = tokio::spawn(async move {
+            let _ = serve(listener, session, db, client, passwords, state_tx, None).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        write_half
+            .write_all(format!("a1 LOGIN \"{}\" \"abcd-efgh-ijkl-mnop\"\r\n", username).as_bytes())
+            .await
+            .unwrap();
+        let reply = read_until_tag(&mut reader, "a1").await;
+        listener_task.abort();
+        drop(dir);
+        reply.last().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn login_accepts_the_account_address_and_its_own_sender_addresses() {
+        for username in ["tester@aster.test", "me@custom.test", "ME@Custom.Test"] {
+            let reply = login_reply(username).await;
+            assert!(reply.starts_with("a1 OK"), "{} got {:?}", username, reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_addresses_the_account_does_not_send_from() {
+        for username in ["old@custom.test", "stranger@custom.test", "tester"] {
+            let reply = login_reply(username).await;
+            assert!(reply.starts_with("a1 NO"), "{} got {:?}", username, reply);
+        }
     }
 }

@@ -53,6 +53,7 @@ pub struct UserPreferences {
     pub text_spacing: Option<bool>,
     pub color_vision_mode: Option<String>,
     pub toast_position: Option<String>,
+    pub show_aster_branding: Option<bool>,
 }
 
 fn derive_preferences_key(identity_key: &str) -> [u8; 32] {

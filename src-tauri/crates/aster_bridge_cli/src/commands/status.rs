@@ -199,7 +199,7 @@ fn render(ctx: &Context, s: &Snapshot) {
 
     let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(account) = &s.state.account {
-        rows.push(("Account", account.email.clone()));
+        rows.push(("Account", account.shown_address().to_string()));
     }
     let plan = match &s.state.plan {
         Some(plan) => {

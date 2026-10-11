@@ -309,6 +309,13 @@ pub async fn set(
             Ok(mut b) => {
                 let reply = draft_reply(ctx, &msg);
                 crate::smtp::reply_thread::apply_reply_thread(&mut b, &ctx.client, &access_token, &reply).await;
+                crate::smtp::branding::apply_branding_preference(
+                    &mut b,
+                    &ctx.session,
+                    &ctx.client,
+                    &access_token,
+                )
+                .await;
                 attach_sent_copy(ctx, &mut b).await;
                 if let Err(e) = crate::crypto::internal_send::seal_internal_body(
                     &mut b,
