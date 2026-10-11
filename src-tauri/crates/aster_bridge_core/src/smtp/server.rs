@@ -962,6 +962,7 @@ pub async fn build_threaded_send_payload(
     )
     .await?;
     crate::smtp::reply_thread::apply_reply_thread(&mut payload, client, &access_token, &reply).await;
+    crate::smtp::branding::apply_branding_preference(&mut payload, session, client, &access_token).await;
     crate::crypto::internal_send::seal_internal_body(&mut payload, session, client, db, &access_token)
         .await?;
     Ok((payload, access_token))

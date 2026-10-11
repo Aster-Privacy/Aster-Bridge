@@ -94,8 +94,11 @@ where
             .split_once(':')
             .ok_or_else(unauthorized)?;
 
-        let expected_email = auth_state.session.read().await.email.clone();
-        if expected_email.is_empty() || !user.eq_ignore_ascii_case(&expected_email) {
+        let (expected_email, user_ok) = {
+            let s = auth_state.session.read().await;
+            (s.email.clone(), s.accepts_login_name(user))
+        };
+        if !user_ok {
             register_auth_failure().await;
             return Err(unauthorized());
         }

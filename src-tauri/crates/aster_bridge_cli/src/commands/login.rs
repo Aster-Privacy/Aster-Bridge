@@ -59,12 +59,12 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
             out.json(json!({
                 "status": "signed_in",
                 "already_signed_in": true,
-                "account": { "email": account.email, "username": account.username, "user_id": account.user_id },
+                "account": { "email": account.email, "sender_address": account.shown_address(), "username": account.username, "user_id": account.user_id },
             }));
         } else {
             out.banner(Tone::Good, "Connected to Aster Mail");
             out.blank();
-            out.fields(&[("Account", account.email.clone())]);
+            out.fields(&[("Account", account.shown_address().to_string())]);
             out.blank();
             out.line(out.dim(
                 "To use a different account, run aster-bridge logout first.",
@@ -261,6 +261,7 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
             .map(|p| p.username.clone())
             .unwrap_or_else(|| session.username.clone()),
         display_name: profile.and_then(|p| p.display_name),
+        sender_address: Some(session.default_sender_address()),
     };
 
     let db = Database::open(dir).map_err(|e| map_store_error("Couldn't create the mail cache", e))?;
@@ -310,13 +311,13 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
             if out.json {
                 out.json(json!({
                     "status": "signed_in",
-                    "account": { "email": account.email, "username": account.username, "user_id": account.user_id },
+                    "account": { "email": account.email, "sender_address": account.shown_address(), "username": account.username, "user_id": account.user_id },
                     "plan": plan,
                 }));
             } else {
                 connected_panel(
                     out,
-                    &account.email,
+                    account.shown_address(),
                     Some(common::plan_label(Some(grant.plan_code()))),
                 );
             }
@@ -329,7 +330,7 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
             if out.json {
                 out.json(json!({
                     "status": "signed_in",
-                    "account": { "email": account.email, "username": account.username, "user_id": account.user_id },
+                    "account": { "email": account.email, "sender_address": account.shown_address(), "username": account.username, "user_id": account.user_id },
                     "plan": null,
                     "warning": error.to_string(),
                 }));
@@ -338,7 +339,7 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
                     "Couldn't check your plan: {}. Aster Bridge checks it again when it starts.",
                     error
                 ));
-                connected_panel(out, &account.email, None);
+                connected_panel(out, account.shown_address(), None);
             }
             Ok(EXIT_OK)
         }
