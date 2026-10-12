@@ -26,7 +26,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, ImportProgress, PortConflict } from "@/api";
+import type { ConnectionInfo, HistoryProgress, ImportProgress, PortConflict } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -66,7 +66,13 @@ type SyncProgress = {
   total: number;
   folder_done?: number;
   folder_total?: number;
+  history?: boolean;
 };
+
+function history_as_sync_progress(p: HistoryProgress | null): SyncProgress | null {
+  if (!p || !p.active || p.total <= 0) return null;
+  return { folder: "", done: 0, total: 1, folder_done: p.indexed, folder_total: p.total, history: true };
+}
 
 function sync_bar_fraction(p: SyncProgress): number {
   if (p.total <= 0) return 0;
@@ -787,6 +793,7 @@ function SetupView({
   const { t } = useTranslation();
   const [state, set_state] = useState<SetupState>("idle");
   const [code, set_code] = useState<string | null>(null);
+  const [device_fingerprint, set_device_fingerprint] = useState("");
   const [time_left, set_time_left] = useState(0);
 
   const poll_ref = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -812,6 +819,7 @@ function SetupView({
     try {
       const result = await api.get_setup_code();
       set_code(result.code);
+      set_device_fingerprint(result.device_fingerprint ?? "");
       const lifetime =
         result.expires_in > 0 ? result.expires_in : DEFAULT_CODE_LIFETIME;
       const expiry = Date.now() + lifetime * 1000;
@@ -921,6 +929,13 @@ function SetupView({
                   ))}
                 </div>
               </div>
+              {device_fingerprint && (
+                <div className="w-full mt-4 text-center">
+                  <span className="text-xs font-medium text-txt-muted">{t("setup_device_fingerprint")}</span>
+                  <p className="mt-1 text-sm font-mono font-semibold text-txt-primary select-text">{device_fingerprint}</p>
+                  <p className="mt-1 text-xs leading-relaxed text-txt-muted">{t("setup_device_fingerprint_hint")}</p>
+                </div>
+              )}
               <div className="flex items-center gap-3 w-full mt-6">
                 <Button className="flex-1" size="xl" variant="secondary" onClick={handle_copy_code}>{t("setup_copy_code")}</Button>
                 <Button className="flex-1" size="xl" variant="depth" onClick={() => api.open_url(LINK_DEVICE_URL)}>{t("setup_open_browser")}</Button>
@@ -1362,7 +1377,7 @@ function ConfigPanel({
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
                 <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z" />
               </svg>
-              <span className="truncate">{t("syncing_folder", { folder: sync_progress.folder })}</span>
+              <span className="truncate">{sync_progress.history ? t("indexing_history") : t("syncing_folder", { folder: sync_progress.folder })}</span>
             </span>
             <span className="text-xs font-normal text-txt-muted tabular-nums flex-shrink-0 leading-none">
               {sync_progress.folder_total && sync_progress.folder_total > 0
@@ -1768,6 +1783,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [autostart_loading, set_autostart_loading] = useState(true);
   const [service_mode, set_service_mode] = useState(false);
   const [service_mode_loading, set_service_mode_loading] = useState(true);
+  const [full_history, set_full_history] = useState(true);
+  const [full_history_loading, set_full_history_loading] = useState(true);
+  const [require_post_quantum, set_require_post_quantum] = useState(false);
   const [update_info, set_update_info] = useState<UpdateInfo | null>(null);
   const [update_checking, set_update_checking] = useState(false);
   const [update_installing, set_update_installing] = useState(false);
@@ -1783,6 +1801,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const setup_display = use_frozen(setup_client);
   const [show_repair_modal, set_show_repair_modal] = useState(false);
   const [repairing, set_repairing] = useState(false);
+  const [show_recipient_key_modal, set_show_recipient_key_modal] = useState(false);
+  const [recipient_key_address, set_recipient_key_address] = useState("");
+  const [accepting_recipient_key, set_accepting_recipient_key] = useState(false);
   const [logs_open, set_logs_open] = useState(false);
   const [log_lines, set_log_lines] = useState<string[]>([]);
   const [logs_loading, set_logs_loading] = useState(false);
@@ -1839,6 +1860,24 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       show_toast(typeof e === "string" ? e : t("toast_repair_failed"), "error");
     }
     set_repairing(false);
+  };
+
+  const handle_accept_recipient_key = async () => {
+    const address = recipient_key_address.trim();
+    if (!/^[^\s@]+@[^\s@]+$/.test(address)) {
+      show_toast(t("toast_recipient_key_invalid"), "error");
+      return;
+    }
+    set_accepting_recipient_key(true);
+    try {
+      const accepted = await api.accept_recipient_key(address);
+      show_toast(t(accepted ? "toast_recipient_key_accepted" : "toast_recipient_key_none"), "success");
+      set_show_recipient_key_modal(false);
+      set_recipient_key_address("");
+    } catch {
+      show_toast(t("toast_recipient_key_failed"), "error");
+    }
+    set_accepting_recipient_key(false);
   };
 
   const handle_toggle_logs = async () => {
@@ -1899,6 +1938,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     api.get_service_settings().then((s) => {
       set_autostart(s.autostart);
       set_service_mode(s.service_mode);
+      set_require_post_quantum(s.require_post_quantum);
       set_autostart_loading(false);
       set_service_mode_loading(false);
     }).catch(() => {
@@ -1911,6 +1951,28 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     import("@tauri-apps/api/app").then(({ getVersion }) => getVersion()).then(set_app_version).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    api.get_full_mail_history().then((enabled) => {
+      set_full_history(enabled);
+      set_full_history_loading(false);
+    }).catch(() => set_full_history_loading(false));
+  }, []);
+
+  const handle_toggle_full_history = async () => {
+    const new_value = !full_history;
+    set_full_history(new_value);
+    set_full_history_loading(true);
+    try {
+      await api.set_full_mail_history(new_value);
+      if (bridge_running) await api.restart_bridge();
+      show_toast(new_value ? t("toast_full_history_on") : t("toast_full_history_off"), "success");
+    } catch {
+      set_full_history(!new_value);
+      show_toast(t("toast_full_history_failed"), "error");
+    }
+    set_full_history_loading(false);
+  };
+
   const handle_toggle_service_mode = async () => {
     const new_value = !service_mode;
     set_service_mode(new_value);
@@ -1920,6 +1982,18 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_service_mode(!new_value);
       show_toast(t("toast_background_mode_failed"), "error");
+    }
+  };
+
+  const handle_toggle_require_post_quantum = async () => {
+    const new_value = !require_post_quantum;
+    set_require_post_quantum(new_value);
+    try {
+      await api.set_require_post_quantum(new_value);
+      show_toast(new_value ? t("toast_require_post_quantum_on") : t("toast_require_post_quantum_off"), "success");
+    } catch {
+      set_require_post_quantum(!new_value);
+      show_toast(t("toast_require_post_quantum_failed"), "error");
     }
   };
 
@@ -1969,10 +2043,14 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
   const handle_check_updates = async () => {
     set_update_checking(true);
-    const info = await check_for_update().catch(() => null);
-    set_update_info(info);
+    try {
+      const info = await check_for_update();
+      set_update_info(info);
+      if (!info) show_toast(t("toast_up_to_date"), "success");
+    } catch {
+      show_toast(t("toast_update_check_failed"), "error");
+    }
     set_update_checking(false);
-    if (!info) show_toast(t("toast_up_to_date"), "success");
   };
 
   useEffect(() => {
@@ -2015,6 +2093,12 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </SettingRow>
         <SettingRow label={t("run_in_background")} sublabel={t("run_in_background_hint")}>
           <Toggle checked={service_mode} disabled={service_mode_loading} on_click={handle_toggle_service_mode} />
+        </SettingRow>
+        <SettingRow label={t("full_mail_history")} sublabel={t("full_mail_history_hint")}>
+          <Toggle checked={full_history} disabled={full_history_loading} on_click={handle_toggle_full_history} />
+        </SettingRow>
+        <SettingRow label={t("require_post_quantum")} sublabel={t("require_post_quantum_hint")}>
+          <Toggle checked={require_post_quantum} disabled={service_mode_loading} on_click={handle_toggle_require_post_quantum} />
         </SettingRow>
       </SettingsGroup>
 
@@ -2206,6 +2290,19 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         <SettingRow
+          label={t("recipient_key")}
+          sublabel={t("recipient_key_sub")}
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          }
+        >
+          <Button variant="secondary" size="sm" onClick={() => set_show_recipient_key_modal(true)}>
+            {t("recipient_key_accept")}
+          </Button>
+        </SettingRow>
+        <SettingRow
           danger
           label={t("reset_bridge")}
           sublabel={t("reset_bridge_sub")}
@@ -2230,6 +2327,25 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
         </ModalActions>
       </Modal>
 
+
+      <Modal open={show_recipient_key_modal} on_close={() => !accepting_recipient_key && set_show_recipient_key_modal(false)}>
+        <p className="text-base font-semibold text-txt-primary">{t("recipient_key_title")}</p>
+        <ModalBody>{t("recipient_key_body")}</ModalBody>
+        <input
+          type="email"
+          autoComplete="off"
+          spellCheck={false}
+          aria-label={t("recipient_key_address")}
+          placeholder={t("recipient_key_placeholder")}
+          value={recipient_key_address}
+          onChange={(e) => set_recipient_key_address(e.target.value)}
+          className="bridge_field w-full h-9 px-2.5 text-sm text-txt-primary"
+        />
+        <ModalActions>
+          <Button variant="ghost" size="md" disabled={accepting_recipient_key} onClick={() => set_show_recipient_key_modal(false)}>{t("cancel")}</Button>
+          <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_accept_recipient_key}>{t("recipient_key_accept")}</Button>
+        </ModalActions>
+      </Modal>
 
       <Modal open={show_reset_modal} on_close={() => set_show_reset_modal(false)}>
         <p className="text-base font-semibold text-txt-primary">{t("reset_bridge_title")}</p>
@@ -2514,6 +2630,7 @@ export function BridgeApp() {
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
   const [sync_progress, set_sync_progress] = useState<SyncProgress | null>(null);
+  const [history_progress, set_history_progress] = useState<HistoryProgress | null>(null);
   const [import_progress, set_import_progress] = useState<ImportProgress | null>(null);
   const import_dismissed = useRef<number | null>(null);
   const apply_import_progress = useCallback((p: ImportProgress | null) => {
@@ -2615,6 +2732,9 @@ export function BridgeApp() {
           sync_visible.current = false;
           set_sync_progress(null);
         }, e.payload.failed ? 0 : 1200);
+      }),
+      listen_tauri<HistoryProgress>("history_progress", (e) => {
+        set_history_progress(e.payload.active ? e.payload : null);
       }),
       listen_tauri<ImportProgress>("import_progress", (e) => {
         apply_import_progress(e.payload);
@@ -2851,7 +2971,7 @@ export function BridgeApp() {
         on_sign_out={handle_sign_out} on_reset={handle_reset} on_retry_plan={load_state}
         has_bridge_access={has_bridge_access}
         plan_info_loaded={plan_info_loaded} outbox_count={outbox_count}
-        connected_since={connected_since} sync_progress={sync_progress} is_online={is_online}
+        connected_since={connected_since} sync_progress={sync_progress ?? history_as_sync_progress(history_progress)} is_online={is_online}
         import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
         port_conflict={port_conflict} on_use_alternate_ports={handle_use_alternate_ports}
       />

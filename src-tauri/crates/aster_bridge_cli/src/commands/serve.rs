@@ -221,12 +221,13 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     )
     .await
     .map_err(|e| common::map_login_error(&dir, e))?;
-    let email = session.email.clone();
+    let email = session.default_sender_address();
     let account = AccountInfo {
         user_id: session.user_id.to_string(),
         email: session.email.clone(),
         username: session.username.clone(),
         display_name: cached.account.as_ref().and_then(|a| a.display_name.clone()),
+        sender_address: Some(email.clone()),
     };
     common::save_state(&dir, |s| {
         s.account = Some(account);
@@ -628,6 +629,11 @@ impl Shared {
                     .map_err(|e| CliError::coded(CODE_SYNC, format!("The cache was rebuilt, but sync didn't finish: {}", e)))?;
                 Ok(json!({ "repaired": true, "synced": true }))
             }
+            "recipient_key_accept" => common::recipient_key_accept(
+                &self.db,
+                &state::load(&self.data_dir),
+                args.get("address").and_then(Value::as_str).unwrap_or_default(),
+            ),
             "app_password_create" => common::app_password_create(
                 &self.passwords,
                 &state::load(&self.data_dir),

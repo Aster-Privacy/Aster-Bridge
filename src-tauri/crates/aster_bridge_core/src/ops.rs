@@ -44,6 +44,7 @@ pub struct DeviceCode {
     pub code: String,
     pub normalized: String,
     pub expires_in: u64,
+    pub device_fingerprint: String,
 }
 
 pub fn normalize_code(code: &str) -> String {
@@ -71,6 +72,7 @@ pub async fn request_device_code(
         normalized: normalize_code(&response.code),
         code: response.code,
         expires_in: response.expires_in,
+        device_fingerprint: device_identity::device_fingerprint(identity),
     })
 }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
-use crate::db::{CachedAttachment, CachedMessage, ATTACHMENTS_STORED};
+use crate::db::{CachedAttachment, CachedMessage};
 use crate::jmap::dispatcher::MethodError;
 use crate::jmap::state::JmapContext;
 use crate::jmap::store;
@@ -68,7 +68,7 @@ pub async fn get(ctx: &Arc<JmapContext>, args: Value) -> Result<Value, MethodErr
     let mut messages = ctx.db.get_cached_messages(&want, with_body).unwrap_or_default();
     let stored: Vec<String> = messages
         .values()
-        .filter(|m| m.attachments_state == ATTACHMENTS_STORED)
+        .filter(|m| crate::db::attachment_parts_known(m.attachments_state))
         .map(|m| m.aster_id.clone())
         .collect();
     let attachment_meta = ctx
@@ -170,7 +170,7 @@ fn serialize_email(
                     "value": format!(
                         "{}{}",
                         body,
-                        crate::message_render::sender_unverified_suffix(&meta, is_html)
+                        crate::message_render::trust_note_suffix(&meta, is_html)
                     ),
                     "isEncodingProblem": false,
                     "isTruncated": false,
@@ -1194,7 +1194,7 @@ pub async fn set(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
-    use crate::db::Database;
+    use crate::db::{Database, ATTACHMENTS_STORED};
     use tokio::sync::{broadcast, RwLock};
     use uuid::Uuid;
 
@@ -1447,6 +1447,16 @@ mod tests {
         let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
         assert!(value.starts_with("this is the body text here\r\n\r\n"));
         assert!(value.ends_with(crate::message_render::SENDER_UNVERIFIED_NOTE));
+    }
+
+    #[test]
+    fn serialize_email_marks_a_message_stored_without_encryption() {
+        let mut m = cached("e8", "inbox");
+        m.raw_headers = Some(json!({"is_html": false, "not_end_to_end_encrypted": true}).to_string());
+        let v = serialize_email(&m, &HashMap::new(), &None, true, &[], &[]);
+        let value = v.pointer("/bodyValues/1/value").and_then(|v| v.as_str()).unwrap();
+        assert!(value.starts_with("this is the body text here\r\n\r\n"));
+        assert!(value.ends_with(crate::message_render::NOT_END_TO_END_ENCRYPTED_NOTE));
     }
 
     #[tokio::test]

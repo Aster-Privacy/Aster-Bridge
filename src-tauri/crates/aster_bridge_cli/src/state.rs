@@ -36,6 +36,17 @@ pub struct AccountInfo {
     pub username: String,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub sender_address: Option<String>,
+}
+
+impl AccountInfo {
+    pub fn shown_address(&self) -> &str {
+        self.sender_address
+            .as_deref()
+            .filter(|address| !address.is_empty())
+            .unwrap_or(&self.email)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +248,7 @@ mod tests {
                 email: "a@example.test".into(),
                 username: "a".into(),
                 display_name: None,
+                sender_address: None,
             });
             s.account_state = AccountState::Suspended;
         })

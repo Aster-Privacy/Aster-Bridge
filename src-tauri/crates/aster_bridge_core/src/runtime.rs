@@ -169,7 +169,10 @@ pub struct RuntimeTuning {
 impl RuntimeTuning {
     pub fn for_config(config: &BridgeConfig) -> Self {
         Self {
-            poll: PollTuning::from_interval_secs(Some(config.poll_interval_secs)),
+            poll: PollTuning {
+                full_history: config.full_mail_history,
+                ..PollTuning::from_interval_secs(Some(config.poll_interval_secs))
+            },
             plan_retry_delay: Duration::from_secs(2),
             token_refresh_interval: Duration::from_secs(50 * 60),
             token_retry_interval: Duration::from_secs(60),

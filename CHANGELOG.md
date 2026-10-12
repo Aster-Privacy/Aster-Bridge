@@ -2,6 +2,37 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.7 - 2026-10-11
+
+### Fixed
+- When you turn off **Aster Mail watermark** in Aster Mail settings, messages that you send through Aster Bridge no longer end with "Secured by Aster Mail".
+- You can sign in to your mail app with any of your sending addresses as the username, including an address on your own domain.
+- The command-line app shows your default sending address instead of always showing your Aster address.
+
+## 1.0.6 - 2026-10-10
+
+### Fixed
+- **Check for updates** works. In version 1.0.5 and earlier, Aster Bridge reported that it was up to date even when a newer version was available. To get this fix, download and install version 1.0.6 yourself. Later versions install from **Updates** in the app.
+- When a check for updates fails, Aster Bridge tells you instead of reporting that it is up to date.
+- Aster recipients can open the attachments on a message that you send through Aster Bridge, including a message that also goes to recipients outside Aster.
+- Each hidden Bcc recipient gets a separately protected copy of a message that you send through Aster Bridge.
+- When the server refuses a request for one older message, Aster Bridge continues to index the rest of your mailbox.
+- When a message moves while its attachments download, your mail app receives it as a new message instead of the wrong content.
+
+## 1.0.5 - 2026-10-07
+
+### What's new
+- Aster Bridge syncs every message in every folder, not only the newest 2,000. Older mail is indexed in the background, and its attachments download the first time you open them. To keep only recent mail and save disk space, turn off **Sync all mail** in **General**.
+- When a recipient's encryption key changes, Aster Bridge refuses to send and tells you. After you confirm the change with the recipient, you can accept the new key in the app or the command-line app.
+- A new setting, **Require post-quantum protection for Aster recipients**, stops a send to an Aster recipient whose keys don't support post-quantum protection.
+- The pairing screen and the command-line app show a device fingerprint, so you can confirm that you're approving the right device.
+
+### Fixed
+- When one message's attachments can't be downloaded, your mail app still receives the other messages it asked for.
+- When you turn off **Sync all mail**, Aster Bridge returns the freed space to your disk.
+- Aster Bridge checks attachments and recipient keys against the signed message and refuses anything that was changed.
+- Background indexing sends fewer requests, so your sync is less likely to pause.
+
 ## 1.0.4 - 2026-10-06
 
 ### Fixed

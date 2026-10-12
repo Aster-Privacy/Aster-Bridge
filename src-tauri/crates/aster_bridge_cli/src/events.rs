@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aster_bridge_core::account_state::AccountState;
-use aster_bridge_core::events::{BridgeEvents, SyncProgress};
+use aster_bridge_core::events::{BridgeEvents, HistoryProgress, SyncProgress};
 use serde_json::{json, Map, Value};
 
 use crate::state::{self, SyncInfo};
@@ -98,6 +98,17 @@ impl BridgeEvents for CliEvents {
                 "total": progress.total,
                 "folder_done": progress.folder_done,
                 "folder_total": progress.folder_total,
+            }),
+        );
+    }
+
+    fn history_progress(&self, progress: &HistoryProgress) {
+        self.emit(
+            "history_progress",
+            json!({
+                "indexed": progress.indexed,
+                "total": progress.total,
+                "active": progress.active,
             }),
         );
     }

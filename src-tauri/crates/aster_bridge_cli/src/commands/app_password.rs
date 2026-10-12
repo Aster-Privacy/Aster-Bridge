@@ -30,7 +30,10 @@ use crate::spinner;
 
 pub async fn run(ctx: &Context, command: AppPasswordCommand) -> CliResult<i32> {
     let state = common::require_account(&ctx.data_dir)?;
-    let email = state.account.map(|a| a.email).unwrap_or_default();
+    let email = state
+        .account
+        .map(|a| a.shown_address().to_string())
+        .unwrap_or_default();
     match command {
         AppPasswordCommand::Create { label } => create(ctx, label, &email).await,
         AppPasswordCommand::List => list(ctx).await,

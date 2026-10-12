@@ -50,7 +50,7 @@ jobs:
         run: |
           bash scripts/fetch_pinned_sources.sh ui
           cd ../aster-ui
-          npm ci --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund
           npm run build
 
       - name: Fetch aster-crypto source (Aster-Mail)
@@ -58,7 +58,7 @@ jobs:
         run: bash scripts/fetch_pinned_sources.sh mail
 
       - name: Install frontend dependencies
-        run: npm ci --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Build ARM AppImage
         env:

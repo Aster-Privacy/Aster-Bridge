@@ -78,7 +78,7 @@ jobs:
         run: |
           bash scripts/fetch_pinned_sources.sh ui
           cd ../aster-ui
-          npm ci --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund
           npm run build
 
       - name: Fetch aster-crypto source (Aster-Mail)
@@ -86,7 +86,7 @@ jobs:
         run: bash scripts/fetch_pinned_sources.sh mail
 
       - name: Install frontend dependencies
-        run: npm ci --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Import Apple certificate
         if: matrix.leg == 'mac' && env.APPLE_CERTIFICATE != ''
@@ -233,6 +233,52 @@ jobs:
             rename_asset "Aster.Bridge_${V}_universal.app.tar.gz.sig" "Aster-Bridge-universal.app.tar.gz.sig"
           fi
 
+      - name: Stage the installers built in this run for provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/provenance"
+          B="src-tauri/target/release/bundle"
+          mkdir -p "$OUT"
+          shopt -s nullglob
+          stage() {
+            local dst="$1"
+            shift
+            for f in "$@"; do
+              if [ -f "$f" ]; then
+                cp "$f" "$OUT/$dst"
+                return 0
+              fi
+            done
+            echo "::warning::$dst was not built in this run, so it gets no provenance attestation"
+          }
+          case "${{ matrix.leg }}" in
+            win)
+              stage Aster-Bridge-x64-setup.exe "$B"/nsis/*-setup.exe
+              stage Aster-Bridge-x64.msi "$B"/msi/*.msi
+              ;;
+            linux-x64)
+              stage Aster-Bridge-x86_64.AppImage "$B"/appimage/*.AppImage
+              stage Aster-Bridge-amd64.deb "$B"/deb/*.deb
+              stage Aster-Bridge-x86_64.rpm "$B"/rpm/*.rpm
+              stage Aster-Bridge-x86_64.pkg.tar.zst packaging/arch/Aster-Bridge-x86_64.pkg.tar.zst
+              ;;
+            linux-arm64)
+              stage Aster-Bridge-aarch64.AppImage "$B"/appimage/*.AppImage
+              stage Aster-Bridge-arm64.deb "$B"/deb/*.deb
+              stage Aster-Bridge-aarch64.rpm "$B"/rpm/*.rpm
+              ;;
+          esac
+          ls -l "$OUT"
+
+      - name: Upload this run's installers for provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: provenance-${{ matrix.leg }}
+          path: ${{ runner.temp }}/provenance/
+          if-no-files-found: warn
+          retention-days: 1
+
   cli:
     needs: build
     if: always()
@@ -361,6 +407,16 @@ jobs:
           fi
           cat "$ARCHIVE.sha256"
           gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+          mkdir -p "$RUNNER_TEMP/provenance"
+          cp "$ARCHIVE" "$RUNNER_TEMP/provenance/"
+
+      - name: Upload this run's command-line archive for provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: provenance-cli-${{ matrix.target }}
+          path: ${{ runner.temp }}/provenance/
+          if-no-files-found: ignore
+          retention-days: 1
 
   update_latest_json:
     needs: build
@@ -479,6 +535,7 @@ jobs:
           if [ -z "$V" ]; then V="${GITHUB_REF_NAME#v}"; fi
           TAG="v${V}"
           TMP="$(mktemp -d)"
+          CARRIED=()
 
           REQUIRED=(
             Aster-Bridge-x64-setup.exe
@@ -541,6 +598,7 @@ jobs:
                     gh release download "$prev" --repo "$REPO" --pattern "$name" --dir "$TMP" --clobber
                     gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
                     echo "::warning::carried over $name from $prev - cut a fresh build to replace it"
+                    CARRIED+=("\`$name\` ($prev)")
                     break
                   fi
                 done
@@ -567,12 +625,29 @@ jobs:
             exit 1
           fi
 
+          if [ ${#CARRIED[@]} -ne 0 ]; then
+            LIST="$(printf '%s, ' "${CARRIED[@]}")"
+            LIST="${LIST%, }"
+            MARK="has no new build of the following files"
+            NOTE="$(printf '> [!WARNING]\n> This release %s. Each one is a copy from the release shown in parentheses: %s.' "$MARK" "$LIST")"
+            {
+              echo "### Files not built in this run"
+              echo ""
+              echo "$TAG $MARK. Each one is a copy from the release shown in parentheses, and none of them has a provenance attestation for this run: $LIST."
+            } >> "$GITHUB_STEP_SUMMARY"
+            BODY="$(gh release view "$TAG" --repo "$REPO" --json body -q .body)"
+            if ! grep -qF "$MARK" <<<"$BODY"; then
+              printf '%s\n\n%s\n' "$BODY" "$NOTE" > "$TMP/body.md"
+              gh release edit "$TAG" --repo "$REPO" --notes-file "$TMP/body.md"
+            fi
+          fi
+
           echo "All 6 bridge download assets present on $TAG."
           gh release edit "$TAG" --repo "$REPO" --prerelease=false --latest
           echo "Promoted $TAG to Latest."
 
   attest_provenance:
-    needs: ensure_download_assets
+    needs: [build, cli, ensure_download_assets]
     if: always()
     runs-on: ubuntu-22.04
     continue-on-error: true
@@ -581,32 +656,36 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the installers built in this run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          persist-credentials: false
-      - name: Download the canonical installers
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          pattern: provenance-*
+          path: attest
+          merge-multiple: true
+      - name: List what this run built
+        id: built
         shell: bash
         run: |
-          # Provenance ties each shipped installer to this commit, this workflow
-          # and this run. It is advisory: the job never blocks a release, so a
-          # transient signing failure cannot keep an installer off the site.
           set -uo pipefail
-          V=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
-          if [ -z "$V" ]; then V="${GITHUB_REF_NAME#v}"; fi
-          TAG="v${V}"
           mkdir -p attest
-          for a in Aster-Bridge-x64-setup.exe Aster-Bridge-x64.msi Aster-Bridge-x86_64.AppImage Aster-Bridge-amd64.deb Aster-Bridge-x86_64.rpm Aster-Bridge-universal.dmg; do
-            gh release download "$TAG" --pattern "$a" --dir attest --clobber 2>/dev/null || \
-              echo "::warning::$a absent on $TAG, not attested"
-          done
-          for a in aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz aster-bridge-cli-universal-apple-darwin.tar.gz aster-bridge-cli-x86_64-pc-windows-msvc.zip; do
-            gh release download "$TAG" --pattern "$a" --dir attest --clobber 2>/dev/null || \
-              echo "::warning::$a absent on $TAG, not attested"
-          done
+          COUNT=$(find attest -maxdepth 1 -type f | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Provenance"
+            echo ""
+            echo "Only files built in this run are attested. A file carried over from an earlier release or uploaded by hand has no attestation for this run."
+            echo ""
+            for a in Aster-Bridge-x64-setup.exe Aster-Bridge-x64.msi Aster-Bridge-x86_64.AppImage Aster-Bridge-amd64.deb Aster-Bridge-x86_64.rpm Aster-Bridge-universal.dmg aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz aster-bridge-cli-universal-apple-darwin.tar.gz aster-bridge-cli-x86_64-pc-windows-msvc.zip; do
+              if [ -f "attest/$a" ]; then
+                echo "- \`$a\`: built in this run, attested"
+              else
+                echo "- \`$a\`: not built in this run, not attested"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
           ls -l attest || true
       - name: Attest build provenance
+        if: steps.built.outputs.count != '0'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: "attest/*"

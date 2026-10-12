@@ -626,6 +626,39 @@ fn scan_bundle_payload(payload: &str) -> Option<(Option<String>, String)> {
     Some((subject, body?))
 }
 
+fn bundle_attachment_manifest(payload: &str) -> Option<Vec<Value>> {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(payload) else {
+        return None;
+    };
+    match map.get(crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD) {
+        Some(Value::Array(entries)) if !entries.is_empty() => Some(entries.clone()),
+        _ => None,
+    }
+}
+
+fn bundle_payload(text: &str) -> Option<&str> {
+    let marker_index = text.find(SUBJECT_BUNDLE_MARKER)?;
+    let prefix = &text[..marker_index];
+    let framing = prefix.strip_suffix(SUBJECT_BUNDLE_DELIMITER).unwrap_or(prefix);
+    if !framing.chars().all(is_bundle_framing) {
+        return None;
+    }
+    let payload = &text[marker_index + SUBJECT_BUNDLE_MARKER.len()..];
+    Some(payload.strip_prefix(SUBJECT_BUNDLE_DELIMITER).unwrap_or(payload))
+}
+
+pub fn wrap_subject_bundle(subject: &str, body: &str, attachment_manifest: &[Value]) -> String {
+    format!(
+        "{delimiter}{marker}{delimiter}{{\"s\":{subject},\"b\":{body},\"{field}\":{manifest}}}",
+        delimiter = SUBJECT_BUNDLE_DELIMITER,
+        marker = SUBJECT_BUNDLE_MARKER,
+        subject = Value::String(subject.to_string()),
+        body = Value::String(body.to_string()),
+        field = crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD,
+        manifest = Value::Array(attachment_manifest.to_vec()),
+    )
+}
+
 fn unwrap_subject_bundle_layer(text: &str) -> Option<(Option<String>, String)> {
     let marker_index = text.find(SUBJECT_BUNDLE_MARKER)?;
     let prefix = &text[..marker_index];
@@ -649,9 +682,11 @@ pub struct SubjectBundle {
     pub subject: Option<String>,
     pub body: String,
     pub sender_unverified: bool,
+    pub attachment_manifest: Option<Vec<Value>>,
 }
 
 pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
+    let attachment_manifest = bundle_payload(decrypted).and_then(bundle_attachment_manifest);
     let mut subject: Option<String> = None;
     let mut body = decrypted.to_string();
     let mut unwrapped = false;
@@ -666,12 +701,18 @@ pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
         unwrapped = true;
     }
     if !unwrapped {
-        return SubjectBundle { subject: None, body, sender_unverified: false };
+        return SubjectBundle {
+            subject: None,
+            body,
+            sender_unverified: false,
+            attachment_manifest: None,
+        };
     }
     SubjectBundle {
         subject: Some(subject.unwrap_or_default()),
         body,
         sender_unverified: false,
+        attachment_manifest,
     }
 }
 
@@ -1081,6 +1122,31 @@ mod tests {
         assert!(escrow_dedupe_key("mail-123", &json!({ "header": {} })).is_none());
         assert!(escrow_dedupe_key("mail-123", &json!({})).is_none());
         assert_eq!(escrow_aad_v2("k"), b"aster.escrow.v2\0k".to_vec());
+    }
+
+    #[test]
+    fn a_wrapped_bundle_carries_the_attachment_manifest_after_subject_and_body() {
+        let manifest = vec![serde_json::json!({"seq": 0, "key": "a2V5", "sha256": "ab", "size": 3})];
+        let wrapped = wrap_subject_bundle("Q3 \"plan\"", "<p>s and b</p>", &manifest);
+        assert!(wrapped.starts_with("\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":"));
+        let subject_at = wrapped.find("\"s\":").unwrap();
+        let body_at = wrapped.find("\"b\":").unwrap();
+        let manifest_at = wrapped.find("\"attachment_manifest\":").unwrap();
+        assert!(subject_at < body_at && body_at < manifest_at);
+
+        let opened = extract_subject_bundle(&wrapped);
+        assert_eq!(opened.subject.as_deref(), Some("Q3 \"plan\""));
+        assert_eq!(opened.body, "<p>s and b</p>");
+        assert_eq!(opened.attachment_manifest, Some(manifest));
+
+        let plain = extract_subject_bundle("\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":\"x\",\"b\":\"y\"}");
+        assert_eq!(plain.attachment_manifest, None);
+        let inner = wrap_subject_bundle("in", "body", &[serde_json::json!({"seq": 9})]);
+        let nested = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"out\",\"b\":{}}}",
+            Value::String(inner)
+        );
+        assert_eq!(extract_subject_bundle(&nested).attachment_manifest, None);
     }
 
     #[test]

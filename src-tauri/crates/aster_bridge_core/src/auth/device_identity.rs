@@ -303,6 +303,38 @@ pub fn sign_with_key(key: &SigningKey, nonce_b64: &str) -> Result<String, String
     Ok(b64url(&sig.to_bytes()))
 }
 
+const FINGERPRINT_DOMAIN: &[u8] = b"aster-bridge-device-fingerprint-v1\0";
+const FINGERPRINT_BYTES: usize = 10;
+
+pub fn fingerprint_of_public_keys(ed25519_pk: &[u8], mlkem_pk: &[u8], x25519_pk: &[u8]) -> String {
+    use sha2::Digest;
+
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_DOMAIN);
+    for part in [ed25519_pk, mlkem_pk, x25519_pk] {
+        hasher.update((part.len() as u32).to_be_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest[..FINGERPRINT_BYTES]
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|group| std::str::from_utf8(group).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn device_fingerprint(identity: &DeviceIdentity) -> String {
+    fingerprint_of_public_keys(
+        identity.ed25519_signing_key.verifying_key().as_bytes(),
+        &identity.mlkem_encaps_key_bytes,
+        &identity.x25519_public_bytes,
+    )
+}
+
 pub fn get_pubkeys(identity: &DeviceIdentity) -> (String, String, String) {
     let ed25519_pk = b64url(identity.ed25519_signing_key.verifying_key().as_bytes());
     let mlkem_pk = b64url(&identity.mlkem_encaps_key_bytes);
@@ -510,6 +542,22 @@ pub fn clear_identity(data_dir: &Path) {
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
+
+    #[test]
+    fn the_device_fingerprint_matches_the_published_vector() {
+        let fingerprint = fingerprint_of_public_keys(&[1u8; 32], &[2u8; 1184], &[3u8; 32]);
+        assert_eq!(fingerprint, "9B16 AF79 0A6A E2F2 55D3");
+    }
+
+    #[test]
+    fn the_device_fingerprint_changes_with_any_public_key() {
+        let base = fingerprint_of_public_keys(&[1u8; 32], &[2u8; 1184], &[3u8; 32]);
+        assert_eq!(base.len(), 24);
+        assert_ne!(base, fingerprint_of_public_keys(&[9u8; 32], &[2u8; 1184], &[3u8; 32]));
+        assert_ne!(base, fingerprint_of_public_keys(&[1u8; 32], &[9u8; 1184], &[3u8; 32]));
+        assert_ne!(base, fingerprint_of_public_keys(&[1u8; 32], &[2u8; 1184], &[9u8; 32]));
+        assert_ne!(base, fingerprint_of_public_keys(&[1u8; 32], &[2u8; 1183], &[3u8; 33]));
+    }
 
     #[test]
     fn b64url_round_trips_arbitrary_bytes() {

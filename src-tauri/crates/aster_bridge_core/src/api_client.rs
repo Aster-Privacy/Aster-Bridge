@@ -194,7 +194,18 @@ pub struct PrekeyBundle {
     pub kem_identity_key: String,
     pub signed_prekey: String,
     #[serde(default)]
+    pub signed_prekey_signature: Option<String>,
+    #[serde(default)]
     pub pq_prekey: Option<BundlePqPrekey>,
+    #[serde(default)]
+    pub pq_kem_public_key: Option<String>,
+    #[serde(default)]
+    pub x3dh_max_version: Option<i16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecipientPublicKey {
+    pub public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -995,6 +1006,54 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn find_prekey_bundle(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<PrekeyBundle>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_recipient_public_key(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<String>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/keys/public/{}", self.base_url, username))
+            .query(&[("email", email)])
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: RecipientPublicKey = resp.json().await.map_err(BridgeError::from)?;
+        let key = body.public_key.trim().to_string();
+        Ok(if key.is_empty() { None } else { Some(key) })
+    }
+
     pub async fn report_envelope_capability(
         &self,
         access_token: &str,
@@ -1304,7 +1363,19 @@ impl ApiClient {
         access_token: &str,
         query: &MailListQuery,
     ) -> Result<MailListResponse> {
+        self.list_mail_with(access_token, query, true).await
+    }
+
+    pub async fn list_mail_with(
+        &self,
+        access_token: &str,
+        query: &MailListQuery,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
         let mut params: Vec<(&str, String)> = Vec::new();
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
 
         if let Some(ref item_type) = query.item_type {
             params.push(("item_type", item_type.clone()));
@@ -1673,15 +1744,31 @@ impl ApiClient {
         limit: i64,
         offset: i64,
     ) -> Result<MailListResponse> {
+        self.list_folder_mail_with(access_token, label_token, limit, offset, true)
+            .await
+    }
+
+    pub async fn list_folder_mail_with(
+        &self,
+        access_token: &str,
+        label_token: &str,
+        limit: i64,
+        offset: i64,
+        include_envelope: bool,
+    ) -> Result<MailListResponse> {
+        let mut params = vec![
+            ("label_token", label_token.to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if !include_envelope {
+            params.push(("include_envelope", "false".to_string()));
+        }
         let resp = self
             .client
             .get(format!("{}/bridge/v1/messages", self.base_url))
             .bearer_auth(access_token)
-            .query(&[
-                ("label_token", label_token.to_string()),
-                ("limit", limit.to_string()),
-                ("offset", offset.to_string()),
-            ])
+            .query(&params)
             .send()
             .await?;
         if !resp.status().is_success() {

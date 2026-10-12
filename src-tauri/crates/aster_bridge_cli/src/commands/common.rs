@@ -27,6 +27,7 @@ use aster_bridge_core::auth::app_passwords::{generate_app_password, AppPasswords
 use aster_bridge_core::auth::device_identity;
 use aster_bridge_core::auth::session::{self, Session};
 use aster_bridge_core::config::{self, BridgeConfig};
+use aster_bridge_core::crypto::recipient_trust;
 use aster_bridge_core::db::Database;
 use aster_bridge_core::error::BridgeError;
 use aster_bridge_core::runtime;
@@ -36,7 +37,8 @@ use zeroize::Zeroizing;
 use crate::context::{self, Context};
 use crate::exit::{
     CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
-    CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_SETTINGS_READ, CODE_SIGN_IN,
+    CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_SETTINGS_READ,
+    CODE_SIGN_IN,
     EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL,
 };
 use crate::lock::InstanceLock;
@@ -326,6 +328,26 @@ fn parse_subject(raw_mime: &[u8]) -> Option<String> {
     mail_parser::MessageParser::default()
         .parse(raw_mime)
         .and_then(|message| message.subject().map(str::to_string))
+}
+
+pub fn recipient_key_accept(db: &Database, state: &CliState, address: &str) -> CliResult<Value> {
+    let address = address.trim().to_lowercase();
+    let well_formed = !address.contains(char::is_whitespace)
+        && address
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !well_formed {
+        return Err(CliError::usage("Enter the recipient's full email address.")
+            .with_hint("For example: aster-bridge recipient-key accept name@example.com"));
+    }
+    let account = state.account.as_ref().ok_or_else(CliError::not_signed_in)?;
+    let accepted = recipient_trust::accept_recipient_key(db, &account.user_id, &address).map_err(|e| {
+        CliError::coded(
+            CODE_RECIPIENT_KEY,
+            format!("Couldn't update the saved key for {}: {}", address, e),
+        )
+    })?;
+    Ok(json!({ "address": address, "accepted": accepted }))
 }
 
 pub fn outbox_list(db: &Database) -> CliResult<Value> {

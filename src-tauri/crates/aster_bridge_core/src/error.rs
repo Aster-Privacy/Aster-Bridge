@@ -57,6 +57,9 @@ pub enum BridgeError {
 
     #[error("message too large: {0}")]
     MessageTooLarge(String),
+
+    #[error("recipient key not trusted: {0}")]
+    RecipientKey(String),
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;

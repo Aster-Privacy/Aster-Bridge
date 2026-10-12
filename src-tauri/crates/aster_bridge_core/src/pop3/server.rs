@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::api_client::ApiClient;
 use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
-use crate::db::{CachedAttachment, Database, ATTACHMENTS_STORED};
+use crate::db::{CachedAttachment, Database, ATTACHMENTS_ON_DEMAND};
 use crate::error::Result;
 use crate::message_render;
 
@@ -31,13 +31,35 @@ fn attachments_of<'a>(
 }
 
 fn full_message_text(db: &Database, m: &crate::db::CachedMessage) -> String {
-    let attachments = if m.attachments_state == ATTACHMENTS_STORED {
+    let attachments = if crate::db::attachment_parts_known(m.attachments_state) {
         db.get_message_attachments(&m.aster_id).unwrap_or_default()
     } else {
         Vec::new()
     };
     message_render::render_text(m, &attachments)
 }
+
+async fn with_attachments(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    m: crate::db::CachedMessage,
+) -> Option<crate::db::CachedMessage> {
+    if m.attachments_state != ATTACHMENTS_ON_DEMAND {
+        return Some(m);
+    }
+    use crate::sync::poller::on_demand::{ensure_attachments, AttachmentFill};
+    if ensure_attachments(db, client, session, &m.aster_id, None).await == AttachmentFill::Unavailable {
+        return None;
+    }
+    db.get_cached_message(&m.aster_id)
+        .ok()
+        .flatten()
+        .filter(|filled| filled.attachments_state != ATTACHMENTS_ON_DEMAND)
+}
+
+const ATTACHMENTS_UNAVAILABLE: &[u8] =
+    b"-ERR [SYS/TEMP] the attachments of this message could not be downloaded; try again later\r\n";
 
 static POP3_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -394,9 +416,13 @@ where
                 if let Ok(n) = args.parse::<usize>() {
                     if n == 0 || n > messages.len() || deleted[n - 1] {
                         writer.write_all(b"-ERR no such message\r\n").await?;
-                    } else if let Some(full) =
+                    } else if let Some(stored) =
                         db.get_cached_message(&messages[n - 1].aster_id).ok().flatten()
                     {
+                        let Some(full) = with_attachments(&db, &client, &session, stored).await else {
+                            writer.write_all(ATTACHMENTS_UNAVAILABLE).await?;
+                            continue;
+                        };
                         let rfc = full_message_text(&db, &full);
                         let mut dot_stuffed = String::with_capacity(rfc.len() + 64);
                         let lines: Vec<&str> = rfc.split("\r\n").collect();
@@ -430,6 +456,16 @@ where
                     None
                 } else {
                     db.get_cached_message(&messages[msg_num - 1].aster_id).ok().flatten()
+                };
+                let full_top = match full_top {
+                    Some(stored) if line_count > 0 => match with_attachments(&db, &client, &session, stored).await {
+                        Some(full) => Some(full),
+                        None => {
+                            writer.write_all(ATTACHMENTS_UNAVAILABLE).await?;
+                            continue;
+                        }
+                    },
+                    other => other,
                 };
                 if let Some(full) = full_top {
                     let rfc = full_message_text(&db, &full);

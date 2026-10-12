@@ -109,6 +109,14 @@ impl Session {
             .map(|i| i.address.clone())
             .unwrap_or_else(|| self.email.clone())
     }
+
+    pub fn accepts_login_name(&self, name: &str) -> bool {
+        if self.email.is_empty() || name.is_empty() {
+            return false;
+        }
+        name.eq_ignore_ascii_case(&self.email)
+            || self.find_send_identity(name).is_some_and(|i| i.enabled)
+    }
 }
 
 impl Drop for Session {
@@ -806,6 +814,65 @@ mod tests {
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
         }
+    }
+
+    fn identity(address: &str, kind: SendIdentityKind, enabled: bool, sender_id: &str) -> SendIdentity {
+        SendIdentity {
+            address: address.to_string(),
+            auth_hash_b64: None,
+            display_name: None,
+            kind,
+            enabled,
+            sender_id: sender_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn every_enabled_address_is_accepted_as_a_login_name() {
+        let mut s = sample_session();
+        s.send_identities = vec![
+            identity("alice@astermail.org", SendIdentityKind::Primary, true, "primary"),
+            identity("me@custom.test", SendIdentityKind::CustomDomain, true, "domain-1"),
+            identity("shop@astermail.org", SendIdentityKind::Alias, true, "alias-1"),
+            identity("old@custom.test", SendIdentityKind::CustomDomain, false, "domain-2"),
+        ];
+        assert!(s.accepts_login_name("alice@astermail.org"));
+        assert!(s.accepts_login_name("ALICE@AsterMail.org"));
+        assert!(s.accepts_login_name("me@custom.test"));
+        assert!(s.accepts_login_name("Me@Custom.Test"));
+        assert!(s.accepts_login_name("shop@astermail.org"));
+        assert!(!s.accepts_login_name("old@custom.test"));
+        assert!(!s.accepts_login_name("stranger@custom.test"));
+        assert!(!s.accepts_login_name("alice"));
+        assert!(!s.accepts_login_name(""));
+    }
+
+    #[test]
+    fn a_signed_out_session_accepts_no_login_name() {
+        let mut s = sample_session();
+        s.send_identities = vec![identity(
+            "me@custom.test",
+            SendIdentityKind::CustomDomain,
+            true,
+            "domain-1",
+        )];
+        s.email = String::new();
+        assert!(!s.accepts_login_name("me@custom.test"));
+        assert!(!s.accepts_login_name(""));
+    }
+
+    #[test]
+    fn the_shown_address_follows_the_default_sender() {
+        let mut s = sample_session();
+        s.send_identities = vec![
+            identity("alice@astermail.org", SendIdentityKind::Primary, true, "primary"),
+            identity("me@custom.test", SendIdentityKind::CustomDomain, true, "domain-1"),
+        ];
+        assert_eq!(s.default_sender_address(), "alice@astermail.org");
+        s.default_sender_id = Some("domain-1".to_string());
+        assert_eq!(s.default_sender_address(), "me@custom.test");
+        s.default_sender_id = Some("domain-gone".to_string());
+        assert_eq!(s.default_sender_address(), "alice@astermail.org");
     }
 
     #[test]

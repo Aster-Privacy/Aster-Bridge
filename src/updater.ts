@@ -72,19 +72,15 @@ async function load_process(): Promise<{ relaunch: () => Promise<void> }> {
 }
 
 export async function check_for_update(): Promise<UpdateInfo | null> {
-  try {
-    const { check } = await load_updater();
-    const result = await check();
-    if (!result) return null;
-    return {
-      version: result.version,
-      current_version: result.currentVersion,
-      notes: result.body,
-      date: result.date,
-    };
-  } catch {
-    return null;
-  }
+  const { check } = await load_updater();
+  const result = await check();
+  if (!result) return null;
+  return {
+    version: result.version,
+    current_version: result.currentVersion,
+    notes: result.body,
+    date: result.date,
+  };
 }
 
 export async function download_and_install(): Promise<void> {
