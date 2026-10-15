@@ -265,7 +265,7 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-fn plain_text_to_html(text: &str) -> String {
+pub(crate) fn plain_text_to_html(text: &str) -> String {
     escape_html(text).replace("\r\n", "\n").replace('\n', "<br>")
 }
 
