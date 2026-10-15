@@ -703,6 +703,42 @@ fn sanitize_display_name(value: &str) -> String {
         .collect()
 }
 
+const PGP_MESSAGE_ARMOR: &str = "-----BEGIN PGP MESSAGE-----";
+
+fn has_html_body(parsed: &mail_parser::Message<'_>) -> bool {
+    parsed
+        .html_part(0)
+        .is_some_and(|part| matches!(part.body, mail_parser::PartType::Html(_)))
+}
+
+fn plain_text_to_html_fragment(text: &str) -> String {
+    format!(
+        "<div style=\"white-space: pre-wrap\">{}</div>",
+        crate::smtp::reply_thread::plain_text_to_html(text)
+    )
+}
+
+pub(crate) fn pgp_mime_armor(parsed: &mail_parser::Message<'_>) -> Option<String> {
+    use mail_parser::MimeHeaders;
+    let is_encrypted = parsed.content_type().is_some_and(|ct| {
+        ct.ctype().eq_ignore_ascii_case("multipart")
+            && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("encrypted"))
+    });
+    if !is_encrypted {
+        return None;
+    }
+    parsed.parts.iter().find_map(|part| {
+        let ct = part.content_type()?;
+        let is_octet_stream = ct.ctype().eq_ignore_ascii_case("application")
+            && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("octet-stream"));
+        if !is_octet_stream {
+            return None;
+        }
+        let text = std::str::from_utf8(part.contents()).ok()?;
+        text.contains(PGP_MESSAGE_ARMOR).then(|| text.to_string())
+    })
+}
+
 pub fn build_send_payload(
     raw_message: &[u8],
     from: Option<&str>,
@@ -803,7 +839,16 @@ pub fn build_send_payload_with_own_key(
         to_list
     };
 
-    let body_html = parsed.body_html(0).map(|s| s.to_string());
+    let pgp_mime_body = pgp_mime_armor(&parsed);
+    let body_html = if has_html_body(&parsed) {
+        parsed.body_html(0).map(|s| s.to_string())
+    } else {
+        pgp_mime_body
+            .clone()
+            .or_else(|| parsed.body_text(0).map(|s| s.to_string()))
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| plain_text_to_html_fragment(&text))
+    };
     let body_plain = parsed.body_text(0).map(|s| s.to_string());
     let is_html = body_html.is_some();
     let body = body_html.as_deref()
@@ -864,7 +909,11 @@ pub fn build_send_payload_with_own_key(
         payload["body_html"] = serde_json::json!(html);
     }
 
-    let attachments = crate::crypto::attachment::mime_attachments(&parsed, MAX_DATA_SIZE);
+    let attachments = if pgp_mime_body.is_some() {
+        Vec::new()
+    } else {
+        crate::crypto::attachment::mime_attachments(&parsed, MAX_DATA_SIZE)
+    };
     if !attachments.is_empty() {
         let sealed = crate::crypto::attachment::seal_send_attachments_with_own_key(&attachments, passphrase, own_key)
             .map_err(|e| crate::error::BridgeError::Smtp(format!("attachment sealing failed: {}", e)))?;
@@ -901,7 +950,7 @@ pub async fn build_send_payload_blocking(
         let parsed = mail_parser::MessageParser::default().parse(&raw_message);
         let plain_text = parsed
             .as_ref()
-            .and_then(|m| m.body_text(0).map(|s| s.to_string()));
+            .and_then(|m| pgp_mime_armor(m).or_else(|| m.body_text(0).map(|s| s.to_string())));
         let message_id = parsed
             .as_ref()
             .and_then(|m| m.message_id())
@@ -1443,6 +1492,150 @@ mod tests {
         assert_eq!(payload["to"], serde_json::json!(["to@example.com"]));
         assert_eq!(payload["cc"], serde_json::json!(["cc@example.com"]));
         assert!(payload["bcc"].is_null());
+    }
+
+    const PATCH_RAW: &[u8] = b"From: Dev Person <dev@example.com>
+To: rcpt@example.com
+Subject: [PATCH] fix parser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Dev Person <dev@example.com>
+
+Fix it & more.
+---
+ src/lib.rs | 2 +-
+
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1,3 +1,3 @@
+ fn main() {
+-    let a = 1 &lt; 2;
++    let a = 1 < 2 && b > c;
+ }
+-- 
+2.43.0
+";
+
+    fn payload_for(raw: &[u8]) -> serde_json::Value {
+        let recipients = vec!["rcpt@example.com".to_string()];
+        build_send_payload(raw, Some("sender@aster.test"), &recipients, "sender@aster.test", None, b"pass").unwrap()
+    }
+
+    #[test]
+    fn plain_text_patch_is_sent_as_an_escaped_fragment() {
+        let payload = payload_for(PATCH_RAW);
+        let body = payload["body"].as_str().unwrap();
+        assert!(!body.to_ascii_lowercase().contains("<html"));
+        assert!(!body.to_ascii_lowercase().contains("<body"));
+        assert!(body.starts_with("<div style=\"white-space: pre-wrap\">From: Dev Person &lt;dev@example.com&gt;<br>"));
+        assert!(body.contains("Fix it &amp; more."));
+        assert!(body.contains("<br> fn main() {<br>-    let a = 1 &amp;lt; 2;<br>+    let a = 1 &lt; 2 &amp;&amp; b &gt; c;<br> }<br>-- <br>2.43.0"));
+        assert_eq!(payload["is_html"], true);
+        assert_eq!(payload["body_html"], payload["body"]);
+    }
+
+    #[test]
+    fn real_html_part_is_still_sent_as_html() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: hi
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary=\"a1\"
+
+--a1
+Content-Type: text/plain
+
+plain
+--a1
+Content-Type: text/html
+
+<p>rich</p>
+--a1--
+";
+        let payload = payload_for(raw);
+        assert!(payload["body"].as_str().unwrap().contains("<p>rich</p>"));
+        assert_eq!(payload["is_html"], true);
+    }
+
+    #[test]
+    fn inline_pgp_message_body_keeps_its_lines() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: enc
+Content-Type: text/plain; charset=us-ascii
+
+-----BEGIN PGP MESSAGE-----
+
+hQEMA1234567890ABCDEF
+=AbCd
+-----END PGP MESSAGE-----
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("-----BEGIN PGP MESSAGE-----<br><br>hQEMA1234567890ABCDEF<br>=AbCd<br>-----END PGP MESSAGE-----"));
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn pgp_mime_submission_sends_the_armor_as_the_body() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: enc
+MIME-Version: 1.0
+Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"e1\"
+
+--e1
+Content-Type: application/pgp-encrypted
+
+Version: 1
+
+--e1
+Content-Type: application/octet-stream; name=\"encrypted.asc\"
+Content-Disposition: inline; filename=\"encrypted.asc\"
+
+-----BEGIN PGP MESSAGE-----
+
+hQEMA1234567890ABCDEF
+-----END PGP MESSAGE-----
+
+--e1--
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("-----BEGIN PGP MESSAGE-----<br><br>hQEMA1234567890ABCDEF<br>-----END PGP MESSAGE-----"));
+        assert_eq!(payload["is_html"], true);
+        assert!(payload.get("attachments").is_none());
+    }
+
+    #[test]
+    fn pgp_signed_submission_keeps_the_text_body() {
+        let raw = b"From: sender@aster.test
+To: rcpt@example.com
+Subject: signed
+MIME-Version: 1.0
+Content-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"s1\"
+
+--s1
+Content-Type: text/plain; charset=UTF-8
+
+signed hello
+  indented
+
+--s1
+Content-Type: application/pgp-signature; name=\"signature.asc\"
+
+-----BEGIN PGP SIGNATURE-----
+
+iQEz
+-----END PGP SIGNATURE-----
+
+--s1--
+";
+        let payload = payload_for(raw);
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("signed hello<br>  indented"));
+        assert!(!body.contains("BEGIN PGP SIGNATURE"));
     }
 
     #[test]
