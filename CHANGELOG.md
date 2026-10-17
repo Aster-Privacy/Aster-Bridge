@@ -2,6 +2,13 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.8 - 2026-10-17
+
+### Fixed
+- When your mail app saves a message, such as a draft or a sent copy, the message keeps the same ID after Aster Bridge syncs, so it no longer shows up twice or moves out of its folder.
+- Labels that your mail app sets when it saves a message are now applied in Aster Mail.
+- PGP-encrypted messages and plain-text messages such as code patches now arrive with their full body intact.
+
 ## 1.0.7 - 2026-10-11
 
 ### Fixed
