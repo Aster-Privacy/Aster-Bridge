@@ -31,6 +31,7 @@ use crate::db::{CachedMessage, Database};
 use crate::error::Result;
 use crate::folder_ops::FolderOpError;
 use crate::jmap::state::StateChange;
+use crate::protocol_text::response_text;
 
 const IDLE_KEEPALIVE_SECS: u64 = 5 * 60;
 const GMAIL_ALL_MAIL: &str = "\\Allmail";
@@ -939,7 +940,10 @@ fn resolve_mailbox(db: &Database, raw: &str) -> Option<crate::folders::MailboxEn
 }
 
 fn quote_imap_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        response_text(value).replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2297,7 +2301,7 @@ where
                                                 text
                                             );
                                             writer
-                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
                                                 .await?;
                                         }
                                     }
@@ -2381,7 +2385,7 @@ where
                                                 text
                                             );
                                             writer
-                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
                                                 .await?;
                                         }
                                         write_ok(
@@ -2419,7 +2423,7 @@ where
                                                 text
                                             );
                                             writer
-                                                .write_all(format!("* NO {}\r\n", text).as_bytes())
+                                                .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
                                                 .await?;
                                         }
                                         match uid {
@@ -2788,7 +2792,7 @@ async fn write_ok(
     msg: &str,
 ) -> std::io::Result<()> {
     writer
-        .write_all(format!("{} OK {}\r\n", tag, msg).as_bytes())
+        .write_all(format!("{} OK {}\r\n", tag, response_text(msg)).as_bytes())
         .await
 }
 
@@ -2798,7 +2802,7 @@ async fn write_no(
     msg: &str,
 ) -> std::io::Result<()> {
     writer
-        .write_all(format!("{} NO {}\r\n", tag, msg).as_bytes())
+        .write_all(format!("{} NO {}\r\n", tag, response_text(msg)).as_bytes())
         .await
 }
 
@@ -2808,7 +2812,7 @@ async fn write_bad(
     msg: &str,
 ) -> std::io::Result<()> {
     writer
-        .write_all(format!("{} BAD {}\r\n", tag, msg).as_bytes())
+        .write_all(format!("{} BAD {}\r\n", tag, response_text(msg)).as_bytes())
         .await
 }
 
@@ -4422,6 +4426,28 @@ mod tests {
     use uuid::Uuid;
 
     type BackendCalls = Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
+
+    #[test]
+    fn quoted_strings_drop_line_breaks() {
+        assert_eq!(quote_imap_string("a\"b\\c\r\n* BYE"), "\"a\\\"b\\\\c  * BYE\"");
+    }
+
+    #[tokio::test]
+    async fn tagged_responses_stay_on_one_line() {
+        let hostile = "[SERVERBUG] the attachment x\r\na9 OK done\n\0 failed";
+        let mut out: Vec<u8> = Vec::new();
+        write_no(&mut out, "a1", hostile).await.unwrap();
+        write_ok(&mut out, "a2", hostile).await.unwrap();
+        write_bad(&mut out, "a3", hostile).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.split_terminator("\r\n").collect();
+        assert_eq!(lines.len(), 3, "{:?}", text);
+        assert_eq!(lines[0], "a1 NO [SERVERBUG] the attachment x  a9 OK done   failed");
+        assert!(lines[1].starts_with("a2 OK "));
+        assert!(lines[2].starts_with("a3 BAD "));
+        assert!(!text.contains('\0'));
+        assert_eq!(text.matches('\n').count(), 3);
+    }
 
     #[derive(Debug, Default, Clone, Copy)]
     struct MockOpts {

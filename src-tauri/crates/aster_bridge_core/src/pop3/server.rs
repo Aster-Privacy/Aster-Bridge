@@ -15,12 +15,17 @@ use crate::auth::session::Session;
 use crate::db::{CachedAttachment, Database, ATTACHMENTS_ON_DEMAND};
 use crate::error::Result;
 use crate::message_render;
+use crate::protocol_text::response_text;
 
 const MAX_LINE_LENGTH: usize = 512;
 const MAX_FAILED_AUTH: u32 = 5;
 
 fn pop3_size(m: &crate::db::CachedMessage, attachments: &[CachedAttachment]) -> usize {
     message_render::rendered_size(m, attachments)
+}
+
+fn uidl_line(n: usize, aster_id: &str) -> String {
+    format!("{} {}\r\n", n, response_text(aster_id))
 }
 
 fn attachments_of<'a>(
@@ -397,7 +402,7 @@ where
                     let mut resp = String::from("+OK\r\n");
                     for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
                         if !del {
-                            resp.push_str(&format!("{} {}\r\n", i + 1, msg.aster_id));
+                            resp.push_str(&uidl_line(i + 1, &msg.aster_id));
                         }
                     }
                     resp.push_str(".\r\n");
@@ -406,7 +411,7 @@ where
                     if n == 0 || n > messages.len() || deleted[n - 1] {
                         writer.write_all(b"-ERR no such message\r\n").await?;
                     } else {
-                        writer.write_all(format!("+OK {} {}\r\n", n, messages[n - 1].aster_id).as_bytes()).await?;
+                        writer.write_all(format!("+OK {}", uidl_line(n, &messages[n - 1].aster_id)).as_bytes()).await?;
                     }
                 } else {
                     writer.write_all(b"-ERR syntax error\r\n").await?;
@@ -698,7 +703,7 @@ mod tests {
         let mut resp = String::from("+OK\r\n");
         for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
             if !del {
-                resp.push_str(&format!("{} {}\r\n", i + 1, msg.aster_id));
+                resp.push_str(&uidl_line(i + 1, &msg.aster_id));
             }
         }
         resp.push_str(".\r\n");
@@ -712,11 +717,16 @@ mod tests {
         let mut resp = String::from("+OK\r\n");
         for (i, (msg, del)) in messages.iter().zip(deleted.iter()).enumerate() {
             if !del {
-                resp.push_str(&format!("{} {}\r\n", i + 1, msg.aster_id));
+                resp.push_str(&uidl_line(i + 1, &msg.aster_id));
             }
         }
         resp.push_str(".\r\n");
         assert_eq!(resp, "+OK\r\n2 uid-b\r\n.\r\n");
+    }
+
+    #[test]
+    fn uidl_line_keeps_a_hostile_id_on_one_line() {
+        assert_eq!(uidl_line(3, "id\r\n+OK forged\0"), "3 id  +OK forged \r\n");
     }
 
     #[test]

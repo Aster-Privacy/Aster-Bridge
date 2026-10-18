@@ -424,7 +424,8 @@ pub fn mime_attachments(parsed: &mail_parser::Message<'_>, max_bytes: usize) -> 
         }
         let name = part
             .attachment_name()
-            .map(|s| s.to_string())
+            .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("attachment-{}", out.len() + 1));
         let mime_type = part
             .content_type()
@@ -700,6 +701,39 @@ mod tests {
         let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
         assert!(mime_attachments(&parsed, 4).is_empty());
         assert_eq!(mime_attachments(&parsed, 64).len(), 1);
+    }
+
+    #[test]
+    fn mime_attachments_strip_control_chars_from_encoded_names() {
+        let raw = concat!(
+            "From: a@b.c\r\n",
+            "Subject: names\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"B\"\r\n",
+            "\r\n",
+            "--B\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "body\r\n",
+            "--B\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Disposition: attachment; filename*=UTF-8''x%0D%0Aa9%20OK%20done.txt\r\n",
+            "\r\n",
+            "data\r\n",
+            "--B\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Disposition: attachment; filename*=UTF-8''%0D%0A%00\r\n",
+            "\r\n",
+            "data\r\n",
+            "--B--\r\n"
+        )
+        .as_bytes();
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let list = mime_attachments(&parsed, 1024);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "xa9 OK done.txt");
+        assert_eq!(list[1].name, "attachment-2");
+        assert!(list.iter().all(|a| !a.name.chars().any(char::is_control)));
     }
 
     fn random_key() -> [u8; 32] {

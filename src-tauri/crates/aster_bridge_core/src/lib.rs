@@ -41,6 +41,7 @@ pub mod ops;
 pub mod outbox;
 pub mod pop3;
 pub mod port_picker;
+pub mod protocol_text;
 #[cfg(test)]
 mod protocol_harness;
 pub mod runtime;

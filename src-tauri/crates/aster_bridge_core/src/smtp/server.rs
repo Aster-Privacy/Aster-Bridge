@@ -370,11 +370,11 @@ where
                                 }
                                 BridgeError::MessageTooLarge(msg) => format!(
                                     "552 5.3.4 {}\r\n",
-                                    msg.replace(['\r', '\n'], " ")
+                                    crate::protocol_text::response_text(msg)
                                 ),
                                 BridgeError::RecipientKey(msg) => format!(
                                     "550 5.7.5 {}\r\n",
-                                    msg.replace(['\r', '\n'], " ")
+                                    crate::protocol_text::response_text(msg)
                                 ),
                                 _ => "550 Send rejected\r\n".to_string(),
                             };
