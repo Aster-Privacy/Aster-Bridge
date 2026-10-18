@@ -36,21 +36,42 @@ pub fn key_pem_path(data_dir: &Path) -> PathBuf {
 
 const RENEW_BEFORE_EXPIRY_DAYS: u64 = 30;
 
+const REQUIRE_SERVER_AUTH_USAGE: bool = cfg!(target_os = "macos");
+
+const EXTENDED_KEY_USAGE_OID: &str = "2.5.29.37";
+const SERVER_AUTH_OID: &str = "1.3.6.1.5.5.7.3.1";
+
 pub fn ensure_cert(
     data_dir: &Path,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    ensure_cert_with_policy(data_dir, REQUIRE_SERVER_AUTH_USAGE)
+}
+
+fn ensure_cert_with_policy(
+    data_dir: &Path,
+    require_server_auth_usage: bool,
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = cert_pem_path(data_dir);
     let key_path = key_pem_path(data_dir);
 
     if cert_path.exists() && key_path.exists() {
         if let Ok((certs, key)) = load_existing(&cert_path, &key_path) {
-            if !expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS) {
+            let expiring = expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS);
+            let unusable_for_server_auth =
+                require_server_auth_usage && !allows_server_auth(certs[0].as_ref());
+            if !expiring && !unusable_for_server_auth {
                 return Ok((certs, key));
             }
-            tracing::info!(
-                "TLS cert expires within {} days; regenerating",
-                RENEW_BEFORE_EXPIRY_DAYS
-            );
+            if expiring {
+                tracing::info!(
+                    "TLS cert expires within {} days; regenerating",
+                    RENEW_BEFORE_EXPIRY_DAYS
+                );
+            } else {
+                tracing::info!(
+                    "TLS cert has no serverAuth extended key usage, which macOS mail clients reject; regenerating"
+                );
+            }
         } else {
             tracing::warn!("existing TLS material failed to parse; regenerating");
         }
@@ -86,7 +107,10 @@ fn generate_and_persist(
     cert_path: &Path,
     key_path: &Path,
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
     use time::OffsetDateTime;
 
     let mut params = CertificateParams::new(vec![
@@ -107,6 +131,9 @@ fn generate_and_persist(
         SanType::DnsName("localhost".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
         SanType::DnsName("bridge.local".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
     ];
+
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
     let now = OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
@@ -271,6 +298,57 @@ fn cert_not_after(cert_der: &[u8]) -> Option<std::time::SystemTime> {
     Some(std::time::UNIX_EPOCH + since_epoch)
 }
 
+fn allows_server_auth(cert_der: &[u8]) -> bool {
+    cert_extended_key_usages(cert_der)
+        .map(|usages| usages.iter().any(|oid| oid == SERVER_AUTH_OID))
+        .unwrap_or(false)
+}
+
+fn cert_extended_key_usages(cert_der: &[u8]) -> Option<Vec<String>> {
+    use der::asn1::{AnyRef, ObjectIdentifier, OctetStringRef};
+    use der::{Decode, Reader, SliceReader, Tag, TagNumber, Tagged};
+
+    let cert = AnyRef::from_der(cert_der).ok()?;
+    let tbs = AnyRef::decode(&mut SliceReader::new(cert.value()).ok()?).ok()?;
+    let mut fields = SliceReader::new(tbs.value()).ok()?;
+    let extensions_tag = Tag::ContextSpecific {
+        constructed: true,
+        number: TagNumber::N3,
+    };
+    let extensions = loop {
+        if fields.is_finished() {
+            return Some(Vec::new());
+        }
+        let field = AnyRef::decode(&mut fields).ok()?;
+        if field.tag() == extensions_tag {
+            break field;
+        }
+    };
+    let list = AnyRef::from_der(extensions.value()).ok()?;
+    let mut entries = SliceReader::new(list.value()).ok()?;
+    while !entries.is_finished() {
+        let entry = AnyRef::decode(&mut entries).ok()?;
+        let mut parts = SliceReader::new(entry.value()).ok()?;
+        let oid = ObjectIdentifier::decode(&mut parts).ok()?;
+        if oid.to_string() != EXTENDED_KEY_USAGE_OID {
+            continue;
+        }
+        let mut value = AnyRef::decode(&mut parts).ok()?;
+        if value.tag() == Tag::Boolean {
+            value = AnyRef::decode(&mut parts).ok()?;
+        }
+        let octets = OctetStringRef::try_from(value).ok()?;
+        let purposes = AnyRef::from_der(octets.as_bytes()).ok()?;
+        let mut reader = SliceReader::new(purposes.value()).ok()?;
+        let mut usages = Vec::new();
+        while !reader.is_finished() {
+            usages.push(ObjectIdentifier::decode(&mut reader).ok()?.to_string());
+        }
+        return Some(usages);
+    }
+    Some(Vec::new())
+}
+
 pub fn cert_fingerprint_sha256(data_dir: &Path) -> Option<String> {
     let path = cert_pem_path(data_dir);
     let bytes = std::fs::read(&path).ok()?;
@@ -351,6 +429,7 @@ mod tests {
 
     fn write_cert_valid_for(dir: &Path, days: i64) -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(days);
@@ -486,6 +565,62 @@ mod tests {
             "a silent client on a TLS port must be disconnected, not held open"
         );
         assert!(server.await.unwrap(), "the handshake must report a timeout");
+    }
+
+    fn write_cert_without_server_auth(dir: &Path) -> Vec<u8> {
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(cert_pem_path(dir), cert.pem()).unwrap();
+        std::fs::write(key_pem_path(dir), key_pair.serialize_pem()).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn a_new_certificate_is_marked_for_server_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, _key) = ensure_cert(dir.path()).unwrap();
+        let usages = cert_extended_key_usages(certs[0].as_ref()).unwrap();
+        assert_eq!(usages, vec![SERVER_AUTH_OID.to_string()]);
+        assert!(allows_server_auth(certs[0].as_ref()));
+    }
+
+    #[test]
+    fn a_certificate_without_extended_key_usage_is_not_server_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let der = write_cert_without_server_auth(dir.path());
+        assert_eq!(cert_extended_key_usages(&der), Some(Vec::new()));
+        assert!(!allows_server_auth(&der));
+        assert!(!allows_server_auth(b"not a certificate"));
+    }
+
+    #[test]
+    fn a_certificate_with_only_client_auth_is_not_server_auth() {
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        assert!(!allows_server_auth(cert.der()));
+    }
+
+    #[test]
+    fn a_certificate_without_server_auth_is_replaced_when_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_without_server_auth(dir.path());
+        let (certs, key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        assert_ne!(certs[0].as_ref(), &old[..]);
+        assert!(allows_server_auth(certs[0].as_ref()));
+        server_config(certs.clone(), key).expect("the regenerated pair must belong together");
+
+        let (again, _key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        assert_eq!(again[0].as_ref(), certs[0].as_ref());
+    }
+
+    #[test]
+    fn a_certificate_without_server_auth_is_kept_when_not_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_cert_without_server_auth(dir.path());
+        let (certs, _key) = ensure_cert_with_policy(dir.path(), false).unwrap();
+        assert_eq!(certs[0].as_ref(), &old[..]);
     }
 
     #[test]
