@@ -365,6 +365,7 @@ where
                         }
                         _session_lock = Some(Pop3SessionLock);
                         passwords.record_use(&pw_id, Some("pop3"));
+                        crate::sign_in_notice::record_signed_in("pop3");
                         messages = db.list_cached_message_meta("inbox").unwrap_or_default();
                         attachment_meta = db.list_attachment_meta_for_folder("inbox").unwrap_or_default();
                         deleted = vec![false; messages.len()];
@@ -658,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn sign_in_without_tls_explains_the_fix_and_is_recorded() {
         let _guard = crate::sign_in_notice::test_support::test_lock();
-        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        crate::sign_in_notice::dismiss_insecure(u64::MAX);
         let out = pop3_transcript("USER tester@aster.test\r\nPASS x\r\nQUIT\r\n", true).await;
         let expected = "-ERR [PRIVACYREQUIRED] Turn on SSL/TLS for this account in your mail app, then try again\r\n";
         assert_eq!(out.matches(expected).count(), 2, "{:?}", out);

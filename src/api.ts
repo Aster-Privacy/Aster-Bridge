@@ -45,6 +45,7 @@ export interface PortConflict {
 export interface InsecureSignIn {
   protocol: string;
   at: number;
+  seq: number;
 }
 
 export interface BridgeState {
@@ -332,8 +333,8 @@ export async function open_url(url: string): Promise<void> {
   await open(parsed.toString());
 }
 
-export async function dismiss_insecure_sign_in(at: number): Promise<void> {
-  return tauri_invoke("dismiss_insecure_sign_in", { at });
+export async function dismiss_insecure_sign_in(seq: number): Promise<void> {
+  return tauri_invoke("dismiss_insecure_sign_in", { seq });
 }
 
 export async function trigger_sync(): Promise<void> {

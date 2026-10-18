@@ -209,6 +209,15 @@ fn load_config_from(dir: PathBuf) -> Result<BridgeConfig, String> {
     Ok(config)
 }
 
+pub fn shared_port(c: &BridgeConfig) -> Option<u16> {
+    let mut ports = [
+        c.imap_port, c.imap_implicit_tls_port, c.smtp_port, c.smtp_implicit_tls_port,
+        c.jmap_port, c.pop3_port, c.pop3s_port, c.carddav_port,
+    ];
+    ports.sort();
+    ports.windows(2).find(|w| w[0] == w[1]).map(|w| w[0])
+}
+
 pub fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
     for (name, port) in [
         ("imap_port", c.imap_port),
@@ -224,15 +233,8 @@ pub fn validate_ports(c: &BridgeConfig) -> Result<(), String> {
             return Err(format!("{} must be >= 1024 (got {})", name, port));
         }
     }
-    let mut ports = [
-        c.imap_port, c.imap_implicit_tls_port, c.smtp_port, c.smtp_implicit_tls_port,
-        c.jmap_port, c.pop3_port, c.pop3s_port, c.carddav_port,
-    ];
-    ports.sort();
-    for i in 0..ports.len() - 1 {
-        if ports[i] == ports[i + 1] {
-            return Err(format!("port {} is assigned to multiple protocols", ports[i]));
-        }
+    if let Some(port) = shared_port(c) {
+        return Err(format!("port {} is assigned to multiple protocols", port));
     }
     Ok(())
 }
@@ -333,6 +335,15 @@ mod tests {
         c.imap_port = 143;
         let err = validate_ports(&c).unwrap_err();
         assert!(err.contains("imap_port"));
+    }
+
+    #[test]
+    fn shared_port_names_the_port_two_protocols_use() {
+        let mut c = BridgeConfig::default();
+        assert_eq!(shared_port(&c), None);
+        c.smtp_port = c.pop3_port;
+        assert_eq!(shared_port(&c), Some(c.pop3_port));
+        assert!(validate_ports(&c).unwrap_err().contains("multiple protocols"));
     }
 
     #[test]

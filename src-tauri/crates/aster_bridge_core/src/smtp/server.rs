@@ -597,6 +597,7 @@ where
                         pre_auth.mark_signed_in();
                         smtp.state = SmtpState::Authenticated;
                         passwords.record_use(&pw_id, Some("smtp"));
+                        crate::sign_in_notice::record_signed_in("smtp");
                         writer.write_all(b"235 Authentication successful\r\n").await?;
                         ok = true;
                     }
@@ -1224,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn auth_without_tls_explains_the_fix_and_is_recorded() {
         let _guard = crate::sign_in_notice::test_support::test_lock();
-        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        crate::sign_in_notice::dismiss_insecure(u64::MAX);
         let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB4\r\nQUIT\r\n", true).await;
         assert!(
             out.contains("\r\n538 5.7.11 Turn on SSL/TLS for this account in your mail app, then try again\r\n"),

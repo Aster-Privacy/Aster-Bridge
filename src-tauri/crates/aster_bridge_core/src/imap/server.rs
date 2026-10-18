@@ -1537,6 +1537,7 @@ where
                                 if let Some(pw_id) = passwords.verify_and_id_async(&password).await {
                                     conn.state = ImapState::Authenticated;
                                     passwords.record_use(&pw_id, Some("imap"));
+                                    crate::sign_in_notice::record_signed_in("imap");
                                     crate::sync::poller::try_kick_sync();
                                     write_ok(&mut writer, &tag, "AUTHENTICATE completed").await?;
                                     ok = true;
@@ -2905,6 +2906,7 @@ async fn handle_login(
     if let Some(pw_id) = passwords.verify_and_id_async(password).await {
         conn.state = ImapState::Authenticated;
         passwords.record_use(&pw_id, Some("imap"));
+        crate::sign_in_notice::record_signed_in("imap");
         crate::sync::poller::try_kick_sync();
         write_ok(writer, tag, "LOGIN completed").await?;
         Ok(true)
@@ -4589,7 +4591,7 @@ mod tests {
     #[tokio::test]
     async fn sign_in_without_tls_explains_the_fix_and_is_recorded() {
         let _guard = crate::sign_in_notice::test_support::test_lock();
-        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        crate::sign_in_notice::dismiss_insecure(u64::MAX);
         let out = imap_transcript(
             "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 LOGOUT\r\n",
             true,

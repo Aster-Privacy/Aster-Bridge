@@ -18,6 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 pub const TLS_REQUIRED_TEXT: &str =
@@ -30,15 +31,33 @@ pub const BAD_CREDENTIALS_TEXT: &str =
 pub struct InsecureSignIn {
     pub protocol: &'static str,
     pub at: i64,
+    pub seq: u64,
 }
 
 static LAST_INSECURE: Mutex<Option<InsecureSignIn>> = Mutex::new(None);
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+static CLEAR_ON_SIGN_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn record_insecure(protocol: &'static str) {
     tracing::warn!("a {} client tried to sign in without SSL/TLS", protocol);
     let at = chrono::Utc::now().timestamp();
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut last) = LAST_INSECURE.lock() {
-        *last = Some(InsecureSignIn { protocol, at });
+        *last = Some(InsecureSignIn { protocol, at, seq });
+    }
+}
+
+pub fn record_signed_in(protocol: &str) {
+    #[cfg(test)]
+    if !CLEAR_ON_SIGN_IN.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(mut last) = LAST_INSECURE.lock() {
+        if last.is_some_and(|l| l.protocol == protocol) {
+            *last = None;
+        }
     }
 }
 
@@ -46,9 +65,9 @@ pub fn last_insecure() -> Option<InsecureSignIn> {
     LAST_INSECURE.lock().ok().and_then(|last| *last)
 }
 
-pub fn dismiss_insecure(at: i64) {
+pub fn dismiss_insecure(seq: u64) {
     if let Ok(mut last) = LAST_INSECURE.lock() {
-        if last.is_some_and(|l| l.at <= at) {
+        if last.is_some_and(|l| l.seq <= seq) {
             *last = None;
         }
     }
@@ -144,7 +163,7 @@ mod tests {
     #[test]
     fn record_keeps_the_latest_attempt() {
         let _guard = test_lock();
-        dismiss_insecure(i64::MAX);
+        dismiss_insecure(u64::MAX);
         record_insecure("imap");
         record_insecure("smtp");
         let last = last_insecure().expect("an attempt was recorded");
@@ -156,10 +175,35 @@ mod tests {
     fn dismiss_clears_only_attempts_the_user_has_seen() {
         let _guard = test_lock();
         record_insecure("pop3");
-        let seen = last_insecure().unwrap().at;
+        let seen = last_insecure().unwrap().seq;
         dismiss_insecure(seen - 1);
         assert!(last_insecure().is_some());
         dismiss_insecure(seen);
+        assert_eq!(last_insecure(), None);
+    }
+
+    #[test]
+    fn a_new_attempt_in_the_same_second_survives_a_dismiss() {
+        let _guard = test_lock();
+        record_insecure("imap");
+        let seen = last_insecure().unwrap();
+        record_insecure("imap");
+        let newer = last_insecure().unwrap();
+        assert_eq!(newer.at, seen.at);
+        dismiss_insecure(seen.seq);
+        assert_eq!(last_insecure(), Some(newer));
+        dismiss_insecure(newer.seq);
+    }
+
+    #[test]
+    fn a_later_sign_in_on_the_same_protocol_clears_the_notice() {
+        let _guard = test_lock();
+        CLEAR_ON_SIGN_IN.store(true, Ordering::SeqCst);
+        record_insecure("notice-test-a");
+        record_signed_in("notice-test-b");
+        assert_eq!(last_insecure().map(|l| l.protocol), Some("notice-test-a"));
+        record_signed_in("notice-test-a");
+        CLEAR_ON_SIGN_IN.store(false, Ordering::SeqCst);
         assert_eq!(last_insecure(), None);
     }
 

@@ -1277,7 +1277,8 @@ function InsecureSignInNotice({
         <p className="text-[12px] text-txt-muted mt-1">
           {t("insecure_sign_in_body", {
             protocol: attempt.protocol.toUpperCase(),
-            time: new Date(attempt.at * 1000).toLocaleTimeString(),
+            date: new Date(attempt.at * 1000).toLocaleDateString(undefined, { dateStyle: "medium" }),
+            time: new Date(attempt.at * 1000).toLocaleTimeString(undefined, { timeStyle: "short" }),
           })}
         </p>
       </div>
@@ -2103,8 +2104,15 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       } else {
         show_toast(t("toast_ports_updated"), "success");
       }
-    } catch {
-      show_toast(t("toast_ports_failed"), "error");
+    } catch (save_error) {
+      show_toast(
+        save_error === "port_shared"
+          ? t("toast_port_shared")
+          : save_error === "port_reserved"
+            ? t("toast_port_reserved")
+            : t("toast_ports_failed"),
+        "error",
+      );
     }
     set_saving_ports(false);
   };
@@ -2716,6 +2724,7 @@ export function BridgeApp() {
   const [plan_info_loaded, set_plan_info_loaded] = useState(false);
   const [port_conflict, set_port_conflict] = useState<PortConflict | null>(null);
   const [insecure_sign_in, set_insecure_sign_in] = useState<InsecureSignIn | null>(null);
+  const dismissed_insecure_seq = useRef(0);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
@@ -2729,7 +2738,10 @@ export function BridgeApp() {
     set_import_progress(p);
   }, []);
   const handle_dismiss_insecure_sign_in = useCallback(() => {
-    if (insecure_sign_in) api.dismiss_insecure_sign_in(insecure_sign_in.at).catch(() => {});
+    if (insecure_sign_in) {
+      dismissed_insecure_seq.current = Math.max(dismissed_insecure_seq.current, insecure_sign_in.seq);
+      api.dismiss_insecure_sign_in(insecure_sign_in.seq).catch(() => {});
+    }
     set_insecure_sign_in(null);
   }, [insecure_sign_in]);
   const handle_dismiss_import = useCallback(() => {
@@ -2762,7 +2774,11 @@ export function BridgeApp() {
         set_has_bridge_access(state.has_bridge_access);
         set_plan_info_loaded(state.plan_info_loaded);
         set_port_conflict(state.port_conflict);
-        set_insecure_sign_in(state.insecure_sign_in);
+        set_insecure_sign_in(
+          state.insecure_sign_in && state.insecure_sign_in.seq > dismissed_insecure_seq.current
+            ? state.insecure_sign_in
+            : null,
+        );
         apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();

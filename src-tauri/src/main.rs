@@ -962,12 +962,15 @@ async fn update_connection_settings(
     imap_port: u16,
     smtp_port: u16,
 ) -> Result<(), String> {
-    ops::validate_port(imap_port).map_err(|e| format!("imap_port: {}", e))?;
-    ops::validate_port(smtp_port).map_err(|e| format!("smtp_port: {}", e))?;
+    ops::validate_port(imap_port).map_err(|_| "port_reserved".to_string())?;
+    ops::validate_port(smtp_port).map_err(|_| "port_reserved".to_string())?;
     let mut guard = state.0.lock().await;
     let mut candidate = guard.config.clone();
     candidate.imap_port = imap_port;
     candidate.smtp_port = smtp_port;
+    if config::shared_port(&candidate).is_some() {
+        return Err("port_shared".to_string());
+    }
     config::validate_ports(&candidate)?;
     guard.config.imap_port = imap_port;
     guard.config.smtp_port = smtp_port;
@@ -1148,8 +1151,8 @@ async fn set_autostart(
 }
 
 #[tauri::command]
-fn dismiss_insecure_sign_in(at: i64) {
-    sign_in_notice::dismiss_insecure(at);
+fn dismiss_insecure_sign_in(seq: u64) {
+    sign_in_notice::dismiss_insecure(seq);
 }
 
 #[tauri::command]
