@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -12,17 +13,47 @@ use tokio::time::Instant;
 const MAX_CONNECTIONS_PER_PROTOCOL: usize = 256;
 pub const PRE_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PRE_AUTH_DEADLINE: Duration = Duration::from_secs(300);
+pub const PRE_AUTH_GRACE: Duration = Duration::from_secs(10);
+pub const PRE_AUTH_FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PreAuthClock {
     deadline: Instant,
+    signed_in: Arc<AtomicBool>,
 }
 
 impl PreAuthClock {
     pub fn start() -> Self {
         Self {
             deadline: Instant::now() + PRE_AUTH_DEADLINE,
+            signed_in: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn mark_signed_in(&self) {
+        self.signed_in.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_signed_in(&self) -> bool {
+        self.signed_in.load(Ordering::SeqCst)
+    }
+
+    pub async fn guard<F: Future>(&self, future: F) -> Option<F::Output> {
+        let expiry = async {
+            tokio::time::sleep_until(self.deadline + PRE_AUTH_GRACE).await;
+            if self.is_signed_in() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            output = future => Some(output),
+            _ = expiry => None,
+        }
+    }
+
+    pub fn farewell_window(&self) -> Option<Duration> {
+        (!self.is_signed_in()).then_some(PRE_AUTH_FAREWELL_TIMEOUT)
     }
 
     pub async fn bound<F: Future>(&self, future: F) -> Option<F::Output> {
@@ -102,6 +133,28 @@ pub(crate) mod test_support {
             .is_ok();
         (String::from_utf8_lossy(&out).into_owned(), closed)
     }
+
+    pub(crate) async fn flood_without_reading<F, Fut, T>(
+        serve: F,
+        command: &'static [u8],
+        limit: Duration,
+    ) -> (bool, ReadHalf<DuplexStream>)
+    where
+        F: FnOnce(DuplexStream) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        use tokio::io::AsyncWriteExt;
+        let (client_side, server_side) = tokio::io::duplex(1024);
+        let server = tokio::spawn(serve(server_side));
+        let (reader, mut writer) = tokio::io::split(client_side);
+        let flood = tokio::spawn(async move {
+            while writer.write_all(command).await.is_ok() {}
+        });
+        let finished = tokio::time::timeout(limit, server).await.is_ok();
+        flood.abort();
+        (finished, reader)
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +232,38 @@ mod tests {
             })
             .await;
         assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_ends_a_stalled_session_before_sign_in() {
+        let clock = PreAuthClock::start();
+        let started = Instant::now();
+        let result = clock.guard(std::future::pending::<()>()).await;
+        assert!(result.is_none());
+        assert_eq!(started.elapsed(), PRE_AUTH_DEADLINE + PRE_AUTH_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_leaves_a_signed_in_session_alone() {
+        let clock = PreAuthClock::start();
+        let inner = clock.clone();
+        let wait = PRE_AUTH_DEADLINE * 4;
+        let result = clock
+            .guard(async move {
+                inner.mark_signed_in();
+                tokio::time::sleep(wait).await;
+                9u32
+            })
+            .await;
+        assert_eq!(result, Some(9));
+    }
+
+    #[test]
+    fn farewell_is_short_before_sign_in_only() {
+        let clock = PreAuthClock::start();
+        assert_eq!(clock.farewell_window(), Some(PRE_AUTH_FAREWELL_TIMEOUT));
+        clock.clone().mark_signed_in();
+        assert_eq!(clock.farewell_window(), None);
     }
 
     #[test]

@@ -1203,8 +1203,9 @@ async fn run_session_erased(
     client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
     broadcaster: broadcast::Sender<StateChange>,
+    pre_auth: crate::conn_limit::PreAuthClock,
 ) -> Result<()> {
-    run_session(stream, session, db, client, passwords, broadcaster, None).await
+    run_session_inner(stream, session, db, client, passwords, broadcaster, None, pre_auth).await
 }
 
 async fn run_session<S>(
@@ -1215,6 +1216,40 @@ async fn run_session<S>(
     passwords: Arc<AppPasswords>,
     broadcaster: broadcast::Sender<StateChange>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
+    let inner = run_session_inner(
+        stream,
+        session,
+        db,
+        client,
+        passwords,
+        broadcaster,
+        tls_config,
+        pre_auth.clone(),
+    );
+    match pre_auth.guard(inner).await {
+        Some(result) => result,
+        None => {
+            tracing::debug!("IMAP connection closed: no sign-in before the deadline");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_inner<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    db: Arc<Database>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    broadcaster: broadcast::Sender<StateChange>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    pre_auth: crate::conn_limit::PreAuthClock,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1244,9 +1279,11 @@ where
 
     let mut line = String::new();
     let mut failed_auth: u32 = 0;
-    let pre_auth = crate::conn_limit::PreAuthClock::start();
 
     loop {
+        if conn.state != ImapState::NotAuthenticated {
+            pre_auth.mark_signed_in();
+        }
         writer.disarm();
         writer.flush().await?;
         line.clear();
@@ -1406,6 +1443,7 @@ where
                     upgraded_client,
                     upgraded_passwords,
                     upgraded_broadcaster,
+                    pre_auth.clone(),
                 ))
                 .await;
             }
@@ -2490,8 +2528,16 @@ where
         }
     }
 
-    let _ = writer.flush().await;
-    let _ = writer.shutdown().await;
+    let closing = async {
+        let _ = writer.flush().await;
+        let _ = writer.shutdown().await;
+    };
+    match pre_auth.farewell_window() {
+        Some(window) => {
+            let _ = tokio::time::timeout(window, closing).await;
+        }
+        None => closing.await,
+    }
 
     Ok(())
 }
@@ -4493,8 +4539,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_cannot_hold_a_slot_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_GRACE};
+        use crate::imap::heartbeat::PUMP_DRAIN_TIMEOUT;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        let (finished, mut reader) = test_support::flood_without_reading(
+            move |stream| run_session(stream, session, db, client, passwords, tx, None),
+            b"a CAPABILITY\r\n",
+            PRE_AUTH_DEADLINE * 3,
+        )
+        .await;
+        assert!(finished, "a client that never reads held its slot");
+        assert!(started.elapsed() <= PRE_AUTH_DEADLINE + PRE_AUTH_GRACE + Duration::from_secs(1));
+        let (_, closed) =
+            test_support::read_until_closed(&mut reader, PUMP_DRAIN_TIMEOUT + Duration::from_secs(2)).await;
+        assert!(closed, "the stalled reply pump kept the socket open");
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
         use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
+        let _guard = crate::sign_in_notice::test_support::test_lock();
         let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
             crate::sign_in_notice::test_support::fixture();
         let (tx, _rx) = broadcast::channel(16);

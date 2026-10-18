@@ -243,8 +243,9 @@ async fn handle_session_erased(
     client: Arc<ApiClient>,
     passwords: Arc<AppPasswords>,
     db: Arc<Database>,
+    pre_auth: crate::conn_limit::PreAuthClock,
 ) -> Result<()> {
-    handle_session(stream, session, client, passwords, db, None, false).await
+    handle_session_inner(stream, session, client, passwords, db, None, false, pre_auth).await
 }
 
 async fn handle_session<S>(
@@ -255,6 +256,40 @@ async fn handle_session<S>(
     db: Arc<Database>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     greet: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
+    let inner = handle_session_inner(
+        stream,
+        session,
+        client,
+        passwords,
+        db,
+        tls_config,
+        greet,
+        pre_auth.clone(),
+    );
+    match pre_auth.guard(inner).await {
+        Some(result) => result,
+        None => {
+            tracing::debug!("SMTP connection closed: no sign-in before the deadline");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_inner<S>(
+    stream: S,
+    session: Arc<RwLock<Session>>,
+    client: Arc<ApiClient>,
+    passwords: Arc<AppPasswords>,
+    db: Arc<Database>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    greet: bool,
+    pre_auth: crate::conn_limit::PreAuthClock,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -280,7 +315,6 @@ where
     let mut refreshed_identities = false;
 
     let mut line_bytes: Vec<u8> = Vec::new();
-    let pre_auth = crate::conn_limit::PreAuthClock::start();
 
     loop {
         let in_data = smtp.state == SmtpState::Data;
@@ -289,7 +323,11 @@ where
             .bound_until_auth(smtp.authenticated, read_line_bytes(&mut reader, &mut line_bytes, cap))
             .await;
         let Some(read) = read else {
-            writer.write_all(b"421 4.4.2 Idle timeout, closing connection\r\n").await?;
+            let _ = tokio::time::timeout(
+                crate::conn_limit::PRE_AUTH_FAREWELL_TIMEOUT,
+                writer.write_all(b"421 4.4.2 Idle timeout, closing connection\r\n"),
+            )
+            .await;
             break;
         };
         let n = match read {
@@ -500,6 +538,7 @@ where
                     upgraded_client,
                     upgraded_passwords,
                     upgraded_db,
+                    pre_auth.clone(),
                 ))
                 .await;
             }
@@ -555,6 +594,7 @@ where
                 if let Some(password) = password_str {
                     if let Some(pw_id) = passwords.verify_and_id_async(&password).await {
                         smtp.authenticated = true;
+                        pre_auth.mark_signed_in();
                         smtp.state = SmtpState::Authenticated;
                         passwords.record_use(&pw_id, Some("smtp"));
                         writer.write_all(b"235 Authentication successful\r\n").await?;
@@ -693,8 +733,16 @@ where
         }
     }
 
-    let _ = writer.flush().await;
-    let _ = writer.shutdown().await;
+    let closing = async {
+        let _ = writer.flush().await;
+        let _ = writer.shutdown().await;
+    };
+    match pre_auth.farewell_window() {
+        Some(window) => {
+            let _ = tokio::time::timeout(window, closing).await;
+        }
+        None => closing.await,
+    }
 
     Ok(())
 }
@@ -1109,9 +1157,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_cannot_hold_a_slot_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_GRACE};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (finished, mut reader) = test_support::flood_without_reading(
+            move |stream| handle_session(stream, session, client, passwords, db, None, true),
+            b"EHLO test\r\n",
+            PRE_AUTH_DEADLINE * 3,
+        )
+        .await;
+        assert!(finished, "a client that never reads held its slot");
+        assert!(
+            started.elapsed()
+                <= PRE_AUTH_DEADLINE + PRE_AUTH_GRACE + std::time::Duration::from_secs(1)
+        );
+        let (_, closed) =
+            test_support::read_until_closed(&mut reader, std::time::Duration::from_secs(2)).await;
+        assert!(closed);
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
         use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
         use tokio::io::AsyncWriteExt;
+        let _guard = crate::sign_in_notice::test_support::test_lock();
         let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
             crate::sign_in_notice::test_support::fixture();
         let (mut reader, mut writer) = test_support::connect(move |stream| {

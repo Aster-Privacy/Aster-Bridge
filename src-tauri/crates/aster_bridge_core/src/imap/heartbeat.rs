@@ -108,6 +108,28 @@ where
     }
 }
 
+pub const PUMP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl<W> Drop for HeartbeatWriter<W> {
+    fn drop(&mut self) {
+        self.tx = None;
+        let Some(handle) = self.pump.take() else {
+            return;
+        };
+        let abort = handle.abort_handle();
+        drop(handle);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(PUMP_DRAIN_TIMEOUT).await;
+                    abort.abort();
+                });
+            }
+            Err(_) => abort.abort(),
+        }
+    }
+}
+
 impl<W> AsyncWrite for HeartbeatWriter<W>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -209,6 +231,51 @@ where
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    struct Stalled {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for Stalled {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for Stalled {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_writer_releases_a_stalled_socket() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut writer = HeartbeatWriter::new(
+            Stalled {
+                dropped: dropped.clone(),
+            },
+            Duration::from_secs(3600),
+        );
+        writer.write_all(b"* OK hello\r\n").await.unwrap();
+        tokio::task::yield_now().await;
+        drop(writer);
+        tokio::time::sleep(PUMP_DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst), "a stalled pump must not keep the socket open");
+    }
 
     #[derive(Clone, Default)]
     struct Recorder {
