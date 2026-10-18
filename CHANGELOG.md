@@ -2,6 +2,21 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.9 - 2026-10-18
+
+### What's new
+- When a mail app signs in to Aster Bridge without TLS, Aster Bridge warns you and explains how to turn on TLS in that app.
+- If another app already uses one of the Aster Bridge ports, Aster Bridge tells you which port is taken and how to choose a different one.
+
+### Fixed
+- Messages that claim to come from an Aster address but arrive from outside Aster Mail, and attachments the sender didn't sign, are now marked as unverified so you can tell them apart from genuine mail.
+- Post-quantum sends now require a signed key from every recipient. If you turn on **Require post-quantum protection for Aster recipients** and a message includes an outside recipient, Aster Bridge stops the send and tells you why.
+- When you accept a contact's new key, Aster Bridge keeps the exact key you confirmed, and send errors now tell you whether a key was tampered with or not yet trusted.
+- Messages sent only to Bcc recipients from a custom domain stay end-to-end encrypted.
+- Signing out now removes all local mail data, including messages that a background import or move was still saving.
+- Connections that stall before signing in now close on their own, so they can't hold Aster Bridge open.
+- Sign-in errors in your mail app now explain what went wrong when TLS or the app password is the cause.
+
 ## 1.0.8 - 2026-10-17
 
 ### Fixed
