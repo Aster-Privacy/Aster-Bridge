@@ -42,6 +42,11 @@ export interface PortConflict {
   held_by_bridge: boolean;
 }
 
+export interface InsecureSignIn {
+  protocol: string;
+  at: number;
+}
+
 export interface BridgeState {
   enrolled: boolean;
   email: string | null;
@@ -55,6 +60,7 @@ export interface BridgeState {
   plan_info_loaded: boolean;
   import_progress: ImportProgress | null;
   port_conflict: PortConflict | null;
+  insecure_sign_in: InsecureSignIn | null;
 }
 
 async function tauri_invoke<T>(
@@ -82,6 +88,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     plan_info_loaded: boolean;
     import_progress: ImportProgress | null;
     port_conflict: PortConflict | null;
+    insecure_sign_in: InsecureSignIn | null;
   }>("get_bridge_status");
 
   let passwords: AppPassword[] = [];
@@ -106,6 +113,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     plan_info_loaded: status.plan_info_loaded ?? false,
     import_progress: status.import_progress ?? null,
     port_conflict: status.port_conflict ?? null,
+    insecure_sign_in: status.insecure_sign_in ?? null,
   };
 }
 
@@ -322,6 +330,10 @@ export async function open_url(url: string): Promise<void> {
   }
   const { open } = await import("@tauri-apps/plugin-shell");
   await open(parsed.toString());
+}
+
+export async function dismiss_insecure_sign_in(at: number): Promise<void> {
+  return tauri_invoke("dismiss_insecure_sign_in", { at });
 }
 
 export async function trigger_sync(): Promise<void> {

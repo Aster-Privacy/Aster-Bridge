@@ -26,7 +26,7 @@ mod shell;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod webkit_sandbox;
 
-use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sync, tls};
+use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sign_in_notice, sync, tls};
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -124,6 +124,7 @@ struct BridgeStatusResponse {
     plan_info_loaded: bool,
     import_progress: Option<imap::append::ImportProgress>,
     port_conflict: Option<PortConflict>,
+    insecure_sign_in: Option<sign_in_notice::InsecureSignIn>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -237,6 +238,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         plan_info_loaded: guard.plan_info_loaded,
         import_progress: imap::append::current_import_progress(),
         port_conflict: guard.port_conflict.clone(),
+        insecure_sign_in: sign_in_notice::last_insecure(),
     })
 }
 
@@ -1138,6 +1140,11 @@ async fn set_autostart(
 }
 
 #[tauri::command]
+fn dismiss_insecure_sign_in(at: i64) {
+    sign_in_notice::dismiss_insecure(at);
+}
+
+#[tauri::command]
 async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
     let trigger = {
         let guard = state.0.lock().await;
@@ -1547,6 +1554,7 @@ fn main() {
             provision_bundle,
             take_pending_deep_link,
             trigger_sync,
+            dismiss_insecure_sign_in,
             repair_cache,
             accept_recipient_key,
             recipient_key_fingerprint,
