@@ -1422,7 +1422,8 @@ where
             }
             "LOGIN" => {
                 if starttls_capable {
-                    write_no(&mut writer, &tag, "[PRIVACYREQUIRED] STARTTLS required before LOGIN").await?;
+                    crate::sign_in_notice::record_insecure("imap");
+                    write_no(&mut writer, &tag, &format!("[PRIVACYREQUIRED] {}", crate::sign_in_notice::TLS_REQUIRED_TEXT)).await?;
                     continue;
                 }
                 let ok = handle_login(&mut writer, &session, &passwords, &mut conn, &tag, &args).await?;
@@ -1440,7 +1441,8 @@ where
             }
             "AUTHENTICATE" => {
                 if starttls_capable {
-                    write_no(&mut writer, &tag, "[PRIVACYREQUIRED] STARTTLS required before AUTHENTICATE").await?;
+                    crate::sign_in_notice::record_insecure("imap");
+                    write_no(&mut writer, &tag, &format!("[PRIVACYREQUIRED] {}", crate::sign_in_notice::TLS_REQUIRED_TEXT)).await?;
                     continue;
                 }
                 let upper_args = args.to_ascii_uppercase();
@@ -1497,7 +1499,7 @@ where
                         failed_auth = failed_auth.saturating_add(1);
                         let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        write_no(&mut writer, &tag, "[AUTHENTICATIONFAILED] Invalid credentials")
+                        write_no(&mut writer, &tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT))
                             .await?;
                         if failed_auth >= MAX_FAILED_AUTH {
                             writer
@@ -2839,7 +2841,7 @@ async fn handle_login(
     let password = login_parts[1].trim_matches('"');
 
     if !session.read().await.accepts_login_name(username) {
-        write_no(writer, tag, "[AUTHENTICATIONFAILED] Invalid credentials").await?;
+        write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
         return Ok(false);
     }
 
@@ -2850,7 +2852,7 @@ async fn handle_login(
         write_ok(writer, tag, "LOGIN completed").await?;
         Ok(true)
     } else {
-        write_no(writer, tag, "[AUTHENTICATIONFAILED] Invalid credentials").await?;
+        write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
         Ok(false)
     }
 }
@@ -4447,6 +4449,50 @@ mod tests {
         assert!(lines[2].starts_with("a3 BAD "));
         assert!(!text.contains('\0'));
         assert_eq!(text.matches('\n').count(), 3);
+    }
+
+    async fn imap_transcript(script: &str, with_tls: bool) -> String {
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let tls = with_tls.then_some(tls);
+        let (tx, _rx) = broadcast::channel(16);
+        let out = crate::sign_in_notice::test_support::transcript(script, move |stream| {
+            run_session(stream, session, db, client, passwords, tx, tls)
+        })
+        .await;
+        drop(dir);
+        out
+    }
+
+    #[tokio::test]
+    async fn sign_in_without_tls_explains_the_fix_and_is_recorded() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        let out = imap_transcript(
+            "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 LOGOUT\r\n",
+            true,
+        )
+        .await;
+        let expected = "NO [PRIVACYREQUIRED] Turn on SSL/TLS for this account in your mail app, then try again\r\n";
+        assert!(out.contains(&format!("a1 {}", expected)), "{:?}", out);
+        assert!(out.contains(&format!("a2 {}", expected)), "{:?}", out);
+        assert_eq!(
+            crate::sign_in_notice::last_insecure().map(|l| l.protocol),
+            Some("imap")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_username_and_wrong_password_get_the_same_helpful_reply() {
+        let out = imap_transcript(
+            "a1 LOGIN someone@else.test abcd-efgh-ijkl-mnop\r\na2 LOGIN tester@aster.test wrong-password\r\na3 LOGOUT\r\n",
+            false,
+        )
+        .await;
+        let expected = "NO [AUTHENTICATIONFAILED] Sign-in failed. Use the username and app password shown in Aster Bridge\r\n";
+        assert!(out.contains(&format!("a1 {}", expected)), "{:?}", out);
+        assert!(out.contains(&format!("a2 {}", expected)), "{:?}", out);
+        assert!(out.contains("a3 OK"), "{:?}", out);
     }
 
     #[derive(Debug, Default, Clone, Copy)]

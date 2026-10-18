@@ -47,6 +47,7 @@ mod protocol_harness;
 pub mod runtime;
 pub mod secrets;
 pub mod shutdown;
+pub mod sign_in_notice;
 pub mod smtp;
 pub mod sync;
 pub mod system_tools;

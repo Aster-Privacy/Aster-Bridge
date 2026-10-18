@@ -503,7 +503,8 @@ where
                     continue;
                 }
                 if starttls_capable {
-                    writer.write_all(b"538 5.7.11 Encryption required for requested authentication mechanism\r\n").await?;
+                    crate::sign_in_notice::record_insecure("smtp");
+                    writer.write_all(format!("538 5.7.11 {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
                     continue;
                 }
 
@@ -560,7 +561,7 @@ where
                     let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     writer
-                        .write_all(b"535 Authentication failed\r\n")
+                        .write_all(format!("535 5.7.8 {}\r\n", crate::sign_in_notice::BAD_CREDENTIALS_TEXT).as_bytes())
                         .await?;
                     if failed_auth >= MAX_FAILED_AUTH {
                         writer
@@ -1055,6 +1056,44 @@ mod tests {
     #[test]
     fn io_errors_are_transient() {
         assert!(is_transient_send_error(&io_err()));
+    }
+
+    async fn smtp_transcript(script: &str, with_tls: bool) -> String {
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let tls = with_tls.then_some(tls);
+        let out = crate::sign_in_notice::test_support::transcript(script, move |stream| {
+            handle_session(stream, session, client, passwords, db, tls, true)
+        })
+        .await;
+        drop(dir);
+        out
+    }
+
+    #[tokio::test]
+    async fn auth_without_tls_explains_the_fix_and_is_recorded() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB4\r\nQUIT\r\n", true).await;
+        assert!(
+            out.contains("\r\n538 5.7.11 Turn on SSL/TLS for this account in your mail app, then try again\r\n"),
+            "{:?}",
+            out
+        );
+        assert_eq!(
+            crate::sign_in_notice::last_insecure().map(|l| l.protocol),
+            Some("smtp")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_points_at_the_app_password_in_bridge() {
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB3cm9uZw==\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("\r\n535 5.7.8 Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
     }
 
     #[test]

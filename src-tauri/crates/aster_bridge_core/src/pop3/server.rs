@@ -286,7 +286,8 @@ where
             match cmd.as_str() {
                 "USER" => {
                     if stls_capable {
-                        writer.write_all(b"-ERR [PRIVACYREQUIRED] STLS required before USER\r\n").await?;
+                        crate::sign_in_notice::record_insecure("pop3");
+                        writer.write_all(format!("-ERR [PRIVACYREQUIRED] {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
                         continue;
                     }
                     user_received = true;
@@ -316,7 +317,8 @@ where
                 }
                 "PASS" => {
                     if stls_capable {
-                        writer.write_all(b"-ERR [PRIVACYREQUIRED] STLS required before PASS\r\n").await?;
+                        crate::sign_in_notice::record_insecure("pop3");
+                        writer.write_all(format!("-ERR [PRIVACYREQUIRED] {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
                         continue;
                     }
                     if !user_received {
@@ -341,7 +343,7 @@ where
                             writer.write_all(b"-ERR too many failed attempts\r\n").await?;
                             break;
                         }
-                        writer.write_all(b"-ERR invalid credentials\r\n").await?;
+                        writer.write_all(format!("-ERR {}\r\n", crate::sign_in_notice::BAD_CREDENTIALS_TEXT).as_bytes()).await?;
                     }
                 }
                 "CAPA" => {
@@ -597,6 +599,41 @@ mod tests {
         let m = sample_message("id-1");
         let expected = build_rfc822(&m).len();
         assert_eq!(pop3_size(&m, &[]), expected);
+    }
+
+    async fn pop3_transcript(script: &str, with_tls: bool) -> String {
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        let tls = with_tls.then_some(tls);
+        let out = crate::sign_in_notice::test_support::transcript(script, move |stream| {
+            run_session(stream, session, db, client, passwords, tls)
+        })
+        .await;
+        drop(dir);
+        out
+    }
+
+    #[tokio::test]
+    async fn sign_in_without_tls_explains_the_fix_and_is_recorded() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        crate::sign_in_notice::dismiss_insecure(i64::MAX);
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS x\r\nQUIT\r\n", true).await;
+        let expected = "-ERR [PRIVACYREQUIRED] Turn on SSL/TLS for this account in your mail app, then try again\r\n";
+        assert_eq!(out.matches(expected).count(), 2, "{:?}", out);
+        assert_eq!(
+            crate::sign_in_notice::last_insecure().map(|l| l.protocol),
+            Some("pop3")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_points_at_the_app_password_in_bridge() {
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS wrong-password\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("-ERR Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
     }
 
     #[test]
