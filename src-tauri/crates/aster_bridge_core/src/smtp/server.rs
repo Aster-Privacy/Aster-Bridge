@@ -1683,6 +1683,36 @@ iQEz
     }
 
     #[test]
+    fn bcc_only_send_from_a_custom_domain_is_not_split_as_external() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: me@mydomain.example\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["friend@astermail.org".to_string()];
+        let identity = SendIdentity {
+            address: "me@mydomain.example".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind: SendIdentityKind::CustomDomain,
+            enabled: true,
+            sender_id: "domain-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &recipients,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert_eq!(payload["bcc"], serde_json::json!(["friend@astermail.org"]));
+        let own = vec!["primary@astermail.org".to_string(), identity.address.clone()];
+        let split = crate::crypto::internal_send::split_recipients(&payload, &own);
+        assert!(!split.has_external);
+        assert_eq!(split.internal, vec!["friend@astermail.org".to_string()]);
+    }
+
+    #[test]
     fn build_send_payload_sends_the_from_header_display_name() {
         let raw = b"From: Ada Lovelace <primary@aster.test>\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let recipients = vec!["rcpt@example.com".to_string()];

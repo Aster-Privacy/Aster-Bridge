@@ -89,9 +89,16 @@ fn listed_in(payload: &Value, fields: &[&str], address: &str) -> bool {
     })
 }
 
-pub fn split_recipients(payload: &Value) -> RecipientSplit {
+pub fn split_recipients(payload: &Value, own_addresses: &[String]) -> RecipientSplit {
     let all = payload_recipients(payload);
-    let has_external = all.iter().any(|address| !is_internal_address(address));
+    let is_own = |address: &String| {
+        own_addresses
+            .iter()
+            .any(|own| own.trim().eq_ignore_ascii_case(address.trim()))
+    };
+    let has_external = all
+        .iter()
+        .any(|address| !is_internal_address(address) && !is_own(address));
     let internal: Vec<String> = all
         .into_iter()
         .filter(|address| is_internal_address(address))
@@ -343,6 +350,22 @@ fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()
     }
 }
 
+fn enforce_private_body(has_external: bool, required: bool) -> Result<()> {
+    if required && has_external {
+        return Err(BridgeError::RecipientKey(
+            "This message has recipients outside Aster, so its contents cannot have post-quantum protection, and Aster Bridge is set to require it, so the message was not sent. To send it anyway, turn off Require post-quantum protection for Aster recipients in the Aster Bridge settings.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn own_addresses(session: &Arc<RwLock<Session>>) -> Vec<String> {
+    let guard = session.read().await;
+    std::iter::once(guard.email.clone())
+        .chain(guard.send_identities.iter().map(|identity| identity.address.clone()))
+        .collect()
+}
+
 pub async fn seal_internal_body(
     payload: &mut Value,
     session: &Arc<RwLock<Session>>,
@@ -350,10 +373,12 @@ pub async fn seal_internal_body(
     db: &Database,
     access_token: &str,
 ) -> Result<()> {
-    let split = split_recipients(payload);
+    let split = split_recipients(payload, &own_addresses(session).await);
     if split.internal.is_empty() {
         return Ok(());
     }
+    let require_post_quantum = crate::config::require_post_quantum();
+    enforce_private_body(split.has_external, require_post_quantum)?;
 
     let plaintext = sealed_plaintext(payload);
 
@@ -403,7 +428,7 @@ pub async fn seal_internal_body(
         });
     }
 
-    enforce_post_quantum(&routed, crate::config::require_post_quantum())?;
+    enforce_post_quantum(&routed, require_post_quantum)?;
     if split.has_external {
         let everyone: Vec<&RoutedRecipient> = routed.iter().collect();
         seal_attachment_metas(payload, &sender, &everyone, None)?;
@@ -621,7 +646,7 @@ mod tests {
     #[test]
     fn all_internal_puts_the_ciphertext_in_body_and_flags_encryption() {
         let mut payload = payload_with(vec!["a@astermail.org", "b@aster.cx"]);
-        let split = split_recipients(&payload);
+        let split = split_recipients(&payload, &[]);
         assert_eq!(split.internal.len(), 2);
         assert!(!split.has_external);
 
@@ -638,7 +663,7 @@ mod tests {
     #[test]
     fn mixed_recipients_keep_plaintext_and_add_the_sealed_copy() {
         let mut payload = payload_with(vec!["a@astermail.org", "b@example.com"]);
-        let split = split_recipients(&payload);
+        let split = split_recipients(&payload, &[]);
         assert_eq!(split.internal, vec!["a@astermail.org".to_string()]);
         assert!(split.has_external);
 
@@ -654,7 +679,7 @@ mod tests {
     #[test]
     fn all_external_leaves_the_payload_untouched() {
         let payload = payload_with(vec!["a@example.com", "b@example.net"]);
-        let split = split_recipients(&payload);
+        let split = split_recipients(&payload, &[]);
         assert!(split.internal.is_empty());
         assert!(split.has_external);
 
@@ -663,6 +688,65 @@ mod tests {
             apply_envelope(&mut after, "SEALED".to_string(), split.has_external);
         }
         assert_eq!(after, payload);
+    }
+
+    #[test]
+    fn a_bcc_only_send_from_an_own_custom_domain_stays_sealed() {
+        let mut payload = json!({
+            "to": ["me@mydomain.example"],
+            "bcc": ["a@astermail.org"],
+            "subject": "Hi",
+            "body": "<p>hello</p>",
+            "body_html": "<p>hello</p>",
+            "is_html": true,
+            "is_e2e_encrypted": false,
+            "sender_email": "me@mydomain.example",
+        });
+        let own = vec!["user@astermail.org".to_string(), "Me@MyDomain.example".to_string()];
+        let split = split_recipients(&payload, &own);
+        assert!(!split.has_external);
+        assert_eq!(split.internal, vec!["a@astermail.org".to_string()]);
+        assert_eq!(split.hidden, vec!["a@astermail.org".to_string()]);
+
+        apply_envelope(&mut payload, "SEALED".to_string(), split.has_external);
+        assert_eq!(payload["body"], json!("SEALED"));
+        assert_eq!(payload["is_e2e_encrypted"], json!(true));
+        assert!(payload.get("body_html").is_none());
+    }
+
+    #[test]
+    fn a_real_external_recipient_still_takes_the_external_path() {
+        let payload = json!({
+            "to": ["me@mydomain.example"],
+            "bcc": ["a@astermail.org", "friend@example.com"],
+        });
+        let own = vec!["me@mydomain.example".to_string()];
+        let split = split_recipients(&payload, &own);
+        assert!(split.has_external);
+        assert_eq!(split.internal, vec!["a@astermail.org".to_string()]);
+    }
+
+    #[test]
+    fn own_internal_addresses_are_still_sealed_targets() {
+        let payload = payload_with(vec!["user@astermail.org", "a@aster.cx"]);
+        let own = vec!["user@astermail.org".to_string()];
+        let split = split_recipients(&payload, &own);
+        assert!(!split.has_external);
+        assert_eq!(
+            split.internal,
+            vec!["user@astermail.org".to_string(), "a@aster.cx".to_string()]
+        );
+    }
+
+    #[test]
+    fn required_post_quantum_fails_closed_when_the_body_would_be_readable() {
+        assert!(matches!(
+            enforce_private_body(true, true),
+            Err(BridgeError::RecipientKey(_))
+        ));
+        assert!(enforce_private_body(true, false).is_ok());
+        assert!(enforce_private_body(false, true).is_ok());
+        assert!(enforce_private_body(false, false).is_ok());
     }
 
     #[test]
@@ -992,7 +1076,7 @@ mod tests {
             "cc": ["B@aster.cx"],
             "bcc": ["hidden@astermail.org", "b@aster.cx", "secret@example.com", " Other@Aster.cx "],
         });
-        let split = split_recipients(&payload);
+        let split = split_recipients(&payload, &[]);
         assert!(split.has_external);
         assert_eq!(
             split.internal,
