@@ -1107,6 +1107,7 @@ struct PreparedMessage {
     attachments: Vec<EnvelopeAttachment>,
     expected_attachments: usize,
     unencrypted: bool,
+    sender_unverified: bool,
 }
 
 enum Prepared {
@@ -1157,7 +1158,7 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
-    let plaintext_result = decrypt_envelope_with_previous_keys(
+    let plaintext_result = crate::crypto::envelope::decrypt_envelope_noting_inbound(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
@@ -1167,8 +1168,12 @@ fn prepare_mail_item(
     );
 
     let mut unencrypted = false;
+    let mut from_inbound = false;
     let plaintext = match plaintext_result {
-        Ok(p) => p,
+        Ok((p, inbound)) => {
+            from_inbound = inbound;
+            p
+        }
         Err(_) => {
             let inbound = crate::crypto::inbound::is_inbound_payload(
                 &item.encrypted_envelope,
@@ -1217,6 +1222,10 @@ fn prepare_mail_item(
         tracing::debug!("envelope decrypt skipped");
         return Prepared::Done(CacheOutcome::default());
     }
+
+    let sender_unverified = from_inbound
+        && (is_ratchet_envelope
+            || crate::crypto::internal_send::is_internal_address(&envelope_sender_address(&parsed)));
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -1276,6 +1285,7 @@ fn prepare_mail_item(
         attachments,
         expected_attachments,
         unencrypted,
+        sender_unverified,
     })
 }
 
@@ -1372,6 +1382,9 @@ fn commit_prepared(
             crate::message_render::NOT_END_TO_END_ENCRYPTED_FLAG.to_string(),
             serde_json::json!(true),
         );
+    }
+    if prepared.sender_unverified {
+        raw_headers_map.insert("sender_unverified".to_string(), serde_json::json!(true));
     }
     if !prepared.attachments.is_empty() {
         raw_headers_map.insert(
@@ -1743,7 +1756,7 @@ async fn try_decrypt_internal_mail(
     item: &MailItem,
     ctx: &InternalDecryptContext<'_>,
 ) -> Option<crate::crypto::ratchet_recovery::SubjectBundle> {
-    let plaintext_env = decrypt_envelope_with_previous_keys(
+    let (plaintext_env, from_inbound) = crate::crypto::envelope::decrypt_envelope_noting_inbound(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         ctx.passphrase,
@@ -1806,7 +1819,7 @@ async fn try_decrypt_internal_mail(
         failed_steps.push("no_recipient_entry");
     }
     match opened {
-        Some(plaintext) => Some(unsealed_bundle(&plaintext, sender_unverified)),
+        Some(plaintext) => Some(unsealed_bundle(&plaintext, sender_unverified || from_inbound)),
         None => {
             tracing::debug!(
                 "ratchet message {} still sealed after: {}",
@@ -3996,6 +4009,51 @@ mod tests {
         let outcome = cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys);
         assert!(outcome.was_new);
         assert!(!outcome.inbound_decrypt_failed);
+    }
+
+    fn cached_meta(db: &Database, id: &str) -> serde_json::Value {
+        let raw = db.get_cached_message(id).unwrap().unwrap().raw_headers.unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn inbound_mail_claiming_an_aster_sender_is_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let keys = [inbound_candidate(&recipient)];
+        let cases = [
+            ("in-aster", serde_json::json!({"from": "Bob <bob@astermail.org>", "body_text": "b"}), true),
+            ("in-aster-obj", serde_json::json!({"from": {"name": "Bob", "email": "BOB@aster.cx"}, "body_text": "b"}), true),
+            ("in-outside", serde_json::json!({"from": "carol@example.com", "body_text": "b"}), false),
+        ];
+        for (id, json, expected) in cases {
+            let item = inbound_item(id, &json, &recipient);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
+            assert_eq!(crate::message_render::sender_unverified(&cached_meta(&db, id)), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn inbound_mail_carrying_a_ratchet_body_is_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let keys = [inbound_candidate(&recipient)];
+        let json = serde_json::json!({
+            "from": "carol@example.com",
+            "body_text": serde_json::json!({"type": "double_ratchet_v2", "recipients": {}}).to_string(),
+        });
+        let item = inbound_item("in-ratchet", &json, &recipient);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
+        assert!(crate::message_render::sender_unverified(&cached_meta(&db, "in-ratchet")));
+    }
+
+    #[test]
+    fn sealed_mail_from_an_aster_sender_is_not_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"from": "bob@astermail.org", "body_text": "b"});
+        let item = item_with_envelope("sealed-aster", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+        assert!(!crate::message_render::sender_unverified(&cached_meta(&db, "sealed-aster")));
     }
 
     #[test]

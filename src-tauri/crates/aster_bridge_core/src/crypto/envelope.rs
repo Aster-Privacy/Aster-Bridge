@@ -65,6 +65,25 @@ pub fn decrypt_envelope_with_previous_keys(
     previous_keys: &[String],
     inbound_keys: &[InboundKeyCandidate],
 ) -> Result<String> {
+    decrypt_envelope_noting_inbound(
+        encrypted_data_b64,
+        nonce_b64,
+        passphrase,
+        identity_key,
+        previous_keys,
+        inbound_keys,
+    )
+    .map(|(plaintext, _)| plaintext)
+}
+
+pub fn decrypt_envelope_noting_inbound(
+    encrypted_data_b64: &str,
+    nonce_b64: Option<&str>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[InboundKeyCandidate],
+) -> Result<(String, bool)> {
     let nonce_bytes = match nonce_b64 {
         Some(n) if !n.is_empty() => STANDARD
             .decode(n)
@@ -73,11 +92,12 @@ pub fn decrypt_envelope_with_previous_keys(
     };
 
     if nonce_bytes.is_empty() {
-        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase);
+        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase)
+            .map(|plaintext| (plaintext, false));
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
-        return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase);
+        return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase).map(|plaintext| (plaintext, false));
     }
 
     if nonce_bytes.len() == NONCE_LEN && !inbound_keys.is_empty() {
@@ -87,7 +107,7 @@ pub fn decrypt_envelope_with_previous_keys(
                 Some(&INBOUND_ECDH_MARKER) | Some(&INBOUND_PQ_HYBRID_MARKER)
             ) {
                 if let Ok(result) = decrypt_inbound_envelope(&data, &nonce_bytes, inbound_keys) {
-                    return Ok(result);
+                    return Ok((result, true));
                 }
             }
         }
@@ -98,11 +118,11 @@ pub fn decrypt_envelope_with_previous_keys(
         .chain(previous_keys.iter().map(String::as_str))
     {
         if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, &nonce_bytes, ik) {
-            return Ok(result);
+            return Ok((result, false));
         }
     }
 
-    decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
+    decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase).map(|plaintext| (plaintext, false))
 }
 
 pub(crate) fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Result<String> {
