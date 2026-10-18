@@ -138,8 +138,13 @@ jobs:
           APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY != '' && format('~/private_keys/AuthKey_{0}.p8', secrets.APPLE_API_KEY) || '' }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ARGS: ${{ matrix.args }}
+          LEG: ${{ matrix.leg }}
         shell: bash
         run: |
+          set -euo pipefail
+          if [ "$LEG" = "win" ]; then
+            source scripts/use_msvc_toolchain.sh
+          fi
           TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/throwaway_updater.key")"
           export TAURI_SIGNING_PRIVATE_KEY
           npm run tauri build -- $ARGS
@@ -311,28 +316,7 @@ jobs:
           set -euo pipefail
           cd src-tauri
           if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
-            if [ -z "${VCToolsInstallDir:-}" ]; then
-              echo "::error::the MSVC environment is not set up, so rustc would link with the wrong link.exe"
-              exit 1
-            fi
-            VC_BIN="$(cygpath -u "$VCToolsInstallDir")"
-            VC_BIN="${VC_BIN%/}/bin/Hostx64/x64"
-            if [ ! -x "$VC_BIN/link.exe" ]; then
-              echo "::error::no MSVC linker at $VC_BIN"
-              exit 1
-            fi
-            export PATH="$VC_BIN:$PATH"
-            if [ ! -x "/c/Strawberry/perl/bin/perl.exe" ]; then
-              echo "::error::Strawberry Perl is missing, so the vendored OpenSSL build would run the wrong perl"
-              exit 1
-            fi
-            export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
-            export PATH="/c/Strawberry/perl/bin:$PATH"
-            LINKER="$(command -v link)"
-            case "$LINKER" in
-              *MSVC*) ;;
-              *) echo "::error::link resolves to $LINKER instead of the MSVC linker"; exit 1 ;;
-            esac
+            source ../scripts/use_msvc_toolchain.sh
           fi
           case "$TARGET" in
             universal-apple-darwin)
