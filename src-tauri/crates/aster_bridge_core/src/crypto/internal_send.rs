@@ -25,12 +25,15 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, PrekeyBundle, RecipientKeyLookup};
 use crate::auth::session::Session;
 use zeroize::Zeroizing;
 
 use crate::crypto::ratchet::{encrypt_bootstrap_versioned, RatchetMessage};
-use crate::crypto::recipient_trust::{evaluate_recipient, pin_id, RatchetTarget, SendRoute};
+use crate::crypto::recipient_trust::{
+    evaluate_recipient, pin_id, verify_bundle, BundleVerdict, RatchetTarget, RecipientPin,
+    SendRoute,
+};
 use crate::db::Database;
 use crate::error::{BridgeError, Result};
 
@@ -44,6 +47,7 @@ const INTERNAL_DOMAINS: [&str; 6] = [
 ];
 
 const GHOST_DOMAIN: &str = "realiased.me";
+const LOOKUP_USERNAME_MAX: usize = 64;
 
 const ASTER_SYSTEM_ADDRESSES: [&str; 8] = [
     "noreply@astermail.org",
@@ -105,13 +109,67 @@ fn listed_in(payload: &Value, fields: &[&str], address: &str) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedClass {
+    Hosted,
+    AsterRouted,
+    External,
+}
+
+pub fn classify_hosted(
+    lookup: Option<&RecipientKeyLookup>,
+    bundle_verified: bool,
+    pin: Option<&RecipientPin>,
+) -> HostedClass {
+    if lookup.is_some_and(|lookup| lookup.internal) || pin.is_some_and(|pin| pin.hosted) {
+        return HostedClass::Hosted;
+    }
+    if pin.is_some() || bundle_verified {
+        return HostedClass::AsterRouted;
+    }
+    HostedClass::External
+}
+
+#[derive(Debug, Default)]
+pub struct HostedRecipients {
+    pub hosted: Vec<String>,
+    pub routed_like_external: Vec<String>,
+}
+
+impl HostedRecipients {
+    fn contains(&self, address: &str) -> bool {
+        self.hosted
+            .iter()
+            .chain(self.routed_like_external.iter())
+            .any(|listed| listed.eq_ignore_ascii_case(address.trim()))
+    }
+
+    fn routed_like_external(&self, address: &str) -> bool {
+        self.routed_like_external
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(address.trim()))
+    }
+
+    fn all(&self) -> Vec<String> {
+        self.hosted
+            .iter()
+            .chain(self.routed_like_external.iter())
+            .cloned()
+            .collect()
+    }
+}
+
 pub fn split_recipients(payload: &Value) -> RecipientSplit {
+    split_recipients_with(payload, &HostedRecipients::default())
+}
+
+pub fn split_recipients_with(payload: &Value, hosted: &HostedRecipients) -> RecipientSplit {
     let all = payload_recipients(payload);
-    let has_external = all.iter().any(|address| !is_internal_address(address));
-    let internal: Vec<String> = all
-        .into_iter()
-        .filter(|address| is_internal_address(address))
-        .collect();
+    let is_aster = |address: &str| is_internal_address(address) || hosted.contains(address);
+    let has_external = all
+        .iter()
+        .any(|address| !is_aster(address) || hosted.routed_like_external(address));
+    let internal: Vec<String> = all.into_iter().filter(|address| is_aster(address)).collect();
     let hidden = internal
         .iter()
         .filter(|address| {
@@ -138,14 +196,37 @@ pub fn apply_hidden_bodies(payload: &mut Value, hidden_bodies: Vec<(String, Stri
 }
 
 pub fn key_lookup_username(address: &str, own_username: &str) -> Option<String> {
-    let (local, domain) = address.trim().split_once('@')?;
+    let (local, domain) = address.trim().rsplit_once('@')?;
     if domain.eq_ignore_ascii_case(GHOST_DOMAIN) && !own_username.is_empty() {
         return Some(own_username.to_string());
     }
+    let local = local.split('+').next().unwrap_or_default();
     if local.is_empty() {
         return None;
     }
     Some(local.to_string())
+}
+
+fn hosted_lookup_username(address: &str) -> Option<String> {
+    let (local, domain) = address.trim().rsplit_once('@')?;
+    if domain.is_empty() || !domain.contains('.') {
+        return None;
+    }
+    let local = local.split('+').next().unwrap_or_default();
+    let shaped = !local.is_empty()
+        && local.len() <= LOOKUP_USERNAME_MAX
+        && local
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    shaped.then(|| local.to_string())
+}
+
+pub fn apply_hosted_recipients(payload: &mut Value, hosted: &HostedRecipients) {
+    let listed = hosted.all();
+    if listed.is_empty() {
+        return;
+    }
+    payload["hosted_recipients"] = json!(listed);
 }
 
 pub fn recipient_entry(message: &RatchetMessage) -> Value {
@@ -362,6 +443,121 @@ fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()
     }
 }
 
+fn enforce_routed_like_external(hosted: &HostedRecipients, required: bool) -> Result<()> {
+    match hosted.routed_like_external.first() {
+        Some(address) if required => Err(BridgeError::RecipientKey(format!(
+            "{} uses Aster, but Aster delivers mail to this address the same way as mail to an address outside Aster, so its contents cannot have post-quantum protection, and Aster Bridge is set to require it, so the message was not sent. To send it anyway, turn off Require post-quantum protection for Aster recipients in the Aster Bridge settings.",
+            address
+        ))),
+        _ => Ok(()),
+    }
+}
+
+struct KnownKeys {
+    address: String,
+    bundle: Option<PrekeyBundle>,
+    owner_public_key: Option<String>,
+}
+
+struct HostedLookup {
+    hosted: HostedRecipients,
+    known: Vec<KnownKeys>,
+}
+
+impl HostedLookup {
+    fn take(&mut self, address: &str) -> Option<KnownKeys> {
+        let index = self
+            .known
+            .iter()
+            .position(|known| known.address.eq_ignore_ascii_case(address))?;
+        Some(self.known.swap_remove(index))
+    }
+}
+
+fn is_own_address(session: &Session, address: &str) -> bool {
+    let address = address.trim();
+    session.email.trim().eq_ignore_ascii_case(address)
+        || session
+            .send_identities
+            .iter()
+            .any(|identity| identity.address.trim().eq_ignore_ascii_case(address))
+}
+
+async fn lookup_hosted_recipients(
+    payload: &Value,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    db: &Database,
+    access_token: &str,
+) -> Result<HostedLookup> {
+    let candidates: Vec<String> = {
+        let guard = session.read().await;
+        payload_recipients(payload)
+            .into_iter()
+            .filter(|address| !is_internal_address(address) && !is_own_address(&guard, address))
+            .collect()
+    };
+    let account_id = session.read().await.user_id.to_string();
+    let mut lookup = HostedLookup {
+        hosted: HostedRecipients::default(),
+        known: Vec::new(),
+    };
+    for address in candidates {
+        let Some(username) = hosted_lookup_username(&address) else {
+            continue;
+        };
+        let pin = db.recipient_pin_get(&pin_id(&account_id, &address)).map_err(|_| {
+            BridgeError::RecipientKey(format!(
+                "The saved key record for {} could not be read, so the message was not sent.",
+                address
+            ))
+        })?;
+        let fetched = fetch_hosted_keys(client, access_token, &username, &address).await;
+        let (key_lookup, bundle) = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) if pin.is_some() => return Err(error),
+            Err(_) => continue,
+        };
+        let owner_public_key = key_lookup.as_ref().and_then(|lookup| lookup.public_key.clone());
+        let bundle_verified = matches!(
+            (bundle.as_ref(), owner_public_key.as_deref()),
+            (Some(bundle), Some(owner)) if matches!(
+                verify_bundle(bundle, Some(owner)),
+                BundleVerdict::Verified { .. }
+            )
+        );
+        match classify_hosted(key_lookup.as_ref(), bundle_verified, pin.as_ref()) {
+            HostedClass::Hosted => lookup.hosted.hosted.push(address.clone()),
+            HostedClass::AsterRouted => lookup.hosted.routed_like_external.push(address.clone()),
+            HostedClass::External => continue,
+        }
+        lookup.known.push(KnownKeys {
+            address,
+            bundle,
+            owner_public_key,
+        });
+    }
+    Ok(lookup)
+}
+
+async fn fetch_hosted_keys(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+) -> Result<(Option<RecipientKeyLookup>, Option<PrekeyBundle>)> {
+    let key_lookup = client
+        .lookup_recipient_key(access_token, username, address)
+        .await?;
+    if key_lookup.as_ref().and_then(|lookup| lookup.public_key.as_ref()).is_none() {
+        return Ok((key_lookup, None));
+    }
+    let bundle = client
+        .find_prekey_bundle(access_token, username, address)
+        .await?;
+    Ok((key_lookup, bundle))
+}
+
 fn enforce_private_body(has_external: bool, required: bool) -> Result<()> {
     if required && has_external {
         return Err(BridgeError::RecipientKey(
@@ -378,11 +574,31 @@ pub async fn seal_internal_body(
     db: &Database,
     access_token: &str,
 ) -> Result<()> {
-    let split = split_recipients(payload);
+    let require_post_quantum = crate::config::require_post_quantum();
+    seal_internal_body_with(payload, session, client, db, access_token, require_post_quantum).await
+}
+
+async fn seal_internal_body_with(
+    payload: &mut Value,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    db: &Database,
+    access_token: &str,
+    require_post_quantum: bool,
+) -> Result<()> {
+    let mut lookup = lookup_hosted_recipients(payload, session, client, db, access_token).await?;
+    let split = split_recipients_with(payload, &lookup.hosted);
     if split.internal.is_empty() {
         return Ok(());
     }
-    let require_post_quantum = crate::config::require_post_quantum();
+    let only_routed_like_external = split
+        .internal
+        .iter()
+        .all(|address| lookup.hosted.routed_like_external(address));
+    if only_routed_like_external && session.read().await.ratchet_keys.is_empty() {
+        return Ok(());
+    }
+    enforce_routed_like_external(&lookup.hosted, require_post_quantum)?;
     enforce_private_body(split.has_external, require_post_quantum)?;
 
     let plaintext = sealed_plaintext(payload);
@@ -392,15 +608,22 @@ pub async fn seal_internal_body(
     let mut pending_pins = Vec::new();
 
     for address in &split.internal {
-        let username = key_lookup_username(address, &sender.username).ok_or_else(|| {
-            BridgeError::Crypto("recipient address has no username to look up".to_string())
-        })?;
-        let bundle = client
-            .find_prekey_bundle(access_token, &username, address)
-            .await?;
-        let owner_public_key = client
-            .get_recipient_public_key(access_token, &username, address)
-            .await?;
+        let is_hosted = lookup.hosted.contains(address);
+        let (bundle, owner_public_key) = match lookup.take(address) {
+            Some(known) => (known.bundle, known.owner_public_key),
+            None => {
+                let username = key_lookup_username(address, &sender.username).ok_or_else(|| {
+                    BridgeError::Crypto("recipient address has no username to look up".to_string())
+                })?;
+                let bundle = client
+                    .find_prekey_bundle(access_token, &username, address)
+                    .await?;
+                let owner_public_key = client
+                    .get_recipient_public_key(access_token, &username, address)
+                    .await?;
+                (bundle, owner_public_key)
+            }
+        };
         let pin_key = pin_id(&sender.account_id, address);
         let existing = db.recipient_pin_get(&pin_key).map_err(|_| {
             BridgeError::RecipientKey(format!(
@@ -423,7 +646,8 @@ pub async fn seal_internal_body(
                 return Err(error);
             }
         };
-        if let Some(pin) = evaluation.pin {
+        let hosted_now = is_hosted && !lookup.hosted.routed_like_external(address);
+        if let Some(pin) = pin_to_save(evaluation.pin, existing.as_ref(), hosted_now) {
             pending_pins.push((pin_key, pin));
         }
         routed.push(RoutedRecipient {
@@ -458,7 +682,27 @@ pub async fn seal_internal_body(
     }
     apply_envelope(payload, envelope, split.has_external);
     apply_hidden_bodies(payload, hidden_bodies);
+    apply_hosted_recipients(payload, &lookup.hosted);
     Ok(())
+}
+
+fn pin_to_save(
+    evaluated: Option<RecipientPin>,
+    existing: Option<&RecipientPin>,
+    hosted: bool,
+) -> Option<RecipientPin> {
+    match evaluated {
+        Some(pin) => Some(RecipientPin {
+            hosted: pin.hosted || hosted,
+            ..pin
+        }),
+        None => existing
+            .filter(|pin| hosted && !pin.hosted)
+            .map(|pin| RecipientPin {
+                hosted: true,
+                ..pin.clone()
+            }),
+    }
 }
 
 fn seal_attachment_metas(
@@ -1414,5 +1658,300 @@ mod tests {
             seal_routed(&keys, &[routed("user@astermail.org", None, &account)], "x"),
             Err(BridgeError::Crypto(_))
         ));
+    }
+
+    fn lookup(public_key: Option<&str>, internal: bool) -> RecipientKeyLookup {
+        RecipientKeyLookup {
+            public_key: public_key.map(str::to_string),
+            internal,
+        }
+    }
+
+    #[test]
+    fn hosted_recipients_are_classified_from_the_flag_the_pin_and_a_verified_bundle() {
+        let hosted_pin = RecipientPin {
+            hosted: true,
+            ..RecipientPin::default()
+        };
+        let plain_pin = RecipientPin::default();
+        let flagged = lookup(Some("key"), true);
+        let unflagged = lookup(Some("key"), false);
+
+        assert_eq!(classify_hosted(Some(&flagged), false, None), HostedClass::Hosted);
+        assert_eq!(classify_hosted(Some(&unflagged), false, Some(&hosted_pin)), HostedClass::Hosted);
+        assert_eq!(classify_hosted(None, false, Some(&hosted_pin)), HostedClass::Hosted);
+        assert_eq!(classify_hosted(Some(&unflagged), true, None), HostedClass::AsterRouted);
+        assert_eq!(classify_hosted(None, false, Some(&plain_pin)), HostedClass::AsterRouted);
+        assert_eq!(classify_hosted(Some(&unflagged), false, None), HostedClass::External);
+        assert_eq!(classify_hosted(None, false, None), HostedClass::External);
+    }
+
+    #[test]
+    fn hosted_lookups_use_the_web_username_shape() {
+        assert_eq!(hosted_lookup_username("bob@custom.example").as_deref(), Some("bob"));
+        assert_eq!(hosted_lookup_username("bob+news@custom.example").as_deref(), Some("bob"));
+        assert_eq!(hosted_lookup_username("b.o_b-1@custom.example").as_deref(), Some("b.o_b-1"));
+        assert_eq!(hosted_lookup_username("bob@localhost"), None);
+        assert_eq!(hosted_lookup_username("bo b@custom.example"), None);
+        assert_eq!(hosted_lookup_username("+tag@custom.example"), None);
+        assert_eq!(hosted_lookup_username(&format!("{}@custom.example", "a".repeat(65))), None);
+        assert_eq!(
+            key_lookup_username("bob+news@astermail.org", "alice").as_deref(),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn hosted_recipients_join_the_sealed_copy_and_routed_ones_keep_a_readable_body() {
+        let payload = payload_with(vec!["bob@custom.example", "carol@alias.example"]);
+        let hosted = HostedRecipients {
+            hosted: vec!["bob@custom.example".to_string()],
+            routed_like_external: Vec::new(),
+        };
+        let split = split_recipients_with(&payload, &hosted);
+        assert_eq!(split.internal, vec!["bob@custom.example".to_string()]);
+        assert!(split.has_external);
+
+        let only_hosted = payload_with(vec!["bob@custom.example", "a@astermail.org"]);
+        let split = split_recipients_with(&only_hosted, &hosted);
+        assert_eq!(split.internal.len(), 2);
+        assert!(!split.has_external);
+
+        let routed = HostedRecipients {
+            hosted: Vec::new(),
+            routed_like_external: vec!["carol@alias.example".to_string()],
+        };
+        let only_routed = payload_with(vec!["carol@alias.example"]);
+        let split = split_recipients_with(&only_routed, &routed);
+        assert_eq!(split.internal, vec!["carol@alias.example".to_string()]);
+        assert!(split.has_external);
+
+        let mut listed = payload_with(vec!["bob@custom.example"]);
+        apply_hosted_recipients(&mut listed, &HostedRecipients::default());
+        assert!(listed.get("hosted_recipients").is_none());
+        apply_hosted_recipients(&mut listed, &hosted);
+        assert_eq!(listed["hosted_recipients"], json!(["bob@custom.example"]));
+    }
+
+    #[test]
+    fn requiring_post_quantum_refuses_an_aster_address_routed_like_an_outside_one() {
+        let routed = HostedRecipients {
+            hosted: Vec::new(),
+            routed_like_external: vec!["carol@alias.example".to_string()],
+        };
+        assert!(enforce_routed_like_external(&routed, false).is_ok());
+        assert!(enforce_routed_like_external(&HostedRecipients::default(), true).is_ok());
+        match enforce_routed_like_external(&routed, true) {
+            Err(BridgeError::RecipientKey(message)) => {
+                assert!(message.starts_with("carol@alias.example uses Aster"));
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn a_hosted_pin_is_saved_once_and_never_cleared() {
+        let existing = RecipientPin {
+            owner_fingerprint: "aa".to_string(),
+            ..RecipientPin::default()
+        };
+        let saved = pin_to_save(None, Some(&existing), true).expect("marked hosted");
+        assert!(saved.hosted);
+        assert_eq!(saved.owner_fingerprint, "aa");
+        assert!(pin_to_save(None, Some(&saved), true).is_none());
+        assert!(pin_to_save(None, Some(&existing), false).is_none());
+        let evaluated = RecipientPin {
+            hosted: true,
+            ..RecipientPin::default()
+        };
+        assert!(pin_to_save(Some(evaluated), None, false).unwrap().hosted);
+        assert!(!pin_to_save(Some(RecipientPin::default()), None, false).unwrap().hosted);
+    }
+
+    struct FakeDirectory {
+        keys: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+        bundles: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    }
+
+    impl FakeDirectory {
+        fn set_key(&self, address: &str, value: Option<Value>) {
+            let mut keys = self.keys.lock().unwrap();
+            match value {
+                Some(value) => keys.insert(address.to_string(), value),
+                None => keys.remove(address),
+            };
+        }
+
+        fn set_bundle(&self, address: &str, value: Option<Value>) {
+            let mut bundles = self.bundles.lock().unwrap();
+            match value {
+                Some(value) => bundles.insert(address.to_string(), value),
+                None => bundles.remove(address),
+            };
+        }
+    }
+
+    async fn start_directory() -> (String, Arc<FakeDirectory>) {
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::collections::HashMap;
+
+        let directory = Arc::new(FakeDirectory {
+            keys: std::sync::Mutex::new(HashMap::new()),
+            bundles: std::sync::Mutex::new(HashMap::new()),
+        });
+        let (keys, bundles) = (directory.clone(), directory.clone());
+        let found = |value: Option<Value>| match value {
+            Some(value) => axum::Json(value).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/crypto/v1/keys/public/:username",
+                axum::routing::get(move |Query(query): Query<HashMap<String, String>>| {
+                    let keys = keys.clone();
+                    async move {
+                        let email = query.get("email").cloned().unwrap_or_default();
+                        let value = keys.keys.lock().unwrap().get(&email).cloned();
+                        found(value)
+                    }
+                }),
+            )
+            .route(
+                "/crypto/v1/ratchet/prekey-bundle/:username",
+                axum::routing::get(move |Query(query): Query<HashMap<String, String>>| {
+                    let bundles = bundles.clone();
+                    async move {
+                        let email = query.get("email").cloned().unwrap_or_default();
+                        let value = bundles.bundles.lock().unwrap().get(&email).cloned();
+                        found(value)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), directory)
+    }
+
+    fn bundle_json(bundle: &crate::api_client::PrekeyBundle) -> Value {
+        json!({
+            "kem_identity_key": bundle.kem_identity_key,
+            "signed_prekey": bundle.signed_prekey,
+            "signed_prekey_signature": bundle.signed_prekey_signature,
+            "pq_kem_public_key": bundle.pq_kem_public_key,
+            "x3dh_max_version": bundle.x3dh_max_version,
+        })
+    }
+
+    fn sending_session(account: &crate::crypto::recipient_trust::tests::Owner) -> Arc<RwLock<Session>> {
+        let prekey = SecretKey::random(&mut OsRng);
+        Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: uuid::Uuid::new_v4(),
+            username: "sender".to_string(),
+            email: "sender@astermail.org".to_string(),
+            access_token: Zeroizing::new("token".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: Some(account.keypair.to_armored().unwrap()),
+            ratchet_identity_public: None,
+            ratchet_keys: vec![crate::crypto::ratchet::RatchetReceiverKeys {
+                identity_secret_d: SecretKey::random(&mut OsRng).to_bytes().to_vec(),
+                signed_prekey_secret_d: prekey.to_bytes().to_vec(),
+                signed_prekey_public: prekey.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            }],
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn custom_domain_aster_recipients_are_sealed_and_cannot_be_quietly_moved_outside() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let sender_account = owner("sender");
+        let session = sending_session(&sender_account);
+
+        let bob = owner("bob");
+        let mut bob_keys = recipient();
+        sign_v2(&mut bob_keys.bundle, &bob);
+        directory.set_key("bob@custom.example", Some(json!({"public_key": bob.public_key, "internal": true})));
+        directory.set_bundle("bob@custom.example", Some(bundle_json(&bob_keys.bundle)));
+
+        let carol = owner("carol");
+        let mut carol_keys = recipient();
+        sign_v2(&mut carol_keys.bundle, &carol);
+        directory.set_key("carol@alias.example", Some(json!({"public_key": carol.public_key, "internal": false})));
+        directory.set_bundle("carol@alias.example", Some(bundle_json(&carol_keys.bundle)));
+
+        directory.set_key("dave@mismatch.example", Some(json!({"public_key": carol.public_key, "internal": false})));
+        directory.set_bundle("dave@mismatch.example", Some(bundle_json(&bob_keys.bundle)));
+
+        let seal = |to: Vec<&str>| {
+            let mut payload = payload_with(to);
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                seal_internal_body_with(&mut payload, session, client, db, "token", false)
+                    .await
+                    .map(|_| payload)
+            }
+        };
+
+        let untouched = payload_with(vec!["stranger@example.com", "dave@mismatch.example"]);
+        assert_eq!(seal(vec!["stranger@example.com", "dave@mismatch.example"]).await.unwrap(), untouched);
+
+        let sealed = seal(vec!["bob@custom.example"]).await.unwrap();
+        assert_eq!(sealed["is_e2e_encrypted"], json!(true));
+        assert!(sealed["body"].as_str().unwrap().contains("double_ratchet_v2"));
+        assert!(sealed["body"].as_str().unwrap().contains("bob@custom.example"));
+        assert!(sealed.get("body_html").is_none());
+        assert_eq!(sealed["hosted_recipients"], json!(["bob@custom.example"]));
+
+        let mixed = seal(vec!["bob@custom.example", "stranger@example.com"]).await.unwrap();
+        assert_eq!(mixed["is_e2e_encrypted"], json!(false));
+        assert_eq!(mixed["body"], json!("<p>hello</p>"));
+        assert!(mixed["internal_encrypted_body"].as_str().unwrap().contains("bob@custom.example"));
+        assert_eq!(mixed["hosted_recipients"], json!(["bob@custom.example"]));
+
+        let routed = seal(vec!["carol@alias.example"]).await.unwrap();
+        assert_eq!(routed["is_e2e_encrypted"], json!(false));
+        assert!(routed["internal_encrypted_body"].as_str().unwrap().contains("carol@alias.example"));
+        assert_eq!(routed["hosted_recipients"], json!(["carol@alias.example"]));
+        let mut strict = payload_with(vec!["carol@alias.example"]);
+        assert!(matches!(
+            seal_internal_body_with(&mut strict, &session, &client, &db, "token", true).await,
+            Err(BridgeError::RecipientKey(_))
+        ));
+
+        directory.set_key("bob@custom.example", Some(json!({"public_key": bob.public_key, "internal": false})));
+        let flipped = seal(vec!["bob@custom.example"]).await.unwrap();
+        assert_eq!(flipped["is_e2e_encrypted"], json!(true), "a pinned hosted recipient stays sealed");
+        assert_eq!(flipped["hosted_recipients"], json!(["bob@custom.example"]));
+
+        directory.set_key("bob@custom.example", None);
+        directory.set_bundle("bob@custom.example", None);
+        assert!(
+            matches!(seal(vec!["bob@custom.example"]).await, Err(BridgeError::RecipientKey(_))),
+            "a pinned recipient whose keys vanish is refused instead of sent readable"
+        );
+
+        directory.set_key("carol@alias.example", Some(json!({"public_key": carol.public_key, "internal": false})));
+        directory.set_bundle("carol@alias.example", None);
+        assert!(
+            seal(vec!["carol@alias.example"]).await.is_err(),
+            "a pinned recipient that drops its post-quantum bundle is refused"
+        );
     }
 }

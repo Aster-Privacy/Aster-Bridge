@@ -206,6 +206,14 @@ pub struct PrekeyBundle {
 #[derive(Debug, Deserialize)]
 pub struct RecipientPublicKey {
     pub public_key: String,
+    #[serde(default)]
+    pub internal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientKeyLookup {
+    pub public_key: Option<String>,
+    pub internal: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1035,6 +1043,18 @@ impl ApiClient {
         username: &str,
         email: &str,
     ) -> Result<Option<String>> {
+        Ok(self
+            .lookup_recipient_key(access_token, username, email)
+            .await?
+            .and_then(|lookup| lookup.public_key))
+    }
+
+    pub async fn lookup_recipient_key(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Option<RecipientKeyLookup>> {
         let resp = self.client
             .get(format!("{}/crypto/v1/keys/public/{}", self.base_url, username))
             .query(&[("email", email)])
@@ -1051,7 +1071,10 @@ impl ApiClient {
 
         let body: RecipientPublicKey = resp.json().await.map_err(BridgeError::from)?;
         let key = body.public_key.trim().to_string();
-        Ok(if key.is_empty() { None } else { Some(key) })
+        Ok(Some(RecipientKeyLookup {
+            public_key: if key.is_empty() { None } else { Some(key) },
+            internal: body.internal,
+        }))
     }
 
     pub async fn report_envelope_capability(

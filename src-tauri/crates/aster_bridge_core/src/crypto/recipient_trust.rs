@@ -64,6 +64,7 @@ pub struct RecipientPin {
     pub transcript_bound: bool,
     pub binding_epoch: i64,
     pub binding_fingerprint: String,
+    pub hosted: bool,
     pub flagged: bool,
 }
 
@@ -533,6 +534,7 @@ pub fn evaluate_recipient(
             transcript_bound: target.transcript_bound,
             binding_epoch,
             binding_fingerprint,
+            hosted: base.hosted,
             flagged: false,
         };
         return Evaluation {
