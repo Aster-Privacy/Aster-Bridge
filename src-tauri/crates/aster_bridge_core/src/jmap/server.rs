@@ -132,12 +132,13 @@ fn build_app(
 
     let ctx = JmapContext::new(session, db, client, broadcaster);
 
+    let shutdown = crate::shutdown::current();
     let state = AppState {
         ctx,
         auth,
         bind_port,
         use_https,
-        shutdown: crate::shutdown::current(),
+        shutdown: shutdown.clone(),
     };
 
     Router::new()
@@ -159,6 +160,7 @@ fn build_app(
         .route("/jmap/ws", get(super::ws::ws_upgrade))
         .layer(middleware::from_fn(move |req, next| host_guard(req, next, bind_port, use_https)))
         .layer(middleware::from_fn(loopback_only))
+        .layer(middleware::from_fn_with_state(shutdown, crate::shutdown::hold_request))
         .with_state(state)
 }
 
@@ -1205,6 +1207,32 @@ mod e2e_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(released, "the closed socket kept its state subscription");
+    }
+
+    #[tokio::test]
+    async fn sign_out_waits_for_an_open_websocket_to_finish() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let (base, auth, _dir, _passwords, _id, tx, task) = start_server_scoped(shutdown).await;
+        let idle = tx.receiver_count();
+        let ws_url = base.replacen("http://", "ws://", 1) + "/jmap/ws";
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut().insert("authorization", auth.parse().unwrap());
+        req.headers_mut().insert("sec-websocket-protocol", "jmap".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let enable = json!({"@type": "WebSocketPushEnable", "dataTypes": ["Email","Mailbox"]});
+        ws.send(Message::Text(enable.to_string())).await.unwrap();
+        let _ = ws.next().await.unwrap().unwrap();
+        assert!(tx.receiver_count() > idle);
+
+        tokio::time::timeout(Duration::from_secs(5), trigger.close_and_wait())
+            .await
+            .expect("sign-out never finished waiting for the WebSocket");
+        assert_eq!(tx.receiver_count(), idle, "the WebSocket was still running when sign-out finished waiting");
+        task.abort();
     }
 
     #[tokio::test]

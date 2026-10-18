@@ -229,6 +229,7 @@ impl AppPasswords {
         }
         let db = self.db.clone();
         let pw = password.to_string();
+        let _held = crate::shutdown::current().hold()?;
         let (id, hash) = tokio::task::spawn_blocking(move || AppPasswords { db }.verify_match(&pw))
             .await
             .ok()

@@ -46,6 +46,10 @@ impl ShutdownTrigger {
         self.close_connections();
         drop(self.work.write().await);
     }
+
+    pub fn is_idle(&self) -> bool {
+        self.work.try_write().is_ok()
+    }
 }
 
 impl ConnectionShutdown {
@@ -118,6 +122,30 @@ where
         })
         .await,
     )
+}
+
+pub async fn hold_request(
+    axum::extract::State(shutdown): axum::extract::State<ConnectionShutdown>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(_held) = shutdown.hold() else {
+        return shutting_down();
+    };
+    match shutdown.clone().scope(until_closed(shutdown, next.run(req))).await {
+        Some(response) => response,
+        None => shutting_down(),
+    }
+}
+
+fn shutting_down() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONNECTION, "close")],
+        "Aster Bridge is stopping. Try again after it restarts.",
+    )
+        .into_response()
 }
 
 pub async fn until_closed<F: Future>(shutdown: ConnectionShutdown, fut: F) -> Option<F::Output> {
@@ -267,5 +295,114 @@ mod tests {
         drop(trigger);
         let out = tokio::time::timeout(Duration::from_millis(50), shutdown.closed()).await;
         assert!(out.is_err());
+    }
+
+    async fn serve_router(shutdown: ConnectionShutdown, app: axum::Router) -> String {
+        let app = app.layer(axum::middleware::from_fn_with_state(shutdown, hold_request));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn close_and_wait_waits_for_a_request_that_is_writing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (trigger, shutdown) = channel();
+        let wrote = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let writer = wrote.clone();
+        let app = axum::Router::new().route(
+            "/write",
+            axum::routing::post(move || {
+                let writer = writer.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    spawn_blocking_held(move || {
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
+                        writer.store(true, Ordering::SeqCst);
+                    })
+                    .await;
+                    "done"
+                }
+            }),
+        );
+        let base = serve_router(shutdown, app).await;
+        let request = tokio::spawn(async move { reqwest::Client::new().post(format!("{}/write", base)).send().await });
+        started_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), trigger.close_and_wait()).await.unwrap();
+        assert!(wrote.load(Ordering::SeqCst));
+        let _ = request.await;
+    }
+
+    #[tokio::test]
+    async fn a_request_that_is_waiting_is_cancelled_by_close_and_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (trigger, shutdown) = channel();
+        let reached = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let seen = reached.clone();
+        let app = axum::Router::new().route(
+            "/wait",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    if let Some(tx) = started_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    seen.store(true, Ordering::SeqCst);
+                    "late"
+                }
+            }),
+        );
+        let base = serve_router(shutdown, app).await;
+        let request = tokio::spawn(async move { reqwest::get(format!("{}/wait", base)).await });
+        started_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), trigger.close_and_wait()).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_request_after_the_close_is_refused_without_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (trigger, shutdown) = channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = ran.clone();
+        let app = axum::Router::new().route(
+            "/write",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.store(true, Ordering::SeqCst);
+                    "ran"
+                }
+            }),
+        );
+        let base = serve_router(shutdown, app).await;
+        trigger.close_and_wait().await;
+        let response = reqwest::Client::new().post(format!("{}/write", base)).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_trigger_is_idle_only_when_no_work_is_held() {
+        let (trigger, shutdown) = channel();
+        assert!(trigger.is_idle());
+        let guard = shutdown.hold().unwrap();
+        assert!(!trigger.is_idle());
+        drop(guard);
+        assert!(trigger.is_idle());
     }
 }

@@ -153,6 +153,10 @@ pub fn build_app(
             request_guard(req, next, bind_port, use_https)
         }))
         .layer(middleware::from_fn(loopback_only))
+        .layer(middleware::from_fn_with_state(
+            crate::shutdown::current(),
+            crate::shutdown::hold_request,
+        ))
         .with_state(state)
 }
 

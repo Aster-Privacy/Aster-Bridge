@@ -641,16 +641,62 @@ fn import_job_idle_for() -> Option<u64> {
     guard.map(|at| at.elapsed().as_secs())
 }
 
-fn spawn_import_job_closer(client: Arc<ApiClient>, session: Arc<RwLock<Session>>) {
+struct ImportCloserSlot {
+    flag: &'static std::sync::atomic::AtomicBool,
+    base_url: String,
+    finished: bool,
+}
+
+impl Drop for ImportCloserSlot {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Ok(mut jobs) = import_job_slot().try_lock() {
+                jobs.remove(&self.base_url);
+            }
+            finish_import_progress();
+        }
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn spawn_closer<F>(flag: &'static std::sync::atomic::AtomicBool, base_url: String, run: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     use std::sync::atomic::Ordering;
-    if IMPORT_JOB_CLOSER
+    if flag
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return;
+        return false;
     }
-
+    let slot = ImportCloserSlot {
+        flag,
+        base_url,
+        finished: false,
+    };
+    let shutdown = crate::shutdown::current();
+    let Some(held) = shutdown.hold() else {
+        drop(slot);
+        return true;
+    };
     tokio::spawn(async move {
+        let _held = held;
+        let mut slot = slot;
+        let finished = shutdown.clone().scope(crate::shutdown::until_closed(shutdown, run)).await.is_some();
+        if !finished {
+            import_job_slot().lock().await.remove(&slot.base_url);
+            finish_import_progress();
+        }
+        slot.finished = true;
+        drop(slot);
+    });
+    true
+}
+
+fn spawn_import_job_closer(client: Arc<ApiClient>, session: Arc<RwLock<Session>>) {
+    let base_url = client.base_url().to_string();
+    spawn_closer(&IMPORT_JOB_CLOSER, base_url, async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(IMPORT_JOB_POLL_SECS)).await;
             let idle = import_job_idle_for().unwrap_or(0);
@@ -677,7 +723,6 @@ fn spawn_import_job_closer(client: Arc<ApiClient>, session: Arc<RwLock<Session>>
                 }
             }
             finish_import_progress();
-            IMPORT_JOB_CLOSER.store(false, Ordering::SeqCst);
             return;
         }
     });
@@ -1962,5 +2007,70 @@ mod tests {
         let out = crate::crypto::envelope::decrypt_envelope(&data, Some(&nonce), b"", Some(ik), &[])
             .unwrap();
         assert_eq!(out, msg.envelope_json);
+    }
+
+    static TEST_CLOSER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static TEST_CLOSER_BEFORE_CLOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static TEST_CLOSER_FINISHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[tokio::test]
+    async fn sign_out_cancels_the_import_job_closer_and_forgets_its_job() {
+        use std::sync::atomic::Ordering;
+        let base_url = "test://closer-cancelled".to_string();
+        import_job_slot().lock().await.insert(base_url.clone(), "job-1".to_string());
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let spawned = shutdown
+            .scope(async {
+                spawn_closer(&TEST_CLOSER_RUNNING, base_url.clone(), async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                })
+            })
+            .await;
+        assert!(spawned);
+        assert!(TEST_CLOSER_RUNNING.load(Ordering::SeqCst));
+        tokio::time::timeout(std::time::Duration::from_secs(5), trigger.close_and_wait())
+            .await
+            .unwrap();
+        assert!(!TEST_CLOSER_RUNNING.load(Ordering::SeqCst));
+        assert!(import_job_slot().lock().await.get(&base_url).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_closer_never_starts_after_sign_out_and_can_start_again_later() {
+        use std::sync::atomic::Ordering;
+        let (trigger, shutdown) = crate::shutdown::channel();
+        trigger.close_and_wait().await;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ran.clone();
+        shutdown
+            .scope(async {
+                spawn_closer(&TEST_CLOSER_BEFORE_CLOSE, "test://closer-closed".to_string(), async move {
+                    seen.store(true, Ordering::SeqCst);
+                })
+            })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(!TEST_CLOSER_BEFORE_CLOSE.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_closer_that_finishes_keeps_other_jobs_and_frees_its_slot() {
+        use std::sync::atomic::Ordering;
+        let base_url = "test://closer-finished".to_string();
+        import_job_slot().lock().await.insert(base_url.clone(), "job-2".to_string());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(spawn_closer(&TEST_CLOSER_FINISHES, base_url.clone(), async move {
+            let _ = done_tx.send(());
+        }));
+        done_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while TEST_CLOSER_FINISHES.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(import_job_slot().lock().await.get(&base_url).map(String::as_str), Some("job-2"));
     }
 }

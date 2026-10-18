@@ -42,10 +42,17 @@ pub async fn ws_upgrade(
         )
             .into_response();
     }
+    let Some(held) = state.shutdown.hold() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Aster Bridge is stopping. Try again after it restarts.")
+            .into_response();
+    };
     ws.protocols(["jmap"])
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| serve(socket, state))
+        .on_upgrade(move |socket| async move {
+            let _held = held;
+            serve(socket, state).await
+        })
 }
 
 const MAX_WS_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -65,21 +72,29 @@ async fn serve(socket: WebSocket, state: AppState) {
     let push_filter = Arc::new(Mutex::new(PushFilter::default()));
 
     let shutdown = state.shutdown.clone();
-    let mut send_task = tokio::spawn(send_loop(
+    let mut send_task = shutdown.spawn(send_loop(
         sender,
         out_rx,
         state.clone(),
         account_id.clone(),
         push_filter.clone(),
     ));
-    let mut recv_task = tokio::spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
+    let mut recv_task = shutdown.spawn(recv_loop(receiver, state, account_id, out_tx, push_filter));
 
     tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
+        _ = &mut send_task => {
+            recv_task.abort();
+            let _ = recv_task.await;
+        }
+        _ = &mut recv_task => {
+            send_task.abort();
+            let _ = send_task.await;
+        }
         _ = shutdown.closed() => {
             send_task.abort();
             recv_task.abort();
+            let _ = send_task.await;
+            let _ = recv_task.await;
         }
     }
 }
