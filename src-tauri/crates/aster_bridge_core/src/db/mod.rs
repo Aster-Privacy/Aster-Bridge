@@ -472,6 +472,27 @@ const PENDING_CLEAR_MARKER: &str = "user_data_clear_pending";
 const CLEAR_ATTEMPTS: u32 = 5;
 const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
+const USER_DATA_TABLES: &[&str] = &[
+    "message_cache",
+    "message_keywords",
+    "message_tag",
+    "custom_tag",
+    "custom_folder",
+    "message_attachment",
+    "message_fts",
+    "uid_map",
+    "app_passwords",
+    "sync_state",
+    "jmap_mailbox",
+    "jmap_state",
+    "jmap_change_log",
+    "jmap_blob",
+    "envelope_nonces",
+    "recipient_key_pin",
+    "outbox",
+    "sqlite_sequence",
+];
+
 pub struct Database {
     conn: Mutex<Connection>,
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
@@ -3044,26 +3065,18 @@ impl Database {
     pub fn clear_all_user_data(&self) -> Result<(), String> {
         let result = self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(
-                "DELETE FROM message_cache;
-                 DELETE FROM message_keywords;
-                 DELETE FROM message_tag;
-                 DELETE FROM custom_tag;
-                 DELETE FROM message_attachment;
-                 DELETE FROM message_fts;
-                 DELETE FROM uid_map;
-                 DELETE FROM app_passwords;
-                 DELETE FROM sync_state;
-                 DELETE FROM jmap_state;
-                 DELETE FROM jmap_change_log;
-                 DELETE FROM jmap_blob;
-                 DELETE FROM envelope_nonces;
-                 DELETE FROM outbox;",
-            )?;
+            for table in USER_DATA_TABLES {
+                tx.execute_batch(&format!("DELETE FROM {};", table))?;
+            }
             tx.execute_batch(history::HISTORY_CLEAR_SQL)?;
+            tx.execute_batch("INSERT INTO message_fts(message_fts) VALUES('optimize');")?;
             tx.commit()
         });
         self.app_password_cache.clear();
+        self.append_pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         result
     }
 
@@ -4512,6 +4525,94 @@ mod db_tests {
         db.clear_all_user_data().unwrap();
         assert_eq!(db.count_cached_messages("inbox").unwrap(), 0);
         assert!(db.outbox_list_pending().unwrap().is_empty());
+    }
+
+    fn schema_tables(db: &Database) -> Vec<String> {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+    }
+
+    fn history_tables() -> Vec<&'static str> {
+        history::HISTORY_CLEAR_SQL
+            .split(';')
+            .filter_map(|stmt| stmt.trim().strip_prefix("DELETE FROM "))
+            .map(str::trim)
+            .collect()
+    }
+
+    const FTS_SHADOW_TABLES: &[&str] = &[
+        "message_fts_config",
+        "message_fts_content",
+        "message_fts_data",
+        "message_fts_docsize",
+        "message_fts_idx",
+    ];
+
+    #[test]
+    fn every_schema_table_is_wiped_on_sign_out() {
+        let (_d, db) = open_db();
+        let history = history_tables();
+        assert!(!history.is_empty());
+        let missed: Vec<String> = schema_tables(&db)
+            .into_iter()
+            .filter(|t| !USER_DATA_TABLES.contains(&t.as_str()))
+            .filter(|t| !history.contains(&t.as_str()))
+            .filter(|t| !FTS_SHADOW_TABLES.contains(&t.as_str()))
+            .collect();
+        assert!(missed.is_empty(), "tables not wiped by clear_all_user_data: {:?}", missed);
+    }
+
+    #[test]
+    fn clear_all_user_data_forgets_append_pins() {
+        let (_d, db) = open_db();
+        let since = std::time::Instant::now();
+        db.pin_appended("a1", "INBOX");
+        db.clear_all_user_data().unwrap();
+        assert_eq!(db.unless_appended_since("a1", since, || 1), Some(1));
+    }
+
+    #[test]
+    fn clear_all_user_data_leaves_no_account_rows() {
+        let (_d, db) = open_db();
+        db.upsert_cached_message("a1", "inbox", Some("zebrasecret"), Some("from@x"), Some("to@x"), None, 10, Some("quokkabody"), None)
+            .unwrap();
+        db.outbox_insert(b"mime", "from@x", "to@x").unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO custom_folder (label_token, server_id, name) VALUES ('lt', 'sid', 'Private Folder');
+                 INSERT INTO jmap_mailbox (id, name, folder_label) VALUES ('mb', 'Private Folder', 'lt');
+                 INSERT INTO recipient_key_pin (pin_id, identity_fingerprint, owner_fingerprint, updated_at) VALUES ('p', 'if', 'of', 1);
+                 INSERT INTO jmap_change_log (type, state, object_id, op, ts) VALUES ('Email', 1, 'a1', 'created', 1);
+                 INSERT INTO listing_member (listing, aster_id) VALUES ('inbox', 'a1');",
+            )
+        })
+        .unwrap();
+        db.clear_all_user_data().unwrap();
+        for table in schema_tables(&db) {
+            if table == "message_fts_config" || table == "message_fts_data" {
+                continue;
+            }
+            let count: i64 = db
+                .with_conn(|conn| conn.query_row(&format!("SELECT COUNT(*) FROM \"{}\"", table), [], |r| r.get(0)))
+                .unwrap();
+            assert_eq!(count, 0, "{} still holds rows", table);
+        }
+        let leaked: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_fts_data WHERE instr(block, CAST('zebrasecret' AS BLOB)) > 0 OR instr(block, CAST('quokkabody' AS BLOB)) > 0",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(leaked, 0);
     }
 
     #[test]
