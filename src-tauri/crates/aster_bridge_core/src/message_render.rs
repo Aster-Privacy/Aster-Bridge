@@ -381,6 +381,19 @@ pub fn sender_unverified(meta: &serde_json::Value) -> bool {
     meta.get("sender_unverified").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+pub const ATTACHMENTS_UNVERIFIED_NOTE: &str = "[Aster Bridge could not confirm that the attachments on this message come from the sender shown. Before you open them, check with the sender another way.]";
+pub const ATTACHMENTS_UNVERIFIED_FLAG: &str = "attachments_unverified";
+
+pub fn attachments_unverified(meta: &serde_json::Value) -> bool {
+    meta.get(ATTACHMENTS_UNVERIFIED_FLAG)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn has_listed_attachments(meta: &serde_json::Value) -> bool {
+    described_attachments(meta).0 > 0
+}
+
 pub const NOT_END_TO_END_ENCRYPTED_NOTE: &str = "[Aster stored this message without end-to-end encryption, so Aster Bridge could not confirm that its content is unchanged. Before you act on it, check with the sender another way.]";
 pub const NOT_END_TO_END_ENCRYPTED_FLAG: &str = "not_end_to_end_encrypted";
 
@@ -392,12 +405,16 @@ pub fn not_end_to_end_encrypted(meta: &serde_json::Value) -> bool {
 
 pub fn trust_note_suffix(meta: &serde_json::Value, is_html: bool) -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         note_suffix(
             not_end_to_end_encrypted(meta).then_some(NOT_END_TO_END_ENCRYPTED_NOTE),
             is_html
         ),
-        note_suffix(sender_unverified(meta).then_some(SENDER_UNVERIFIED_NOTE), is_html)
+        note_suffix(sender_unverified(meta).then_some(SENDER_UNVERIFIED_NOTE), is_html),
+        note_suffix(
+            attachments_unverified(meta).then_some(ATTACHMENTS_UNVERIFIED_NOTE),
+            is_html
+        )
     )
 }
 
@@ -928,6 +945,24 @@ mod tests {
         assert!(!render(&verified, &[], true).text.contains("could not confirm"));
         let flagged_false = msg(Some("hello"), Some("{\"sender_unverified\":false}"), 0);
         assert!(!render(&flagged_false, &[], true).text.contains("could not confirm"));
+    }
+
+    #[test]
+    fn unverified_attachments_show_a_note_in_text_and_html() {
+        let plain = msg(Some("hello"), Some("{\"is_html\":false,\"attachments_unverified\":true}"), 0);
+        let r = render(&plain, &[], true);
+        assert!(r.text.ends_with(&format!("hello\r\n\r\n{}", ATTACHMENTS_UNVERIFIED_NOTE)));
+        assert_eq!(rendered_size(&plain, &[]), r.text.len());
+
+        let html = msg(Some("<p>hi</p>"), Some("{\"is_html\":true,\"attachments_unverified\":true}"), 0);
+        let r = render(&html, &[], true);
+        assert!(r.text.contains("<p>hi</p>\r\n<p>[Aster Bridge could not confirm that the attachments"));
+
+        let verified = msg(Some("hello"), Some("{\"is_html\":false}"), 0);
+        assert!(!render(&verified, &[], true).text.contains("the attachments on this message"));
+        assert!(has_listed_attachments(&serde_json::json!({"attachment_count": 1})));
+        assert!(has_listed_attachments(&serde_json::json!({"attachments": [{"seq": 0}]})));
+        assert!(!has_listed_attachments(&serde_json::json!({"attachment_count": 0})));
     }
 
     #[test]

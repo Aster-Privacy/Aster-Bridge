@@ -1965,7 +1965,14 @@ fn store_unsealed_message(
     if bundle.sender_unverified {
         meta_map.insert("sender_unverified".to_string(), serde_json::json!(true));
     }
-    let meta = serde_json::Value::Object(meta_map).to_string();
+    let flag = crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG;
+    let mut meta = serde_json::Value::Object(meta_map);
+    if listed.is_empty() && crate::message_render::has_listed_attachments(&meta) {
+        meta[flag] = serde_json::json!(true);
+    } else if let Some(map) = meta.as_object_mut() {
+        map.remove(flag);
+    }
+    let meta = meta.to_string();
     if let Err(e) = db.update_cached_body(aster_id, &bundle.body, Some(&meta)) {
         tracing::warn!("storing decrypted ratchet body for {} failed: {}", aster_id, e);
         return false;
@@ -6429,6 +6436,57 @@ mod sealed_retry_tests {
         assert!(store_unsealed_message(&db, "sealed-extra", &manifest_bundle(b"real invoice")));
         assert!(db.get_message_attachments("sealed-extra").unwrap().is_empty());
         assert_eq!(db.attachments_state("sealed-extra").unwrap(), ATTACHMENTS_PENDING);
+    }
+
+    #[test]
+    fn unsealing_without_a_sender_manifest_marks_envelope_attachments_unverified() {
+        let (_dir, db) = temp_db();
+        let outer_meta = serde_json::json!({
+            "is_html": false,
+            "attachment_count": 1,
+            "attachments": [{"seq": 0, "name": "invoice.pdf", "type": "application/pdf", "key": "c2VydmVy"}],
+        })
+        .to_string();
+        for id in ["no-manifest", "with-manifest", "no-attachments"] {
+            db.upsert_cached_message(
+                id,
+                "INBOX",
+                Some(""),
+                Some("alice@astermail.org"),
+                Some("hello@astermail.org"),
+                None,
+                1,
+                Some(RATCHET_PLACEHOLDER),
+                Some(if id == "no-attachments" { "{\"is_html\":false}" } else { &outer_meta }),
+            )
+            .unwrap();
+        }
+        let meta_of = |id: &str| -> serde_json::Value {
+            let cached = db.get_cached_message(id).unwrap().unwrap();
+            serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap()
+        };
+        let unlisted = SubjectBundle {
+            subject: Some("Invoice".to_string()),
+            body: "see attached".to_string(),
+            sender_unverified: false,
+            attachment_manifest: None,
+        };
+
+        assert!(store_unsealed_message(&db, "no-manifest", &unlisted));
+        let meta = meta_of("no-manifest");
+        assert_eq!(meta["attachments_unverified"], true);
+        assert!(crate::message_render::trust_note_suffix(&meta, false)
+            .contains(crate::message_render::ATTACHMENTS_UNVERIFIED_NOTE));
+        assert_eq!(meta["attachments"][0]["key"], "c2VydmVy");
+
+        assert!(store_unsealed_message(&db, "with-manifest", &manifest_bundle(b"real invoice")));
+        assert!(meta_of("with-manifest").get("attachments_unverified").is_none());
+
+        assert!(store_unsealed_message(&db, "no-manifest", &manifest_bundle(b"real invoice")));
+        assert!(meta_of("no-manifest").get("attachments_unverified").is_none());
+
+        assert!(store_unsealed_message(&db, "no-attachments", &unlisted));
+        assert!(meta_of("no-attachments").get("attachments_unverified").is_none());
     }
 
     #[test]
