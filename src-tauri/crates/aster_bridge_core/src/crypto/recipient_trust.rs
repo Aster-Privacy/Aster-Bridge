@@ -46,6 +46,8 @@ pub struct RecipientPin {
     pub identity_fingerprint: String,
     pub owner_fingerprint: String,
     pub pq_seen: bool,
+    pub pq_fingerprint: String,
+    pub transcript_bound: bool,
     pub flagged: bool,
 }
 
@@ -53,6 +55,7 @@ pub struct RecipientPin {
 pub struct PqTarget {
     pub public_key: Vec<u8>,
     pub key_id: i32,
+    pub signed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,28 +218,39 @@ fn select_pq_target(
     let identity = identity.filter(|key| key.len() == ML_KEM_768_PUBLIC_KEY_BYTES);
     let one_time = one_time.filter(|(key, _)| key.len() == ML_KEM_768_PUBLIC_KEY_BYTES);
 
+    let malformed = || {
+        refuse(
+            address,
+            "the published post-quantum key is malformed, and the message is not sent with weaker encryption",
+        )
+    };
+
     if covers_pq_identity {
-        if let Some(public_key) = identity {
-            return Ok(Some(PqTarget {
+        return match identity {
+            Some(public_key) => Ok(Some(PqTarget {
                 public_key,
                 key_id: PQ_IDENTITY_KEY_ID,
-            }));
-        }
+                signed: true,
+            })),
+            None => Err(malformed()),
+        };
     }
     if let Some((public_key, key_id)) = one_time {
-        return Ok(Some(PqTarget { public_key, key_id }));
+        return Ok(Some(PqTarget {
+            public_key,
+            key_id,
+            signed: false,
+        }));
     }
     if let Some(public_key) = identity {
         return Ok(Some(PqTarget {
             public_key,
             key_id: PQ_IDENTITY_KEY_ID,
+            signed: false,
         }));
     }
     if advertises_pq {
-        return Err(refuse(
-            address,
-            "the published post-quantum key is malformed, and the message is not sent with weaker encryption",
-        ));
+        return Err(malformed());
     }
     Ok(None)
 }
@@ -302,13 +316,14 @@ pub fn evaluate_recipient(
     if let (Some(bundle), Some(BundleVerdict::Verified { covers_pq_identity })) = (bundle, verdict)
     {
         let advertises_pq = advertised_pq_identity_key(bundle).is_some();
-        if base.pq_seen && !advertises_pq {
+        let pq_pinned = !base.pq_fingerprint.is_empty();
+        if (pq_pinned && !covers_pq_identity) || (base.pq_seen && !advertises_pq) {
             return Evaluation {
                 pin: None,
                 outcome: Err(downgraded(address)),
             };
         }
-        let target = match ratchet_target(address, bundle, covers_pq_identity) {
+        let mut target = match ratchet_target(address, bundle, covers_pq_identity) {
             Ok(target) => target,
             Err(error) => {
                 return Evaluation {
@@ -317,10 +332,21 @@ pub fn evaluate_recipient(
                 }
             }
         };
+        let identity_fingerprint = hex(&Sha256::digest(&target.identity_public));
+        target.transcript_bound |=
+            base.transcript_bound && base.identity_fingerprint == identity_fingerprint;
+        let pq_fingerprint = target
+            .pq_target
+            .as_ref()
+            .filter(|pq| pq.signed)
+            .map(|pq| hex(&Sha256::digest(&pq.public_key)))
+            .unwrap_or_default();
         let pin = RecipientPin {
-            identity_fingerprint: hex(&Sha256::digest(&target.identity_public)),
+            identity_fingerprint,
             owner_fingerprint,
             pq_seen: base.pq_seen || advertises_pq,
+            pq_fingerprint,
+            transcript_bound: target.transcript_bound,
             flagged: false,
         };
         return Evaluation {
@@ -535,7 +561,12 @@ X1OEWHpsCOAO
 
         assert_eq!(target.key_id, PQ_IDENTITY_KEY_ID);
         assert_eq!(target.public_key, vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]);
+        assert!(target.signed);
         assert!(pin.pq_seen);
+        assert_eq!(
+            pin.pq_fingerprint,
+            hex(&Sha256::digest(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))
+        );
         assert!(!pin.flagged);
         assert!(!pin.identity_fingerprint.is_empty());
     }
@@ -559,16 +590,14 @@ X1OEWHpsCOAO
         let mut bundle = signed_v1_bundle(&alice, Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
         bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
 
-        let target = ratchet(evaluate_recipient(
-            BOB,
-            Some(&bundle),
-            Some(&alice.public_key),
-            None,
-        ))
-        .pq_target
-        .unwrap();
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.clone().unwrap();
+        let target = ratchet(evaluation).pq_target.unwrap();
         assert_eq!(target.key_id, 77);
         assert_eq!(target.public_key, vec![0x33; ML_KEM_768_PUBLIC_KEY_BYTES]);
+        assert!(!target.signed);
+        assert!(pin.pq_seen);
+        assert!(pin.pq_fingerprint.is_empty());
 
         bundle.pq_prekey = None;
         let target = ratchet(evaluate_recipient(
@@ -580,6 +609,84 @@ X1OEWHpsCOAO
         .pq_target
         .unwrap();
         assert_eq!(target.key_id, PQ_IDENTITY_KEY_ID);
+        assert!(!target.signed);
+    }
+
+    #[test]
+    fn a_signed_post_quantum_key_with_the_wrong_size_never_falls_back_to_an_unsigned_one() {
+        let alice = owner("alice");
+        let mut bundle = unsigned_bundle(Some(vec![0x22; 100]));
+        let text = canonical_v2(&bundle).unwrap();
+        sign(&mut bundle, &alice, &text);
+        bundle.pq_prekey = one_time_prekey(0x33, ML_KEM_768_PUBLIC_KEY_BYTES);
+
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(evaluation.pin.is_none());
+    }
+
+    #[test]
+    fn a_pinned_signed_post_quantum_key_is_not_replaced_by_an_unsigned_one() {
+        let alice = owner("alice");
+        let first = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&alice)),
+            Some(&alice.public_key),
+            None,
+        )
+        .pin
+        .unwrap();
+        assert!(!first.pq_fingerprint.is_empty());
+
+        let mut unsigned_pq =
+            signed_v1_bundle(&alice, Some(vec![0x44; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        unsigned_pq.pq_prekey = one_time_prekey(0x55, ML_KEM_768_PUBLIC_KEY_BYTES);
+        let refused =
+            evaluate_recipient(BOB, Some(&unsigned_pq), Some(&alice.public_key), Some(&first));
+        assert!(matches!(refused.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(refused.pin.is_none());
+
+        let mut rotated = unsigned_bundle(Some(vec![0x66; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        let text = canonical_v2(&rotated).unwrap();
+        sign(&mut rotated, &alice, &text);
+        let evaluation =
+            evaluate_recipient(BOB, Some(&rotated), Some(&alice.public_key), Some(&first));
+        let pin = evaluation.pin.clone().unwrap();
+        let target = ratchet(evaluation).pq_target.unwrap();
+        assert!(target.signed);
+        assert_eq!(target.public_key, vec![0x66; ML_KEM_768_PUBLIC_KEY_BYTES]);
+        assert_eq!(
+            pin.pq_fingerprint,
+            hex(&Sha256::digest(vec![0x66; ML_KEM_768_PUBLIC_KEY_BYTES]))
+        );
+    }
+
+    #[test]
+    fn an_unsigned_handshake_version_cannot_downgrade_a_pinned_bound_handshake() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        bundle.x3dh_max_version = Some(2);
+        let first = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = first.pin.clone().unwrap();
+        assert!(pin.transcript_bound);
+        assert!(ratchet(first).transcript_bound);
+
+        for version in [None, Some(1)] {
+            bundle.x3dh_max_version = version;
+            let evaluation =
+                evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), Some(&pin));
+            assert!(evaluation.pin.is_none());
+            assert!(ratchet(evaluation).transcript_bound);
+        }
+
+        let mut rotated = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        rotated.kem_identity_key = STANDARD.encode([0x05u8; 65]);
+        let text = canonical_v2(&rotated).unwrap();
+        sign(&mut rotated, &alice, &text);
+        let evaluation =
+            evaluate_recipient(BOB, Some(&rotated), Some(&alice.public_key), Some(&pin));
+        assert!(!evaluation.pin.clone().unwrap().transcript_bound);
+        assert!(!ratchet(evaluation).transcript_bound);
     }
 
     #[test]
@@ -767,6 +874,10 @@ X1OEWHpsCOAO
 
         let weaker = [
             Some(signed_v1_bundle(&alice, None)),
+            Some(signed_v1_bundle(
+                &alice,
+                Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]),
+            )),
             Some(unsigned_bundle(None)),
             Some(unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))),
             None,

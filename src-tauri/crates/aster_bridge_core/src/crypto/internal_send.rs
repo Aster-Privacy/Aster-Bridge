@@ -331,7 +331,7 @@ fn sealed_plaintext(payload: &Value) -> String {
 }
 
 fn has_post_quantum_protection(route: &SendRoute) -> bool {
-    matches!(route, SendRoute::Ratchet(target) if target.pq_target.is_some())
+    matches!(route, SendRoute::Ratchet(target) if target.pq_target.as_ref().is_some_and(|pq| pq.signed))
 }
 
 fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()> {
@@ -934,6 +934,33 @@ mod tests {
                 other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
             }
         }
+    }
+
+    #[test]
+    fn unsigned_post_quantum_keys_do_not_meet_the_post_quantum_requirement() {
+        use crate::crypto::recipient_trust::tests::{owner, sign};
+
+        let account = owner("user");
+        let mut bob = recipient();
+        let (_, encap) = MlKem768::generate(&mut OsRng);
+        bob.bundle.pq_prekey = Some(crate::api_client::BundlePqPrekey {
+            key_id: 9,
+            public_key: STANDARD.encode(encap.as_bytes()),
+        });
+        let text = format!(
+            "aster-ratchet-prekey-v1:{}.{}",
+            bob.bundle.kem_identity_key, bob.bundle.signed_prekey
+        );
+        sign(&mut bob.bundle, &account, &text);
+
+        let weak = routed("bob@astermail.org", Some(&bob.bundle), &account);
+        assert!(matches!(&weak.route, SendRoute::Ratchet(target) if target.pq_target.is_some()));
+        assert!(!has_post_quantum_protection(&weak.route));
+        assert!(enforce_post_quantum(std::slice::from_ref(&weak), false).is_ok());
+        assert!(matches!(
+            enforce_post_quantum(&[weak], true),
+            Err(BridgeError::RecipientKey(_))
+        ));
     }
 
     #[test]
