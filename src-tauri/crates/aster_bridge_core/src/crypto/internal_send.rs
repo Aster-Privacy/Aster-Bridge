@@ -331,7 +331,10 @@ fn sealed_plaintext(payload: &Value) -> String {
 }
 
 fn has_post_quantum_protection(route: &SendRoute) -> bool {
-    matches!(route, SendRoute::Ratchet(target) if target.pq_target.as_ref().is_some_and(|pq| pq.signed))
+    matches!(
+        route,
+        SendRoute::Ratchet(target) if target.pq_target.as_ref().is_some_and(|pq| pq.signed)
+    )
 }
 
 fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()> {

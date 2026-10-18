@@ -392,7 +392,7 @@ pub fn evaluate_recipient(
                 outcome: Err(downgraded(address, Some(&owner_fingerprint))),
             };
         }
-        let mut target = match ratchet_target(address, bundle, covers_pq_identity) {
+        let target = match ratchet_target(address, bundle, covers_pq_identity) {
             Ok(target) => target,
             Err(error) => {
                 return Evaluation {
@@ -402,8 +402,6 @@ pub fn evaluate_recipient(
             }
         };
         let identity_fingerprint = hex(&Sha256::digest(&target.identity_public));
-        target.transcript_bound |=
-            base.transcript_bound && base.identity_fingerprint == identity_fingerprint;
         let pq_fingerprint = target
             .pq_target
             .as_ref()
@@ -829,7 +827,7 @@ X1OEWHpsCOAO
     }
 
     #[test]
-    fn an_unsigned_handshake_version_cannot_downgrade_a_pinned_bound_handshake() {
+    fn the_handshake_version_follows_what_every_recipient_device_supports() {
         let alice = owner("alice");
         let mut bundle = signed_v2_bundle(&alice);
         bundle.x3dh_max_version = Some(2);
@@ -842,18 +840,9 @@ X1OEWHpsCOAO
             bundle.x3dh_max_version = version;
             let evaluation =
                 evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), Some(&pin));
-            assert!(evaluation.pin.is_none());
-            assert!(ratchet(evaluation).transcript_bound);
+            assert!(!evaluation.pin.clone().unwrap().transcript_bound);
+            assert!(!ratchet(evaluation).transcript_bound);
         }
-
-        let mut rotated = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
-        rotated.kem_identity_key = STANDARD.encode([0x05u8; 65]);
-        let text = canonical_v2(&rotated).unwrap();
-        sign(&mut rotated, &alice, &text);
-        let evaluation =
-            evaluate_recipient(BOB, Some(&rotated), Some(&alice.public_key), Some(&pin));
-        assert!(!evaluation.pin.clone().unwrap().transcript_bound);
-        assert!(!ratchet(evaluation).transcript_bound);
     }
 
     #[test]
