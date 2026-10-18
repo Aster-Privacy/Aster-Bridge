@@ -135,14 +135,20 @@ jobs:
           fetch cli "$SIGNER_CLI_INTEGRITY"
           fetch cli-linux-x64-gnu "$SIGNER_NATIVE_INTEGRITY"
 
-      - name: Sign and collect canonical names
+      - name: Sign with the current and the next updater key and collect canonical names
         id: collect
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          UPDATER_KEY_V1: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_KEY_V1_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          UPDATER_KEY_V2: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_V2 }}
+          UPDATER_KEY_V2_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_V2 }}
         shell: bash
         run: |
           set -euo pipefail
+          if [ -z "$UPDATER_KEY_V1" ] || [ -z "$UPDATER_KEY_V2" ]; then
+            echo "::error::both updater keys must be set; installs on either key would stop updating"
+            exit 1
+          fi
           OUT=$(mktemp -d)
           SRC=$(find "$PWD/unsigned" -maxdepth 1 -type f -name '*aarch64.AppImage' | head -1)
           if [ -z "$SRC" ]; then
@@ -150,9 +156,16 @@ jobs:
             exit 1
           fi
           WORK="$(mktemp -d)"
-          (cd "$WORK" && node "$RUNNER_TEMP/signer/node_modules/@tauri-apps/cli/tauri.js" signer sign "$SRC" </dev/null)
+          TAURI="$RUNNER_TEMP/signer/node_modules/@tauri-apps/cli/tauri.js"
+          sign_with() {
+            local key="$1" password="$2" dest="$3"
+            rm -f "${SRC}.sig"
+            (cd "$WORK" && TAURI_SIGNING_PRIVATE_KEY="$key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$password" node "$TAURI" signer sign "$SRC" </dev/null)
+            mv "${SRC}.sig" "$dest"
+          }
           cp "$SRC" "$OUT/Aster-Bridge-aarch64.AppImage"
-          cp "${SRC}.sig" "$OUT/Aster-Bridge-aarch64.AppImage.sig"
+          sign_with "$UPDATER_KEY_V1" "$UPDATER_KEY_V1_PASSWORD" "$OUT/Aster-Bridge-aarch64.AppImage.sig"
+          sign_with "$UPDATER_KEY_V2" "$UPDATER_KEY_V2_PASSWORD" "$OUT/Aster-Bridge-aarch64.AppImage.v2.sig"
           echo "outdir=$OUT" >> "$GITHUB_OUTPUT"
           ls -la "$OUT"
 
@@ -186,5 +199,5 @@ jobs:
           set -euo pipefail
           gh release upload "$TAG" \
             signed/Aster-Bridge-aarch64.AppImage \
-            signed/Aster-Bridge-aarch64.AppImage.sig \
+            signed/Aster-Bridge-aarch64.AppImage.sig             signed/Aster-Bridge-aarch64.AppImage.v2.sig \
             --repo "$GITHUB_REPOSITORY" --clobber
