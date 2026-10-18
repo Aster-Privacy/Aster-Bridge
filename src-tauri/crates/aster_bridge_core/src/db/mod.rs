@@ -2055,14 +2055,6 @@ impl Database {
         })
     }
 
-    pub fn recipient_pin_delete(&self, pin_id: &str) -> Result<bool, String> {
-        self.with_conn(|conn| {
-            let removed =
-                conn.execute("DELETE FROM recipient_key_pin WHERE pin_id = ?1", [pin_id])?;
-            Ok(removed > 0)
-        })
-    }
-
     pub fn jmap_blob_get(&self, blob_id: &str) -> Result<Option<(Vec<u8>, Option<String>)>, String> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -4388,10 +4380,6 @@ mod db_tests {
         db.repair_cache().unwrap();
         db.clear_user_data().unwrap();
         assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(rotated));
-
-        assert!(db.recipient_pin_delete("pin").unwrap());
-        assert!(!db.recipient_pin_delete("pin").unwrap());
-        assert!(db.recipient_pin_get("pin").unwrap().is_none());
     }
 
     #[test]

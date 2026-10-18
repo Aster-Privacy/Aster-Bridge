@@ -225,7 +225,7 @@ fn refuse(address: &str, reason: &str) -> BridgeError {
 fn accept_hint(address: &str, fingerprint: Option<&str>) -> String {
     match fingerprint {
         Some(fingerprint) => format!(
-            "The key that {} publishes now has the fingerprint {}. If you expect this change, confirm this fingerprint with the recipient, then accept the key. In Aster Bridge, go to Settings > Advanced and click Accept key, or run: aster-bridge recipient-key accept {} --fingerprint {}",
+            "The key that {} publishes now has the fingerprint {}. If you expect this change, confirm this fingerprint with the recipient, then accept the key. In Aster Bridge, go to Settings > Advanced, click Accept key, enter the address, and click Show key, or run: aster-bridge recipient-key accept {} --fingerprint {}",
             address,
             format_fingerprint(fingerprint),
             address,
@@ -243,6 +243,13 @@ fn untrusted(address: &str, fingerprint: Option<&str>) -> BridgeError {
         "The encryption keys for {} changed or failed verification, so the message was not sent. {}",
         address,
         accept_hint(address, fingerprint)
+    ))
+}
+
+fn tampered(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "The encryption keys that {} publishes are not signed by the recipient's account key, so the message was not sent. Accepting the key does not fix this. Ask the recipient to sign in to Aster again so their keys are published again.",
+        address
     ))
 }
 
@@ -371,7 +378,11 @@ pub fn evaluate_recipient(
                     ..base
                 },
             ),
-            outcome: Err(untrusted(address, owner_fingerprint.as_deref())),
+            outcome: Err(if verdict == Some(BundleVerdict::Tampered) {
+                tampered(address)
+            } else {
+                untrusted(address, owner_fingerprint.as_deref())
+            }),
         };
     }
 
@@ -698,7 +709,11 @@ X1OEWHpsCOAO
         );
         let evaluation =
             evaluate_recipient(BOB, Some(&bundle), Some(INTEROP_PUBLIC_KEY), None);
-        assert!(matches!(evaluation.outcome, Err(BridgeError::RecipientKey(_))));
+        let Err(BridgeError::RecipientKey(message)) = &evaluation.outcome else {
+            panic!("a tampered bundle must be refused");
+        };
+        assert!(message.contains("Accepting the key does not fix this"), "{message}");
+        assert!(!message.contains("--fingerprint"), "{message}");
         assert!(evaluation.pin.unwrap().flagged);
     }
 

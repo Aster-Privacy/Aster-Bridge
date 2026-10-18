@@ -427,7 +427,8 @@ pub async fn recipient_key_accept(
         )
         .with_hint(format!(
             "Confirm this fingerprint with the recipient, then run: aster-bridge recipient-key accept {} --fingerprint {}",
-            address, current
+            address,
+            current.to_uppercase()
         ))),
         recipient_trust::KeyAcceptance::Mismatch { fingerprint: None } => {
             Err(no_published_recipient_key(&address))
