@@ -105,6 +105,21 @@ pub fn closing_handle(shutdown: ConnectionShutdown) -> axum_server::Handle {
     handle
 }
 
+pub async fn spawn_blocking_held<T, F>(f: F) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let held = current().hold()?;
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            f()
+        })
+        .await,
+    )
+}
+
 pub async fn until_closed<F: Future>(shutdown: ConnectionShutdown, fut: F) -> Option<F::Output> {
     tokio::select! {
         biased;
@@ -190,6 +205,36 @@ mod tests {
         trigger.close_and_wait().await;
         assert!(wrote.load(std::sync::atomic::Ordering::SeqCst));
         write.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_work_outlives_its_caller_until_close_and_wait_returns() {
+        let (trigger, shutdown) = channel();
+        let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = wrote.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let caller = shutdown.spawn(spawn_blocking_held(move || {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(200));
+            writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        started_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), trigger.close_and_wait()).await.unwrap();
+        assert!(wrote.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(caller.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn blocking_work_does_not_start_once_connections_are_closed() {
+        let (trigger, shutdown) = channel();
+        trigger.close_and_wait().await;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = ran.clone();
+        let out = shutdown
+            .scope(spawn_blocking_held(move || runner.store(true, std::sync::atomic::Ordering::SeqCst)))
+            .await;
+        assert!(out.is_none());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

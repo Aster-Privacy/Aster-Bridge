@@ -41,7 +41,7 @@ struct BridgeState {
     client: Arc<api_client::ApiClient>,
     passwords: Option<Arc<auth::app_passwords::AppPasswords>>,
     runtime: Option<runtime::RunningBridge>,
-    stopped_runtime: Option<runtime::RunningBridge>,
+    stopped_runtimes: Vec<runtime::RunningBridge>,
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
     identity: auth::device_identity::DeviceIdentity,
     pending_code: Option<String>,
@@ -85,12 +85,13 @@ impl BridgeState {
     fn stop_runtime(&mut self, reason: runtime::StopReason) {
         if let Some(running) = self.runtime.take() {
             running.stop(reason);
-            self.stopped_runtime = Some(running);
+            self.stopped_runtimes.push(running);
         }
     }
 
     async fn stop_runtime_and_wait(&mut self, reason: runtime::StopReason) {
-        for running in self.runtime.take().into_iter().chain(self.stopped_runtime.take()) {
+        let stopped = std::mem::take(&mut self.stopped_runtimes);
+        for running in self.runtime.take().into_iter().chain(stopped) {
             running.stop_and_wait(reason.clone()).await;
         }
     }
@@ -1644,7 +1645,7 @@ fn main() {
             client,
             passwords: None,
             runtime: None,
-            stopped_runtime: None,
+            stopped_runtimes: Vec::new(),
             tls_server_config,
             identity,
             pending_code: None,

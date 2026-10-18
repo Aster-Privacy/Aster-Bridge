@@ -3476,7 +3476,7 @@ async fn handle_copy_move(
         let folder = source_folder.clone();
         let target = target_internal.clone();
         let entries = selected.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::shutdown::spawn_blocking_held(move || {
             let mut src: Vec<u32> = Vec::new();
             let mut tgt: Vec<u32> = Vec::new();
             let mut all_assigned = true;
@@ -3507,8 +3507,9 @@ async fn handle_copy_move(
         .await
     };
     let (src_uids, tgt_uids, all_assigned) = match assigned {
-        Ok(result) => result,
-        Err(e) => {
+        Some(Ok(result)) => result,
+        None => return write_no(writer, tag, "[UNAVAILABLE] Aster Bridge is stopping").await,
+        Some(Err(e)) => {
             tracing::warn!("{} cache update task failed: {}", verb, e);
             return write_no(writer, tag, "[SERVERBUG] could not update the local mailbox").await;
         }
