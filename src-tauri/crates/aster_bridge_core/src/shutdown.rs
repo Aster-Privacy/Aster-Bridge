@@ -97,17 +97,7 @@ pub fn current() -> ConnectionShutdown {
         .unwrap_or_else(|_| ConnectionShutdown::never())
 }
 
-const HTTP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-pub fn closing_handle(shutdown: ConnectionShutdown) -> axum_server::Handle {
-    let handle = axum_server::Handle::new();
-    let closer = handle.clone();
-    tokio::spawn(async move {
-        shutdown.closed().await;
-        closer.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
-    });
-    handle
-}
+pub(crate) const HTTP_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn spawn_blocking_held<T, F>(f: F) -> Option<Result<T, tokio::task::JoinError>>
 where

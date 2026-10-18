@@ -68,13 +68,11 @@ pub async fn run(
             sock_addr.port(),
             true,
         );
-        tracing::info!("JMAP server listening on https://{}", sock_addr);
-        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
-        return axum_server::bind_rustls(sock_addr, rustls_cfg)
-            .handle(crate::shutdown::closing_handle(crate::shutdown::current()))
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        let listener = tokio::net::TcpListener::bind(sock_addr)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("bind {} failed: {}", sock_addr, e))?;
+        tracing::info!("JMAP server listening on https://{}", sock_addr);
+        return crate::http_listener::serve(listener, crate::conn_limit::Protocol::Jmap, app, Some(cfg)).await;
     }
 
     let listener = crate::port_picker::bind_loopback_listener(addr)
@@ -105,13 +103,7 @@ pub async fn serve(
 
     tracing::info!("JMAP server listening on http://{}", sock_addr);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(crate::shutdown::current().closed())
-    .await
-    .map_err(|e| e.to_string())
+    crate::http_listener::serve(listener, crate::conn_limit::Protocol::Jmap, app, None).await
 }
 
 fn build_app(
@@ -1328,5 +1320,150 @@ mod e2e_tests {
         let mut late = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut late)).await;
         assert!(late.is_empty(), "the closed connection still answered a request");
+    }
+
+    const LIMIT_TEST_PORT: u16 = 41443;
+
+    fn limit_test_peer() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_jmap_client_that_never_sends_is_dropped_before_sign_in() {
+        use crate::conn_limit::test_support::{connect, read_until_closed};
+        use crate::conn_limit::PRE_AUTH_IDLE_TIMEOUT;
+        let (app, _dir) = limit_test_app();
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = connect(move |io| {
+            crate::http_listener::serve_connection(
+                io,
+                limit_test_peer(),
+                app,
+                None,
+                crate::shutdown::ConnectionShutdown::never(),
+            )
+        });
+        let (out, closed) = read_until_closed(&mut reader, PRE_AUTH_IDLE_TIMEOUT * 2).await;
+        assert!(closed, "a silent client kept its connection");
+        assert!(out.is_empty(), "{}", out);
+        assert!(started.elapsed() >= PRE_AUTH_IDLE_TIMEOUT);
+        assert!(started.elapsed() < PRE_AUTH_IDLE_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_jmap_client_that_never_reads_is_dropped_before_sign_in() {
+        use crate::conn_limit::test_support::flood_without_reading;
+        use crate::conn_limit::PRE_AUTH_IDLE_TIMEOUT;
+        let (app, _dir) = limit_test_app();
+        let started = tokio::time::Instant::now();
+        let (finished, _reader) = flood_without_reading(
+            move |io| {
+                crate::http_listener::serve_connection(
+                    io,
+                    limit_test_peer(),
+                    app,
+                    None,
+                    crate::shutdown::ConnectionShutdown::never(),
+                )
+            },
+            REQUEST,
+            PRE_AUTH_IDLE_TIMEOUT * 2,
+        )
+        .await;
+        assert!(finished, "a client that never reads kept its connection");
+        assert!(started.elapsed() >= PRE_AUTH_IDLE_TIMEOUT);
+    }
+
+    const REQUEST: &[u8] = b"GET /jmap/session HTTP/1.1\r\nHost: 127.0.0.1:41443\r\n\r\n";
+
+    fn limit_test_app() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let (tx, _rx) = broadcast::channel(8);
+        let app = build_app(
+            session,
+            db,
+            Arc::new(ApiClient::new()),
+            passwords,
+            tx,
+            LIMIT_TEST_PORT,
+            false,
+        );
+        (app, dir)
+    }
+
+    #[tokio::test]
+    async fn a_good_password_marks_the_connection_signed_in() {
+        use axum::extract::FromRequestParts;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_with_key(dir.path(), &[7u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db.clone()));
+        passwords.store("test", "abcd-efgh-ijkl-mnop").unwrap();
+        let auth = Arc::new(JmapAuth {
+            passwords,
+            session: Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        })),
+        });
+        let attempt = |password: &str| {
+            let clock = crate::conn_limit::PreAuthClock::start();
+            let value = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("tester@aster.test:{}", password))
+            );
+            let request = axum::http::Request::builder()
+                .header(header::AUTHORIZATION, value)
+                .extension(clock.clone())
+                .body(())
+                .unwrap();
+            (request.into_parts().0, clock)
+        };
+
+        let (mut parts, clock) = attempt("wrong-pass-word-here");
+        assert!(crate::jmap::auth::AuthedAccount::from_request_parts(&mut parts, &auth)
+            .await
+            .is_err());
+        assert!(!clock.is_signed_in(), "a wrong password must not lift the pre-auth limits");
+
+        let (mut parts, clock) = attempt("abcd-efgh-ijkl-mnop");
+        assert!(crate::jmap::auth::AuthedAccount::from_request_parts(&mut parts, &auth)
+            .await
+            .is_ok());
+        assert!(clock.is_signed_in(), "a good password must lift the pre-auth limits");
     }
 }

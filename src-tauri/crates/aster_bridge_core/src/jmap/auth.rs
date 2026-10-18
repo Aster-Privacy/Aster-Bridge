@@ -111,6 +111,9 @@ where
             }
         };
         register_auth_success();
+        if let Some(clock) = parts.extensions.get::<crate::conn_limit::PreAuthClock>() {
+            clock.mark_signed_in();
+        }
 
         let user_agent = parts
             .headers

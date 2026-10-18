@@ -78,13 +78,11 @@ pub async fn run(
 
     if let Some(cfg) = tls_config {
         let app = build_app(session, client, passwords, sock_addr.port(), true);
-        tracing::info!("CardDAV server listening on https://{}", sock_addr);
-        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
-        return axum_server::bind_rustls(sock_addr, rustls_cfg)
-            .handle(crate::shutdown::closing_handle(crate::shutdown::current()))
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        let listener = tokio::net::TcpListener::bind(sock_addr)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("bind {} failed: {}", sock_addr, e))?;
+        tracing::info!("CardDAV server listening on https://{}", sock_addr);
+        return crate::http_listener::serve(listener, crate::conn_limit::Protocol::Dav, app, Some(cfg)).await;
     }
 
     let listener = crate::port_picker::bind_loopback_listener(addr)
@@ -105,13 +103,7 @@ pub async fn serve(
 
     tracing::info!("CardDAV server listening on http://{}", sock_addr);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(crate::shutdown::current().closed())
-    .await
-    .map_err(|e| e.to_string())
+    crate::http_listener::serve(listener, crate::conn_limit::Protocol::Dav, app, None).await
 }
 
 pub fn build_app(
@@ -1730,5 +1722,91 @@ mod e2e_tests {
         let mut late = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut late)).await;
         assert!(late.is_empty(), "the closed connection still answered a request");
+    }
+
+    const LIMIT_TEST_PORT: u16 = 41443;
+
+    fn limit_test_peer() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dav_client_that_never_sends_is_dropped_before_sign_in() {
+        use crate::conn_limit::test_support::{connect, read_until_closed};
+        use crate::conn_limit::PRE_AUTH_IDLE_TIMEOUT;
+        let (app, _dir) = limit_test_app();
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = connect(move |io| {
+            crate::http_listener::serve_connection(
+                io,
+                limit_test_peer(),
+                app,
+                None,
+                crate::shutdown::ConnectionShutdown::never(),
+            )
+        });
+        let (out, closed) = read_until_closed(&mut reader, PRE_AUTH_IDLE_TIMEOUT * 2).await;
+        assert!(closed, "a silent client kept its connection");
+        assert!(out.is_empty(), "{}", out);
+        assert!(started.elapsed() >= PRE_AUTH_IDLE_TIMEOUT);
+        assert!(started.elapsed() < PRE_AUTH_IDLE_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dav_client_that_never_reads_is_dropped_before_sign_in() {
+        use crate::conn_limit::test_support::flood_without_reading;
+        use crate::conn_limit::PRE_AUTH_IDLE_TIMEOUT;
+        let (app, _dir) = limit_test_app();
+        let started = tokio::time::Instant::now();
+        let (finished, _reader) = flood_without_reading(
+            move |io| {
+                crate::http_listener::serve_connection(
+                    io,
+                    limit_test_peer(),
+                    app,
+                    None,
+                    crate::shutdown::ConnectionShutdown::never(),
+                )
+            },
+            REQUEST,
+            PRE_AUTH_IDLE_TIMEOUT * 2,
+        )
+        .await;
+        assert!(finished, "a client that never reads kept its connection");
+        assert!(started.elapsed() >= PRE_AUTH_IDLE_TIMEOUT);
+    }
+
+    const REQUEST: &[u8] = b"PROPFIND /addressbooks/user/ HTTP/1.1\r\nHost: 127.0.0.1:41443\r\nDepth: 0\r\nContent-Length: 0\r\n\r\n";
+
+    fn limit_test_app() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open_with_key(dir.path(), &[9u8; 32]).unwrap());
+        let passwords = Arc::new(AppPasswords::new(db));
+        let session = Arc::new(RwLock::new(Session {
+            data_kek: None,
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: Vec::new(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: Default::default(),
+        }));
+        let app = build_app(
+            session,
+            Arc::new(ApiClient::new()),
+            passwords,
+            LIMIT_TEST_PORT,
+            false,
+        );
+        (app, dir)
     }
 }
