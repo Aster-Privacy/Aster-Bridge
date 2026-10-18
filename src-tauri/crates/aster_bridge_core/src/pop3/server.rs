@@ -148,13 +148,12 @@ pub async fn serve_with_tls(
         let client = client.clone();
         let tls_config = tls_config.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             if let Err(e) = run_session(stream, session, db, client, passwords, tls_config).await {
                 tracing::error!("POP3 connection error: {}", e);
             }
-        }));
+        });
     }
 }
 
@@ -194,8 +193,7 @@ pub async fn run_implicit_tls(
         let client = client.clone();
         let acceptor = acceptor.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "POP3S").await {
                 Some(s) => s,
@@ -204,7 +202,7 @@ pub async fn run_implicit_tls(
             if let Err(e) = run_session(tls_stream, session, db, client, passwords, None).await {
                 tracing::error!("POP3S connection error: {}", e);
             }
-        }));
+        });
     }
 }
 

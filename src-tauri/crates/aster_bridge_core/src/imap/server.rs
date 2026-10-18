@@ -1125,8 +1125,7 @@ pub async fn serve(
         let broadcaster = broadcaster.clone();
         let tls_config = tls_config.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             if let Err(e) = run_session(
                 stream, session, db, client, passwords, broadcaster, tls_config,
@@ -1135,7 +1134,7 @@ pub async fn serve(
             {
                 tracing::error!("IMAP connection error: {}", e);
             }
-        }));
+        });
     }
 }
 
@@ -1177,8 +1176,7 @@ pub async fn run_implicit_tls(
         let broadcaster = broadcaster.clone();
         let acceptor = acceptor.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "IMAPS").await {
                 Some(s) => s,
@@ -1191,7 +1189,7 @@ pub async fn run_implicit_tls(
             {
                 tracing::error!("IMAPS connection error: {}", e);
             }
-        }));
+        });
     }
 }
 
@@ -1739,7 +1737,7 @@ where
                         if !seen_changes.is_empty() {
                             let client = client.clone();
                             let session = session.clone();
-                            tokio::spawn(async move {
+                            crate::shutdown::current().spawn(async move {
                                 let token = session.read().await.access_token.to_string();
                                 for (aster_id, is_read) in seen_changes {
                                     if let Err(e) =
@@ -1927,7 +1925,7 @@ where
                     if !seen_changes.is_empty() {
                         let client = client.clone();
                         let session = session.clone();
-                        tokio::spawn(async move {
+                        crate::shutdown::current().spawn(async move {
                             let token = session.read().await.access_token.to_string();
                             for (aster_id, is_read) in seen_changes {
                                 if let Err(e) =
@@ -2769,14 +2767,14 @@ async fn run_with_keepalive_every<T>(
 where
     T: Send + 'static,
 {
-    let mut handle = tokio::spawn(fut);
+    let mut handle = crate::shutdown::current().spawn(fut);
     let expires_at = tokio::time::Instant::now() + deadline;
     let mut alive = true;
     loop {
         tokio::select! {
             joined = &mut handle => {
                 return match joined {
-                    Ok(out) => Some(out),
+                    Ok(out) => out,
                     Err(e) => {
                         tracing::error!("APPEND worker ended without a result: {}", e);
                         None
@@ -4405,7 +4403,7 @@ async fn handle_fetch(
     if !fetch_seen_pushes.is_empty() {
         let client = client.clone();
         let session = session.clone();
-        tokio::spawn(async move {
+        crate::shutdown::current().spawn(async move {
             let token = session.read().await.access_token.to_string();
             for aster_id in fetch_seen_pushes {
                 if let Err(e) = client.set_read_status(&token, &aster_id, true).await {
@@ -5944,6 +5942,35 @@ mod tests {
             .matches("* OK APPEND in progress\r\n")
             .count();
         assert_eq!(beats, 6, "expected keepalives right up to the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_connections_stops_an_append_the_client_gave_up_on() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (trigger, shutdown) = crate::shutdown::channel();
+        let wrote = Arc::new(AtomicBool::new(false));
+        let seen = wrote.clone();
+        let result = shutdown
+            .scope(async move {
+                let mut out: Vec<u8> = Vec::new();
+                run_with_keepalive_every(
+                    &mut out,
+                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(30),
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        seen.store(true, Ordering::SeqCst);
+                    },
+                )
+                .await
+            })
+            .await;
+        assert_eq!(result, None);
+        tokio::time::timeout(std::time::Duration::from_secs(5), trigger.close_and_wait())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
+        assert!(!wrote.load(Ordering::SeqCst), "the import wrote after sign-out");
     }
 
     async fn append_literal(

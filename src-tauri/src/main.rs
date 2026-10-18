@@ -41,6 +41,7 @@ struct BridgeState {
     client: Arc<api_client::ApiClient>,
     passwords: Option<Arc<auth::app_passwords::AppPasswords>>,
     runtime: Option<runtime::RunningBridge>,
+    stopped_runtime: Option<runtime::RunningBridge>,
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
     identity: auth::device_identity::DeviceIdentity,
     pending_code: Option<String>,
@@ -84,6 +85,13 @@ impl BridgeState {
     fn stop_runtime(&mut self, reason: runtime::StopReason) {
         if let Some(running) = self.runtime.take() {
             running.stop(reason);
+            self.stopped_runtime = Some(running);
+        }
+    }
+
+    async fn stop_runtime_and_wait(&mut self, reason: runtime::StopReason) {
+        for running in self.runtime.take().into_iter().chain(self.stopped_runtime.take()) {
+            running.stop_and_wait(reason.clone()).await;
         }
     }
 }
@@ -420,7 +428,7 @@ async fn stop_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
 async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut guard = state.0.lock().await;
 
-    guard.stop_runtime(runtime::StopReason::UserRequested);
+    guard.stop_runtime_and_wait(runtime::StopReason::UserRequested).await;
 
     guard.session = None;
     guard.passwords = None;
@@ -1633,6 +1641,7 @@ fn main() {
             client,
             passwords: None,
             runtime: None,
+            stopped_runtime: None,
             tls_server_config,
             identity,
             pending_code: None,

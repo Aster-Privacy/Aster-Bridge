@@ -179,13 +179,12 @@ pub async fn serve(
         let db = db.clone();
         let tls_config = tls_config.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_session(stream, session, client, passwords, db, tls_config, true).await {
                 tracing::error!("SMTP connection error: {}", e);
             }
-        }));
+        });
     }
 }
 
@@ -225,8 +224,7 @@ pub async fn run_implicit_tls(
         let db = db.clone();
         let acceptor = acceptor.clone();
 
-        let shutdown = shutdown.clone();
-        tokio::spawn(crate::shutdown::until_closed(shutdown, async move {
+        shutdown.spawn(async move {
             let _permit = permit;
             let tls_stream = match crate::tls::accept_with_timeout(&acceptor, stream, "SMTPS").await {
                 Some(s) => s,
@@ -235,7 +233,7 @@ pub async fn run_implicit_tls(
             if let Err(e) = handle_session(tls_stream, session, client, passwords, db, None, true).await {
                 tracing::error!("SMTPS connection error: {}", e);
             }
-        }));
+        });
     }
 }
 

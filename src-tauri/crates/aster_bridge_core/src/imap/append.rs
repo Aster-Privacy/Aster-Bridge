@@ -1098,7 +1098,11 @@ async fn import_message(
         let cache_folder = folder.to_string();
         let cache_id = aster_id.clone();
         let cache_bits = flags.local_bits() & !16;
+        let work = crate::shutdown::current()
+            .hold()
+            .ok_or_else(|| "Aster Bridge stopped before the message was stored locally".to_string())?;
         tokio::task::spawn_blocking(move || {
+            let _work = work;
             crate::sync::poller::cache_mail_item(
                 &cache_db,
                 &cache_folder,

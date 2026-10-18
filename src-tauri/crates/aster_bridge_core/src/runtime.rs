@@ -304,6 +304,7 @@ pub struct StartOptions {
 
 struct Inner {
     handles: StdMutex<Vec<(Service, JoinHandle<()>)>>,
+    stopping: StdMutex<Vec<JoinHandle<()>>>,
     stop_tx: watch::Sender<Option<StopReason>>,
     sync_trigger: SyncTriggerTx,
     connections: crate::shutdown::ShutdownTrigger,
@@ -326,9 +327,15 @@ impl Inner {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
+        let mut stopping = match self.stopping.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         for (_, handle) in handles {
             handle.abort();
+            stopping.push(handle);
         }
+        drop(stopping);
         if first {
             poller::clear_global_sync_trigger_if(&self.sync_trigger);
             tracing::info!("bridge stopped ({})", reason.code());
@@ -371,6 +378,18 @@ impl RunningBridge {
 
     pub fn stop(&self, reason: StopReason) {
         self.inner.stop(reason);
+    }
+
+    pub async fn stop_and_wait(&self, reason: StopReason) {
+        self.inner.stop(reason);
+        let stopping = match self.inner.stopping.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for handle in stopping {
+            let _ = handle.await;
+        }
+        self.inner.connections.close_and_wait().await;
     }
 
     pub async fn wait(&self) -> StopReason {
@@ -820,6 +839,7 @@ impl BridgeRuntime {
         let (stop_tx, stop_rx) = watch::channel(None);
         let inner = Arc::new(Inner {
             handles: StdMutex::new(handles),
+            stopping: StdMutex::new(Vec::new()),
             stop_tx,
             sync_trigger: sync_tx,
             connections,

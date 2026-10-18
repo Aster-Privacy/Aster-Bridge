@@ -369,6 +369,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     tracing::info!("aster-bridge is running");
 
     let reason = wait_for_stop(ctx, &running, &db, &stop, ndjson).await;
+    running.stop_and_wait(reason.clone()).await;
     drop(control_server);
 
     common::save_state(&dir, |s| {
