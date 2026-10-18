@@ -977,14 +977,26 @@ mod tests {
         let mut reader = BufReader::new(client_read);
         let mut line = String::new();
 
-        client_write.write_all(b"CAPA
-").await.unwrap();
+        client_write.write_all(b"CAPA\r\n").await.unwrap();
         client_write.flush().await.unwrap();
         reader.read_line(&mut line).await.unwrap();
         assert!(
             line.starts_with("+OK Capability list follows"),
             "a session resumed after STLS answered {:?} first, so every later reply is off by one",
             line
+        );
+        loop {
+            let mut next = String::new();
+            reader.read_line(&mut next).await.unwrap();
+            line.push_str(&next);
+            if next == ".\r\n" || next.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            line,
+            "+OK Capability list follows\r\nUSER\r\nUIDL\r\nTOP\r\nRESP-CODES\r\nEXPIRE NEVER\r\nIMPLEMENTATION Aster Bridge\r\n.\r\n",
+            "a session resumed after STLS must list its capabilities once, without STLS"
         );
 
         handle.abort();

@@ -380,6 +380,17 @@ impl RunningBridge {
         self.inner.stop(reason);
     }
 
+    pub fn is_drained(&self) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        let stopping_done = match self.inner.stopping.lock() {
+            Ok(guard) => guard.iter().all(|h| h.is_finished()),
+            Err(_) => false,
+        };
+        stopping_done && self.inner.connections.is_idle()
+    }
+
     pub async fn stop_and_wait(&self, reason: StopReason) {
         self.inner.stop(reason);
         let stopping = match self.inner.stopping.lock() {
@@ -547,6 +558,22 @@ where
     }))
 }
 
+fn spawn_worker<F>(shutdown: crate::shutdown::ConnectionShutdown, fut: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let held = shutdown.hold();
+    tokio::spawn(async move {
+        let Some(_held) = held else {
+            return;
+        };
+        let _ = shutdown
+            .clone()
+            .scope(crate::shutdown::until_closed(shutdown, fut))
+            .await;
+    })
+}
+
 pub struct BridgeRuntime;
 
 impl BridgeRuntime {
@@ -707,7 +734,7 @@ impl BridgeRuntime {
             let stop = stop_signal_tx.clone();
             handles.push((
                 Service::Sync,
-                tokio::spawn(async move {
+                spawn_worker(conn_shutdown.clone(), async move {
                     if poller::run_poll_loop_tuned(s, c, d, b, sync_rx, tuning).await
                         == PollExit::AccessRevoked
                     {
@@ -723,7 +750,7 @@ impl BridgeRuntime {
             let every = opts.tuning.blob_gc_interval;
             handles.push((
                 Service::Gc,
-                tokio::spawn(async move {
+                spawn_worker(conn_shutdown.clone(), async move {
                     let mut tick = tokio::time::interval(every);
                     loop {
                         tick.tick().await;
@@ -743,7 +770,7 @@ impl BridgeRuntime {
             let (s, c, d) = (session.clone(), client.clone(), db.clone());
             handles.push((
                 Service::Outbox,
-                tokio::spawn(async move {
+                spawn_worker(conn_shutdown.clone(), async move {
                     crate::outbox::run_outbox_loop(s, c, d, outbox_rx).await;
                 }),
             ));
@@ -759,7 +786,7 @@ impl BridgeRuntime {
             let stop = stop_signal_tx.clone();
             handles.push((
                 Service::TokenRefresh,
-                tokio::spawn(async move {
+                spawn_worker(conn_shutdown.clone(), async move {
                     crate::auth::session::set_session_rejected(false);
                     let mut consecutive_failures: u32 = 0;
                     let mut definitive_failures: u32 = 0;
@@ -956,5 +983,116 @@ mod tests {
         ports.apply_to_config(&mut saved);
         crate::config::validate_ports(&saved).expect("saved ports must stay distinct");
         drop(held);
+    }
+
+    fn bridge_with<F>(spawn: F) -> (RunningBridge, crate::shutdown::ConnectionShutdown)
+    where
+        F: FnOnce(crate::shutdown::ConnectionShutdown) -> Vec<(Service, JoinHandle<()>)>,
+    {
+        let (connections, conn_shutdown) = crate::shutdown::channel();
+        let handles = spawn(conn_shutdown.clone());
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let (sync_tx, _sync_rx) = poller::sync_trigger_channel();
+        let (outbox_tx, _outbox_rx) = crate::outbox::outbox_trigger_channel();
+        let inner = Arc::new(Inner {
+            handles: StdMutex::new(handles),
+            stopping: StdMutex::new(Vec::new()),
+            stop_tx,
+            sync_trigger: sync_tx,
+            connections,
+        });
+        (
+            RunningBridge {
+                inner,
+                ports: BoundPorts::default(),
+                outbox_trigger: outbox_tx,
+                stop_rx,
+            },
+            conn_shutdown,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sign_out_waits_for_background_writes_and_none_start_after_the_wipe() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let writes = Arc::new(AtomicU32::new(0));
+        let writing = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (w, busy) = (writes.clone(), writing.clone());
+        let (bridge, _) = bridge_with(move |shutdown| {
+            let mut started = Some(started_tx);
+            vec![
+                (
+                    Service::Sync,
+                    spawn_worker(shutdown.clone(), async move {
+                        loop {
+                            let (w, busy) = (w.clone(), busy.clone());
+                            let first = started.take();
+                            let out = crate::shutdown::spawn_blocking_held(move || {
+                                busy.store(true, Ordering::SeqCst);
+                                if let Some(tx) = first {
+                                    let _ = tx.send(());
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                w.fetch_add(1, Ordering::SeqCst);
+                                busy.store(false, Ordering::SeqCst);
+                            })
+                            .await;
+                            if out.is_none() {
+                                return;
+                            }
+                        }
+                    }),
+                ),
+                (
+                    Service::Outbox,
+                    spawn_worker(shutdown, async move {
+                        std::future::pending::<()>().await;
+                    }),
+                ),
+            ]
+        });
+        started_rx.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bridge.stop_and_wait(StopReason::UserRequested),
+        )
+        .await
+        .unwrap();
+        assert!(!writing.load(Ordering::SeqCst));
+        let after_wipe = writes.load(Ordering::SeqCst);
+        assert!(after_wipe >= 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(writes.load(Ordering::SeqCst), after_wipe);
+        assert!(bridge.is_drained());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_bridge_is_drained_only_once_its_work_is_released() {
+        let (bridge, shutdown) = bridge_with(|shutdown| {
+            vec![(
+                Service::Gc,
+                spawn_worker(shutdown, async { std::future::pending::<()>().await }),
+            )]
+        });
+        assert!(!bridge.is_drained());
+        let connection = shutdown.hold().unwrap();
+        bridge.stop(StopReason::UserRequested);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!bridge.is_drained());
+        drop(connection);
+        assert!(bridge.is_drained());
+    }
+
+    #[tokio::test]
+    async fn a_worker_does_not_start_once_connections_are_closed() {
+        let (trigger, shutdown) = crate::shutdown::channel();
+        trigger.close_and_wait().await;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ran.clone();
+        spawn_worker(shutdown, async move { seen.store(true, std::sync::atomic::Ordering::SeqCst) })
+            .await
+            .unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

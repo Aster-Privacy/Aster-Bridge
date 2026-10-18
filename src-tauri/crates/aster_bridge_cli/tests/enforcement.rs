@@ -391,3 +391,54 @@ fn logout_removes_the_account_and_keys() {
     env.login();
     assert_eq!(env.mock.code_requests().len(), 2);
 }
+
+fn plant_cache_files(dir: &std::path::Path) {
+    for name in [
+        "bridge.db",
+        "bridge.db-wal",
+        "bridge.db-shm",
+        "bridge.db.enc",
+        "bridge.db.unreadable.1700000000000",
+        "bridge.db.incompatible.1700000000000-wal",
+    ] {
+        std::fs::write(dir.join(name), b"cached mail").unwrap();
+    }
+    std::fs::write(dir.join("bridge.dbx"), b"not the cache").unwrap();
+}
+
+fn cache_files_left(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("bridge.db"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn logout_deletes_the_mail_cache_and_every_old_copy() {
+    let env = Env::new();
+    env.login();
+    plant_cache_files(&env.data);
+    env.json(&["logout"]).expect(0);
+    assert_eq!(cache_files_left(&env.data), vec!["bridge.dbx".to_string()]);
+}
+
+#[test]
+fn logout_keeping_the_cache_still_deletes_old_copies() {
+    let env = Env::new();
+    env.login();
+    plant_cache_files(&env.data);
+    env.json(&["logout", "--keep-cache"]).expect(0);
+    assert_eq!(
+        cache_files_left(&env.data),
+        vec![
+            "bridge.db".to_string(),
+            "bridge.db-shm".to_string(),
+            "bridge.db-wal".to_string(),
+            "bridge.dbx".to_string(),
+        ]
+    );
+}

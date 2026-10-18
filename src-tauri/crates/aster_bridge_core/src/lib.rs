@@ -34,6 +34,7 @@ pub mod error;
 pub mod events;
 pub mod folder_ops;
 pub mod folders;
+pub mod http_listener;
 pub mod imap;
 pub mod jmap;
 pub mod message_render;

@@ -83,16 +83,22 @@ pub enum Protocol {
     Imap,
     Smtp,
     Pop3,
+    Jmap,
+    Dav,
 }
 
 fn semaphore_for(protocol: Protocol) -> &'static Arc<Semaphore> {
     static IMAP: OnceLock<Arc<Semaphore>> = OnceLock::new();
     static SMTP: OnceLock<Arc<Semaphore>> = OnceLock::new();
     static POP3: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    static JMAP: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    static DAV: OnceLock<Arc<Semaphore>> = OnceLock::new();
     let cell = match protocol {
         Protocol::Imap => &IMAP,
         Protocol::Smtp => &SMTP,
         Protocol::Pop3 => &POP3,
+        Protocol::Jmap => &JMAP,
+        Protocol::Dav => &DAV,
     };
     cell.get_or_init(|| Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_PROTOCOL)))
 }

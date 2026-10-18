@@ -83,6 +83,7 @@ impl BridgeState {
     }
 
     fn stop_runtime(&mut self, reason: runtime::StopReason) {
+        self.stopped_runtimes.retain(|r| !r.is_drained());
         if let Some(running) = self.runtime.take() {
             running.stop(reason);
             self.stopped_runtimes.push(running);
@@ -465,7 +466,8 @@ async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> R
 
 #[tauri::command]
 async fn reset_bridge_data(state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.0.lock().await;
+    let mut guard = state.0.lock().await;
+    guard.stop_runtime_and_wait(runtime::StopReason::UserRequested).await;
     guard.db.clear_all_user_data().map_err(|e| e.to_string())?;
     tracing::info!("bridge data reset");
     Ok(())
