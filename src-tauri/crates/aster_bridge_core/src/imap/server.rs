@@ -1246,12 +1246,23 @@ where
 
     let mut line = String::new();
     let mut failed_auth: u32 = 0;
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
 
     loop {
         writer.disarm();
         writer.flush().await?;
         line.clear();
-        let n = match read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH).await {
+        let read = pre_auth
+            .bound_until_auth(
+                conn.state != ImapState::NotAuthenticated,
+                read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH),
+            )
+            .await;
+        let Some(read) = read else {
+            writer.write_all(b"* BYE Autologout; idle for too long\r\n").await?;
+            break;
+        };
+        let n = match read {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 writer.write_all(b"* BAD Line too long\r\n").await?;
@@ -1385,10 +1396,10 @@ where
                 let reclaimed = writer.reclaim().await?;
                 let rejoined = tokio::io::join(reader.into_inner(), reclaimed);
                 let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                let tls_stream = acceptor
-                    .accept(rejoined)
-                    .await
-                    .map_err(std::io::Error::other)?;
+                let Some(accepted) = pre_auth.bound(acceptor.accept(rejoined)).await else {
+                    return Ok(());
+                };
+                let tls_stream = accepted.map_err(std::io::Error::other)?;
                 let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                 return Box::pin(run_session_erased(
                     erased,
@@ -1456,8 +1467,10 @@ where
                         None => {
                             writer.write_all(b"+ \r\n").await?;
                             line.clear();
-                            let nb = read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH)
+                            let nb = pre_auth
+                                .bound(read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH))
                                 .await
+                                .and_then(|r| r.ok())
                                 .unwrap_or(0);
                             if nb == 0 {
                                 break;
@@ -4462,6 +4475,48 @@ mod tests {
         .await;
         drop(dir);
         out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_logged_out_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, tx, None)
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "an idle connection held its slot: {:?}", out);
+        assert!(out.contains("* BYE Autologout"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, tx, None)
+        });
+        writer
+            .write_all(b"a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 3).await;
+        assert!(!closed, "a signed-in session was closed: {:?}", out);
+        assert!(out.contains("a1 OK"), "{:?}", out);
+        writer.write_all(b"a2 NOOP\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, Duration::from_secs(5)).await;
+        assert!(!closed);
+        assert!(out.contains("a2 OK"), "{:?}", out);
+        drop(dir);
     }
 
     #[tokio::test]

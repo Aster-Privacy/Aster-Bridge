@@ -282,11 +282,19 @@ where
     let mut refreshed_identities = false;
 
     let mut line_bytes: Vec<u8> = Vec::new();
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
 
     loop {
         let in_data = smtp.state == SmtpState::Data;
         let cap = if in_data { MAX_DATA_LINE_LENGTH } else { MAX_LINE_LENGTH };
-        let n = match read_line_bytes(&mut reader, &mut line_bytes, cap).await {
+        let read = pre_auth
+            .bound_until_auth(smtp.authenticated, read_line_bytes(&mut reader, &mut line_bytes, cap))
+            .await;
+        let Some(read) = read else {
+            writer.write_all(b"421 4.4.2 Idle timeout, closing connection\r\n").await?;
+            break;
+        };
+        let n = match read {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 writer.write_all(b"500 Line too long\r\n").await?;
@@ -483,10 +491,10 @@ where
                 let upgraded_db = db.clone();
                 let rejoined = tokio::io::join(reader.into_inner(), writer);
                 let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                let tls_stream = acceptor
-                    .accept(rejoined)
-                    .await
-                    .map_err(std::io::Error::other)?;
+                let Some(accepted) = pre_auth.bound(acceptor.accept(rejoined)).await else {
+                    return Ok(());
+                };
+                let tls_stream = accepted.map_err(std::io::Error::other)?;
                 let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                 return Box::pin(handle_session_erased(
                     erased,
@@ -517,7 +525,7 @@ where
                     } else {
                         writer.write_all(b"334 \r\n").await?;
                         let mut cont = Vec::new();
-                        if read_line_bytes(&mut reader, &mut cont, MAX_LINE_LENGTH).await.unwrap_or(0) == 0 {
+                        if pre_auth.bound(read_line_bytes(&mut reader, &mut cont, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 {
                             break;
                         }
                         std::str::from_utf8(&cont).unwrap_or("").trim_end().to_string()
@@ -532,10 +540,10 @@ where
                 } else if auth_type.eq_ignore_ascii_case("LOGIN") {
                     writer.write_all(b"334 VXNlcm5hbWU6\r\n").await?;
                     let mut line = Vec::new();
-                    if read_line_bytes(&mut reader, &mut line, MAX_LINE_LENGTH).await.unwrap_or(0) == 0 { break; }
+                    if pre_auth.bound(read_line_bytes(&mut reader, &mut line, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 { break; }
                     writer.write_all(b"334 UGFzc3dvcmQ6\r\n").await?;
                     let mut pw_line = Vec::new();
-                    if read_line_bytes(&mut reader, &mut pw_line, MAX_LINE_LENGTH).await.unwrap_or(0) == 0 { break; }
+                    if pre_auth.bound(read_line_bytes(&mut reader, &mut pw_line, MAX_LINE_LENGTH)).await.and_then(|r| r.ok()).unwrap_or(0) == 0 { break; }
                     let pw_b64 = std::str::from_utf8(&pw_line).unwrap_or("").trim_end();
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pw_b64)
                         .ok()
@@ -1056,6 +1064,70 @@ mod tests {
     #[test]
     fn io_errors_are_transient() {
         assert!(is_transient_send_error(&io_err()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_closed_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "an idle connection held its slot: {:?}", out);
+        assert!(out.ends_with("421 4.4.2 Idle timeout, closing connection\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_auth_login_exchange_is_closed() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        use tokio::io::AsyncWriteExt;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        writer.write_all(b"EHLO test\r\nAUTH LOGIN\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "a stalled AUTH exchange held its slot: {:?}", out);
+        assert!(out.ends_with("334 VXNlcm5hbWU6\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_signed_in_connection_stays_open_past_the_pre_auth_limits() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE};
+        use tokio::io::AsyncWriteExt;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            handle_session(stream, session, client, passwords, db, None, true)
+        });
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("\0tester@aster.test\0{}", crate::sign_in_notice::test_support::APP_PASSWORD),
+        );
+        writer
+            .write_all(format!("EHLO test\r\nAUTH PLAIN {}\r\n", credentials).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 3).await;
+        assert!(!closed, "a signed-in session was closed: {:?}", out);
+        assert!(out.contains("235 "), "{:?}", out);
+        writer.write_all(b"RSET\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let (out, closed) = test_support::read_until_closed(&mut reader, std::time::Duration::from_secs(5)).await;
+        assert!(!closed);
+        assert!(!out.is_empty() && !out.starts_with("421"), "{:?}", out);
+        drop(dir);
     }
 
     async fn smtp_transcript(script: &str, with_tls: bool) -> String {

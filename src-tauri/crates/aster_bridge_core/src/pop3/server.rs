@@ -263,11 +263,19 @@ where
     let mut line = String::new();
     let mut failed_auth: u32 = 0;
     let mut _session_lock: Option<Pop3SessionLock> = None;
+    let pre_auth = crate::conn_limit::PreAuthClock::start();
 
     loop {
         writer.flush().await?;
         line.clear();
-        let n = match read_pop3_line(&mut reader, &mut line).await {
+        let read = pre_auth
+            .bound_until_auth(authenticated, read_pop3_line(&mut reader, &mut line))
+            .await;
+        let Some(read) = read else {
+            writer.write_all(b"-ERR idle timeout\r\n").await?;
+            break;
+        };
+        let n = match read {
             Ok(n) => n,
             Err(_) => break,
         };
@@ -308,10 +316,10 @@ where
                     writer.flush().await?;
                     let rejoined = tokio::io::join(reader.into_inner(), writer);
                     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                    let tls_stream = acceptor
-                        .accept(rejoined)
-                        .await
-                        .map_err(std::io::Error::other)?;
+                    let Some(accepted) = pre_auth.bound(acceptor.accept(rejoined)).await else {
+                        return Ok(());
+                    };
+                    let tls_stream = accepted.map_err(std::io::Error::other)?;
                     let erased: Box<dyn AsyncReadWrite + Send + Unpin> = Box::new(tls_stream);
                     return Box::pin(run_session_erased(erased, session, db, client, passwords)).await;
                 }
@@ -823,6 +831,49 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}", port), calls)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_closed_before_sign_in() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (mut reader, _writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, None)
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "an idle connection held its slot: {:?}", out);
+        assert!(out.ends_with("-ERR idle timeout\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_IDLE_TIMEOUT + std::time::Duration::from_secs(1));
+        drop(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trickle_of_commands_cannot_outlast_the_pre_auth_deadline() {
+        use crate::conn_limit::{test_support, PRE_AUTH_DEADLINE, PRE_AUTH_IDLE_TIMEOUT};
+        use tokio::io::AsyncWriteExt;
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let started = tokio::time::Instant::now();
+        let (mut reader, mut writer) = test_support::connect(move |stream| {
+            run_session(stream, session, db, client, passwords, None)
+        });
+        let step = PRE_AUTH_IDLE_TIMEOUT - std::time::Duration::from_secs(10);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(step).await;
+                if writer.write_all(b"CAPA\r\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (out, closed) = test_support::read_until_closed(&mut reader, PRE_AUTH_DEADLINE * 2).await;
+        assert!(closed, "a trickling client held its slot: {:?}", out);
+        assert!(out.contains("+OK Capability list follows"), "{:?}", out);
+        assert!(out.ends_with("-ERR idle timeout\r\n"), "{:?}", out);
+        assert!(started.elapsed() <= PRE_AUTH_DEADLINE + std::time::Duration::from_secs(1));
+        drop(dir);
     }
 
     #[tokio::test]

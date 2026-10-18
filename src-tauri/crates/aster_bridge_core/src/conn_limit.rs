@@ -3,10 +3,47 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 const MAX_CONNECTIONS_PER_PROTOCOL: usize = 256;
+pub const PRE_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const PRE_AUTH_DEADLINE: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy)]
+pub struct PreAuthClock {
+    deadline: Instant,
+}
+
+impl PreAuthClock {
+    pub fn start() -> Self {
+        Self {
+            deadline: Instant::now() + PRE_AUTH_DEADLINE,
+        }
+    }
+
+    pub async fn bound<F: Future>(&self, future: F) -> Option<F::Output> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining.min(PRE_AUTH_IDLE_TIMEOUT), future)
+            .await
+            .ok()
+    }
+
+    pub async fn bound_until_auth<F: Future>(
+        &self,
+        authenticated: bool,
+        future: F,
+    ) -> Option<F::Output> {
+        if authenticated {
+            Some(future.await)
+        } else {
+            self.bound(future).await
+        }
+    }
+}
 
 /// A local mail listener family. Each protocol gets its own connection pool so a
 /// flood (or long-lived IMAP IDLE sessions) on one cannot starve the others.
@@ -36,6 +73,35 @@ fn semaphore_for(protocol: Protocol) -> &'static Arc<Semaphore> {
 /// case the caller should drop the connection rather than spawn a handler.
 pub fn try_acquire_connection(protocol: Protocol) -> Option<OwnedSemaphorePermit> {
     semaphore_for(protocol).clone().try_acquire_owned().ok()
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream, ReadHalf, WriteHalf};
+
+    pub(crate) fn connect<F, Fut, T>(serve: F) -> (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>)
+    where
+        F: FnOnce(DuplexStream) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (client_side, server_side) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(serve(server_side));
+        tokio::io::split(client_side)
+    }
+
+    pub(crate) async fn read_until_closed(
+        reader: &mut ReadHalf<DuplexStream>,
+        limit: Duration,
+    ) -> (String, bool) {
+        let mut out = Vec::new();
+        let closed = tokio::time::timeout(limit, reader.read_to_end(&mut out))
+            .await
+            .is_ok();
+        (String::from_utf8_lossy(&out).into_owned(), closed)
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +143,42 @@ mod tests {
             try_acquire_connection(Protocol::Imap).is_some(),
             "permits must be reusable after release"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_auth_read_times_out_when_idle() {
+        let clock = PreAuthClock::start();
+        let started = Instant::now();
+        let result = clock.bound(std::future::pending::<()>()).await;
+        assert!(result.is_none());
+        assert_eq!(started.elapsed(), PRE_AUTH_IDLE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_auth_deadline_caps_a_slow_trickle() {
+        let clock = PreAuthClock::start();
+        let started = Instant::now();
+        let step = PRE_AUTH_IDLE_TIMEOUT - Duration::from_secs(1);
+        let mut completed = 0u32;
+        while clock.bound(tokio::time::sleep(step)).await.is_some() {
+            completed += 1;
+        }
+        assert!(completed > 0);
+        assert!(started.elapsed() <= PRE_AUTH_DEADLINE);
+        assert!(started.elapsed() >= PRE_AUTH_DEADLINE - step);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_reads_are_not_bounded() {
+        let clock = PreAuthClock::start();
+        let wait = PRE_AUTH_DEADLINE * 4;
+        let result = clock
+            .bound_until_auth(true, async {
+                tokio::time::sleep(wait).await;
+                7u32
+            })
+            .await;
+        assert_eq!(result, Some(7));
     }
 
     #[test]
