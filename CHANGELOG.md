@@ -2,6 +2,16 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.10 - 2026-10-18
+
+### Fixed
+- On macOS, you can now add Aster Bridge to the built-in mail app. Previously the app reported the Aster Bridge certificate as invalid and didn't offer to trust it.
+- Messages to Aster users at a custom domain are now sealed end to end.
+- Accepting a contact's new key never lowers the post-quantum protection you had with that contact.
+- Signing out now waits for imports, moves, and background syncs to finish, and then removes all local mail data, including old copies of the mail database.
+- Connections to the JMAP and CalDAV/CardDAV servers that stall before signing in now close on their own.
+- Aster Bridge updates are now signed with a key used only for Aster Bridge.
+
 ## 1.0.9 - 2026-10-18
 
 ### What's new
