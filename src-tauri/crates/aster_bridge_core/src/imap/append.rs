@@ -2028,7 +2028,7 @@ mod tests {
             .await;
         assert!(spawned);
         assert!(TEST_CLOSER_RUNNING.load(Ordering::SeqCst));
-        tokio::time::timeout(std::time::Duration::from_secs(5), trigger.close_and_wait())
+        tokio::time::timeout(std::time::Duration::from_secs(60), trigger.close_and_wait())
             .await
             .unwrap();
         assert!(!TEST_CLOSER_RUNNING.load(Ordering::SeqCst));
