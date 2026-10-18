@@ -1695,7 +1695,10 @@ async fn try_bootstrap(
     None
 }
 
-async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
+async fn try_escrow(
+    ctx: &InternalDecryptContext<'_>,
+    dedupe_key: &str,
+) -> Option<crate::crypto::ratchet_recovery::EscrowPlaintext> {
     if ctx.escrow_keys.is_empty() {
         return None;
     }
@@ -1717,6 +1720,12 @@ async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Optio
         &entry.encrypted_plaintext,
         &entry.plaintext_nonce,
     )
+}
+
+fn unsealed_bundle(plaintext: &str, sender_unverified: bool) -> crate::crypto::ratchet_recovery::SubjectBundle {
+    let mut bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(plaintext);
+    bundle.sender_unverified = sender_unverified;
+    bundle
 }
 
 fn replay_marker(item: &MailItem) -> String {
@@ -1755,7 +1764,7 @@ async fn try_decrypt_internal_mail(
     let attempts =
         crate::crypto::ratchet_recovery::recipient_attempts(&ratchet_obj, ctx.our_email, &sender_email);
     let mut opened: Option<String> = None;
-    let mut via_recovery_lane = false;
+    let mut sender_unverified = false;
     let mut failed_steps: Vec<&str> = Vec::new();
     for attempt in &attempts {
         if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
@@ -1775,29 +1784,29 @@ async fn try_decrypt_internal_mail(
                 &ctx.recovery.lane_candidates,
             );
             if opened.is_some() {
-                via_recovery_lane = true;
+                sender_unverified = true;
                 break;
             }
             failed_steps.push("recovery_lane");
         }
         if let Some(dedupe_key) = crate::crypto::ratchet_recovery::escrow_dedupe_key(&item.id, attempt.data) {
-            opened = try_escrow(ctx, &dedupe_key).await;
-            if opened.is_some() {
+            if let Some(entry) = try_escrow(ctx, &dedupe_key).await {
+                sender_unverified = !entry.bound_to_message;
+                opened = Some(entry.plaintext);
                 break;
             }
             failed_steps.push("escrow");
         }
     }
     if opened.is_none() && attempts.is_empty() {
-        opened = try_escrow(ctx, &item.id).await;
+        if let Some(entry) = try_escrow(ctx, &item.id).await {
+            sender_unverified = !entry.bound_to_message;
+            opened = Some(entry.plaintext);
+        }
         failed_steps.push("no_recipient_entry");
     }
     match opened {
-        Some(plaintext) => {
-            let mut bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&plaintext);
-            bundle.sender_unverified = via_recovery_lane;
-            Some(bundle)
-        }
+        Some(plaintext) => Some(unsealed_bundle(&plaintext, sender_unverified)),
         None => {
             tracing::debug!(
                 "ratchet message {} still sealed after: {}",
@@ -6466,5 +6475,47 @@ mod sealed_retry_tests {
         assert_eq!(kept.body_text.as_deref(), Some("text"));
         let kept_meta: serde_json::Value = serde_json::from_str(kept.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(kept_meta["sender_unverified"], true);
+    }
+
+    #[test]
+    fn escrow_without_message_binding_marks_sender_unverified() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let key = Zeroizing::new([7u8; 32]);
+        let nonce = [1u8; 12];
+        let seal = |aad: &[u8]| {
+            let sealed = Aes256Gcm::new_from_slice(key.as_slice())
+                .unwrap()
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg: b"from alice".as_slice(), aad })
+                .unwrap();
+            STANDARD.encode(sealed)
+        };
+        let keys = vec![key.clone()];
+        let nonce_b64 = STANDARD.encode(nonce);
+        let open = |dedupe: &str, sealed: &str| {
+            let entry =
+                crate::crypto::ratchet_recovery::decrypt_escrow_entry(&keys, dedupe, sealed, &nonce_b64).unwrap();
+            unsealed_bundle(&entry.plaintext, !entry.bound_to_message)
+        };
+
+        let legacy = seal(&[]);
+        let replayed = open("bob-item:BBob==:1", &legacy);
+        assert_eq!(replayed.body, "from alice");
+        assert!(replayed.sender_unverified);
+
+        let bound = seal(&crate::crypto::ratchet_recovery::escrow_aad_v2("alice-item:BAli==:3"));
+        let genuine = open("alice-item:BAli==:3", &bound);
+        assert_eq!(genuine.body, "from alice");
+        assert!(!genuine.sender_unverified);
+        assert!(crate::crypto::ratchet_recovery::decrypt_escrow_entry(
+            &keys,
+            "bob-item:BBob==:1",
+            &bound,
+            &nonce_b64
+        )
+        .is_none());
     }
 }
