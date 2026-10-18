@@ -31,7 +31,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
-use crate::exit::{CliError, CODE_CONTROL_TIMEOUT, CODE_CONTROL_UNREACHABLE, EXIT_ERROR};
+use crate::exit::{
+    CliError, CODE_CONTROL_OUTDATED, CODE_CONTROL_TIMEOUT, CODE_CONTROL_UNREACHABLE, CODE_USAGE,
+    EXIT_ERROR,
+};
 
 const CONTROL_FILE: &str = "control.json";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -234,19 +237,60 @@ impl ControlClient {
     }
 }
 
-pub async fn running(data_dir: &Path) -> Option<ControlClient> {
+async fn ping(data_dir: &Path) -> Option<(ControlClient, Value)> {
     let client = ControlClient::discover(data_dir)?;
     match tokio::time::timeout(Duration::from_secs(3), client.call("ping", Value::Null)).await {
-        Ok(Ok(_)) => Some(client),
+        Ok(Ok(info)) => Some((client, info)),
         _ => None,
     }
+}
+
+pub async fn running(data_dir: &Path) -> Option<ControlClient> {
+    ping(data_dir).await.map(|(client, _)| client)
 }
 
 pub async fn call_running(data_dir: &Path, op: &str, args: Value) -> Result<Option<Value>, CliError> {
     let Some(client) = running(data_dir).await else {
         return Ok(None);
     };
+    finish_call(client.call(op, args).await)
+}
+
+fn outdated_service() -> CliError {
+    CliError::coded(
+        CODE_CONTROL_OUTDATED,
+        "The Aster Bridge background service that's running is an older version, so the key wasn't accepted. Restart or update Aster Bridge, then try again.",
+    )
+}
+
+fn unknown_operation(err: &CliError) -> bool {
+    err.code == CODE_USAGE && err.message.starts_with("Unknown operation")
+}
+
+pub async fn call_running_recipient_trust(
+    data_dir: &Path,
+    op: &str,
+    args: Value,
+    required: u32,
+) -> Result<Option<Value>, CliError> {
+    let Some((client, info)) = ping(data_dir).await else {
+        return Ok(None);
+    };
+    let supported = info
+        .get("recipient_trust")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if supported < u64::from(required) {
+        return Err(outdated_service());
+    }
     match client.call(op, args).await {
+        Err(CallError::Remote(err)) if unknown_operation(&err) => Err(outdated_service()),
+        other => finish_call(other),
+    }
+}
+
+fn finish_call(result: Result<Value, CallError>) -> Result<Option<Value>, CliError> {
+    match result {
         Ok(value) => Ok(Some(value)),
         Err(CallError::Remote(err)) => Err(err),
         Err(CallError::TimedOut) => Err(CliError::coded(
@@ -289,6 +333,85 @@ mod tests {
             Err(CallError::Remote(e)) => assert_eq!(e.exit_code, crate::exit::EXIT_USAGE),
             _ => panic!("expected a remote error"),
         }
+    }
+
+    fn daemon_handler(recipient_trust: Option<u32>, knows_v2: bool) -> Handler {
+        Arc::new(move |op, args| {
+            Box::pin(async move {
+                match op.as_str() {
+                    "ping" => Ok(match recipient_trust {
+                        Some(level) => json!({ "pid": 1, "recipient_trust": level }),
+                        None => json!({ "pid": 1 }),
+                    }),
+                    "recipient_key_accept" => Ok(json!({ "accepted": "legacy" })),
+                    "recipient_key_accept_v2" if knows_v2 => Ok(json!({ "accepted": args["address"] })),
+                    other => Err(CliError::usage(format!("Unknown operation: {}", other))),
+                }
+            })
+        })
+    }
+
+    async fn accept_through(handler: Handler) -> Result<Option<Value>, CliError> {
+        let dir = tempfile::tempdir().unwrap();
+        let _server = start(dir.path(), handler).await.unwrap();
+        call_running_recipient_trust(
+            dir.path(),
+            "recipient_key_accept_v2",
+            json!({ "address": "bob@example.com" }),
+            2,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn older_service_without_trust_level_is_refused_with_restart_advice() {
+        let err = accept_through(daemon_handler(None, false)).await.unwrap_err();
+        assert_eq!(err.code, CODE_CONTROL_OUTDATED);
+        assert!(err.message.contains("Restart or update Aster Bridge"));
+    }
+
+    #[tokio::test]
+    async fn service_with_lower_trust_level_is_refused() {
+        let err = accept_through(daemon_handler(Some(1), true)).await.unwrap_err();
+        assert_eq!(err.code, CODE_CONTROL_OUTDATED);
+    }
+
+    #[tokio::test]
+    async fn service_that_does_not_know_the_operation_is_refused() {
+        let err = accept_through(daemon_handler(Some(2), false)).await.unwrap_err();
+        assert_eq!(err.code, CODE_CONTROL_OUTDATED);
+    }
+
+    #[tokio::test]
+    async fn current_service_accepts_through_the_new_operation() {
+        let value = accept_through(daemon_handler(Some(2), true)).await.unwrap();
+        assert_eq!(value.unwrap()["accepted"], "bob@example.com");
+    }
+
+    #[tokio::test]
+    async fn no_running_service_falls_back_to_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = call_running_recipient_trust(dir.path(), "recipient_key_accept_v2", Value::Null, 2)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_errors_other_than_unknown_operation_pass_through() {
+        let handler: Handler = Arc::new(|op, _| {
+            Box::pin(async move {
+                match op.as_str() {
+                    "ping" => Ok(json!({ "recipient_trust": 2 })),
+                    _ => Err(CliError::coded(
+                        crate::exit::CODE_RECIPIENT_KEY_MISMATCH,
+                        "mismatch",
+                    )),
+                }
+            })
+        });
+        let err = accept_through(handler).await.unwrap_err();
+        assert_eq!(err.code, crate::exit::CODE_RECIPIENT_KEY_MISMATCH);
     }
 
     #[tokio::test]

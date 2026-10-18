@@ -58,6 +58,7 @@ pub const CODE_PROGRAM_PATH: &str = "program_path_unknown";
 pub const CODE_DATA_DIR: &str = "data_dir_failed";
 pub const CODE_CONTROL_UNREACHABLE: &str = "control_unreachable";
 pub const CODE_CONTROL_TIMEOUT: &str = "control_timeout";
+pub const CODE_CONTROL_OUTDATED: &str = "control_outdated";
 pub const CODE_PLAN_CHECK: &str = "plan_check_failed";
 pub const CODE_USAGE: &str = "usage";
 pub const CODE_NOT_SIGNED_IN: &str = "not_signed_in";
@@ -292,6 +293,13 @@ pub const CATALOG: &[ErrorDoc] = &[
         exit_code: EXIT_ERROR,
         summary: "The key that this recipient publishes now doesn't match the fingerprint you entered, so Aster Bridge didn't accept it.",
         resolution: "Confirm the fingerprint shown in the message with the recipient, then run the command again with that fingerprint.",
+    },
+    ErrorDoc {
+        reference: "ASTER-1030",
+        code: CODE_CONTROL_OUTDATED,
+        exit_code: EXIT_ERROR,
+        summary: "The Aster Bridge background service that's running is an older version than this command.",
+        resolution: "Restart or update Aster Bridge, then run the command again.",
     },
     ErrorDoc {
         reference: "ASTER-2000",

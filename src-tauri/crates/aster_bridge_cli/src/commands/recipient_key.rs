@@ -18,6 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
+use aster_bridge_core::crypto::recipient_trust::RECIPIENT_TRUST_PROTOCOL;
 use serde_json::{json, Value};
 
 use super::common;
@@ -36,14 +37,22 @@ pub async fn run(ctx: &Context, command: RecipientKeyCommand) -> CliResult<i32> 
 }
 
 async fn call(ctx: &Context, address: String, fingerprint: Option<String>) -> CliResult<Value> {
-    let (op, args) = match &fingerprint {
-        Some(fingerprint) => (
-            "recipient_key_accept",
-            json!({ "address": address, "fingerprint": fingerprint }),
-        ),
-        None => ("recipient_key_show", json!({ "address": address })),
+    let running = match &fingerprint {
+        Some(fingerprint) => {
+            control::call_running_recipient_trust(
+                &ctx.data_dir,
+                "recipient_key_accept_v2",
+                json!({ "address": address, "fingerprint": fingerprint }),
+                RECIPIENT_TRUST_PROTOCOL,
+            )
+            .await?
+        }
+        None => {
+            control::call_running(&ctx.data_dir, "recipient_key_show", json!({ "address": address }))
+                .await?
+        }
     };
-    if let Some(value) = control::call_running(&ctx.data_dir, op, args).await? {
+    if let Some(value) = running {
         return Ok(value);
     }
     let offline = common::open_offline(ctx)?;
