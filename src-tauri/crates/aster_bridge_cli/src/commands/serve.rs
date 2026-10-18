@@ -37,6 +37,7 @@ use aster_bridge_core::runtime::{
 use aster_bridge_core::tls;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, Notify, RwLock};
+use zeroize::Zeroizing;
 
 use super::common::{self, VERSION};
 use crate::context::{self, Context};
@@ -629,11 +630,29 @@ impl Shared {
                     .map_err(|e| CliError::coded(CODE_SYNC, format!("The cache was rebuilt, but sync didn't finish: {}", e)))?;
                 Ok(json!({ "repaired": true, "synced": true }))
             }
-            "recipient_key_accept" => common::recipient_key_accept(
-                &self.db,
-                &state::load(&self.data_dir),
-                args.get("address").and_then(Value::as_str).unwrap_or_default(),
-            ),
+            "recipient_key_show" => {
+                let (token, username) = self.token_and_username().await;
+                common::recipient_key_show(
+                    &self.client,
+                    &token,
+                    &username,
+                    args.get("address").and_then(Value::as_str).unwrap_or_default(),
+                )
+                .await
+            }
+            "recipient_key_accept" => {
+                let (token, username) = self.token_and_username().await;
+                common::recipient_key_accept(
+                    &self.db,
+                    &state::load(&self.data_dir),
+                    &self.client,
+                    &token,
+                    &username,
+                    args.get("address").and_then(Value::as_str).unwrap_or_default(),
+                    args.get("fingerprint").and_then(Value::as_str).unwrap_or_default(),
+                )
+                .await
+            }
             "app_password_create" => common::app_password_create(
                 &self.passwords,
                 &state::load(&self.data_dir),
@@ -755,6 +774,11 @@ impl Shared {
             }
         }
         Ok(json!({ "queued": ids }))
+    }
+
+    async fn token_and_username(&self) -> (Zeroizing<String>, String) {
+        let session = self.session.read().await;
+        (session.access_token.clone(), session.username.clone())
     }
 
     async fn refresh_plan(&self) -> CliResult<Value> {

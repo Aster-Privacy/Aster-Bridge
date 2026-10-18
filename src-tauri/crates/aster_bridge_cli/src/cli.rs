@@ -161,10 +161,17 @@ pub enum OutboxCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum RecipientKeyCommand {
-    #[command(about = "Trust the key a recipient publishes now, after you confirm the change with them")]
+    #[command(about = "Show the fingerprint of the key a recipient publishes now")]
+    Show {
+        #[arg(value_name = "ADDRESS", help = "The recipient's email address")]
+        address: String,
+    },
+    #[command(about = "Trust the key a recipient publishes now, after you confirm its fingerprint with them")]
     Accept {
         #[arg(value_name = "ADDRESS", help = "The recipient's email address")]
         address: String,
+        #[arg(long, value_name = "FINGERPRINT", help = "The fingerprint you confirmed with the recipient")]
+        fingerprint: String,
     },
 }
 
@@ -209,13 +216,32 @@ mod tests {
     }
 
     #[test]
-    fn recipient_key_accept_takes_one_address() {
-        let cli = Cli::try_parse_from(["aster-bridge", "recipient-key", "accept", "bob@astermail.org"]).unwrap();
+    fn recipient_key_accept_takes_one_address_and_the_confirmed_fingerprint() {
+        let cli = Cli::try_parse_from([
+            "aster-bridge",
+            "recipient-key",
+            "accept",
+            "bob@astermail.org",
+            "--fingerprint",
+            "C5DFC7E1",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
-            Command::RecipientKey(RecipientKeyCommand::Accept { ref address }) if address == "bob@astermail.org"
+            Command::RecipientKey(RecipientKeyCommand::Accept { ref address, ref fingerprint })
+                if address == "bob@astermail.org" && fingerprint == "C5DFC7E1"
         ));
         assert!(Cli::try_parse_from(["aster-bridge", "recipient-key", "accept"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "recipient-key", "accept", "bob@astermail.org"]).is_err());
+    }
+
+    #[test]
+    fn recipient_key_show_takes_one_address() {
+        let cli = Cli::try_parse_from(["aster-bridge", "recipient-key", "show", "bob@astermail.org"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RecipientKey(RecipientKeyCommand::Show { ref address }) if address == "bob@astermail.org"
+        ));
     }
 
     #[test]

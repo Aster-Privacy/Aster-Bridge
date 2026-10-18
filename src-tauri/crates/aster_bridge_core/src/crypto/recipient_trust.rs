@@ -22,7 +22,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use crate::api_client::PrekeyBundle;
+use crate::api_client::{ApiClient, PrekeyBundle};
+use crate::crypto::internal_send::key_lookup_username;
 use crate::crypto::ratchet::{PQ_IDENTITY_KEY_ID, X3DH_VERSION_TRANSCRIPT_BOUND};
 use crate::db::Database;
 use crate::error::BridgeError;
@@ -146,12 +147,71 @@ pub fn pin_id(account_id: &str, address: &str) -> String {
     hex(&hasher.finalize())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAcceptance {
+    Accepted { fingerprint: String },
+    Mismatch { fingerprint: Option<String> },
+}
+
+pub fn key_fingerprint(owner_public_key: Option<&str>) -> Option<String> {
+    owner_public_key.and_then(|key| aster_crypto::public_key_fingerprint_hex(key.as_bytes()))
+}
+
+pub fn format_fingerprint(fingerprint: &str) -> String {
+    normalize_fingerprint(fingerprint)
+        .to_uppercase()
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+pub async fn fetch_recipient_account_key(
+    client: &ApiClient,
+    access_token: &str,
+    own_username: &str,
+    address: &str,
+) -> Result<Option<String>, BridgeError> {
+    let username = key_lookup_username(address, own_username).ok_or_else(|| {
+        BridgeError::RecipientKey(format!("{} has no username to look up", address))
+    })?;
+    client
+        .get_recipient_public_key(access_token, &username, address)
+        .await
+}
+
 pub fn accept_recipient_key(
     db: &Database,
     account_id: &str,
     address: &str,
-) -> Result<bool, String> {
-    db.recipient_pin_delete(&pin_id(account_id, address))
+    owner_public_key: Option<&str>,
+    confirmed_fingerprint: &str,
+) -> Result<KeyAcceptance, String> {
+    let current = key_fingerprint(owner_public_key);
+    let confirmed = normalize_fingerprint(confirmed_fingerprint);
+    let Some(fingerprint) = current
+        .clone()
+        .filter(|current| !confirmed.is_empty() && normalize_fingerprint(current) == confirmed)
+    else {
+        return Ok(KeyAcceptance::Mismatch { fingerprint: current });
+    };
+    db.recipient_pin_put(
+        &pin_id(account_id, address),
+        &RecipientPin {
+            owner_fingerprint: fingerprint.clone(),
+            ..RecipientPin::default()
+        },
+    )?;
+    Ok(KeyAcceptance::Accepted { fingerprint })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -162,26 +222,35 @@ fn refuse(address: &str, reason: &str) -> BridgeError {
     BridgeError::RecipientKey(format!("{} for {}", reason, address))
 }
 
-fn accept_hint(address: &str) -> String {
-    format!(
-        "If you expect this change, confirm it with the recipient, then accept the new key. In Aster Bridge, go to Settings > Advanced and click Accept key, or run: aster-bridge recipient-key accept {}",
-        address
-    )
+fn accept_hint(address: &str, fingerprint: Option<&str>) -> String {
+    match fingerprint {
+        Some(fingerprint) => format!(
+            "The key that {} publishes now has the fingerprint {}. If you expect this change, confirm this fingerprint with the recipient, then accept the key. In Aster Bridge, go to Settings > Advanced and click Accept key, or run: aster-bridge recipient-key accept {} --fingerprint {}",
+            address,
+            format_fingerprint(fingerprint),
+            address,
+            normalize_fingerprint(fingerprint).to_uppercase()
+        ),
+        None => format!(
+            "To see the fingerprint of the key that {} publishes now, run: aster-bridge recipient-key show {}",
+            address, address
+        ),
+    }
 }
 
-fn untrusted(address: &str) -> BridgeError {
+fn untrusted(address: &str, fingerprint: Option<&str>) -> BridgeError {
     BridgeError::RecipientKey(format!(
         "The encryption keys for {} changed or failed verification, so the message was not sent. {}",
         address,
-        accept_hint(address)
+        accept_hint(address, fingerprint)
     ))
 }
 
-fn downgraded(address: &str) -> BridgeError {
+fn downgraded(address: &str, fingerprint: Option<&str>) -> BridgeError {
     BridgeError::RecipientKey(format!(
         "The post-quantum key that {} published before is no longer available, so the message was not sent. {}",
         address,
-        accept_hint(address)
+        accept_hint(address, fingerprint)
     ))
 }
 
@@ -302,7 +371,7 @@ pub fn evaluate_recipient(
                     ..base
                 },
             ),
-            outcome: Err(untrusted(address)),
+            outcome: Err(untrusted(address, owner_fingerprint.as_deref())),
         };
     }
 
@@ -320,7 +389,7 @@ pub fn evaluate_recipient(
         if (pq_pinned && !covers_pq_identity) || (base.pq_seen && !advertises_pq) {
             return Evaluation {
                 pin: None,
-                outcome: Err(downgraded(address)),
+                outcome: Err(downgraded(address, Some(&owner_fingerprint))),
             };
         }
         let mut target = match ratchet_target(address, bundle, covers_pq_identity) {
@@ -358,7 +427,7 @@ pub fn evaluate_recipient(
     if base.pq_seen {
         return Evaluation {
             pin: None,
-            outcome: Err(downgraded(address)),
+            outcome: Err(downgraded(address, Some(&owner_fingerprint))),
         };
     }
 
@@ -402,14 +471,112 @@ pub(crate) mod tests {
             "a flagged recipient stays refused even when the old key comes back"
         );
 
-        assert!(!accept_recipient_key(&db, "other-account", BOB).unwrap());
-        assert!(accept_recipient_key(&db, "account", " Bob@AsterMail.org ").unwrap());
-        assert!(!accept_recipient_key(&db, "account", BOB).unwrap());
+        let shown = key_fingerprint(Some(&replaced.public_key)).unwrap();
+        assert_eq!(
+            accept_recipient_key(
+                &db,
+                "account",
+                " Bob@AsterMail.org ",
+                Some(&replaced.public_key),
+                &format_fingerprint(&shown).to_lowercase(),
+            )
+            .unwrap(),
+            KeyAcceptance::Accepted {
+                fingerprint: shown.clone()
+            }
+        );
 
         let existing = db.recipient_pin_get(&id).unwrap();
+        assert_eq!(existing.as_ref().unwrap().owner_fingerprint, shown);
+        assert!(!existing.as_ref().unwrap().flagged);
         let accepted = evaluate_recipient(BOB, None, Some(&replaced.public_key), existing.as_ref());
         assert!(accepted.outcome.is_ok());
-        assert!(!accepted.pin.unwrap().flagged);
+        assert!(accepted.pin.is_none());
+    }
+
+    #[test]
+    fn accepting_pins_the_confirmed_key_so_a_later_swap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let confirmed = owner("bob");
+        let swapped = owner("mallory");
+        let id = pin_id("account", BOB);
+        let shown = key_fingerprint(Some(&confirmed.public_key)).unwrap();
+
+        accept_recipient_key(&db, "account", BOB, Some(&confirmed.public_key), &shown).unwrap();
+
+        let existing = db.recipient_pin_get(&id).unwrap();
+        let refused = evaluate_recipient(
+            BOB,
+            Some(&signed_v2_bundle(&swapped)),
+            Some(&swapped.public_key),
+            existing.as_ref(),
+        );
+        assert!(matches!(refused.outcome, Err(BridgeError::RecipientKey(_))));
+        assert!(refused.pin.unwrap().flagged);
+    }
+
+    #[test]
+    fn accepting_refuses_when_the_server_key_no_longer_matches_the_fingerprint_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let first = owner("bob");
+        let seen = owner("bob");
+        let served = owner("mallory");
+        let id = pin_id("account", BOB);
+        let flagged = RecipientPin {
+            owner_fingerprint: key_fingerprint(Some(&first.public_key)).unwrap(),
+            flagged: true,
+            ..RecipientPin::default()
+        };
+        db.recipient_pin_put(&id, &flagged).unwrap();
+        let shown = key_fingerprint(Some(&seen.public_key)).unwrap();
+
+        assert_eq!(
+            accept_recipient_key(&db, "account", BOB, Some(&served.public_key), &shown).unwrap(),
+            KeyAcceptance::Mismatch {
+                fingerprint: key_fingerprint(Some(&served.public_key))
+            }
+        );
+        assert_eq!(
+            accept_recipient_key(&db, "account", BOB, None, &shown).unwrap(),
+            KeyAcceptance::Mismatch { fingerprint: None }
+        );
+        assert_eq!(
+            accept_recipient_key(&db, "account", BOB, Some(&seen.public_key), " ").unwrap(),
+            KeyAcceptance::Mismatch {
+                fingerprint: Some(shown)
+            }
+        );
+        assert_eq!(db.recipient_pin_get(&id).unwrap(), Some(flagged));
+    }
+
+    #[test]
+    fn the_refusal_names_the_fingerprint_of_the_key_published_now() {
+        let alice = owner("alice");
+        let mallory = owner("mallory");
+        let first = evaluate_recipient(BOB, None, Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        let fingerprint = key_fingerprint(Some(&mallory.public_key)).unwrap();
+
+        let message = match evaluate_recipient(BOB, None, Some(&mallory.public_key), Some(&first))
+            .outcome
+        {
+            Err(BridgeError::RecipientKey(message)) => message,
+            other => panic!("expected a refusal, got {:?}", other),
+        };
+        assert!(message.contains(&format_fingerprint(&fingerprint)));
+        assert!(message.contains(&format!(
+            "aster-bridge recipient-key accept {} --fingerprint {}",
+            BOB, fingerprint
+        )));
+    }
+
+    #[test]
+    fn fingerprints_are_grouped_for_display_and_compared_without_separators() {
+        assert_eq!(format_fingerprint("c5dfc7e1d649"), "C5DF C7E1 D649");
+        assert_eq!(normalize_fingerprint("C5:DF c7e1	D649"), "c5dfc7e1d649");
     }
     use crate::api_client::BundlePqPrekey;
 

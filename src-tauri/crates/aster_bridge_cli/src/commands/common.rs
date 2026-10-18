@@ -37,7 +37,8 @@ use zeroize::Zeroizing;
 use crate::context::{self, Context};
 use crate::exit::{
     CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
-    CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_SETTINGS_READ,
+    CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_RECIPIENT_KEY_LOOKUP,
+    CODE_RECIPIENT_KEY_MISMATCH, CODE_SETTINGS_READ,
     CODE_SIGN_IN,
     EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL,
 };
@@ -330,7 +331,7 @@ fn parse_subject(raw_mime: &[u8]) -> Option<String> {
         .and_then(|message| message.subject().map(str::to_string))
 }
 
-pub fn recipient_key_accept(db: &Database, state: &CliState, address: &str) -> CliResult<Value> {
+pub fn recipient_address(address: &str) -> CliResult<String> {
     let address = address.trim().to_lowercase();
     let well_formed = !address.contains(char::is_whitespace)
         && address
@@ -338,16 +339,100 @@ pub fn recipient_key_accept(db: &Database, state: &CliState, address: &str) -> C
             .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
     if !well_formed {
         return Err(CliError::usage("Enter the recipient's full email address.")
-            .with_hint("For example: aster-bridge recipient-key accept name@example.com"));
+            .with_hint("For example: aster-bridge recipient-key show name@example.com"));
     }
+    Ok(address)
+}
+
+fn no_published_recipient_key(address: &str) -> CliError {
+    CliError::coded(
+        CODE_RECIPIENT_KEY_LOOKUP,
+        format!("{} has no published encryption key.", address),
+    )
+}
+
+async fn fetch_recipient_key(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+) -> CliResult<Option<String>> {
+    recipient_trust::fetch_recipient_account_key(client, access_token, username, address)
+        .await
+        .map_err(|e| match e {
+            BridgeError::Network(e) => network_error(&e.to_string()),
+            other => CliError::coded(
+                CODE_RECIPIENT_KEY_LOOKUP,
+                format!("Couldn't look up the key for {}: {}", address, other),
+            ),
+        })
+}
+
+pub async fn recipient_key_show(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+) -> CliResult<Value> {
+    let address = recipient_address(address)?;
+    let key = fetch_recipient_key(client, access_token, username, &address).await?;
+    let fingerprint = recipient_trust::key_fingerprint(key.as_deref())
+        .ok_or_else(|| no_published_recipient_key(&address))?;
+    Ok(json!({
+        "address": address,
+        "fingerprint": recipient_trust::format_fingerprint(&fingerprint),
+    }))
+}
+
+pub async fn recipient_key_accept(
+    db: &Database,
+    state: &CliState,
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+    fingerprint: &str,
+) -> CliResult<Value> {
+    let address = recipient_address(address)?;
     let account = state.account.as_ref().ok_or_else(CliError::not_signed_in)?;
-    let accepted = recipient_trust::accept_recipient_key(db, &account.user_id, &address).map_err(|e| {
+    let key = fetch_recipient_key(client, access_token, username, &address).await?;
+    let outcome = recipient_trust::accept_recipient_key(
+        db,
+        &account.user_id,
+        &address,
+        key.as_deref(),
+        fingerprint,
+    )
+    .map_err(|e| {
         CliError::coded(
             CODE_RECIPIENT_KEY,
             format!("Couldn't update the saved key for {}: {}", address, e),
         )
     })?;
-    Ok(json!({ "address": address, "accepted": accepted }))
+    match outcome {
+        recipient_trust::KeyAcceptance::Accepted { fingerprint } => Ok(json!({
+            "address": address,
+            "accepted": true,
+            "fingerprint": recipient_trust::format_fingerprint(&fingerprint),
+        })),
+        recipient_trust::KeyAcceptance::Mismatch {
+            fingerprint: Some(current),
+        } => Err(CliError::coded(
+            CODE_RECIPIENT_KEY_MISMATCH,
+            format!(
+                "The key that {} publishes now has the fingerprint {}, which doesn't match the fingerprint you entered, so Aster Bridge didn't accept it.",
+                address,
+                recipient_trust::format_fingerprint(&current)
+            ),
+        )
+        .with_hint(format!(
+            "Confirm this fingerprint with the recipient, then run: aster-bridge recipient-key accept {} --fingerprint {}",
+            address, current
+        ))),
+        recipient_trust::KeyAcceptance::Mismatch { fingerprint: None } => {
+            Err(no_published_recipient_key(&address))
+        }
+    }
 }
 
 pub fn outbox_list(db: &Database) -> CliResult<Value> {

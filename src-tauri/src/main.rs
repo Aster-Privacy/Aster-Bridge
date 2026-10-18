@@ -26,7 +26,7 @@ mod shell;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod webkit_sandbox;
 
-use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sync, tls};
+use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sign_in_notice, sync, tls};
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -124,6 +124,7 @@ struct BridgeStatusResponse {
     plan_info_loaded: bool,
     import_progress: Option<imap::append::ImportProgress>,
     port_conflict: Option<PortConflict>,
+    insecure_sign_in: Option<sign_in_notice::InsecureSignIn>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -237,6 +238,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         plan_info_loaded: guard.plan_info_loaded,
         import_progress: imap::append::current_import_progress(),
         port_conflict: guard.port_conflict.clone(),
+        insecure_sign_in: sign_in_notice::last_insecure(),
     })
 }
 
@@ -1138,6 +1140,11 @@ async fn set_autostart(
 }
 
 #[tauri::command]
+fn dismiss_insecure_sign_in(at: i64) {
+    sign_in_notice::dismiss_insecure(at);
+}
+
+#[tauri::command]
 async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
     let trigger = {
         let guard = state.0.lock().await;
@@ -1156,8 +1163,16 @@ async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-async fn accept_recipient_key(state: State<'_, AppState>, address: String) -> Result<bool, String> {
+#[derive(serde::Serialize)]
+struct RecipientKeyResponse {
+    accepted: bool,
+    fingerprint: Option<String>,
+}
+
+async fn current_recipient_key(
+    state: &State<'_, AppState>,
+    address: &str,
+) -> Result<(Arc<db::Database>, String, String, Option<String>), String> {
     let address = address.trim().to_lowercase();
     let well_formed = !address.contains(char::is_whitespace)
         && address
@@ -1166,16 +1181,53 @@ async fn accept_recipient_key(state: State<'_, AppState>, address: String) -> Re
     if !well_formed {
         return Err("invalid address".to_string());
     }
-    let (db, account_id) = {
+    let (db, client, session) = {
         let guard = state.0.lock().await;
         let session = guard
             .session
-            .as_ref()
+            .clone()
             .ok_or_else(|| "not authenticated".to_string())?;
-        let account_id = session.read().await.user_id.to_string();
-        (guard.db.clone(), account_id)
+        (guard.db.clone(), guard.client.clone(), session)
     };
-    aster_bridge_core::crypto::recipient_trust::accept_recipient_key(&db, &account_id, &address)
+    let (account_id, username, token) = {
+        let s = session.read().await;
+        (s.user_id.to_string(), s.username.clone(), s.access_token.clone())
+    };
+    let key = crypto::recipient_trust::fetch_recipient_account_key(
+        &client, &token, &username, &address,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok((db, account_id, address, key))
+}
+
+#[tauri::command]
+async fn recipient_key_fingerprint(state: State<'_, AppState>, address: String) -> Result<Option<String>, String> {
+    let (_, _, _, key) = current_recipient_key(&state, &address).await?;
+    Ok(crypto::recipient_trust::key_fingerprint(key.as_deref())
+        .map(|fingerprint| crypto::recipient_trust::format_fingerprint(&fingerprint)))
+}
+
+#[tauri::command]
+async fn accept_recipient_key(
+    state: State<'_, AppState>,
+    address: String,
+    fingerprint: String,
+) -> Result<RecipientKeyResponse, String> {
+    use crypto::recipient_trust::{self, KeyAcceptance};
+    let (db, account_id, address, key) = current_recipient_key(&state, &address).await?;
+    Ok(
+        match recipient_trust::accept_recipient_key(&db, &account_id, &address, key.as_deref(), &fingerprint)? {
+            KeyAcceptance::Accepted { fingerprint } => RecipientKeyResponse {
+                accepted: true,
+                fingerprint: Some(recipient_trust::format_fingerprint(&fingerprint)),
+            },
+            KeyAcceptance::Mismatch { fingerprint } => RecipientKeyResponse {
+                accepted: false,
+                fingerprint: fingerprint.map(|current| recipient_trust::format_fingerprint(&current)),
+            },
+        },
+    )
 }
 
 #[tauri::command]
@@ -1502,8 +1554,10 @@ fn main() {
             provision_bundle,
             take_pending_deep_link,
             trigger_sync,
+            dismiss_insecure_sign_in,
             repair_cache,
             accept_recipient_key,
+            recipient_key_fingerprint,
             get_recent_logs,
             copy_diagnostic_bundle,
             outbox_list,

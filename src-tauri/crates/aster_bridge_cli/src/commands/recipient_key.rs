@@ -18,44 +18,90 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::common;
 use crate::cli::RecipientKeyCommand;
 use crate::context::Context;
+use crate::control;
 use crate::exit::{CliResult, EXIT_OK};
 use crate::output::Tone;
 
 pub async fn run(ctx: &Context, command: RecipientKeyCommand) -> CliResult<i32> {
     common::require_account(&ctx.data_dir)?;
     match command {
-        RecipientKeyCommand::Accept { address } => accept(ctx, address).await,
+        RecipientKeyCommand::Show { address } => show(ctx, address).await,
+        RecipientKeyCommand::Accept { address, fingerprint } => accept(ctx, address, fingerprint).await,
     }
 }
 
-async fn accept(ctx: &Context, address: String) -> CliResult<i32> {
+async fn call(ctx: &Context, address: String, fingerprint: Option<String>) -> CliResult<Value> {
+    let (op, args) = match &fingerprint {
+        Some(fingerprint) => (
+            "recipient_key_accept",
+            json!({ "address": address, "fingerprint": fingerprint }),
+        ),
+        None => ("recipient_key_show", json!({ "address": address })),
+    };
+    if let Some(value) = control::call_running(&ctx.data_dir, op, args).await? {
+        return Ok(value);
+    }
+    let offline = common::open_offline(ctx)?;
+    let (client, session) = common::sign_in_offline(ctx).await?;
+    match fingerprint {
+        Some(fingerprint) => {
+            common::recipient_key_accept(
+                &offline.db,
+                &offline.state,
+                &client,
+                &session.access_token,
+                &session.username,
+                &address,
+                &fingerprint,
+            )
+            .await
+        }
+        None => {
+            common::recipient_key_show(&client, &session.access_token, &session.username, &address)
+                .await
+        }
+    }
+}
+
+async fn show(ctx: &Context, address: String) -> CliResult<i32> {
     let out = &ctx.out;
-    let requested = address.clone();
-    let result = common::call_or_offline(
-        ctx,
-        "recipient_key_accept",
-        json!({ "address": address }),
-        move |offline| common::recipient_key_accept(&offline.db, &offline.state, &requested),
-    )
-    .await?;
+    let address = common::recipient_address(&address)?;
+    let result = call(ctx, address, None).await?;
     if out.json {
         out.json(result);
         return Ok(EXIT_OK);
     }
     let address = result["address"].as_str().unwrap_or_default();
-    if result["accepted"].as_bool() == Some(true) {
-        out.banner(Tone::Good, &format!("Accepted the new key for {}", address));
-        out.line(out.dim(
-            "Aster Bridge saves the key that this recipient publishes the next time you send to them.",
-        ));
-    } else {
-        out.banner(Tone::Good, &format!("No saved key for {}", address));
-        out.line(out.dim("There is nothing to accept, so you can send to this recipient now."));
+    let fingerprint = result["fingerprint"].as_str().unwrap_or_default();
+    out.banner(Tone::Accent, &format!("Key for {}", address));
+    out.fields(&[("Fingerprint", fingerprint.to_string())]);
+    out.line(out.dim(&format!(
+        "Confirm this fingerprint with the recipient in person or by phone. To accept this key, run: aster-bridge recipient-key accept {} --fingerprint {}",
+        address,
+        fingerprint.replace(' ', "")
+    )));
+    Ok(EXIT_OK)
+}
+
+async fn accept(ctx: &Context, address: String, fingerprint: String) -> CliResult<i32> {
+    let out = &ctx.out;
+    let address = common::recipient_address(&address)?;
+    let result = call(ctx, address, Some(fingerprint)).await?;
+    if out.json {
+        out.json(result);
+        return Ok(EXIT_OK);
     }
+    let address = result["address"].as_str().unwrap_or_default();
+    let fingerprint = result["fingerprint"].as_str().unwrap_or_default();
+    out.banner(Tone::Good, &format!("Accepted the key for {}", address));
+    out.fields(&[("Fingerprint", fingerprint.to_string())]);
+    out.line(out.dim(
+        "Aster Bridge now sends to this recipient only while they publish the key with this fingerprint.",
+    ));
     Ok(EXIT_OK)
 }

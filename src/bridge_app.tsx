@@ -26,7 +26,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, HistoryProgress, ImportProgress, PortConflict } from "@/api";
+import type { ConnectionInfo, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -1258,6 +1258,36 @@ function PortConflictNotice({
   );
 }
 
+function InsecureSignInNotice({
+  attempt,
+  on_dismiss,
+}: {
+  attempt: InsecureSignIn;
+  on_dismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+    >
+      <ExclamationTriangleIcon className="w-5 h-5 flex-shrink-0 mt-0.5" style={{ color: "var(--color-danger)" }} />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold text-txt-primary leading-tight">{t("insecure_sign_in_title")}</p>
+        <p className="text-[12px] text-txt-muted mt-1">
+          {t("insecure_sign_in_body", {
+            protocol: attempt.protocol.toUpperCase(),
+            time: new Date(attempt.at * 1000).toLocaleTimeString(),
+          })}
+        </p>
+      </div>
+      <button type="button" onClick={on_dismiss} className="flex-shrink-0 text-txt-muted hover:text-txt-primary" aria-label={t("dismiss")}>
+        <XMarkIcon className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
+
 function ConfigPanel({
   email,
   display_name,
@@ -1272,6 +1302,8 @@ function ConfigPanel({
   on_dismiss_import,
   port_conflict,
   on_use_alternate_ports,
+  insecure_sign_in,
+  on_dismiss_insecure_sign_in,
 }: {
   email: string | null;
   display_name: string | null;
@@ -1286,6 +1318,8 @@ function ConfigPanel({
   on_dismiss_import: () => void;
   port_conflict: PortConflict | null;
   on_use_alternate_ports: () => Promise<void>;
+  insecure_sign_in: InsecureSignIn | null;
+  on_dismiss_insecure_sign_in: () => void;
 }) {
   const { t } = useTranslation();
   const imap_host = conn_info?.imap_host || "127.0.0.1";
@@ -1367,6 +1401,10 @@ function ConfigPanel({
 
       {!bridge_running && port_conflict && (
         <PortConflictNotice conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} />
+      )}
+
+      {insecure_sign_in && (
+        <InsecureSignInNotice attempt={insecure_sign_in} on_dismiss={on_dismiss_insecure_sign_in} />
       )}
 
       {bridge_running && sync_progress && (
@@ -1804,6 +1842,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [show_recipient_key_modal, set_show_recipient_key_modal] = useState(false);
   const [recipient_key_address, set_recipient_key_address] = useState("");
   const [accepting_recipient_key, set_accepting_recipient_key] = useState(false);
+  const [recipient_key_fingerprint, set_recipient_key_fingerprint] = useState<string | null>(null);
+  const [recipient_key_changed, set_recipient_key_changed] = useState(false);
   const [logs_open, set_logs_open] = useState(false);
   const [log_lines, set_log_lines] = useState<string[]>([]);
   const [logs_loading, set_logs_loading] = useState(false);
@@ -1844,8 +1884,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       await api.outbox_retry_now(id);
       show_toast(t("toast_retry_queued"), "success");
       setTimeout(load_outbox, 1500);
-    } catch (e) {
-      show_toast(typeof e === "string" ? e : t("toast_retry_failed"), "error");
+    } catch {
+      show_toast(t("toast_retry_failed"), "error");
     }
     set_outbox_retrying_id(null);
   };
@@ -1856,13 +1896,23 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       await api.repair_cache();
       show_toast(t("toast_cache_rebuilt"), "success");
       set_show_repair_modal(false);
-    } catch (e) {
-      show_toast(typeof e === "string" ? e : t("toast_repair_failed"), "error");
+    } catch {
+      show_toast(t("toast_repair_failed"), "error");
     }
     set_repairing(false);
   };
 
-  const handle_accept_recipient_key = async () => {
+  const show_recipient_key_fingerprint = (fingerprint: string | null, changed: boolean) => {
+    set_recipient_key_fingerprint(fingerprint);
+    set_recipient_key_changed(changed);
+  };
+
+  const close_recipient_key_modal = () => {
+    set_show_recipient_key_modal(false);
+    show_recipient_key_fingerprint(null, false);
+  };
+
+  const handle_check_recipient_key = async () => {
     const address = recipient_key_address.trim();
     if (!/^[^\s@]+@[^\s@]+$/.test(address)) {
       show_toast(t("toast_recipient_key_invalid"), "error");
@@ -1870,10 +1920,29 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     }
     set_accepting_recipient_key(true);
     try {
-      const accepted = await api.accept_recipient_key(address);
-      show_toast(t(accepted ? "toast_recipient_key_accepted" : "toast_recipient_key_none"), "success");
-      set_show_recipient_key_modal(false);
-      set_recipient_key_address("");
+      const fingerprint = await api.recipient_key_fingerprint(address);
+      show_recipient_key_fingerprint(fingerprint, false);
+      if (!fingerprint) show_toast(t("toast_recipient_key_none"), "error");
+    } catch {
+      show_toast(t("toast_recipient_key_lookup_failed"), "error");
+    }
+    set_accepting_recipient_key(false);
+  };
+
+  const handle_accept_recipient_key = async () => {
+    const address = recipient_key_address.trim();
+    if (!recipient_key_fingerprint) return;
+    set_accepting_recipient_key(true);
+    try {
+      const result = await api.accept_recipient_key(address, recipient_key_fingerprint);
+      if (result.accepted) {
+        show_toast(t("toast_recipient_key_accepted"), "success");
+        close_recipient_key_modal();
+        set_recipient_key_address("");
+      } else {
+        show_recipient_key_fingerprint(result.fingerprint, true);
+        if (!result.fingerprint) show_toast(t("toast_recipient_key_none"), "error");
+      }
     } catch {
       show_toast(t("toast_recipient_key_failed"), "error");
     }
@@ -2034,9 +2103,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       } else {
         show_toast(t("toast_ports_updated"), "success");
       }
-    } catch (e) {
-      const detail = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
-      show_toast(`${t("toast_ports_failed")}: ${detail}`, "error");
+    } catch {
+      show_toast(t("toast_ports_failed"), "error");
     }
     set_saving_ports(false);
   };
@@ -2328,7 +2396,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       </Modal>
 
 
-      <Modal open={show_recipient_key_modal} on_close={() => !accepting_recipient_key && set_show_recipient_key_modal(false)}>
+      <Modal open={show_recipient_key_modal} on_close={() => !accepting_recipient_key && close_recipient_key_modal()}>
         <p className="text-base font-semibold text-txt-primary">{t("recipient_key_title")}</p>
         <ModalBody>{t("recipient_key_body")}</ModalBody>
         <input
@@ -2338,12 +2406,31 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           aria-label={t("recipient_key_address")}
           placeholder={t("recipient_key_placeholder")}
           value={recipient_key_address}
-          onChange={(e) => set_recipient_key_address(e.target.value)}
+          onChange={(e) => {
+            set_recipient_key_address(e.target.value);
+            show_recipient_key_fingerprint(null, false);
+          }}
           className="bridge_field w-full h-9 px-2.5 text-sm text-txt-primary"
         />
+        {recipient_key_fingerprint && (
+          <div className="mt-3">
+            {recipient_key_changed && (
+              <p className="mb-2 text-sm text-aster-danger">{t("recipient_key_changed_again")}</p>
+            )}
+            <span className="text-xs font-medium text-txt-muted">{t("recipient_key_fingerprint")}</span>
+            <code className="bridge_field mt-1 block text-sm font-mono text-txt-primary px-3 py-2 select-all break-all">
+              {recipient_key_fingerprint}
+            </code>
+            <p className="mt-2 text-xs leading-relaxed text-txt-muted">{t("recipient_key_fingerprint_hint")}</p>
+          </div>
+        )}
         <ModalActions>
-          <Button variant="ghost" size="md" disabled={accepting_recipient_key} onClick={() => set_show_recipient_key_modal(false)}>{t("cancel")}</Button>
-          <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_accept_recipient_key}>{t("recipient_key_accept")}</Button>
+          <Button variant="ghost" size="md" disabled={accepting_recipient_key} onClick={close_recipient_key_modal}>{t("cancel")}</Button>
+          {recipient_key_fingerprint ? (
+            <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_accept_recipient_key}>{t("recipient_key_accept")}</Button>
+          ) : (
+            <Button is_loading={accepting_recipient_key} variant="depth" size="md" onClick={handle_check_recipient_key}>{t("recipient_key_check")}</Button>
+          )}
         </ModalActions>
       </Modal>
 
@@ -2511,6 +2598,7 @@ function DashboardView({
   on_toggle_bridge, on_generate_password, on_delete_password, on_sign_out, on_reset, on_retry_plan,
   has_bridge_access, plan_info_loaded, outbox_count, connected_since, sync_progress, is_online,
   import_progress, on_dismiss_import, port_conflict, on_use_alternate_ports,
+  insecure_sign_in, on_dismiss_insecure_sign_in,
 }: {
   email: string | null; display_name: string | null; profile_picture: string | null;
   profile_color: string | null; bridge_running: boolean; conn_info: ConnectionInfo | null;
@@ -2531,6 +2619,8 @@ function DashboardView({
   on_dismiss_import: () => void;
   port_conflict: PortConflict | null;
   on_use_alternate_ports: () => Promise<void>;
+  insecure_sign_in: InsecureSignIn | null;
+  on_dismiss_insecure_sign_in: () => void;
 }) {
   const { t } = useTranslation();
   const show_upgrade_banner = plan_info_loaded && !has_bridge_access;
@@ -2589,7 +2679,7 @@ function DashboardView({
             ) : (
               <>
                 {active_tab === "status" && (
-                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} port_conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} />
+                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} port_conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} insecure_sign_in={insecure_sign_in} on_dismiss_insecure_sign_in={on_dismiss_insecure_sign_in} />
                 )}
                 {active_tab === "passwords" && !plan_info_loaded && (
                   <div className="p-5 text-sm text-txt-muted text-center">{t("loading")}</div>
@@ -2625,6 +2715,7 @@ export function BridgeApp() {
   const [has_bridge_access, set_has_bridge_access] = useState(false);
   const [plan_info_loaded, set_plan_info_loaded] = useState(false);
   const [port_conflict, set_port_conflict] = useState<PortConflict | null>(null);
+  const [insecure_sign_in, set_insecure_sign_in] = useState<InsecureSignIn | null>(null);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
@@ -2637,6 +2728,10 @@ export function BridgeApp() {
     if (p && !p.active && import_dismissed.current === p.started_at_ms) return;
     set_import_progress(p);
   }, []);
+  const handle_dismiss_insecure_sign_in = useCallback(() => {
+    if (insecure_sign_in) api.dismiss_insecure_sign_in(insecure_sign_in.at).catch(() => {});
+    set_insecure_sign_in(null);
+  }, [insecure_sign_in]);
   const handle_dismiss_import = useCallback(() => {
     set_import_progress(prev => {
       if (prev) import_dismissed.current = prev.started_at_ms;
@@ -2667,6 +2762,7 @@ export function BridgeApp() {
         set_has_bridge_access(state.has_bridge_access);
         set_plan_info_loaded(state.plan_info_loaded);
         set_port_conflict(state.port_conflict);
+        set_insecure_sign_in(state.insecure_sign_in);
         apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();
@@ -2974,6 +3070,7 @@ export function BridgeApp() {
         connected_since={connected_since} sync_progress={sync_progress ?? history_as_sync_progress(history_progress)} is_online={is_online}
         import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
         port_conflict={port_conflict} on_use_alternate_ports={handle_use_alternate_ports}
+        insecure_sign_in={insecure_sign_in} on_dismiss_insecure_sign_in={handle_dismiss_insecure_sign_in}
       />
       <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>

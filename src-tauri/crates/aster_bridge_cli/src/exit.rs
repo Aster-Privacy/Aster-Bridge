@@ -39,6 +39,8 @@ pub const CODE_SETTINGS_WRITE: &str = "settings_write_failed";
 pub const CODE_CACHE_REBUILD: &str = "cache_rebuild_failed";
 pub const CODE_SYNC: &str = "sync_failed";
 pub const CODE_RECIPIENT_KEY: &str = "recipient_key_update_failed";
+pub const CODE_RECIPIENT_KEY_LOOKUP: &str = "recipient_key_lookup_failed";
+pub const CODE_RECIPIENT_KEY_MISMATCH: &str = "recipient_key_mismatch";
 pub const CODE_OUTBOX_READ: &str = "outbox_read_failed";
 pub const CODE_OUTBOX_NOT_FOUND: &str = "outbox_message_not_found";
 pub const CODE_OUTBOX_RETRY: &str = "outbox_retry_failed";
@@ -276,6 +278,20 @@ pub const CATALOG: &[ErrorDoc] = &[
         exit_code: EXIT_ERROR,
         summary: "Aster Bridge can't update the saved encryption key for that recipient.",
         resolution: "Check the free space on the disk that holds the data folder, then run the command again.",
+    },
+    ErrorDoc {
+        reference: "ASTER-1028",
+        code: CODE_RECIPIENT_KEY_LOOKUP,
+        exit_code: EXIT_ERROR,
+        summary: "Aster Bridge couldn't look up the encryption key that this recipient publishes.",
+        resolution: "Check the address and your internet connection, then run the command again.",
+    },
+    ErrorDoc {
+        reference: "ASTER-1029",
+        code: CODE_RECIPIENT_KEY_MISMATCH,
+        exit_code: EXIT_ERROR,
+        summary: "The key that this recipient publishes now doesn't match the fingerprint you entered, so Aster Bridge didn't accept it.",
+        resolution: "Confirm the fingerprint shown in the message with the recipient, then run the command again with that fingerprint.",
     },
     ErrorDoc {
         reference: "ASTER-2000",
