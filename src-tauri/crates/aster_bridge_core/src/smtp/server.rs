@@ -835,7 +835,16 @@ pub fn build_send_payload_with_own_key(
         }
     }
 
-    let effective_to = if to_list.is_empty() {
+    let custom_domain_sender = sender_identity
+        .is_some_and(|i| i.kind == crate::auth::session::SendIdentityKind::CustomDomain);
+    let sealed_bcc_only = custom_domain_sender
+        && cc_list
+            .iter()
+            .chain(bcc_list.iter())
+            .all(|address| crate::crypto::internal_send::is_internal_address(address));
+    let effective_to = if to_list.is_empty() && sealed_bcc_only {
+        Vec::new()
+    } else if to_list.is_empty() {
         let own_address = sender_identity
             .filter(|i| i.kind != crate::auth::session::SendIdentityKind::Primary)
             .map(|i| i.address.clone())
@@ -1813,12 +1822,50 @@ iQEz
             b"pass",
         )
         .unwrap();
-        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert_eq!(payload["to"], serde_json::json!([]));
         assert_eq!(payload["bcc"], serde_json::json!(["friend@astermail.org"]));
-        let own = vec!["primary@astermail.org".to_string(), identity.address.clone()];
-        let split = crate::crypto::internal_send::split_recipients(&payload, &own);
+        let split = crate::crypto::internal_send::split_recipients(&payload);
         assert!(!split.has_external);
         assert_eq!(split.internal, vec!["friend@astermail.org".to_string()]);
+
+        let mixed = vec!["friend@astermail.org".to_string(), "pal@example.com".to_string()];
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &mixed,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert!(crate::crypto::internal_send::split_recipients(&payload).has_external);
+    }
+
+    #[test]
+    fn a_custom_domain_sender_who_addresses_themselves_keeps_a_readable_copy() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let raw = b"From: me@mydomain.example\r\nTo: me@mydomain.example\r\nSubject: hi\r\n\r\nbody\r\n";
+        let recipients = vec!["me@mydomain.example".to_string(), "friend@astermail.org".to_string()];
+        let identity = SendIdentity {
+            address: "me@mydomain.example".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind: SendIdentityKind::CustomDomain,
+            enabled: true,
+            sender_id: "domain-1".to_string(),
+        };
+        let payload = build_send_payload(
+            raw,
+            Some("me@mydomain.example"),
+            &recipients,
+            "primary@astermail.org",
+            Some(&identity),
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(payload["to"], serde_json::json!(["me@mydomain.example"]));
+        assert!(crate::crypto::internal_send::split_recipients(&payload).has_external);
     }
 
     #[test]
