@@ -1231,9 +1231,11 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
+    let sender_address = envelope_sender_address(&parsed);
     let sender_unverified = from_inbound
         && !is_ratchet_envelope
-        && crate::crypto::internal_send::is_internal_address(&envelope_sender_address(&parsed));
+        && crate::crypto::internal_send::is_internal_address(&sender_address)
+        && !crate::crypto::internal_send::is_aster_system_address(&sender_address);
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -4035,6 +4037,8 @@ mod tests {
             ("in-aster", serde_json::json!({"from": "Bob <bob@astermail.org>", "body_text": "b"}), true),
             ("in-aster-obj", serde_json::json!({"from": {"name": "Bob", "email": "BOB@aster.cx"}, "body_text": "b"}), true),
             ("in-outside", serde_json::json!({"from": "carol@example.com", "body_text": "b"}), false),
+            ("in-system", serde_json::json!({"from": "Aster Mail <no-reply@astermail.org>", "body_text": "b"}), false),
+            ("in-system-obj", serde_json::json!({"from": {"name": "Aster", "email": "Updates@Aster.cx"}, "body_text": "b"}), false),
         ];
         for (id, json, expected) in cases {
             let item = inbound_item(id, &json, &recipient);

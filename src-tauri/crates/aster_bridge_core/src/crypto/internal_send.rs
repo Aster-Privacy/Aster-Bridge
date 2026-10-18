@@ -45,6 +45,22 @@ const INTERNAL_DOMAINS: [&str; 6] = [
 
 const GHOST_DOMAIN: &str = "realiased.me";
 
+const ASTER_SYSTEM_ADDRESSES: [&str; 8] = [
+    "noreply@astermail.org",
+    "no-reply@astermail.org",
+    "noreply@aster.cx",
+    "no-reply@aster.cx",
+    "system@astermail.org",
+    "system@aster.cx",
+    "updates@astermail.org",
+    "updates@aster.cx",
+];
+
+pub fn is_aster_system_address(address: &str) -> bool {
+    let lower = address.trim().to_lowercase();
+    ASTER_SYSTEM_ADDRESSES.contains(&lower.as_str())
+}
+
 pub fn is_internal_address(address: &str) -> bool {
     let lower = address.trim().to_lowercase();
     INTERNAL_DOMAINS
