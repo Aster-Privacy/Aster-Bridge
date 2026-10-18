@@ -2311,7 +2311,7 @@ where
                                             tracing::warn!(
                                                 "APPEND to {} could not label the existing message: {}",
                                                 folder,
-                                                text
+                                                response_text(&text)
                                             );
                                             writer
                                                 .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
@@ -2395,7 +2395,7 @@ where
                                                 "APPEND to {} stored {} without some keywords: {}",
                                                 folder,
                                                 aster_id,
-                                                text
+                                                response_text(&text)
                                             );
                                             writer
                                                 .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())
@@ -2433,7 +2433,7 @@ where
                                             tracing::warn!(
                                                 "APPEND to {} could not label the existing message: {}",
                                                 folder,
-                                                text
+                                                response_text(&text)
                                             );
                                             writer
                                                 .write_all(format!("* NO {}\r\n", response_text(&text)).as_bytes())

@@ -725,14 +725,20 @@ mod tests {
             "Content-Disposition: attachment; filename*=UTF-8''%0D%0A%00\r\n",
             "\r\n",
             "data\r\n",
+            "--B\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Disposition: attachment; filename=\"   \"\r\n",
+            "\r\n",
+            "data\r\n",
             "--B--\r\n"
         )
         .as_bytes();
         let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
         let list = mime_attachments(&parsed, 1024);
-        assert_eq!(list.len(), 2);
+        assert_eq!(list.len(), 3);
         assert_eq!(list[0].name, "xa9 OK done.txt");
         assert_eq!(list[1].name, "attachment-2");
+        assert_eq!(list[2].name, "attachment-3");
         assert!(list.iter().all(|a| !a.name.chars().any(char::is_control)));
     }
 

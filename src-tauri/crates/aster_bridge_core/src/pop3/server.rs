@@ -15,7 +15,6 @@ use crate::auth::session::Session;
 use crate::db::{CachedAttachment, Database, ATTACHMENTS_ON_DEMAND};
 use crate::error::Result;
 use crate::message_render;
-use crate::protocol_text::response_text;
 
 const MAX_LINE_LENGTH: usize = 512;
 const MAX_FAILED_AUTH: u32 = 5;
@@ -25,7 +24,8 @@ fn pop3_size(m: &crate::db::CachedMessage, attachments: &[CachedAttachment]) -> 
 }
 
 fn uidl_line(n: usize, aster_id: &str) -> String {
-    format!("{} {}\r\n", n, response_text(aster_id))
+    let id: String = aster_id.chars().filter(|c| matches!(c, '\x21'..='\x7e')).collect();
+    format!("{} {}\r\n", n, id)
 }
 
 fn attachments_of<'a>(
@@ -769,7 +769,8 @@ mod tests {
 
     #[test]
     fn uidl_line_keeps_a_hostile_id_on_one_line() {
-        assert_eq!(uidl_line(3, "id\r\n+OK forged\0"), "3 id  +OK forged \r\n");
+        assert_eq!(uidl_line(3, "id\r\n+OK forged\0"), "3 id+OKforged\r\n");
+        assert_eq!(uidl_line(4, "r\u{e9}sum\u{e9} \t1"), "4 rsum1\r\n");
     }
 
     #[test]
