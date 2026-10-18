@@ -18,7 +18,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use std::path::Path;
 use std::time::Duration;
 
 use aster_bridge_core::auth::device_identity;
@@ -86,8 +85,13 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
         if let Err(e) = state::save(dir, &kept) {
             out.warn(format!("Couldn't update the saved state: {}", e));
         }
+        if let Err(e) = db::remove_old_copies(dir) {
+            out.warn(format!("Couldn't delete old copies of the mail cache: {}", e));
+        }
     } else {
-        remove_cache(dir);
+        if let Err(e) = db::destroy_cache_files(dir) {
+            out.warn(format!("Couldn't delete every mail cache file: {}", e));
+        }
         if backend_ready {
             let _ = db::forget_db_key();
         }
@@ -131,15 +135,4 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
         ));
     }
     Ok(EXIT_OK)
-}
-
-fn remove_cache(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("bridge.db") {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }

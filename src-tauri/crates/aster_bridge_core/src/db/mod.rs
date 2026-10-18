@@ -179,6 +179,58 @@ fn best_effort_overwrite(path: &Path) {
     let _ = f.sync_all();
 }
 
+fn is_old_copy(live: &str, name: &str) -> bool {
+    name.len() > live.len() + 1 && name.starts_with(live) && name.as_bytes()[live.len()] == b'.'
+}
+
+fn is_cache_file(live: &str, name: &str) -> bool {
+    name == live || is_old_copy(live, name) || ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+        name.strip_prefix(live) == Some(suffix)
+    })
+}
+
+fn shred_files_where(db_path: &Path, keep: impl Fn(&str, &str) -> bool) -> Result<(), String> {
+    let (Some(dir), Some(live)) = (db_path.parent(), db_path.file_name().and_then(|n| n.to_str())) else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("could not list {}: {}", dir.display(), e)),
+    };
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !keep(live, name) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        best_effort_overwrite(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            failed.push(format!("{} ({})", name, e));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not delete {}", failed.join(", ")))
+    }
+}
+
+pub fn remove_old_copies(data_dir: &Path) -> Result<(), String> {
+    shred_files_where(&data_dir.join("bridge.db"), is_old_copy)
+}
+
+pub fn destroy_cache_files(data_dir: &Path) -> Result<(), String> {
+    shred_files_where(&data_dir.join("bridge.db"), is_cache_file)
+}
+
 fn plaintext_is_readable(db_path: &Path) -> bool {
     match Connection::open(db_path) {
         Ok(c) => is_readable(&c),
@@ -495,6 +547,7 @@ const USER_DATA_TABLES: &[&str] = &[
 
 pub struct Database {
     conn: Mutex<Connection>,
+    path: PathBuf,
     pub(crate) app_password_cache: crate::auth::app_passwords::VerifyCache,
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
     pub(crate) tag_writes: std::sync::atomic::AtomicU64,
@@ -535,6 +588,7 @@ impl Database {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            path: db_path,
             app_password_cache: Default::default(),
             tag_lock: tokio::sync::Mutex::new(()),
             tag_writes: std::sync::atomic::AtomicU64::new(0),
@@ -3069,7 +3123,24 @@ impl Database {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        result
+        result?;
+        self.scrub_free_space()?;
+        match self.path.parent() {
+            Some(dir) => remove_old_copies(dir),
+            None => Ok(()),
+        }
+    }
+
+    fn scrub_free_space(&self) -> Result<(), String> {
+        let busy = self.with_conn(|conn| {
+            conn.pragma_update(None, "secure_delete", "ON")?;
+            conn.execute_batch("VACUUM;")?;
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+        })?;
+        if busy != 0 {
+            return Err("the database is busy, so its log could not be emptied".to_string());
+        }
+        Ok(())
     }
 
 }
@@ -4738,5 +4809,80 @@ mod db_tests {
             "a connection waited {:?} for the database while a sync held it;              an IMAP client sees this as dead air and times out",
             worst
         );
+    }
+
+    #[test]
+    fn sign_out_wipe_empties_the_log_and_leaves_no_free_pages() {
+        let (dir, db) = open_db();
+        for i in 0..400 {
+            insert(&db, &format!("secret-{:04}-{}", i, "x".repeat(300)), "inbox");
+        }
+        let wal = dir.path().join("bridge.db-wal");
+        assert!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0);
+        db.clear_all_user_data().unwrap();
+        assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0);
+        let free: i64 = db.with_conn(|c| c.query_row("PRAGMA freelist_count", [], |r| r.get(0))).unwrap();
+        assert_eq!(free, 0);
+        let secure: i64 = db.with_conn(|c| c.query_row("PRAGMA secure_delete", [], |r| r.get(0))).unwrap();
+        assert_eq!(secure, 1);
+        assert!(db.get_cached_message("secret-0000-x").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_out_deletes_old_database_copies_and_keeps_other_files() {
+        let (dir, db) = open_db();
+        let copies = [
+            "bridge.db.unreadable.1",
+            "bridge.db.incompatible.2",
+            "bridge.db.incompatible.2-wal",
+            "bridge.db.incompatible.2-shm",
+            "bridge.db.enc",
+        ];
+        for name in copies {
+            std::fs::write(dir.path().join(name), b"old account data").unwrap();
+        }
+        std::fs::write(dir.path().join("bridge.dbx"), b"keep").unwrap();
+        std::fs::write(dir.path().join("config.toml"), b"keep").unwrap();
+        db.clear_user_data_or_defer(dir.path()).await.unwrap();
+        for name in copies {
+            assert!(!dir.path().join(name).exists(), "{} survived sign-out", name);
+        }
+        assert!(dir.path().join("bridge.dbx").exists());
+        assert!(dir.path().join("config.toml").exists());
+        assert!(dir.path().join("bridge.db").exists());
+    }
+
+    #[test]
+    fn sign_out_deletes_a_copy_quarantined_for_a_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Database::open_with_key(dir.path(), &[1u8; 32]).unwrap());
+        let db = Database::open_with_key(dir.path(), &[2u8; 32]).unwrap();
+        let unreadable = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("bridge.db.unreadable."))
+                .count()
+        };
+        assert_eq!(unreadable(dir.path()), 1);
+        db.clear_all_user_data().unwrap();
+        assert_eq!(unreadable(dir.path()), 0);
+    }
+
+    #[test]
+    fn destroying_the_cache_removes_every_database_file() {
+        let (dir, db) = open_db();
+        insert(&db, "a1", "inbox");
+        drop(db);
+        std::fs::write(dir.path().join("bridge.db.incompatible.9"), b"old").unwrap();
+        std::fs::write(dir.path().join("bridge.db-journal"), b"old").unwrap();
+        std::fs::write(dir.path().join("bridge.dbx"), b"keep").unwrap();
+        destroy_cache_files(dir.path()).unwrap();
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["bridge.dbx".to_string()]);
     }
 }
