@@ -420,17 +420,12 @@ pub fn escrow_aad_v2(dedupe_key: &str) -> Vec<u8> {
     aad
 }
 
-pub struct EscrowPlaintext {
-    pub plaintext: String,
-    pub bound_to_message: bool,
-}
-
 pub fn decrypt_escrow_entry(
     escrow_keys: &[Zeroizing<[u8; 32]>],
     dedupe_key: &str,
     encrypted_plaintext_b64: &str,
     nonce_b64: &str,
-) -> Option<EscrowPlaintext> {
+) -> Option<String> {
     let ciphertext = b64_decode(encrypted_plaintext_b64).ok()?;
     let nonce = b64_decode(nonce_b64).ok()?;
     if ciphertext.len() > MAX_ESCROW_PLAINTEXT_BYTES + GCM_TAG_LEN {
@@ -438,12 +433,9 @@ pub fn decrypt_escrow_entry(
     }
     let bound_aad = escrow_aad_v2(dedupe_key);
     for key in escrow_keys {
-        for (aad, bound_to_message) in [(bound_aad.as_slice(), true), (&[][..], false)] {
+        for aad in [bound_aad.as_slice(), &[][..]] {
             if let Some(plaintext) = aes_gcm_open(key.as_slice(), &nonce, &ciphertext, aad) {
-                return String::from_utf8(plaintext.to_vec()).ok().map(|plaintext| EscrowPlaintext {
-                    plaintext,
-                    bound_to_message,
-                });
+                return String::from_utf8(plaintext.to_vec()).ok();
             }
         }
     }
@@ -986,15 +978,15 @@ mod tests {
         let nonce = v["escrow_nonce"].as_str().unwrap();
         let unbound = v["escrow_no_aad"].as_str().unwrap();
         let bound = v["escrow_v2_aad"].as_str().unwrap();
-        let legacy = decrypt_escrow_entry(&keys, dedupe, unbound, nonce).unwrap();
-        assert_eq!(legacy.plaintext, "escrowed body without aad");
-        assert!(!legacy.bound_to_message);
-        let bound_entry = decrypt_escrow_entry(&keys, dedupe, bound, nonce).unwrap();
-        assert_eq!(bound_entry.plaintext, "escrowed body with aad");
-        assert!(bound_entry.bound_to_message);
+        assert_eq!(
+            decrypt_escrow_entry(&keys, dedupe, unbound, nonce).as_deref(),
+            Some("escrowed body without aad")
+        );
+        assert_eq!(
+            decrypt_escrow_entry(&keys, dedupe, bound, nonce).as_deref(),
+            Some("escrowed body with aad")
+        );
         assert!(decrypt_escrow_entry(&keys, "mail-999:BAbc==:4", bound, nonce).is_none());
-        let moved = decrypt_escrow_entry(&keys, "mail-999:BAbc==:4", unbound, nonce).unwrap();
-        assert!(!moved.bound_to_message);
         let wrong_pass = RecoveryMaterial::from_vault_with_iterations(&vault, b"wrong", iterations).escrow_keys();
         assert!(decrypt_escrow_entry(&wrong_pass, dedupe, unbound, nonce).is_none());
         let oversized = b64(&vec![0u8; MAX_ESCROW_PLAINTEXT_BYTES + GCM_TAG_LEN + 1]);

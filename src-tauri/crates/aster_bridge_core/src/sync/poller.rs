@@ -26,7 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
-use crate::crypto::envelope::decrypt_envelope_with_previous_keys;
+use crate::crypto::envelope::{decrypt_envelope_noting_inbound, decrypt_envelope_with_previous_keys};
 use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
 use crate::db::{
     CachedAttachment, CachedMessage, CachedSyncState, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
@@ -477,7 +477,7 @@ fn expected_attachment_count(item: &MailItem, entries: &[EnvelopeAttachment]) ->
     entries.len().max(declared.unwrap_or(0)).max(flagged)
 }
 
-fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachment]) -> String {
+fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachment], unsigned: bool) -> String {
     let mut map = raw_headers
         .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
         .and_then(|v| match v {
@@ -490,6 +490,12 @@ fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachmen
         serde_json::json!(entries.len()),
     );
     map.insert("attachments".to_string(), attachment_meta_json(entries));
+    if unsigned && !entries.is_empty() {
+        map.insert(
+            crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG.to_string(),
+            serde_json::json!(true),
+        );
+    }
     serde_json::Value::Object(map).to_string()
 }
 
@@ -675,7 +681,7 @@ async fn refresh_attachment_keys(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
-) -> std::result::Result<Vec<EnvelopeAttachment>, AttachmentFetchError> {
+) -> std::result::Result<(Vec<EnvelopeAttachment>, bool), AttachmentFetchError> {
     let item = client
         .fetch_mail_item(access_token, aster_id)
         .await
@@ -691,7 +697,8 @@ async fn refresh_attachment_keys(
     .map_err(|_| AttachmentFetchError::Content("envelope decrypt failed".to_string()))?;
     let parsed: serde_json::Value = serde_json::from_str(&plaintext)
         .map_err(|e| AttachmentFetchError::Content(format!("envelope parse: {}", e)))?;
-    Ok(parse_envelope_attachments(&parsed))
+    let sealed_ratchet = crate::crypto::ratchet::find_ratchet_object(&parsed).is_some();
+    Ok((parse_envelope_attachments(&parsed), sealed_ratchet))
 }
 
 fn cached_without_encryption(raw_headers: Option<&str>) -> bool {
@@ -745,8 +752,8 @@ async fn download_backlog_item(
         )
         .await
         {
-            Ok(fresh) if !fresh.is_empty() => {
-                meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh));
+            Ok((fresh, sealed_ratchet)) if !fresh.is_empty() => {
+                meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh, sealed_ratchet));
                 entries = fresh;
             }
             Ok(_) => {}
@@ -1108,6 +1115,7 @@ struct PreparedMessage {
     expected_attachments: usize,
     unencrypted: bool,
     sender_unverified: bool,
+    sealed_ratchet: bool,
 }
 
 enum Prepared {
@@ -1158,7 +1166,7 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
-    let plaintext_result = crate::crypto::envelope::decrypt_envelope_noting_inbound(
+    let plaintext_result = decrypt_envelope_noting_inbound(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
@@ -1224,8 +1232,8 @@ fn prepare_mail_item(
     }
 
     let sender_unverified = from_inbound
-        && (is_ratchet_envelope
-            || crate::crypto::internal_send::is_internal_address(&envelope_sender_address(&parsed)));
+        && !is_ratchet_envelope
+        && crate::crypto::internal_send::is_internal_address(&envelope_sender_address(&parsed));
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -1286,6 +1294,7 @@ fn prepare_mail_item(
         expected_attachments,
         unencrypted,
         sender_unverified,
+        sealed_ratchet: is_ratchet_envelope,
     })
 }
 
@@ -1392,7 +1401,11 @@ fn commit_prepared(
             attachment_meta_json(&prepared.attachments),
         );
     }
-    let raw_headers_meta = serde_json::Value::Object(raw_headers_map).to_string();
+    let mut raw_headers_meta = serde_json::Value::Object(raw_headers_map);
+    if prepared.sealed_ratchet && crate::message_render::has_listed_attachments(&raw_headers_meta) {
+        raw_headers_meta[crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG] = serde_json::json!(true);
+    }
+    let raw_headers_meta = raw_headers_meta.to_string();
     let bare_message_id = prepared
         .message_id
         .as_deref()
@@ -1708,10 +1721,7 @@ async fn try_bootstrap(
     None
 }
 
-async fn try_escrow(
-    ctx: &InternalDecryptContext<'_>,
-    dedupe_key: &str,
-) -> Option<crate::crypto::ratchet_recovery::EscrowPlaintext> {
+async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
     if ctx.escrow_keys.is_empty() {
         return None;
     }
@@ -1756,7 +1766,7 @@ async fn try_decrypt_internal_mail(
     item: &MailItem,
     ctx: &InternalDecryptContext<'_>,
 ) -> Option<crate::crypto::ratchet_recovery::SubjectBundle> {
-    let (plaintext_env, from_inbound) = crate::crypto::envelope::decrypt_envelope_noting_inbound(
+    let plaintext_env = decrypt_envelope_with_previous_keys(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         ctx.passphrase,
@@ -1803,23 +1813,21 @@ async fn try_decrypt_internal_mail(
             failed_steps.push("recovery_lane");
         }
         if let Some(dedupe_key) = crate::crypto::ratchet_recovery::escrow_dedupe_key(&item.id, attempt.data) {
-            if let Some(entry) = try_escrow(ctx, &dedupe_key).await {
-                sender_unverified = !entry.bound_to_message;
-                opened = Some(entry.plaintext);
+            opened = try_escrow(ctx, &dedupe_key).await;
+            if opened.is_some() {
+                sender_unverified = true;
                 break;
             }
             failed_steps.push("escrow");
         }
     }
     if opened.is_none() && attempts.is_empty() {
-        if let Some(entry) = try_escrow(ctx, &item.id).await {
-            sender_unverified = !entry.bound_to_message;
-            opened = Some(entry.plaintext);
-        }
+        opened = try_escrow(ctx, &item.id).await;
+        sender_unverified = opened.is_some();
         failed_steps.push("no_recipient_entry");
     }
     match opened {
-        Some(plaintext) => Some(unsealed_bundle(&plaintext, sender_unverified || from_inbound)),
+        Some(plaintext) => Some(unsealed_bundle(&plaintext, sender_unverified)),
         None => {
             tracing::debug!(
                 "ratchet message {} still sealed after: {}",
@@ -1977,6 +1985,8 @@ fn store_unsealed_message(
         .or_insert(serde_json::Value::Null);
     if bundle.sender_unverified {
         meta_map.insert("sender_unverified".to_string(), serde_json::json!(true));
+    } else {
+        meta_map.remove("sender_unverified");
     }
     let flag = crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG;
     let mut meta = serde_json::Value::Object(meta_map);
@@ -4033,18 +4043,119 @@ mod tests {
         }
     }
 
+    fn ratchet_envelope(from: &str, item_id_dh: &str) -> serde_json::Value {
+        let ratchet = serde_json::json!({
+            "type": "double_ratchet_v2",
+            "recipients": {"me@astermail.org": {"header": {"dh_public": item_id_dh, "message_number": 3}}},
+        });
+        serde_json::json!({"from": from, "subject": "s", "body_text": ratchet.to_string()})
+    }
+
     #[test]
-    fn inbound_mail_carrying_a_ratchet_body_is_marked_unverified() {
+    fn inbound_sealed_ratchet_mail_is_judged_by_the_ratchet_layer() {
         let (_dir, db) = temp_db();
         let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
         let keys = [inbound_candidate(&recipient)];
-        let json = serde_json::json!({
-            "from": "carol@example.com",
-            "body_text": serde_json::json!({"type": "double_ratchet_v2", "recipients": {}}).to_string(),
+        for (id, from) in [("r-aster", "bob@astermail.org"), ("r-outside", "carol@example.com")] {
+            let item = inbound_item(id, &ratchet_envelope(from, "BDh=="), &recipient);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
+            assert!(!crate::message_render::sender_unverified(&cached_meta(&db, id)), "{id}");
+        }
+        let bundle = |sender_unverified| crate::crypto::ratchet_recovery::SubjectBundle {
+            subject: None,
+            body: "hi".to_string(),
+            sender_unverified,
+            attachment_manifest: None,
+        };
+        assert!(store_unsealed_message(&db, "r-aster", &bundle(true)));
+        assert!(crate::message_render::sender_unverified(&cached_meta(&db, "r-aster")));
+        assert!(store_unsealed_message(&db, "r-aster", &bundle(false)));
+        assert!(!crate::message_render::sender_unverified(&cached_meta(&db, "r-aster")));
+    }
+
+    #[test]
+    fn a_sealed_ratchet_message_with_listed_attachments_is_flagged_at_cache_time() {
+        let (_dir, db) = temp_db();
+        let keys = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "invoice.pdf"}]);
+        let mut sealed = ratchet_envelope("bob@astermail.org", "BDh==");
+        sealed["attachment_keys"] = keys.clone();
+        let plain = serde_json::json!({"from": "bob@astermail.org", "body_text": "b", "attachment_keys": keys});
+        let bare = ratchet_envelope("bob@astermail.org", "BDh==");
+        for (id, json) in [("sealed-att", &sealed), ("plain-att", &plain), ("sealed-bare", &bare)] {
+            assert!(cache_mail_item(&db, "inbox", &item_with_envelope(id, json), b"pass", IK, &[], &[]).was_new);
+        }
+        let flagged = |id: &str| crate::message_render::attachments_unverified(&cached_meta(&db, id));
+        assert!(flagged("sealed-att"));
+        assert!(!flagged("plain-att"));
+        assert!(!flagged("sealed-bare"));
+    }
+
+    #[tokio::test]
+    async fn an_escrow_opened_body_is_always_marked_sender_unverified() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use axum::{extract::Path, routing::get, Json, Router};
+
+        let key = Zeroizing::new([7u8; 32]);
+        let nonce = [1u8; 12];
+        let dedupe = "alice-item:BAli==:3";
+        let aad = crate::crypto::ratchet_recovery::escrow_aad_v2(dedupe);
+        let sealed_body = Aes256Gcm::new_from_slice(key.as_slice())
+            .unwrap()
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: b"from alice".as_slice(), aad: &aad })
+            .unwrap();
+        let sealed_b64 = STANDARD.encode(sealed_body);
+        let nonce_b64 = STANDARD.encode(nonce);
+        let app = Router::new().route(
+            "/crypto/v1/ratchet/plaintext/:key",
+            get(move |Path(k): Path<String>| {
+                let entry = serde_json::json!({
+                    "message_id": k,
+                    "encrypted_plaintext": sealed_b64,
+                    "plaintext_nonce": nonce_b64,
+                });
+                async move { Json(entry) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
         });
-        let item = inbound_item("in-ratchet", &json, &recipient);
-        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
-        assert!(crate::message_render::sender_unverified(&cached_meta(&db, "in-ratchet")));
+        let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
+
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let inbound_keys = [inbound_candidate(&recipient)];
+        let forged = inbound_item("alice-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
+        assert!(cache_mail_item(&db, "inbox", &forged, b"pass", IK, &[], &inbound_keys).was_new);
+
+        let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
+            storage_keys: Vec::new(),
+            lane_candidates: Vec::new(),
+        };
+        let escrow_keys = vec![key];
+        let ctx = InternalDecryptContext {
+            our_email: "me@astermail.org",
+            passphrase: b"pass",
+            identity_key: IK,
+            previous_keys: &[],
+            ratchet_keys: &[],
+            inbound_keys: &inbound_keys,
+            recovery: &recovery,
+            sync_keys: &[],
+            escrow_keys: &escrow_keys,
+            client: &client,
+            access_token: "tok",
+        };
+        let bundle = try_decrypt_internal_mail(&forged, &ctx).await.unwrap();
+        assert_eq!(bundle.body, "from alice");
+        assert!(bundle.sender_unverified);
+        assert!(store_unsealed_message(&db, "alice-item", &bundle));
+        assert!(crate::message_render::sender_unverified(&cached_meta(&db, "alice-item")));
+
+        let moved = inbound_item("bob-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
+        assert!(try_decrypt_internal_mail(&moved, &ctx).await.is_none());
     }
 
     #[test]
@@ -5760,7 +5871,11 @@ mod tests {
             {"seq": 0, "key": "k0", "filename": "a.pdf", "content_type": "application/pdf", "size": 3}
         ]}));
         let merged: serde_json::Value =
-            serde_json::from_str(&merge_attachment_meta(Some(&raw), &fresh)).unwrap();
+            serde_json::from_str(&merge_attachment_meta(Some(&raw), &fresh, false)).unwrap();
+        assert!(!crate::message_render::attachments_unverified(&merged));
+        let unsigned: serde_json::Value =
+            serde_json::from_str(&merge_attachment_meta(Some(&raw), &fresh, true)).unwrap();
+        assert!(crate::message_render::attachments_unverified(&unsigned));
         assert_eq!(merged.get("is_html"), Some(&serde_json::json!(true)));
         assert_eq!(merged.get("message_id"), Some(&serde_json::json!("<m@x>")));
         let list = merged.get("attachments").and_then(|v| v.as_array()).unwrap();
@@ -6591,47 +6706,5 @@ mod sealed_retry_tests {
         assert_eq!(kept.body_text.as_deref(), Some("text"));
         let kept_meta: serde_json::Value = serde_json::from_str(kept.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(kept_meta["sender_unverified"], true);
-    }
-
-    #[test]
-    fn escrow_without_message_binding_marks_sender_unverified() {
-        use aes_gcm::aead::{Aead, Payload};
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine as _;
-
-        let key = Zeroizing::new([7u8; 32]);
-        let nonce = [1u8; 12];
-        let seal = |aad: &[u8]| {
-            let sealed = Aes256Gcm::new_from_slice(key.as_slice())
-                .unwrap()
-                .encrypt(Nonce::from_slice(&nonce), Payload { msg: b"from alice".as_slice(), aad })
-                .unwrap();
-            STANDARD.encode(sealed)
-        };
-        let keys = vec![key.clone()];
-        let nonce_b64 = STANDARD.encode(nonce);
-        let open = |dedupe: &str, sealed: &str| {
-            let entry =
-                crate::crypto::ratchet_recovery::decrypt_escrow_entry(&keys, dedupe, sealed, &nonce_b64).unwrap();
-            unsealed_bundle(&entry.plaintext, !entry.bound_to_message)
-        };
-
-        let legacy = seal(&[]);
-        let replayed = open("bob-item:BBob==:1", &legacy);
-        assert_eq!(replayed.body, "from alice");
-        assert!(replayed.sender_unverified);
-
-        let bound = seal(&crate::crypto::ratchet_recovery::escrow_aad_v2("alice-item:BAli==:3"));
-        let genuine = open("alice-item:BAli==:3", &bound);
-        assert_eq!(genuine.body, "from alice");
-        assert!(!genuine.sender_unverified);
-        assert!(crate::crypto::ratchet_recovery::decrypt_escrow_entry(
-            &keys,
-            "bob-item:BBob==:1",
-            &bound,
-            &nonce_b64
-        )
-        .is_none());
     }
 }
