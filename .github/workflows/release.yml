@@ -12,7 +12,12 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  SIGNER_VERSION: 2.11.2
+  SIGNER_CLI_INTEGRITY: sha512-bk3HemqvGRoy+5D/dVMUQHKMYLglD0jVnMm/0iGMH6ufZ+p8r14m6BpIixwij3PBvZdvORUp1YifTD8QxVZ1Nw==
+  SIGNER_NATIVE_INTEGRITY: sha512-Ru4gwJKPG0ctVGchRGpRup4Y4lW2SSfFnrbQcyHhCliKy4g8Qz97TrUgCur4CbWyAgKxvGh3SjrkA0LDYzDGiw==
 
 jobs:
   build:
@@ -120,25 +125,24 @@ jobs:
           mkdir -p ~/private_keys
           echo "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/private_keys/AuthKey_${APPLE_API_KEY}.p8
 
-      - name: Build and publish release
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+      - name: Create a throwaway updater key for the bundler
+        shell: bash
+        run: npm run tauri -- signer generate --ci -w "$RUNNER_TEMP/throwaway_updater.key"
+
+      - name: Build the app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY != '' && format('~/private_keys/AuthKey_{0}.p8', secrets.APPLE_API_KEY) || '' }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        with:
-          tagName: v__VERSION__
-          releaseName: Aster Bridge __VERSION__
-          releaseDraft: false
-          prerelease: true
-          updaterJsonPreferNsis: true
-          args: ${{ matrix.args }}
-          tauriScript: npm run tauri
+          ARGS: ${{ matrix.args }}
+        shell: bash
+        run: |
+          TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/throwaway_updater.key")"
+          export TAURI_SIGNING_PRIVATE_KEY
+          npm run tauri build -- $ARGS
 
       - name: Unbundle host graphics libraries from the AppImage
         # linuxdeploy copies libwayland-client.so.0 and friends into the AppDir.
@@ -146,41 +150,37 @@ jobs:
         # resolve wl_fixes_interface on any distribution newer than the runner,
         # and WebKitGTK aborts with EGL_BAD_PARAMETER before the window paints.
         if: startsWith(matrix.leg, 'linux')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get install -y squashfs-tools
-          V=$(node -p "require('./package.json').version")
-          TAG="v${V}"
           shopt -s nullglob
           for img in src-tauri/target/release/bundle/appimage/*.AppImage; do
             bash scripts/fix_appimage_libs.sh "$img"
-            rm -f "$img.sig"
-            npm run tauri -- signer sign "$img"
-            gh release upload "$TAG" "$img" "$img.sig" --clobber
           done
 
-      - name: Build and publish the Arch Linux package
+      - name: Build the Arch Linux package
         # Arch has no .deb or .rpm, and the AppImage is not a package. Repack the
-        # release deb into a pacman package inside an Arch container so
+        # deb built above into a pacman package inside an Arch container so
         # `pacman -U` installs Aster Bridge like any other Arch package.
         if: matrix.leg == 'linux-x64'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           V=$(node -p "require('./package.json').version")
-          TAG="v${V}"
+          shopt -s nullglob
+          DEBS=(src-tauri/target/release/bundle/deb/*_"${V}"_amd64.deb)
+          if [ ${#DEBS[@]} -ne 1 ]; then
+            echo "::error::expected one amd64 deb for $V, found ${#DEBS[@]}"
+            exit 1
+          fi
+          cp "${DEBS[0]}" "packaging/arch/aster-bridge-${V}-amd64.deb"
           docker run --rm -e V="$V" -v "$PWD/packaging/arch:/pkg" archlinux:base-devel bash -c '
             set -euo pipefail
             pacman -Sy --noconfirm --needed pacman-contrib >/dev/null
             useradd -m builder
             cp /pkg/PKGBUILD /home/builder/PKGBUILD
+            cp "/pkg/aster-bridge-${V}-amd64.deb" /home/builder/
             chown -R builder:builder /home/builder
             su builder -c "cd /home/builder && sed -i \"s/^pkgver=.*/pkgver=$V/\" PKGBUILD && updpkgsums && makepkg -f --noconfirm --nodeps"
             cp /home/builder/*.pkg.tar.zst /pkg/
@@ -188,50 +188,31 @@ jobs:
           PKG="packaging/arch/aster-bridge-${V}-1-x86_64.pkg.tar.zst"
           test -f "$PKG"
           cp "$PKG" "packaging/arch/Aster-Bridge-x86_64.pkg.tar.zst"
-          gh release upload "$TAG" "$PKG" "packaging/arch/Aster-Bridge-x86_64.pkg.tar.zst" --clobber
 
-      - name: Rename assets to canonical names
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Collect the unsigned bundles
         shell: bash
         run: |
-          V=$(node -p "require('./package.json').version")
-          TAG="v${V}"
-          TMP=$(mktemp -d)
-
-          rename_asset() {
-            local src="$1" dst="$2"
-            if gh release download "$TAG" --pattern "$src" --dir "$TMP" --clobber 2>/dev/null; then
-              mv "$TMP/$src" "$TMP/$dst"
-              gh release upload "$TAG" "$TMP/$dst" --clobber
-            fi
-          }
-
-          if [[ "${{ matrix.leg }}" == "linux-x64" ]]; then
-            rename_asset "Aster.Bridge_${V}_amd64.AppImage"     "Aster-Bridge-x86_64.AppImage"
-            rename_asset "Aster.Bridge_${V}_amd64.AppImage.sig" "Aster-Bridge-x86_64.AppImage.sig"
-            rename_asset "Aster.Bridge_${V}_amd64.deb"          "Aster-Bridge-amd64.deb"
-            rename_asset "Aster.Bridge_${V}_amd64.deb.sig"      "Aster-Bridge-amd64.deb.sig"
-            rename_asset "Aster.Bridge-${V}-1.x86_64.rpm"       "Aster-Bridge-x86_64.rpm"
-            rename_asset "Aster.Bridge-${V}-1.x86_64.rpm.sig"   "Aster-Bridge-x86_64.rpm.sig"
-          elif [[ "${{ matrix.leg }}" == "linux-arm64" ]]; then
-            rename_asset "Aster.Bridge_${V}_aarch64.AppImage"     "Aster-Bridge-aarch64.AppImage"
-            rename_asset "Aster.Bridge_${V}_aarch64.AppImage.sig" "Aster-Bridge-aarch64.AppImage.sig"
-            rename_asset "Aster.Bridge_${V}_arm64.deb"            "Aster-Bridge-arm64.deb"
-            rename_asset "Aster.Bridge_${V}_arm64.deb.sig"        "Aster-Bridge-arm64.deb.sig"
-            rename_asset "Aster.Bridge-${V}-1.aarch64.rpm"        "Aster-Bridge-aarch64.rpm"
-            rename_asset "Aster.Bridge-${V}-1.aarch64.rpm.sig"    "Aster-Bridge-aarch64.rpm.sig"
-          elif [[ "${{ matrix.leg }}" == "win" ]]; then
-            rename_asset "Aster.Bridge_${V}_x64-setup.exe"     "Aster-Bridge-x64-setup.exe"
-            rename_asset "Aster.Bridge_${V}_x64-setup.exe.sig" "Aster-Bridge-x64-setup.exe.sig"
-            rename_asset "Aster.Bridge_${V}_x64_en-US.msi"     "Aster-Bridge-x64.msi"
-            rename_asset "Aster.Bridge_${V}_x64_en-US.msi.sig" "Aster-Bridge-x64.msi.sig"
-          elif [[ "${{ matrix.leg }}" == "mac" ]]; then
-            rename_asset "Aster.Bridge_${V}_universal.dmg"            "Aster-Bridge-universal.dmg"
-            rename_asset "Aster.Bridge_${V}_universal.dmg.sig"        "Aster-Bridge-universal.dmg.sig"
-            rename_asset "Aster.Bridge_${V}_universal.app.tar.gz"     "Aster-Bridge-universal.app.tar.gz"
-            rename_asset "Aster.Bridge_${V}_universal.app.tar.gz.sig" "Aster-Bridge-universal.app.tar.gz.sig"
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/bundle"
+          mkdir -p "$OUT"
+          shopt -s nullglob
+          for b in src-tauri/target/release/bundle src-tauri/target/*/release/bundle; do
+            for f in "$b"/nsis/*-setup.exe "$b"/msi/*.msi "$b"/appimage/*.AppImage "$b"/deb/*.deb "$b"/rpm/*.rpm "$b"/dmg/*.dmg "$b"/macos/*.app.tar.gz; do
+              cp "$f" "$OUT/"
+            done
+          done
+          if [ "${{ matrix.leg }}" = "linux-x64" ]; then
+            cp packaging/arch/*.pkg.tar.zst "$OUT/"
           fi
+          ls -l "$OUT"
+
+      - name: Upload the unsigned bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-${{ matrix.leg }}
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Stage the installers built in this run for provenance
         shell: bash
@@ -322,20 +303,12 @@ jobs:
         shell: bash
         run: bash scripts/fetch_pinned_sources.sh mail
 
-      - name: Build, package, and publish the command-line tool
+      - name: Build and package the command-line tool
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           set -euo pipefail
-          V=$(node -p "require('./package.json').version")
-          TAG="v${V}"
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::warning::no release $TAG to attach the command-line archive to"
-            exit 0
-          fi
-
           cd src-tauri
           if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
             if [ -z "${VCToolsInstallDir:-}" ]; then
@@ -406,9 +379,17 @@ jobs:
             shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           fi
           cat "$ARCHIVE.sha256"
-          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GITHUB_REPOSITORY" --clobber
-          mkdir -p "$RUNNER_TEMP/provenance"
+          mkdir -p "$RUNNER_TEMP/cli" "$RUNNER_TEMP/provenance"
+          cp "$ARCHIVE" "$ARCHIVE.sha256" "$RUNNER_TEMP/cli/"
           cp "$ARCHIVE" "$RUNNER_TEMP/provenance/"
+
+      - name: Upload the command-line archive for publishing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-${{ matrix.target }}
+          path: ${{ runner.temp }}/cli/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload this run's command-line archive for provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -418,23 +399,147 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-  update_latest_json:
+  sign:
     needs: build
-    # Runs even when a leg fails: the legs that DID succeed have already published
-    # their own partial latest.json, so skipping here would leave that partial file
-    # standing as the manifest. Running always means the guard below still fires.
-    if: always()
+    if: ${{ always() && !inputs.cli_only }}
     runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Download the unsigned bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bundle-*
+          path: bundles
+
+      - name: Install the pinned updater signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNER="$RUNNER_TEMP/signer/node_modules/@tauri-apps"
+          fetch() {
+            local pkg="$1" integrity="$2"
+            local tgz="$RUNNER_TEMP/$pkg.tgz"
+            curl -fsSL --retry 3 -o "$tgz" "https://registry.npmjs.org/@tauri-apps/$pkg/-/$pkg-${SIGNER_VERSION}.tgz"
+            local got="sha512-$(openssl dgst -sha512 -binary "$tgz" | base64 -w0)"
+            if [ "$got" != "$integrity" ]; then
+              echo "::error::@tauri-apps/$pkg $SIGNER_VERSION does not match the pinned integrity"
+              exit 1
+            fi
+            mkdir -p "$SIGNER/$pkg"
+            tar -xzf "$tgz" -C "$SIGNER/$pkg" --strip-components=1
+          }
+          fetch cli "$SIGNER_CLI_INTEGRITY"
+          fetch cli-linux-x64-gnu "$SIGNER_NATIVE_INTEGRITY"
+
+      - name: Sign every updater bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLES="$PWD/bundles"
+          SIGS="$RUNNER_TEMP/signatures"
+          TAURI="$RUNNER_TEMP/signer/node_modules/@tauri-apps/cli/tauri.js"
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          COUNT=0
+          while IFS= read -r -d '' f; do
+            rel="${f#"$BUNDLES"/}"
+            rm -f "$f.sig"
+            node "$TAURI" signer sign "$f" </dev/null
+            mkdir -p "$SIGS/$(dirname "$rel")"
+            mv "$f.sig" "$SIGS/$rel.sig"
+            COUNT=$((COUNT + 1))
+          done < <(find "$BUNDLES" -mindepth 2 -maxdepth 2 -type f \( -name '*-setup.exe' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.app.tar.gz' \) -print0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::no updater bundles to sign; every build leg failed"
+            exit 1
+          fi
+          find "$SIGS" -type f -name '*.sig' | sort
+
+      - name: Upload the updater signatures
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: updater-signatures
+          path: ${{ runner.temp }}/signatures/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [build, sign]
+    if: ${{ always() && !inputs.cli_only && needs.sign.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Download the unsigned bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bundle-*
+          path: bundles
+
+      - name: Download the updater signatures
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: updater-signatures
+          path: bundles
+
+      - name: Publish the installers and their fixed-name copies
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          TAG="v${V}"
+          OUT="$RUNNER_TEMP/upload"
+          mkdir -p "$OUT"
+          shopt -s nullglob
+
+          for f in bundles/*/*; do
+            name="$(basename "$f")"
+            case "$name" in
+              *.app.tar.gz) name="Aster Bridge_${V}_universal.app.tar.gz" ;;
+              *.app.tar.gz.sig) name="Aster Bridge_${V}_universal.app.tar.gz.sig" ;;
+            esac
+            cp "$f" "$OUT/${name// /.}"
+          done
+
+          declare -A FIXED=(
+            ["Aster.Bridge_${V}_x64-setup.exe"]="Aster-Bridge-x64-setup.exe"
+            ["Aster.Bridge_${V}_x64_en-US.msi"]="Aster-Bridge-x64.msi"
+            ["Aster.Bridge_${V}_amd64.AppImage"]="Aster-Bridge-x86_64.AppImage"
+            ["Aster.Bridge_${V}_amd64.deb"]="Aster-Bridge-amd64.deb"
+            ["Aster.Bridge-${V}-1.x86_64.rpm"]="Aster-Bridge-x86_64.rpm"
+            ["Aster.Bridge_${V}_aarch64.AppImage"]="Aster-Bridge-aarch64.AppImage"
+            ["Aster.Bridge_${V}_arm64.deb"]="Aster-Bridge-arm64.deb"
+            ["Aster.Bridge-${V}-1.aarch64.rpm"]="Aster-Bridge-aarch64.rpm"
+            ["Aster.Bridge_${V}_universal.dmg"]="Aster-Bridge-universal.dmg"
+            ["Aster.Bridge_${V}_universal.app.tar.gz"]="Aster-Bridge-universal.app.tar.gz"
+          )
+          for src in "${!FIXED[@]}"; do
+            for ext in "" ".sig"; do
+              if [ -f "$OUT/$src$ext" ]; then
+                cp "$OUT/$src$ext" "$OUT/${FIXED[$src]}$ext"
+              fi
+            done
+          done
+          ls -l "$OUT"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Aster Bridge ${V}" --notes "" --prerelease --target "$GITHUB_SHA"
+          fi
+          gh release upload "$TAG" "$OUT"/* --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Rebuild latest.json from every leg's signatures
-        # Each build leg's tauri-action uploads its own latest.json with --clobber,
-        # so the last leg to finish wins and the others' platforms vanish. v0.4.21
-        # shipped with only linux-aarch64 and Windows installs never saw the update.
-        # Rebuild the manifest from the signatures actually on the release instead
-        # of patching whichever partial file survived.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -444,13 +549,13 @@ jobs:
           TMP=$(mktemp -d)
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
 
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::no release $TAG to build a manifest for; the build legs did not publish"
             exit 1
           fi
 
-          gh release download "$TAG" --pattern latest.json --dir "$TMP" --clobber
-          gh release download "$TAG" --pattern '*.sig' --dir "$TMP" --clobber || true
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$TMP" --clobber 2>/dev/null || echo '{}' > "$TMP/latest.json"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir "$TMP" --clobber || true
 
           SIGDIR="$TMP" BASE="$BASE" V="$V" node -e '
             const fs = require("fs");
@@ -479,7 +584,7 @@ jobs:
             const manifest = {
               version: prior.version || v,
               notes: prior.notes || "",
-              pub_date: prior.pub_date || new Date().toISOString(),
+              pub_date: new Date().toISOString(),
               platforms: {},
             };
 
@@ -514,12 +619,54 @@ jobs:
             fs.writeFileSync(path, JSON.stringify(manifest, null, 2));
           ' "$TMP/latest.json"
 
-          gh release upload "$TAG" "$TMP/latest.json" --clobber
+          gh release upload "$TAG" "$TMP/latest.json" --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish_cli:
+    needs: [cli, publish]
+    if: ${{ always() && needs.cli.result != 'skipped' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Download the command-line archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cli-*
+          path: cli
+          merge-multiple: true
+
+      - name: Publish the command-line archives
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          TAG="v${V}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::warning::no release $TAG to attach the command-line archives to"
+            exit 0
+          fi
+          shopt -s nullglob
+          FILES=(cli/aster-bridge-cli-*)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::warning::no command-line archive was built in this run"
+            exit 0
+          fi
+          gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
 
   ensure_download_assets:
-    needs: [build, cli]
-    if: always() && needs.build.result == 'success'
+    needs: [build, publish, publish_cli]
+    if: always() && needs.build.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - name: Ensure fixed-name bridge download assets exist
         # release.yml builds Windows + Linux only; the verify_release_assets.yml guard
