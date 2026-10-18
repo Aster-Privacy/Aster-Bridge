@@ -31,12 +31,25 @@ use crate::error::BridgeError;
 const CLEARTEXT_SIGNATURE_HEADER: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
 const CANONICAL_PREFIX_V1: &str = "aster-ratchet-prekey-v1:";
 const CANONICAL_PREFIX_V2: &str = "aster-ratchet-prekey-v2:";
+const CANONICAL_PREFIX_V3: &str = "aster-ratchet-prekey-v3:";
+const CANONICAL_NUMBER_MAX_DIGITS: usize = 18;
+pub const RECIPIENT_TRUST_PROTOCOL: u32 = 2;
 const PIN_ID_DOMAIN: &[u8] = b"aster-bridge-recipient-pin-v1";
 const ML_KEM_768_PUBLIC_KEY_BYTES: usize = 1184;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedBinding {
+    pub x3dh_version: i16,
+    pub epoch: i64,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleVerdict {
-    Verified { covers_pq_identity: bool },
+    Verified {
+        covers_pq_identity: bool,
+        signed: Option<SignedBinding>,
+    },
     Tampered,
     Legacy,
     Unknown,
@@ -49,6 +62,8 @@ pub struct RecipientPin {
     pub pq_seen: bool,
     pub pq_fingerprint: String,
     pub transcript_bound: bool,
+    pub binding_epoch: i64,
+    pub binding_fingerprint: String,
     pub flagged: bool,
 }
 
@@ -94,6 +109,38 @@ fn canonical_v2(bundle: &PrekeyBundle) -> Option<String> {
     ))
 }
 
+fn canonical_number(value: &str) -> Option<i64> {
+    if value.is_empty()
+        || value.len() > CANONICAL_NUMBER_MAX_DIGITS
+        || value.starts_with('0')
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse::<i64>().ok().filter(|number| *number >= 1)
+}
+
+fn signed_v3(bundle: &PrekeyBundle, signed_text: &str) -> Option<SignedBinding> {
+    let rest = signed_text.strip_prefix(CANONICAL_PREFIX_V3)?;
+    let parts: Vec<&str> = rest.split('.').collect();
+    let [kem, spk, pq, version, epoch] = parts.as_slice() else {
+        return None;
+    };
+    if *kem != bundle.kem_identity_key
+        || *spk != bundle.signed_prekey
+        || *pq != advertised_pq_identity_key(bundle).unwrap_or_default()
+    {
+        return None;
+    }
+    let x3dh_version = i16::try_from(canonical_number(version)?).ok()?;
+    let epoch = canonical_number(epoch)?;
+    Some(SignedBinding {
+        x3dh_version,
+        epoch,
+        fingerprint: hex(&Sha256::digest(signed_text.as_bytes())),
+    })
+}
+
 fn advertised_pq_identity_key(bundle: &PrekeyBundle) -> Option<&str> {
     bundle
         .pq_kem_public_key
@@ -124,14 +171,22 @@ pub fn verify_bundle(bundle: &PrekeyBundle, owner_public_key: Option<&str>) -> B
         _ => return BundleVerdict::Tampered,
     };
     let signed_text = signed_text.trim();
+    if let Some(signed) = signed_v3(bundle, signed_text) {
+        return BundleVerdict::Verified {
+            covers_pq_identity: advertised_pq_identity_key(bundle).is_some(),
+            signed: Some(signed),
+        };
+    }
     if canonical_v2(bundle).as_deref() == Some(signed_text) {
         return BundleVerdict::Verified {
             covers_pq_identity: true,
+            signed: None,
         };
     }
     if signed_text == canonical_v1(bundle) {
         return BundleVerdict::Verified {
             covers_pq_identity: false,
+            signed: None,
         };
     }
     BundleVerdict::Tampered
@@ -204,14 +259,27 @@ pub fn accept_recipient_key(
     else {
         return Ok(KeyAcceptance::Mismatch { fingerprint: current });
     };
-    db.recipient_pin_put(
-        &pin_id(account_id, address),
-        &RecipientPin {
-            owner_fingerprint: fingerprint.clone(),
-            ..RecipientPin::default()
-        },
-    )?;
+    let id = pin_id(account_id, address);
+    let existing = db.recipient_pin_get(&id)?.unwrap_or_default();
+    db.recipient_pin_put(&id, &accepted_pin(existing, &fingerprint))?;
     Ok(KeyAcceptance::Accepted { fingerprint })
+}
+
+fn accepted_pin(existing: RecipientPin, fingerprint: &str) -> RecipientPin {
+    let owner_changed = !existing.owner_fingerprint.is_empty()
+        && !existing.owner_fingerprint.eq_ignore_ascii_case(fingerprint);
+    let (binding_epoch, binding_fingerprint) = if owner_changed {
+        (0, String::new())
+    } else {
+        (existing.binding_epoch, existing.binding_fingerprint.clone())
+    };
+    RecipientPin {
+        owner_fingerprint: fingerprint.to_string(),
+        binding_epoch,
+        binding_fingerprint,
+        flagged: false,
+        ..existing
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -253,12 +321,30 @@ fn tampered(address: &str) -> BridgeError {
     ))
 }
 
-fn downgraded(address: &str, fingerprint: Option<&str>) -> BridgeError {
+fn downgraded(address: &str) -> BridgeError {
     BridgeError::RecipientKey(format!(
-        "The post-quantum key that {} published before is no longer available, so the message was not sent. {}",
-        address,
-        accept_hint(address, fingerprint)
+        "The post-quantum key that {} published before is no longer available, so the message was not sent with weaker encryption. Accepting the key does not fix this. Ask the recipient to sign in to an up-to-date Aster app so their post-quantum keys are published again.",
+        address
     ))
+}
+
+fn stale_binding(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "The encryption keys that {} publishes now are older than the keys Aster Bridge already trusts for this recipient, so the message was not sent. This can mean that old keys are being replayed. Accepting the key does not fix this. Ask the recipient to sign in to an up-to-date Aster app so their current keys are published again.",
+        address
+    ))
+}
+
+fn binding_is_stale(base: &RecipientPin, signed: Option<&SignedBinding>) -> bool {
+    match signed {
+        None => base.binding_epoch > 0,
+        Some(signed) => {
+            signed.epoch < base.binding_epoch
+                || (signed.epoch == base.binding_epoch
+                    && !base.binding_fingerprint.is_empty()
+                    && signed.fingerprint != base.binding_fingerprint)
+        }
+    }
 }
 
 fn no_published_key(address: &str) -> BridgeError {
@@ -393,17 +479,29 @@ pub fn evaluate_recipient(
         };
     };
 
-    if let (Some(bundle), Some(BundleVerdict::Verified { covers_pq_identity })) = (bundle, verdict)
+    if let (
+        Some(bundle),
+        Some(BundleVerdict::Verified {
+            covers_pq_identity,
+            signed,
+        }),
+    ) = (bundle, verdict)
     {
+        if binding_is_stale(&base, signed.as_ref()) {
+            return Evaluation {
+                pin: None,
+                outcome: Err(stale_binding(address)),
+            };
+        }
         let advertises_pq = advertised_pq_identity_key(bundle).is_some();
         let pq_pinned = !base.pq_fingerprint.is_empty();
         if (pq_pinned && !covers_pq_identity) || (base.pq_seen && !advertises_pq) {
             return Evaluation {
                 pin: None,
-                outcome: Err(downgraded(address, Some(&owner_fingerprint))),
+                outcome: Err(downgraded(address)),
             };
         }
-        let target = match ratchet_target(address, bundle, covers_pq_identity) {
+        let mut target = match ratchet_target(address, bundle, covers_pq_identity) {
             Ok(target) => target,
             Err(error) => {
                 return Evaluation {
@@ -411,6 +509,14 @@ pub fn evaluate_recipient(
                     outcome: Err(error),
                 }
             }
+        };
+        target.transcript_bound = match &signed {
+            Some(signed) => signed.x3dh_version >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND),
+            None => target.transcript_bound || base.transcript_bound,
+        };
+        let (binding_epoch, binding_fingerprint) = match signed {
+            Some(signed) => (signed.epoch, signed.fingerprint),
+            None => (base.binding_epoch, base.binding_fingerprint.clone()),
         };
         let identity_fingerprint = hex(&Sha256::digest(&target.identity_public));
         let pq_fingerprint = target
@@ -425,6 +531,8 @@ pub fn evaluate_recipient(
             pq_seen: base.pq_seen || advertises_pq,
             pq_fingerprint,
             transcript_bound: target.transcript_bound,
+            binding_epoch,
+            binding_fingerprint,
             flagged: false,
         };
         return Evaluation {
@@ -433,10 +541,17 @@ pub fn evaluate_recipient(
         };
     }
 
+    if base.binding_epoch > 0 {
+        return Evaluation {
+            pin: None,
+            outcome: Err(stale_binding(address)),
+        };
+    }
+
     if base.pq_seen {
         return Evaluation {
             pin: None,
-            outcome: Err(downgraded(address, Some(&owner_fingerprint))),
+            outcome: Err(downgraded(address)),
         };
     }
 
@@ -661,6 +776,25 @@ X1OEWHpsCOAO
         bundle
     }
 
+    pub(crate) fn canonical_v3(bundle: &PrekeyBundle, version: &str, epoch: &str) -> String {
+        format!(
+            "{}{}.{}.{}.{}.{}",
+            CANONICAL_PREFIX_V3,
+            bundle.kem_identity_key,
+            bundle.signed_prekey,
+            advertised_pq_identity_key(bundle).unwrap_or_default(),
+            version,
+            epoch
+        )
+    }
+
+    pub(crate) fn signed_v3_bundle(owner: &Owner, version: i16, epoch: i64) -> PrekeyBundle {
+        let mut bundle = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        let text = canonical_v3(&bundle, &version.to_string(), &epoch.to_string());
+        sign(&mut bundle, owner, &text);
+        bundle
+    }
+
     pub(crate) fn signed_v1_bundle(owner: &Owner, pq_identity: Option<Vec<u8>>) -> PrekeyBundle {
         let mut bundle = unsigned_bundle(pq_identity);
         let text = canonical_v1(&bundle);
@@ -692,7 +826,8 @@ X1OEWHpsCOAO
         assert_eq!(
             verify_bundle(&bundle, Some(INTEROP_PUBLIC_KEY)),
             BundleVerdict::Verified {
-                covers_pq_identity: false
+                covers_pq_identity: false,
+                signed: None,
             }
         );
     }
@@ -842,7 +977,7 @@ X1OEWHpsCOAO
     }
 
     #[test]
-    fn the_handshake_version_follows_what_every_recipient_device_supports() {
+    fn an_unsigned_handshake_version_never_lowers_the_pinned_one() {
         let alice = owner("alice");
         let mut bundle = signed_v2_bundle(&alice);
         bundle.x3dh_max_version = Some(2);
@@ -855,9 +990,288 @@ X1OEWHpsCOAO
             bundle.x3dh_max_version = version;
             let evaluation =
                 evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), Some(&pin));
-            assert!(!evaluation.pin.clone().unwrap().transcript_bound);
-            assert!(!ratchet(evaluation).transcript_bound);
+            assert!(evaluation.pin.is_none());
+            assert!(ratchet(evaluation).transcript_bound);
         }
+    }
+
+    #[test]
+    fn the_first_send_after_a_key_rotation_keeps_the_pinned_handshake_version() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        bundle.x3dh_max_version = Some(2);
+        let pin = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+
+        let mut rotated = unsigned_bundle(Some(vec![0x66; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        rotated.kem_identity_key = STANDARD.encode([0x05u8; 65]);
+        rotated.x3dh_max_version = Some(1);
+        let text = canonical_v2(&rotated).unwrap();
+        sign(&mut rotated, &alice, &text);
+
+        let evaluation =
+            evaluate_recipient(BOB, Some(&rotated), Some(&alice.public_key), Some(&pin));
+        let rotated_pin = evaluation.pin.clone().unwrap();
+        assert_ne!(rotated_pin.identity_fingerprint, pin.identity_fingerprint);
+        assert!(rotated_pin.transcript_bound);
+        assert!(ratchet(evaluation).transcript_bound);
+    }
+
+    #[test]
+    fn a_signed_handshake_version_wins_over_the_unsigned_one() {
+        let alice = owner("alice");
+        let mut bundle = signed_v3_bundle(&alice, 2, 4);
+        bundle.x3dh_max_version = Some(1);
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.clone().unwrap();
+        assert!(ratchet(evaluation).transcript_bound);
+        assert!(pin.transcript_bound);
+        assert_eq!(pin.binding_epoch, 4);
+
+        let mut older_device = signed_v3_bundle(&alice, 1, 5);
+        older_device.x3dh_max_version = Some(2);
+        let evaluation =
+            evaluate_recipient(BOB, Some(&older_device), Some(&alice.public_key), Some(&pin));
+        let lowered = evaluation.pin.clone().unwrap();
+        assert!(!ratchet(evaluation).transcript_bound);
+        assert!(!lowered.transcript_bound);
+        assert_eq!(lowered.binding_epoch, 5);
+    }
+
+    #[test]
+    fn a_v3_binding_reports_the_signed_version_and_epoch() {
+        let alice = owner("alice");
+        let bundle = signed_v3_bundle(&alice, 2, 12);
+        let BundleVerdict::Verified {
+            covers_pq_identity,
+            signed: Some(signed),
+        } = verify_bundle(&bundle, Some(&alice.public_key))
+        else {
+            panic!("a v3 binding must verify");
+        };
+        assert!(covers_pq_identity);
+        assert_eq!(signed.x3dh_version, 2);
+        assert_eq!(signed.epoch, 12);
+        assert_eq!(signed.fingerprint.len(), 64);
+
+        let mut classical = unsigned_bundle(None);
+        let text = canonical_v3(&classical, "1", "3");
+        sign(&mut classical, &alice, &text);
+        assert!(matches!(
+            verify_bundle(&classical, Some(&alice.public_key)),
+            BundleVerdict::Verified {
+                covers_pq_identity: false,
+                signed: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn a_v3_binding_over_other_keys_or_with_a_loose_number_is_tampered() {
+        let alice = owner("alice");
+        for (version, epoch) in [("02", "3"), ("2", "03"), ("2", "0"), ("0", "3"), ("2", "+3"), ("2", ""), ("2", "1234567890123456789")] {
+            let mut bundle = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+            let text = canonical_v3(&bundle, version, epoch);
+            sign(&mut bundle, &alice, &text);
+            assert_eq!(
+                verify_bundle(&bundle, Some(&alice.public_key)),
+                BundleVerdict::Tampered,
+                "{version}.{epoch}"
+            );
+        }
+
+        let mut swapped = signed_v3_bundle(&alice, 2, 3);
+        swapped.pq_kem_public_key = Some(STANDARD.encode(vec![0x23; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        assert_eq!(
+            verify_bundle(&swapped, Some(&alice.public_key)),
+            BundleVerdict::Tampered
+        );
+
+        let mut stripped = signed_v3_bundle(&alice, 2, 3);
+        stripped.pq_kem_public_key = None;
+        assert_eq!(
+            verify_bundle(&stripped, Some(&alice.public_key)),
+            BundleVerdict::Tampered
+        );
+
+        let mut extra = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        let text = format!("{}.9", canonical_v3(&extra, "2", "3"));
+        sign(&mut extra, &alice, &text);
+        assert_eq!(
+            verify_bundle(&extra, Some(&alice.public_key)),
+            BundleVerdict::Tampered
+        );
+    }
+
+    #[test]
+    fn a_replayed_or_stale_binding_is_refused_once_a_signed_epoch_is_pinned() {
+        let alice = owner("alice");
+        let current = signed_v3_bundle(&alice, 2, 5);
+        let pin = evaluate_recipient(BOB, Some(&current), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        assert_eq!(pin.binding_epoch, 5);
+        assert!(!pin.binding_fingerprint.is_empty());
+
+        let same = evaluate_recipient(BOB, Some(&current), Some(&alice.public_key), Some(&pin));
+        assert!(same.outcome.is_ok());
+        assert!(same.pin.is_none());
+
+        let mut other_binding_same_epoch = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        other_binding_same_epoch.signed_prekey = STANDARD.encode([0x12u8; 65]);
+        let text = canonical_v3(&other_binding_same_epoch, "2", "5");
+        sign(&mut other_binding_same_epoch, &alice, &text);
+
+        let stale = [
+            Some(signed_v3_bundle(&alice, 2, 4)),
+            Some(other_binding_same_epoch),
+            Some(signed_v2_bundle(&alice)),
+            Some(signed_v1_bundle(&alice, Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))),
+            Some(unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))),
+            None,
+        ];
+        for bundle in &stale {
+            let evaluation =
+                evaluate_recipient(BOB, bundle.as_ref(), Some(&alice.public_key), Some(&pin));
+            let Err(BridgeError::RecipientKey(message)) = &evaluation.outcome else {
+                panic!("a stale binding must be refused");
+            };
+            assert!(message.contains("older than the keys"), "{message}");
+            assert!(message.contains("Accepting the key does not fix this"), "{message}");
+            assert!(evaluation.pin.is_none());
+        }
+
+        let newer = signed_v3_bundle(&alice, 2, 6);
+        let evaluation = evaluate_recipient(BOB, Some(&newer), Some(&alice.public_key), Some(&pin));
+        assert!(evaluation.outcome.is_ok());
+        assert_eq!(evaluation.pin.unwrap().binding_epoch, 6);
+    }
+
+    #[test]
+    fn bindings_without_an_epoch_keep_working_until_one_is_pinned() {
+        let alice = owner("alice");
+        let pin = evaluate_recipient(BOB, Some(&signed_v2_bundle(&alice)), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        assert_eq!(pin.binding_epoch, 0);
+        let again = evaluate_recipient(BOB, Some(&signed_v2_bundle(&alice)), Some(&alice.public_key), Some(&pin));
+        assert!(again.outcome.is_ok());
+
+        let upgraded = evaluate_recipient(BOB, Some(&signed_v3_bundle(&alice, 2, 1)), Some(&alice.public_key), Some(&pin));
+        assert!(upgraded.outcome.is_ok());
+        assert_eq!(upgraded.pin.unwrap().binding_epoch, 1);
+    }
+
+    #[test]
+    fn a_legacy_pin_without_a_post_quantum_fingerprint_is_upgraded_by_the_next_verified_bundle() {
+        let alice = owner("alice");
+        let legacy = RecipientPin {
+            identity_fingerprint: "aa".to_string(),
+            owner_fingerprint: key_fingerprint(Some(&alice.public_key)).unwrap(),
+            pq_seen: true,
+            ..RecipientPin::default()
+        };
+
+        let mut unsigned_pq = signed_v1_bundle(&alice, Some(vec![0x44; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        unsigned_pq.pq_prekey = one_time_prekey(0x55, ML_KEM_768_PUBLIC_KEY_BYTES);
+        let unverified = evaluate_recipient(BOB, Some(&unsigned_pq), Some(&alice.public_key), Some(&legacy));
+        let still_legacy = unverified.pin.clone().unwrap();
+        assert!(!ratchet(unverified).pq_target.unwrap().signed);
+        assert!(still_legacy.pq_fingerprint.is_empty());
+
+        for bundle in [signed_v2_bundle(&alice), signed_v3_bundle(&alice, 2, 7)] {
+            let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), Some(&legacy));
+            let upgraded = evaluation.pin.clone().unwrap();
+            assert!(ratchet(evaluation).pq_target.unwrap().signed);
+            assert_eq!(
+                upgraded.pq_fingerprint,
+                hex(&Sha256::digest(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]))
+            );
+            let refused = evaluate_recipient(BOB, Some(&unsigned_pq), Some(&alice.public_key), Some(&upgraded));
+            assert!(refused.outcome.is_err());
+        }
+
+        let replay_floor = RecipientPin {
+            binding_epoch: 9,
+            binding_fingerprint: "ff".to_string(),
+            ..legacy
+        };
+        let replayed = evaluate_recipient(BOB, Some(&signed_v3_bundle(&alice, 2, 7)), Some(&alice.public_key), Some(&replay_floor));
+        assert!(replayed.outcome.is_err());
+        assert!(replayed.pin.is_none());
+    }
+
+    #[test]
+    fn accepting_a_key_never_lowers_pinned_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let alice = owner("alice");
+        let id = pin_id("account", BOB);
+        let mut bundle = signed_v3_bundle(&alice, 2, 8);
+        bundle.x3dh_max_version = Some(2);
+        let mut pin = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        pin.flagged = true;
+        db.recipient_pin_put(&id, &pin).unwrap();
+
+        let shown = key_fingerprint(Some(&alice.public_key)).unwrap();
+        accept_recipient_key(&db, "account", BOB, Some(&alice.public_key), &shown).unwrap();
+        let accepted = db.recipient_pin_get(&id).unwrap().unwrap();
+        assert_eq!(
+            accepted,
+            RecipientPin {
+                flagged: false,
+                ..pin.clone()
+            }
+        );
+
+        for weaker in [signed_v1_bundle(&alice, None), signed_v3_bundle(&alice, 2, 7)] {
+            assert!(evaluate_recipient(BOB, Some(&weaker), Some(&alice.public_key), Some(&accepted))
+                .outcome
+                .is_err());
+        }
+        let mut unsigned_version = signed_v3_bundle(&alice, 2, 9);
+        unsigned_version.x3dh_max_version = Some(1);
+        assert!(ratchet(evaluate_recipient(BOB, Some(&unsigned_version), Some(&alice.public_key), Some(&accepted))).transcript_bound);
+    }
+
+    #[test]
+    fn accepting_a_new_account_key_keeps_the_post_quantum_floor_and_resets_the_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let alice = owner("alice");
+        let reset = owner("alice");
+        let id = pin_id("account", BOB);
+        let pin = evaluate_recipient(BOB, Some(&signed_v3_bundle(&alice, 2, 40)), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        db.recipient_pin_put(&id, &pin).unwrap();
+
+        let refused = evaluate_recipient(BOB, Some(&signed_v3_bundle(&reset, 2, 1)), Some(&reset.public_key), Some(&pin));
+        assert!(refused.outcome.is_err());
+        db.recipient_pin_put(&id, &refused.pin.unwrap()).unwrap();
+
+        let shown = key_fingerprint(Some(&reset.public_key)).unwrap();
+        accept_recipient_key(&db, "account", BOB, Some(&reset.public_key), &shown).unwrap();
+        let accepted = db.recipient_pin_get(&id).unwrap().unwrap();
+        assert_eq!(accepted.owner_fingerprint, shown);
+        assert!(!accepted.flagged);
+        assert!(accepted.pq_seen);
+        assert_eq!(accepted.pq_fingerprint, pin.pq_fingerprint);
+        assert!(accepted.transcript_bound);
+        assert_eq!(accepted.binding_epoch, 0);
+
+        assert!(evaluate_recipient(BOB, Some(&signed_v3_bundle(&reset, 2, 1)), Some(&reset.public_key), Some(&accepted))
+            .outcome
+            .is_ok());
+        let downgraded = evaluate_recipient(BOB, Some(&signed_v1_bundle(&reset, None)), Some(&reset.public_key), Some(&accepted));
+        let Err(BridgeError::RecipientKey(message)) = downgraded.outcome else {
+            panic!("a dropped post-quantum key must stay refused after Accept");
+        };
+        assert!(message.contains("Accepting the key does not fix this"), "{message}");
+        assert!(!message.contains("--fingerprint"), "{message}");
     }
 
     #[test]

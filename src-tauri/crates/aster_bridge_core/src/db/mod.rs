@@ -720,6 +720,14 @@ impl Database {
             "ALTER TABLE recipient_key_pin ADD COLUMN transcript_bound INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN binding_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN binding_fingerprint TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_attachment (
@@ -1998,7 +2006,7 @@ impl Database {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT identity_fingerprint, owner_fingerprint, pq_seen, flagged,
-                        pq_fingerprint, transcript_bound
+                        pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint
                  FROM recipient_key_pin WHERE pin_id = ?1",
                 [pin_id],
                 |r| {
@@ -2009,6 +2017,8 @@ impl Database {
                         flagged: r.get::<_, i64>(3)? != 0,
                         pq_fingerprint: r.get(4)?,
                         transcript_bound: r.get::<_, i64>(5)? != 0,
+                        binding_epoch: r.get(6)?,
+                        binding_fingerprint: r.get(7)?,
                     })
                 },
             )
@@ -2030,8 +2040,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO recipient_key_pin
                     (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, flagged, updated_at,
-                     pq_fingerprint, transcript_bound)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(pin_id) DO UPDATE SET
                     identity_fingerprint = excluded.identity_fingerprint,
                     owner_fingerprint = excluded.owner_fingerprint,
@@ -2039,7 +2049,9 @@ impl Database {
                     flagged = excluded.flagged,
                     updated_at = excluded.updated_at,
                     pq_fingerprint = excluded.pq_fingerprint,
-                    transcript_bound = excluded.transcript_bound",
+                    transcript_bound = excluded.transcript_bound,
+                    binding_epoch = excluded.binding_epoch,
+                    binding_fingerprint = excluded.binding_fingerprint",
                 rusqlite::params![
                     pin_id,
                     pin.identity_fingerprint,
@@ -2048,7 +2060,9 @@ impl Database {
                     pin.flagged as i64,
                     now,
                     pin.pq_fingerprint,
-                    pin.transcript_bound as i64
+                    pin.transcript_bound as i64,
+                    pin.binding_epoch,
+                    pin.binding_fingerprint
                 ],
             )?;
             Ok(())
@@ -4363,6 +4377,8 @@ mod db_tests {
             pq_seen: false,
             pq_fingerprint: String::new(),
             transcript_bound: false,
+            binding_epoch: 0,
+            binding_fingerprint: String::new(),
             flagged: false,
         };
         db.recipient_pin_put("pin", &first).unwrap();
@@ -4373,6 +4389,8 @@ mod db_tests {
             pq_seen: true,
             pq_fingerprint: "dd".to_string(),
             transcript_bound: true,
+            binding_epoch: 9,
+            binding_fingerprint: "ee".to_string(),
             flagged: true,
             ..first
         };
