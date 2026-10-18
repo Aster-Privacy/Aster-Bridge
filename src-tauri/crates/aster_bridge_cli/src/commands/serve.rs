@@ -29,6 +29,7 @@ use aster_bridge_core::auth::app_passwords::AppPasswords;
 use aster_bridge_core::auth::device_identity;
 use aster_bridge_core::auth::session::{self, Session};
 use aster_bridge_core::config::{self, BridgeConfig};
+use aster_bridge_core::crypto::recipient_trust::RECIPIENT_TRUST_PROTOCOL;
 use aster_bridge_core::db::Database;
 use aster_bridge_core::runtime::{
     self, BridgeRuntime, ClientProfile, RunningBridge, RuntimeDeps, Service, StartError,
@@ -609,7 +610,11 @@ fn handler(shared: Arc<Shared>) -> control::Handler {
 impl Shared {
     async fn handle(&self, op: &str, args: Value) -> CliResult<Value> {
         match op {
-            "ping" => Ok(json!({ "pid": std::process::id(), "version": VERSION })),
+            "ping" => Ok(json!({
+                "pid": std::process::id(),
+                "version": VERSION,
+                "recipient_trust": RECIPIENT_TRUST_PROTOCOL,
+            })),
             "status" => Ok(self.status()),
             "sync_now" => {
                 self.running
@@ -641,7 +646,7 @@ impl Shared {
                 )
                 .await
             }
-            "recipient_key_accept" => {
+            "recipient_key_accept" | "recipient_key_accept_v2" => {
                 let (token, username) = self.token_and_username().await;
                 common::recipient_key_accept(
                     &self.db,
