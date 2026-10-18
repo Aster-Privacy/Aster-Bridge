@@ -939,6 +939,10 @@ fn resolve_mailbox(db: &Database, raw: &str) -> Option<crate::folders::MailboxEn
         .cloned()
 }
 
+fn is_safe_tag(tag: &str) -> bool {
+    !tag.is_empty() && !tag.chars().any(char::is_control)
+}
+
 fn quote_imap_string(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -1371,7 +1375,12 @@ where
                 );
             }
             if let Some((msg, recoverable)) = literal_error {
-                let tag = trimmed.split(' ').next().unwrap_or("*").to_string();
+                let tag = trimmed
+                    .split(' ')
+                    .next()
+                    .filter(|t| is_safe_tag(t))
+                    .unwrap_or("*")
+                    .to_string();
                 write_bad(&mut writer, &tag, msg).await?;
                 if recoverable {
                     continue;
@@ -1380,6 +1389,10 @@ where
             }
         }
         let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+        if !is_safe_tag(parts[0]) {
+            writer.write_all(b"* BAD Invalid tag\r\n").await?;
+            continue;
+        }
         if parts.len() < 2 {
             writer.write_all(b"* BAD Invalid command\r\n").await?;
             continue;
@@ -4631,6 +4644,7 @@ mod tests {
         fail_store_after: Option<usize>,
         fail_metadata: bool,
         fail_tags: bool,
+        store_error: Option<&'static str>,
     }
 
     async fn spawn_mock_backend_full(opts: MockOpts) -> (String, BackendCalls) {
@@ -4644,6 +4658,7 @@ mod tests {
             fail_store_after,
             fail_metadata,
             fail_tags,
+            store_error,
         } = opts;
         let create_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4830,6 +4845,9 @@ mod tests {
                     let hashes = hashes.clone();
                     let store_hits = store_hits.clone();
                     async move {
+                        if let Some(body) = store_error {
+                            return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
+                        }
                         let hit = store_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if rate_limit_first_store && hit == 0 {
                             calls
@@ -6778,6 +6796,123 @@ mod tests {
 
         let search = imap_cmd_lines(&mut reader, &mut writer, "c2", "UID SEARCH ALL").await;
         assert!(search.contains(&format!("* SEARCH {}", source.imap_uid)), "{}", search);
+    }
+
+    async fn lines_until_noop(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+    ) -> Vec<String> {
+        let mut lines = tokio::time::timeout(Duration::from_secs(60), read_until_tag(reader, tag))
+            .await
+            .expect("the tagged reply never arrived");
+        writer.write_all(b"zz NOOP\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        lines.extend(
+            tokio::time::timeout(Duration::from_secs(10), read_until_tag(reader, "zz"))
+                .await
+                .expect("NOOP never completed"),
+        );
+        lines
+    }
+
+    fn assert_one_tagged_no(lines: &[String], tag: &str) {
+        let tagged: Vec<&String> = lines.iter().filter(|l| l.starts_with(&format!("{} ", tag))).collect();
+        assert_eq!(tagged.len(), 1, "expected one tagged reply: {:#?}", lines);
+        assert!(tagged[0].starts_with(&format!("{} NO ", tag)), "{:#?}", lines);
+        for line in lines {
+            assert!(!line.contains('\r'), "a reply carried a bare CR: {:?}", line);
+            assert!(!line.starts_with("* BYE"), "an injected BYE reached the client: {:#?}", lines);
+            assert!(!line.starts_with("A0042"), "an injected tagged line reached the client: {:#?}", lines);
+        }
+        let ok_for_tag = lines.iter().filter(|l| l.starts_with(&format!("{} OK", tag))).count();
+        assert_eq!(ok_for_tag, 0, "{:#?}", lines);
+        assert!(lines.last().unwrap().starts_with("zz OK"), "{:#?}", lines);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_attachment_with_a_hostile_name_gets_one_tagged_no() {
+        use base64::Engine;
+        let (addr, _db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let payload = vec![0u8; crate::imap::append::MAX_ATTACHMENT_BYTES + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let mut body = String::with_capacity(encoded.len() + encoded.len() / 38);
+        for chunk in encoded.as_bytes().chunks(76) {
+            body.push_str(std::str::from_utf8(chunk).unwrap());
+            body.push_str("\r\n");
+        }
+        let literal = format!(
+            concat!(
+                "From: a@b.test\r\n",
+                "Subject: hostile\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/mixed; boundary=\"B\"\r\n",
+                "\r\n",
+                "--B\r\n",
+                "Content-Type: text/plain\r\n",
+                "\r\n",
+                "body\r\n",
+                "--B\r\n",
+                "Content-Type: application/octet-stream\r\n",
+                "Content-Transfer-Encoding: base64\r\n",
+                "Content-Disposition: attachment; filename*=UTF-8''x%0D%0A*%20BYE%20pwned%0D%0AA0042%20OK%20done\r\n",
+                "\r\n",
+                "{}",
+                "--B--\r\n"
+            ),
+            body
+        );
+        writer
+            .write_all(format!("a1 APPEND INBOX {{{}}}\r\n", literal.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut cont = String::new();
+        reader.read_line(&mut cont).await.unwrap();
+        assert!(cont.starts_with("+ "), "expected a continuation, got {:?}", cont);
+        writer.write_all(literal.as_bytes()).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let lines = lines_until_noop(&mut reader, &mut writer, "a1").await;
+        assert_one_tagged_no(&lines, "a1");
+        let tagged = lines.iter().find(|l| l.starts_with("a1 ")).unwrap();
+        assert!(tagged.starts_with("a1 NO [TOOBIG] "), "{:#?}", lines);
+        assert!(tagged.contains("BYE pwned"), "the name should stay readable on the one line: {}", tagged);
+    }
+
+    #[tokio::test]
+    async fn a_copy_error_with_line_breaks_gets_one_tagged_no() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                store_error: Some("disk full\r\n* BYE pwned\r\nA0042 OK done\r\nc1 OK COPY completed"),
+                ..Default::default()
+            },
+            Some("test-ik"),
+        )
+        .await;
+        seed_copy_source(&db, "msg-hostile-copy", "copy me", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        writer.write_all(b"c1 UID COPY 1 Archive\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let lines = lines_until_noop(&mut reader, &mut writer, "c1").await;
+        assert_one_tagged_no(&lines, "c1");
+        let tagged = lines.iter().find(|l| l.starts_with("c1 ")).unwrap();
+        assert!(tagged.contains("could not copy UID 1"), "{:#?}", lines);
+        assert!(tagged.contains("BYE pwned"), "the server text should stay on the one line: {}", tagged);
+        assert!(db.list_cached_messages("archive").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tag_with_a_bare_cr_is_refused_and_never_echoed() {
+        let out = imap_transcript("x\r* BYE NOOP\r\na1 NOOP\r\na2 LOGOUT\r\n", false).await;
+        assert!(out.contains("* BAD Invalid tag\r\n"), "{:?}", out);
+        assert!(!out.contains("x\r"), "{:?}", out);
+        assert!(!out.contains("* BYE NOOP"), "{:?}", out);
+        assert!(out.contains("a1 "), "{:?}", out);
     }
 
     #[tokio::test]
