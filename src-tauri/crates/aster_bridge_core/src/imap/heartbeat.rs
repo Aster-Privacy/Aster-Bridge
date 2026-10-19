@@ -20,16 +20,20 @@
 //
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use futures_util::task::AtomicWaker;
 use tokio::sync::{mpsc, oneshot};
 
 pub const HEARTBEAT_LINE: &[u8] = b"* OK still working\r\n";
 
 const PRODUCTION_INTERVAL_SECS: u64 = 15;
+
+const MAX_QUEUED_BYTES: usize = 1024 * 1024;
+const COALESCE_BYTES: usize = 64 * 1024;
 
 pub fn heartbeat_interval() -> Duration {
     if cfg!(test) {
@@ -45,8 +49,22 @@ enum PumpMessage {
     Wake,
 }
 
+#[derive(Default)]
+struct Backlog {
+    queued: AtomicUsize,
+    space: AtomicWaker,
+}
+
+impl Backlog {
+    fn drained(&self, bytes: usize) {
+        self.queued.fetch_sub(bytes, Ordering::SeqCst);
+        self.space.wake();
+    }
+}
+
 pub struct HeartbeatWriter<W> {
     tx: Option<mpsc::UnboundedSender<PumpMessage>>,
+    backlog: Arc<Backlog>,
     armed: Arc<AtomicBool>,
     command_active: Arc<AtomicBool>,
     pending_flush: Option<oneshot::Receiver<std::io::Result<()>>>,
@@ -60,9 +78,11 @@ where
     pub fn new(inner: W, every: Duration) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let armed = Arc::new(AtomicBool::new(false));
-        let pump = tokio::spawn(pump(inner, rx, armed.clone(), every));
+        let backlog = Arc::new(Backlog::default());
+        let pump = tokio::spawn(pump(inner, rx, backlog.clone(), armed.clone(), every));
         Self {
             tx: Some(tx),
+            backlog,
             armed,
             command_active: Arc::new(AtomicBool::new(false)),
             pending_flush: None,
@@ -136,14 +156,25 @@ where
 {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if this.backlog.queued.load(Ordering::SeqCst) >= MAX_QUEUED_BYTES {
+            this.backlog.space.register(cx.waker());
+            let closed = this.tx.as_ref().is_none_or(|tx| tx.is_closed());
+            if !closed && this.backlog.queued.load(Ordering::SeqCst) >= MAX_QUEUED_BYTES {
+                return Poll::Pending;
+            }
+        }
         this.armed.store(false, Ordering::SeqCst);
+        this.backlog.queued.fetch_add(buf.len(), Ordering::SeqCst);
         match this.send(PumpMessage::Bytes(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => {
+                this.backlog.drained(buf.len());
+                Poll::Ready(Err(e))
+            }
         }
     }
 
@@ -185,45 +216,70 @@ where
 async fn pump<W>(
     mut inner: W,
     mut rx: mpsc::UnboundedReceiver<PumpMessage>,
+    backlog: Arc<Backlog>,
     armed: Arc<AtomicBool>,
     every: Duration,
 ) -> W
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut held: Option<PumpMessage> = None;
     loop {
-        tokio::select! {
-            message = rx.recv() => match message {
-                Some(PumpMessage::Bytes(bytes)) => {
-                    if inner.write_all(&bytes).await.is_err() {
+        let message = match held.take() {
+            Some(message) => Some(message),
+            None => tokio::select! {
+                message = rx.recv() => message,
+                _ = tokio::time::sleep(every) => {
+                    if !armed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    tracing::debug!("IMAP command is still running, sending a keepalive so the client does not time out");
+                    if inner.write_all(HEARTBEAT_LINE).await.is_err() {
                         break;
                     }
-                }
-                Some(PumpMessage::Flush(ack)) => {
-                    let result = inner.flush().await;
-                    let failed = result.is_err();
-                    let _ = ack.send(result);
-                    if failed {
+                    if inner.flush().await.is_err() {
                         break;
                     }
-                }
-                Some(PumpMessage::Wake) => {}
-                None => break,
-            },
-            _ = tokio::time::sleep(every) => {
-                if !armed.load(Ordering::SeqCst) {
                     continue;
                 }
-                tracing::debug!("IMAP command is still running, sending a keepalive so the client does not time out");
-                if inner.write_all(HEARTBEAT_LINE).await.is_err() {
-                    break;
+            },
+        };
+        match message {
+            Some(PumpMessage::Bytes(mut bytes)) => {
+                let mut taken = bytes.len();
+                while bytes.len() < COALESCE_BYTES {
+                    match rx.try_recv() {
+                        Ok(PumpMessage::Bytes(more)) if bytes.len() + more.len() <= COALESCE_BYTES => {
+                            taken += more.len();
+                            bytes.extend_from_slice(&more);
+                        }
+                        Ok(other) => {
+                            held = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
-                if inner.flush().await.is_err() {
+                let written = inner.write_all(&bytes).await;
+                backlog.drained(taken);
+                if written.is_err() {
                     break;
                 }
             }
+            Some(PumpMessage::Flush(ack)) => {
+                let result = inner.flush().await;
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+            Some(PumpMessage::Wake) => {}
+            None => break,
         }
     }
+    rx.close();
+    backlog.space.wake();
     inner
 }
 
@@ -377,6 +433,95 @@ mod tests {
             seen
         );
         assert_eq!(seen, "* 1 FETCH (BODY[] {11}\r\nhello world)\r\n");
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingSocket {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncWrite for CountingSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn small_writes_reach_the_socket_as_one_write() {
+        let socket = CountingSocket::default();
+        let mut writer = HeartbeatWriter::new(socket.clone(), Duration::from_secs(30));
+        for n in 0..50 {
+            writer.write_all(format!("* {} FETCH (FLAGS ())\r\n", n).as_bytes()).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+        let expected: String = (0..50).map(|n| format!("* {} FETCH (FLAGS ())\r\n", n)).collect();
+        assert_eq!(String::from_utf8(socket.bytes.lock().unwrap().clone()).unwrap(), expected);
+        assert_eq!(socket.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_reader_holds_the_writer_back_instead_of_queueing_everything() {
+        let (inner, mut client) = tokio::io::duplex(16 * 1024);
+        let mut writer = HeartbeatWriter::new(inner, Duration::from_secs(30));
+        let backlog = writer.backlog.clone();
+        let chunk = vec![b'x'; 64 * 1024];
+        let total = 8 * 1024 * 1024;
+        let producer = tokio::spawn(async move {
+            for _ in 0..total / chunk.len() {
+                writer.write_all(&chunk).await.unwrap();
+            }
+            writer.flush().await.unwrap();
+            writer
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!producer.is_finished(), "the writer waits while the client does not read");
+        assert!(backlog.queued.load(Ordering::SeqCst) <= 2 * 1024 * 1024);
+
+        let mut received = 0usize;
+        let mut buf = vec![0u8; 256 * 1024];
+        while received < total {
+            let n = tokio::io::AsyncReadExt::read(&mut client, &mut buf).await.unwrap();
+            assert!(n > 0);
+            assert!(buf[..n].iter().all(|b| *b == b'x'));
+            received += n;
+        }
+        assert_eq!(received, total);
+        let _writer = producer.await.unwrap();
+        assert_eq!(backlog.queued.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_writer_waiting_for_room_fails_when_the_socket_dies() {
+        let (inner, client) = tokio::io::duplex(1024);
+        let mut writer = HeartbeatWriter::new(inner, Duration::from_secs(30));
+        let chunk = vec![b'y'; 64 * 1024];
+        let producer = tokio::spawn(async move {
+            loop {
+                if let Err(e) = writer.write_all(&chunk).await {
+                    return e.kind();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+        let kind = tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the waiting writer is woken")
+            .unwrap();
+        assert_eq!(kind, std::io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]
