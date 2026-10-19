@@ -1029,6 +1029,110 @@ pub(crate) struct CacheOutcome {
     decrypt_failed: bool,
 }
 
+const FAILED_ENVELOPE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const FAILED_ENVELOPE_MAX: usize = 5000;
+const FAILED_ENVELOPE_TAIL: usize = 32;
+
+static FAILED_ENVELOPES: OnceLock<StdMutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+
+fn failed_envelopes() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
+    FAILED_ENVELOPES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn envelope_key_fingerprint(
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+) -> String {
+    use sha2::{Digest, Sha256};
+    static SALT: OnceLock<[u8; 32]> = OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        use rand_core::RngCore;
+        let mut bytes = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut bytes);
+        bytes
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    part(passphrase);
+    part(identity_key.unwrap_or("").as_bytes());
+    for key in previous_keys {
+        part(key.as_bytes());
+    }
+    for candidate in inbound_keys {
+        part(&candidate.ecdh_secret_d);
+        part(candidate.pq_decap_key.as_deref().unwrap_or(&[]));
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+fn failed_envelope_key(fingerprint: &str, item: &MailItem) -> String {
+    let envelope = item.encrypted_envelope.as_str();
+    let mut tail_start = envelope.len().saturating_sub(FAILED_ENVELOPE_TAIL);
+    while !envelope.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}|{}|{}|{}|{}",
+        fingerprint,
+        item.id,
+        item.envelope_nonce,
+        envelope.len(),
+        &envelope[tail_start..]
+    )
+}
+
+fn failed_recently(
+    failures: &StdMutex<HashMap<String, std::time::Instant>>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    let Ok(mut map) = failures.lock() else {
+        return false;
+    };
+    match map.get(key) {
+        Some(expires_at) if *expires_at > now => true,
+        Some(_) => {
+            map.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn remember_failure(
+    failures: &StdMutex<HashMap<String, std::time::Instant>>,
+    key: String,
+    now: std::time::Instant,
+) {
+    let Ok(mut map) = failures.lock() else {
+        return;
+    };
+    if map.len() >= FAILED_ENVELOPE_MAX && !map.contains_key(&key) {
+        map.retain(|_, expires_at| *expires_at > now);
+        while map.len() >= FAILED_ENVELOPE_MAX {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, expires_at)| **expires_at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+    }
+    map.insert(key, now + FAILED_ENVELOPE_TTL);
+}
+
 fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
     if item.is_read.is_none() && item.is_starred.is_none() {
         return false;
@@ -1166,6 +1270,21 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
+    let failure_key = failed_envelope_key(
+        &envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys),
+        item,
+    );
+    if failed_recently(failed_envelopes(), &failure_key, std::time::Instant::now()) {
+        return Prepared::Done(CacheOutcome {
+            inbound_decrypt_failed: crate::crypto::inbound::is_inbound_payload(
+                &item.encrypted_envelope,
+                &item.envelope_nonce,
+            ),
+            decrypt_failed: true,
+            ..CacheOutcome::default()
+        });
+    }
+
     let plaintext_result = decrypt_envelope_noting_inbound(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
@@ -1211,6 +1330,7 @@ fn prepare_mail_item(
             } else {
                 tracing::debug!("envelope decrypt skipped");
             }
+            remember_failure(failed_envelopes(), failure_key, std::time::Instant::now());
             return Prepared::Done(CacheOutcome {
                 inbound_decrypt_failed: inbound,
                 decrypt_failed: true,
@@ -4009,6 +4129,79 @@ mod tests {
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         assert!(!db.body_cached("msg-unhealable"));
+    }
+
+    fn identity_sealed_item(id: &str, json: &serde_json::Value, identity_key: &str) -> MailItem {
+        let (data, nonce) = crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
+            &json.to_string(),
+            identity_key,
+            crate::crypto::envelope::ENVELOPE_VERSION_IMPORT,
+        )
+        .unwrap();
+        let mut item = item_with_envelope(id, json);
+        item.encrypted_envelope = data;
+        item.envelope_nonce = nonce;
+        item
+    }
+
+    #[test]
+    fn undecryptable_item_is_not_retried_until_the_keys_change() {
+        let (_dir, db) = temp_db();
+        let json = serde_json::json!({"subject": "imported", "body_text": "old mail"});
+        let item = identity_sealed_item("msg-memo", &json, "older-identity");
+
+        let first = cache_mail_item(&db, "archive", &item, b"pass", Some("current-identity"), &[], &[]);
+        assert!(first.decrypt_failed);
+        assert!(!first.was_new);
+        let key = failed_envelope_key(
+            &envelope_key_fingerprint(b"pass", Some("current-identity"), &[], &[]),
+            &item,
+        );
+        assert!(failed_recently(failed_envelopes(), &key, std::time::Instant::now()));
+
+        let again = cache_mail_item(&db, "archive", &item, b"pass", Some("current-identity"), &[], &[]);
+        assert!(again.decrypt_failed);
+        assert!(!again.inbound_decrypt_failed);
+        assert!(!again.was_new);
+        assert!(!db.body_cached("msg-memo"));
+
+        let previous = vec!["older-identity".to_string()];
+        let healed = cache_mail_item(&db, "archive", &item, b"pass", Some("current-identity"), &previous, &[]);
+        assert!(healed.was_new);
+        let cached = db.get_cached_message("msg-memo").unwrap().unwrap();
+        assert_eq!(cached.subject.as_deref(), Some("imported"));
+    }
+
+    #[test]
+    fn failed_envelope_memo_expires_and_stays_bounded() {
+        let failures = StdMutex::new(HashMap::new());
+        let start = std::time::Instant::now();
+        remember_failure(&failures, "a".to_string(), start);
+        assert!(failed_recently(&failures, "a", start + std::time::Duration::from_secs(60)));
+        assert!(!failed_recently(&failures, "a", start + FAILED_ENVELOPE_TTL));
+        assert!(!failed_recently(&failures, "a", start));
+        assert!(!failed_recently(&failures, "b", start));
+
+        for i in 0..FAILED_ENVELOPE_MAX + 10 {
+            remember_failure(&failures, format!("k{}", i), start + std::time::Duration::from_millis(i as u64));
+        }
+        let map = failures.lock().unwrap();
+        assert_eq!(map.len(), FAILED_ENVELOPE_MAX);
+        assert!(!map.contains_key("k0"));
+        assert!(map.contains_key(&format!("k{}", FAILED_ENVELOPE_MAX + 9)));
+    }
+
+    #[test]
+    fn key_fingerprint_changes_with_any_key() {
+        let base = envelope_key_fingerprint(b"pass", Some("ik"), &[], &[]);
+        assert_eq!(base, envelope_key_fingerprint(b"pass", Some("ik"), &[], &[]));
+        assert_ne!(base, envelope_key_fingerprint(b"other", Some("ik"), &[], &[]));
+        assert_ne!(base, envelope_key_fingerprint(b"pass", Some("ik2"), &[], &[]));
+        assert_ne!(base, envelope_key_fingerprint(b"pass", Some("ik"), &["old".to_string()], &[]));
+        assert_ne!(
+            envelope_key_fingerprint(b"pass", Some("ab"), &["c".to_string()], &[]),
+            envelope_key_fingerprint(b"pass", Some("a"), &["bc".to_string()], &[])
+        );
     }
 
     #[test]
