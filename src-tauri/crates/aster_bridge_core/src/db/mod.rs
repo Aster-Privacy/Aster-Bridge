@@ -1195,6 +1195,53 @@ impl Database {
         })
     }
 
+    pub fn list_cached_message_meta_for_uids(
+        &self,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<Vec<CachedMessage>, String> {
+        let mut uids = uids.to_vec();
+        uids.sort_unstable();
+        uids.dedup();
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            for chunk in uids.chunks(SQL_IN_CHUNK) {
+                let sql = format!(
+                    "SELECT m.aster_id, m.folder, m.subject, m.sender, m.recipients, m.date, m.size, m.flags, NULL, m.raw_headers, u.imap_uid, m.thread_id, m.attachments_state
+                     FROM uid_map u
+                     JOIN message_cache m ON m.aster_id = u.aster_id AND m.folder = u.folder
+                     WHERE u.folder = ? AND u.imap_uid IN ({})
+                     ORDER BY u.imap_uid ASC",
+                    sql_placeholders(chunk.len()),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params = std::iter::once(rusqlite::types::Value::from(folder.to_string()))
+                    .chain(chunk.iter().map(|uid| rusqlite::types::Value::from(*uid as i64)));
+                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok(CachedMessage {
+                        aster_id: row.get(0)?,
+                        folder: row.get(1)?,
+                        subject: row.get(2)?,
+                        sender: row.get(3)?,
+                        recipients: row.get(4)?,
+                        date: row.get(5)?,
+                        size: row.get(6)?,
+                        flags: row.get(7)?,
+                        body_text: row.get(8)?,
+                        raw_headers: row.get(9)?,
+                        imap_uid: row.get::<_, i64>(10)? as u32,
+                        thread_id: row.get(11)?,
+                        attachments_state: row.get(12)?,
+                    })
+                })?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_cached_message_meta(&self, folder: &str) -> Result<Vec<CachedMessage>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -1469,6 +1516,34 @@ impl Database {
                 .query_map([aster_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+    }
+
+    pub fn keywords_for_messages(&self, aster_ids: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
+        self.with_conn(|conn| {
+            let mut out: HashMap<String, Vec<String>> = HashMap::new();
+            for chunk in unique_ids(aster_ids).chunks(SQL_IN_CHUNK) {
+                let placeholders = sql_placeholders(chunk.len());
+                let sql = format!(
+                    "SELECT aster_id, keyword FROM message_keywords WHERE aster_id IN ({0})
+                     UNION
+                     SELECT a.aster_id, t.keyword FROM message_tag a
+                     JOIN custom_tag t ON t.tag_token = a.tag_token
+                     WHERE a.aster_id IN ({0}) AND t.keyword IS NOT NULL
+                     ORDER BY 2",
+                    placeholders,
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?;
+                for row in rows {
+                    let (id, keyword) = row?;
+                    out.entry(id).or_default().push(keyword);
+                }
+            }
+            Ok(out)
         })
     }
 
