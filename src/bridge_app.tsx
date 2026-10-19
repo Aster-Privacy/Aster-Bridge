@@ -2863,7 +2863,7 @@ export function BridgeApp() {
   useEffect(() => {
     if (!bridge_running) { set_outbox_count(0); return; }
     const fetch_outbox = async () => {
-      try { const items = await api.outbox_list(); set_outbox_count(items.length); } catch { set_outbox_count(0); }
+      try { set_outbox_count(await api.outbox_count()); } catch { set_outbox_count(0); }
     };
     fetch_outbox();
     const timer = setInterval(fetch_outbox, 30_000);

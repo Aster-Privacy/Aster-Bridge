@@ -2560,6 +2560,17 @@ impl Database {
         })
     }
 
+    pub fn outbox_pending_count(&self) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status IN ('pending','failed','sending')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as usize)
+        })
+    }
+
     pub fn outbox_list_pending(&self) -> Result<Vec<OutboxRow>, String> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -4724,6 +4735,21 @@ mod db_tests {
         let pending = db.outbox_list_pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, id2);
+    }
+
+    #[test]
+    fn outbox_pending_count_matches_the_pending_list() {
+        let (_d, db) = open_db();
+        assert_eq!(db.outbox_pending_count().unwrap(), 0);
+        let sent = db.outbox_insert(b"a", "f", "t").unwrap();
+        let sending = db.outbox_insert(b"b", "f", "t").unwrap();
+        let failed = db.outbox_insert(b"c", "f", "t").unwrap();
+        db.outbox_insert(b"d", "f", "t").unwrap();
+        db.outbox_mark_sent(sent).unwrap();
+        db.outbox_mark_sending(sending).unwrap();
+        db.outbox_mark_failed(failed, "refused").unwrap();
+        assert_eq!(db.outbox_pending_count().unwrap(), 3);
+        assert_eq!(db.outbox_pending_count().unwrap(), db.outbox_list_pending().unwrap().len());
     }
 
     #[test]

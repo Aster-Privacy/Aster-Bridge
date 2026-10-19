@@ -1356,6 +1356,18 @@ async fn outbox_list(state: State<'_, AppState>) -> Result<Vec<OutboxItem>, Stri
 }
 
 #[tauri::command]
+async fn outbox_count(state: State<'_, AppState>) -> Result<usize, String> {
+    let db = {
+        let guard = state.0.lock().await;
+        if guard.session.is_none() {
+            return Err("not authenticated".to_string());
+        }
+        guard.db.clone()
+    };
+    db.outbox_pending_count()
+}
+
+#[tauri::command]
 async fn outbox_retry_now(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let trigger = {
         let guard = state.0.lock().await;
@@ -1575,6 +1587,7 @@ fn main() {
             get_recent_logs,
             copy_diagnostic_bundle,
             outbox_list,
+            outbox_count,
             outbox_retry_now,
             get_tls_info,
             open_tls_cert,

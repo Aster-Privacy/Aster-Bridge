@@ -383,6 +383,10 @@ export async function outbox_list(): Promise<OutboxItem[]> {
   return tauri_invoke<OutboxItem[]>("outbox_list");
 }
 
+export async function outbox_count(): Promise<number> {
+  return tauri_invoke<number>("outbox_count");
+}
+
 export async function outbox_retry_now(id: number): Promise<void> {
   return tauri_invoke("outbox_retry_now", { id });
 }
