@@ -4184,15 +4184,16 @@ async fn handle_fetch(
             || wants_rfc822
             || wants_rfc822_text);
 
-    let needs_body = wants_body
+    let needs_content = wants_body
         || wants_rfc822
-        || wants_rfc822_header
-        || wants_body_header
         || wants_body_text
         || !section_requests.is_empty()
-        || wants_rfc822_text
+        || wants_rfc822_text;
+    let needs_layout = wants_rfc822_header
+        || wants_body_header
         || wants_bodystructure
         || header_fields.is_some();
+    let needs_body = needs_content || needs_layout;
     let range_cap = if uid_command {
         conn.uids.iter().copied().max().unwrap_or(0)
     } else {
@@ -4268,10 +4269,12 @@ async fn handle_fetch(
         let uid = msg.imap_uid;
         let keywords = folder_keywords.get(&msg.aster_id).map(Vec::as_slice).unwrap_or(&[]);
         let attachments: Vec<crate::db::CachedAttachment> = if needs_body {
-            if crate::db::attachment_parts_known(msg.attachments_state) {
+            if !crate::db::attachment_parts_known(msg.attachments_state) {
+                Vec::new()
+            } else if needs_content {
                 db.get_message_attachments(&msg.aster_id).unwrap_or_default()
             } else {
-                Vec::new()
+                db.get_message_attachment_layout(&msg.aster_id).unwrap_or_default()
             }
         } else {
             folder_attachment_meta
@@ -4279,8 +4282,12 @@ async fn handle_fetch(
                 .cloned()
                 .unwrap_or_default()
         };
-        let mut rendered = crate::message_render::render(msg, &attachments, needs_body);
-        let missing_bytes = needs_body
+        let mut rendered = if needs_layout && !needs_content {
+            crate::message_render::render_layout(msg, &attachments)
+        } else {
+            crate::message_render::render(msg, &attachments, needs_content)
+        };
+        let missing_bytes = needs_content
             && !rendered.is_complete()
             && (needs_every_byte
                 || body_partial
@@ -9336,6 +9343,74 @@ mod tests {
         expected.extend(literal("BODY[2]", r.part_body("2").unwrap()));
         expected.extend_from_slice(b")\r\nf2 OK FETCH completed\r\n");
         assert_eq!(String::from_utf8_lossy(&resp), String::from_utf8_lossy(&expected));
+    }
+
+    #[tokio::test]
+    async fn header_and_structure_fetches_match_the_full_render() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let figures = crate::db::CachedAttachment {
+            seq: 0,
+            name: "figures.csv".to_string(),
+            content_type: "text/csv".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 11,
+            data: b"a,b\r\n1,2\r\n".to_vec(),
+        };
+        let scan = crate::db::CachedAttachment {
+            seq: 1,
+            name: "scan.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            content_id: None,
+            is_inline: false,
+            size: 7,
+            data: vec![0x25; 300_001],
+        };
+        seed_copy_source(&db, "hs-1", "with attachments", &[figures, scan]);
+        seed(&db, "hs-2", "inbox", "no attachments");
+        db.update_cached_body("hs-2", "just text", None).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let full = db.list_cached_messages("inbox").unwrap();
+        for uid in [1u32, 2] {
+            let m = full.iter().find(|m| m.imap_uid == uid).unwrap();
+            let atts = if m.attachments_state == crate::db::ATTACHMENTS_STORED {
+                db.get_message_attachments(&m.aster_id).unwrap()
+            } else {
+                Vec::new()
+            };
+            let r = crate::message_render::render(m, &atts, true);
+            let resp = imap_cmd_bytes(
+                &mut reader,
+                &mut writer,
+                "f1",
+                &format!(
+                    "UID FETCH {} (RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)] BODY.PEEK[HEADER] RFC822.HEADER)",
+                    uid
+                ),
+            )
+            .await;
+            let mut expected = format!(
+                "* {} FETCH (UID {} RFC822.SIZE {} BODYSTRUCTURE {} ",
+                uid, uid, r.size, r.bodystructure
+            )
+            .into_bytes();
+            expected.extend(literal(
+                "BODY[HEADER.FIELDS (SUBJECT FROM)]",
+                filter_header_fields(r.header(), &["SUBJECT".to_string(), "FROM".to_string()]),
+            ));
+            expected.push(b' ');
+            expected.extend(literal("BODY[HEADER]", r.header()));
+            expected.push(b' ');
+            expected.extend(literal("RFC822.HEADER", r.header()));
+            expected.extend_from_slice(b")\r\nf1 OK FETCH completed\r\n");
+            assert_eq!(
+                String::from_utf8_lossy(&resp),
+                String::from_utf8_lossy(&expected),
+                "UID {}",
+                uid
+            );
+        }
     }
 
     #[tokio::test]

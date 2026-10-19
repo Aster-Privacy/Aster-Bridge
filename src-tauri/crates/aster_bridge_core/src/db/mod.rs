@@ -3082,6 +3082,32 @@ impl Database {
         })
     }
 
+    pub fn get_message_attachment_layout(&self, aster_id: &str) -> Result<Vec<CachedAttachment>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, name, content_type, content_id, is_inline,
+                        CASE WHEN length(data) > 0 THEN length(data) ELSE size END
+                 FROM message_attachment WHERE aster_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([aster_id], |row| {
+                Ok(CachedAttachment {
+                    seq: row.get(0)?,
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    content_id: row.get(3)?,
+                    is_inline: row.get::<_, i64>(4)? != 0,
+                    size: row.get(5)?,
+                    data: Vec::new(),
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     pub fn get_attachment_meta_for_messages(
         &self,
         aster_ids: &[String],
