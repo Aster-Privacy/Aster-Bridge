@@ -93,6 +93,7 @@ struct Out {
     buf: String,
     len: usize,
     materialize: bool,
+    attachment_data: bool,
     on_demand: bool,
     gap: Option<usize>,
 }
@@ -106,7 +107,7 @@ impl Out {
     }
 
     fn push_base64(&mut self, data: &[u8], size_hint: usize) {
-        if self.materialize && self.on_demand && data.is_empty() {
+        if self.materialize && (!self.attachment_data || (self.on_demand && data.is_empty())) {
             self.gap.get_or_insert(self.len);
             self.len += base64_encoded_len(size_hint);
         } else if self.materialize && self.gap.is_none() {
@@ -721,6 +722,19 @@ pub fn render(
     attachments: &[CachedAttachment],
     materialize: bool,
 ) -> Rendered {
+    render_with(msg, attachments, materialize, true)
+}
+
+pub fn render_layout(msg: &CachedMessage, attachments: &[CachedAttachment]) -> Rendered {
+    render_with(msg, attachments, true, false)
+}
+
+fn render_with(
+    msg: &CachedMessage,
+    attachments: &[CachedAttachment],
+    materialize: bool,
+    attachment_data: bool,
+) -> Rendered {
     let meta: serde_json::Value = msg
         .raw_headers
         .as_deref()
@@ -749,6 +763,7 @@ pub fn render(
             buf: String::new(),
             len: 0,
             materialize,
+            attachment_data,
             on_demand: msg.attachments_state == ATTACHMENTS_ON_DEMAND,
             gap: None,
         },
@@ -1119,6 +1134,41 @@ mod tests {
     }
 
     #[test]
+    fn layout_render_matches_the_full_render_without_encoding_attachments() {
+        let mut logo = att(0, "logo.png", "image/png", &[3u8; 4097]);
+        logo.is_inline = true;
+        logo.content_id = Some("<logo@x>".to_string());
+        let pdf = att(1, "doc.pdf", "application/pdf", &[5u8; 100_003]);
+        let html = Some("<p>hi<img src=\"cid:logo@x\"></p>");
+        let cases: Vec<(Option<&str>, Option<&str>, Vec<CachedAttachment>)> = vec![
+            (Some("plain body\n"), Some("{\"is_html\":false}"), Vec::new()),
+            (Some("see attached"), Some("{\"is_html\":false}"), vec![pdf.clone()]),
+            (html, Some("{\"is_html\":true}"), vec![logo.clone()]),
+            (html, None, vec![logo, pdf]),
+        ];
+        for (body, raw, full) in cases {
+            let m = msg(body, raw, ATTACHMENTS_STORED);
+            let meta: Vec<CachedAttachment> = full
+                .iter()
+                .map(|a| CachedAttachment { data: Vec::new(), ..a.clone() })
+                .collect();
+            let expected = render(&m, &full, true);
+            let layout = render_layout(&m, &meta);
+            assert_eq!(layout.header(), expected.header(), "{:?}", raw);
+            assert_eq!(layout.bodystructure, expected.bodystructure, "{:?}", raw);
+            assert_eq!(layout.size, expected.size, "{:?}", raw);
+            assert_eq!(layout.parts, expected.parts, "{:?}", raw);
+            assert!(expected.text.starts_with(&layout.text));
+            if full.is_empty() {
+                assert!(layout.is_complete());
+                assert_eq!(layout.text, expected.text);
+            } else {
+                assert!(layout.text.len() < 4096, "{:?}", raw);
+            }
+        }
+    }
+
+    #[test]
     fn multipart_structure_ends_with_the_boundary_parameter() {
         let atts = vec![att(0, "a.txt", "text/plain", b"x")];
         let m = msg(Some("b"), None, ATTACHMENTS_STORED);
@@ -1223,6 +1273,7 @@ X-Evil"
                 buf: String::new(),
                 len: 0,
                 materialize: true,
+                attachment_data: true,
                 on_demand: false,
                 gap: None,
             };
