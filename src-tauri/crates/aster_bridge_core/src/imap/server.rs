@@ -1625,7 +1625,7 @@ where
             }
             "FETCH" => {
                 require_selected!(conn, writer, tag);
-                handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, &args, false).await?;
+                handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, &args, false, None).await?;
             }
             "UID" => {
                 require_auth!(conn, writer, tag);
@@ -1648,7 +1648,7 @@ where
                             write_no(&mut writer, &tag, "No mailbox selected").await?;
                             continue;
                         }
-                        handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, subargs, true).await?;
+                        handle_fetch(&mut writer, &db, &client, &session, &broadcaster, &conn, &tag, subargs, true, synced_meta.take()).await?;
                     }
                     "SEARCH" => {
                         if conn.state != ImapState::Selected {
@@ -4129,6 +4129,8 @@ fn literal(key: &str, data: impl AsRef<[u8]>) -> Vec<u8> {
     out
 }
 
+const FETCH_TARGETED_MAX: usize = 500;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_fetch(
     writer: &mut (impl AsyncWrite + Unpin),
@@ -4140,6 +4142,7 @@ async fn handle_fetch(
     tag: &str,
     args: &str,
     uid_command: bool,
+    listing: Option<Vec<CachedMessage>>,
 ) -> std::io::Result<()> {
     let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
     let mut fetch_seen_pushes: Vec<String> = Vec::new();
@@ -4191,16 +4194,48 @@ async fn handle_fetch(
         || wants_bodystructure
         || header_fields.is_some();
     let needs_body = needs_content || needs_layout;
-    let messages = db.list_cached_message_meta(folder).unwrap_or_default();
-    let folder_keywords = db.folder_keywords(folder).unwrap_or_default();
-    let folder_attachment_meta = if !needs_body && wants_size {
-        db.list_attachment_meta_for_folder(folder).unwrap_or_default()
+    let range_cap = if uid_command {
+        conn.uids.iter().copied().max().unwrap_or(0)
     } else {
-        std::collections::HashMap::new()
+        conn.uids.len() as u32
+    };
+    let selected = parse_set(range_spec, range_cap);
+    let wanted: Vec<u32> = if uid_command {
+        let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
+        selected.iter().copied().filter(|uid| known.contains(uid)).collect()
+    } else {
+        selected
+            .iter()
+            .filter_map(|n| conn.uids.get((*n as usize).checked_sub(1)?).copied())
+            .collect()
+    };
+    let targeted = wanted.len() <= FETCH_TARGETED_MAX;
+    let messages = match listing {
+        Some(listing) => listing,
+        None if targeted => db.list_cached_message_meta_for_uids(folder, &wanted).unwrap_or_default(),
+        None => db.list_cached_message_meta(folder).unwrap_or_default(),
     };
     let view = MailboxView::new(&conn.uids, &messages);
-    let range_cap = if uid_command { view.max_uid } else { view.len() };
-    let selected = parse_set(range_spec, range_cap);
+    let wanted_ids: Vec<String> = if targeted {
+        wanted
+            .iter()
+            .filter_map(|uid| view.by_uid(*uid).map(|(_, m)| m.aster_id.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let folder_keywords = if targeted {
+        db.keywords_for_messages(&wanted_ids).unwrap_or_default()
+    } else {
+        db.folder_keywords(folder).unwrap_or_default()
+    };
+    let folder_attachment_meta = if needs_body || !wants_size {
+        std::collections::HashMap::new()
+    } else if targeted {
+        db.get_attachment_meta_for_messages(&wanted_ids).unwrap_or_default()
+    } else {
+        db.list_attachment_meta_for_folder(folder).unwrap_or_default()
+    };
     let body_partial = parse_body_partial(&upper_parts);
     let needs_every_byte = (wants_body && !matches!(body_partial, Some((_, Some(_)))))
         || wants_rfc822
@@ -9376,6 +9411,64 @@ mod tests {
                 uid
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fetching_a_few_messages_matches_the_folder_wide_fetch() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        let count = FETCH_TARGETED_MAX as u32 + 20;
+        for n in 1..=count {
+            let id = format!("tf-{}", n);
+            if n % 97 == 0 {
+                seed_copy_source(
+                    &db,
+                    &id,
+                    &format!("subject {}", n),
+                    &[crate::db::CachedAttachment {
+                        seq: 0,
+                        name: "notes.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        content_id: None,
+                        is_inline: false,
+                        size: 5,
+                        data: b"notes".to_vec(),
+                    }],
+                );
+            } else {
+                seed(&db, &id, "inbox", &format!("subject {}", n));
+            }
+            if n % 50 == 0 {
+                db.set_message_keywords(&id, &["$label1".to_string(), "Work".to_string()]).unwrap();
+            }
+        }
+        db.update_message_flags(194, "inbox", 1 | 4).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let items = "(FLAGS RFC822.SIZE ENVELOPE)";
+        let all = imap_cmd_bytes(&mut reader, &mut writer, "a1", &format!("FETCH 1:* {}", items)).await;
+        let all = String::from_utf8(all).unwrap();
+        let lines: Vec<&str> = all.split_inclusive("\r\n").collect();
+        assert_eq!(lines.len(), count as usize + 1);
+        assert!(lines[49].contains("FLAGS ($label1 Work)"), "{}", lines[49]);
+        let line = |seq: u32| lines[seq as usize - 1].to_string();
+
+        for (cmd, seqs) in [
+            ("FETCH 50", vec![50u32]),
+            ("FETCH 194,97:100", vec![194u32, 97, 98, 99, 100]),
+            ("FETCH 510:*", (510..=count).collect::<Vec<_>>()),
+        ] {
+            let resp = imap_cmd_bytes(&mut reader, &mut writer, "f1", &format!("{} {}", cmd, items)).await;
+            let expected: String = seqs.iter().map(|s| line(*s)).collect::<String>() + "f1 OK FETCH completed\r\n";
+            assert_eq!(String::from_utf8_lossy(&resp), expected, "{}", cmd);
+        }
+
+        let resp = imap_cmd_bytes(&mut reader, &mut writer, "u1", &format!("UID FETCH 100,194 {}", items)).await;
+        let expected = format!(
+            "{}{}u1 OK FETCH completed\r\n",
+            line(100).replacen(" RFC822.SIZE", " UID 100 RFC822.SIZE", 1),
+            line(194).replacen(" RFC822.SIZE", " UID 194 RFC822.SIZE", 1)
+        );
+        assert_eq!(String::from_utf8_lossy(&resp), expected);
     }
 
     #[tokio::test]
