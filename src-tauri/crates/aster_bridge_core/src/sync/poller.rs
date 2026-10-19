@@ -2428,6 +2428,87 @@ struct FolderPage {
     next_cursor: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn list_folder_page(
+    client: &ApiClient,
+    access_token: &str,
+    system_query: Option<&FolderQuery>,
+    custom_folder: Option<&crate::db::CustomFolder>,
+    cursor: Option<&str>,
+    offset: i64,
+    seen_ids: &HashSet<String>,
+    include_envelope: bool,
+) -> Result<FolderPage, BridgeError> {
+    match (system_query, custom_folder) {
+        (Some(folder_query), _) => {
+            let mut q = folder_query.query.clone();
+            q.cursor = cursor.map(str::to_string);
+            client
+                .list_mail_with(access_token, &q, include_envelope)
+                .await
+                .map(|resp| FolderPage {
+                    label: folder_query.label.to_string(),
+                    raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
+                    total: resp.total.max(0) as usize,
+                    has_more: resp.has_more,
+                    next_cursor: resp.next_cursor,
+                    items: resp.items,
+                })
+        }
+        (None, Some(folder)) => client
+            .list_folder_mail_with(access_token, &folder.label_token, CUSTOM_FOLDER_PAGE, offset, include_envelope)
+            .await
+            .map(|resp| {
+                let fetched = resp.items.len();
+                FolderPage {
+                    label: crate::folders::folder_label(&folder.label_token),
+                    raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
+                    total: resp.total.max(0) as usize,
+                    has_more: resp.has_more && fetched > 0,
+                    next_cursor: (resp.has_more && fetched > 0).then(String::new),
+                    items: resp
+                        .items
+                        .into_iter()
+                        .filter(|i| i.is_spam != Some(true) && !seen_ids.contains(&i.id))
+                        .collect(),
+                }
+            }),
+        (None, None) => Ok(FolderPage {
+            label: String::new(),
+            raw_ids: Vec::new(),
+            items: Vec::new(),
+            total: 0,
+            has_more: false,
+            next_cursor: None,
+        }),
+    }
+}
+
+fn page_needs_envelopes(
+    db: &Database,
+    page: &FolderPage,
+    custom: bool,
+    known_tokens: &HashSet<String>,
+) -> bool {
+    let ids: Vec<&str> = page.items.iter().map(|i| i.id.as_str()).collect();
+    let mut id_counts: HashMap<&str, usize> = HashMap::new();
+    for id in &ids {
+        *id_counts.entry(id).or_default() += 1;
+    }
+    let Ok(snapshot) = db.cached_sync_states(&ids) else {
+        return true;
+    };
+    page.items.iter().any(|item| {
+        let folder = if custom {
+            page.label.clone()
+        } else {
+            target_folder(&page.label, item, known_tokens)
+        };
+        id_counts.get(item.id.as_str()) != Some(&1)
+            || cached_shortcut(snapshot.get(&item.id), &folder, item).is_none()
+    })
+}
+
 const MESSAGE_ID_BACKFILL_KEY: &str = "message_id_backfill_v1";
 
 fn backfill_missing_message_ids(db: &Database) {
@@ -2562,40 +2643,37 @@ async fn run_sync_pass(
             SYSTEM_FOLDER_MAX_ITEMS
         };
         loop {
-            let listed_at = std::time::Instant::now();
-            let page: Result<FolderPage, BridgeError> = match (system_query, custom_folder) {
-                (Some(folder_query), _) => {
-                    let mut q = folder_query.query.clone();
-                    q.cursor = cursor.clone();
-                    client.list_mail(&access_token, &q).await.map(|resp| FolderPage {
-                        label: folder_query.label.to_string(),
-                        raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
-                        total: resp.total.max(0) as usize,
-                        has_more: resp.has_more,
-                        next_cursor: resp.next_cursor,
-                        items: resp.items,
-                    })
-                }
-                (None, Some(folder)) => client
-                    .list_folder_mail(&access_token, &folder.label_token, CUSTOM_FOLDER_PAGE, offset)
-                    .await
-                    .map(|resp| {
-                        let fetched = resp.items.len();
-                        FolderPage {
-                            label: crate::folders::folder_label(&folder.label_token),
-                            raw_ids: resp.items.iter().map(|i| i.id.clone()).collect(),
-                            total: resp.total.max(0) as usize,
-                            has_more: resp.has_more && fetched > 0,
-                            next_cursor: (resp.has_more && fetched > 0).then(String::new),
-                            items: resp
-                                .items
-                                .into_iter()
-                                .filter(|i| i.is_spam != Some(true) && !seen_ids.contains(&i.id))
-                                .collect(),
-                        }
-                    }),
-                (None, None) => break,
-            };
+            if system_query.is_none() && custom_folder.is_none() {
+                break;
+            }
+            let mut listed_at = std::time::Instant::now();
+            let mut page = list_folder_page(
+                client,
+                &access_token,
+                system_query,
+                custom_folder,
+                cursor.as_deref(),
+                offset,
+                &seen_ids,
+                false,
+            )
+            .await;
+            if page.as_ref().is_ok_and(|light| {
+                page_needs_envelopes(db, light, custom_folder.is_some(), &known_tokens)
+            }) {
+                listed_at = std::time::Instant::now();
+                page = list_folder_page(
+                    client,
+                    &access_token,
+                    system_query,
+                    custom_folder,
+                    cursor.as_deref(),
+                    offset,
+                    &seen_ids,
+                    true,
+                )
+                .await;
+            }
             match page {
                 Ok(resp) => {
                     let folder_total = resp.total.min(max_per_folder);

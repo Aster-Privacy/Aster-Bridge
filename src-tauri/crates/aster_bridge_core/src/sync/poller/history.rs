@@ -1594,6 +1594,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sync_pass_with_nothing_new_lists_without_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let backend = Backend::default();
+        let inbox_item = |n: usize| {
+            let mut item = archive_item(n);
+            item["id"] = serde_json::json!(format!("inbox-{}", n));
+            item
+        };
+        *backend.inbox.lock().unwrap() = (1..=30).map(inbox_item).collect();
+        let client = Arc::new(ApiClient::new_with_base_url(&backend.serve().await));
+        let session = session();
+
+        run_sync_pass(&session, &client, &db, None, false).await.unwrap();
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 30);
+        assert!(backend.envelopes_listed.load(Ordering::SeqCst) >= 30);
+
+        backend.envelopes_listed.store(0, Ordering::SeqCst);
+        run_sync_pass(&session, &client, &db, None, false).await.unwrap();
+        assert_eq!(
+            backend.envelopes_listed.load(Ordering::SeqCst),
+            0,
+            "a pass over unchanged mail downloads no message bodies"
+        );
+
+        let mut read = inbox_item(5);
+        read["is_read"] = serde_json::json!(true);
+        backend.inbox.lock().unwrap()[4] = read;
+        run_sync_pass(&session, &client, &db, None, false).await.unwrap();
+        assert_eq!(backend.envelopes_listed.load(Ordering::SeqCst), 0, "a flag change needs no body");
+        assert_eq!(db.get_cached_message("inbox-5").unwrap().unwrap().flags & 1, 1);
+
+        backend.inbox.lock().unwrap().insert(0, inbox_item(0));
+        run_sync_pass(&session, &client, &db, None, false).await.unwrap();
+        assert!(db.get_cached_message("inbox-0").unwrap().is_some());
+        assert_eq!(
+            backend.envelopes_listed.load(Ordering::SeqCst),
+            31,
+            "only the page with the new message is listed again with envelopes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_walk_over_stored_mail_lists_without_envelopes() {
         let (_dir, db, backend, client, session) = indexed_archive(2500).await;
         let full_first_pass = backend.envelopes_listed.load(Ordering::SeqCst);
