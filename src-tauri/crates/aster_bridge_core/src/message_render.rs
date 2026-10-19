@@ -725,8 +725,6 @@ pub fn render(
     render_with(msg, attachments, materialize, true)
 }
 
-/// Renders the headers, the text part and the structure, and only counts the
-/// attachment bodies, so `text` stops where the first attachment body starts.
 pub fn render_layout(msg: &CachedMessage, attachments: &[CachedAttachment]) -> Rendered {
     render_with(msg, attachments, true, false)
 }
