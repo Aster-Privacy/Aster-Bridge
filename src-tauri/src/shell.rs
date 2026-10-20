@@ -249,11 +249,11 @@ pub fn refresh_tray(app: &AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let state: tauri::State<AppState> = handle.state();
-        let (signed_in, running, port, pending) = {
+        let (signed_in, running, port, db) = {
             let guard = state.0.lock().await;
-            let pending = guard.db.outbox_list_pending().map(|r| r.len()).unwrap_or(0);
-            (guard.session.is_some(), guard.running(), guard.bound_ports().imap, pending)
+            (guard.session.is_some(), guard.running(), guard.bound_ports().imap, guard.db.clone())
         };
+        let pending = db.outbox_pending_count().unwrap_or(0);
         let status_text = if !signed_in {
             "Bridge: Not signed in".to_string()
         } else if running && pending > 0 {
@@ -289,11 +289,14 @@ pub fn start_tray_refresh_loop(app: &AppHandle) {
 }
 
 async fn outbox_pending(state: &SharedBridgeState) -> usize {
-    let guard = state.lock().await;
-    if !guard.running() {
-        return 0;
-    }
-    guard.db.outbox_list_pending().map(|r| r.len()).unwrap_or(0)
+    let db = {
+        let guard = state.lock().await;
+        if !guard.running() {
+            return 0;
+        }
+        guard.db.clone()
+    };
+    db.outbox_pending_count().unwrap_or(0)
 }
 
 pub fn request_quit(app: &AppHandle) {
