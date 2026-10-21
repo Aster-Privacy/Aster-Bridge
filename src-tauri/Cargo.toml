@@ -98,3 +98,96 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[profile.release.package.aes]
+opt-level = 3
+
+[profile.release.package.aes-gcm]
+opt-level = 3
+
+[profile.release.package.argon2]
+opt-level = 3
+
+[profile.release.package.aster-crypto]
+opt-level = 3
+
+[profile.release.package.base64]
+opt-level = 3
+
+[profile.release.package.blake2]
+opt-level = 3
+
+[profile.release.package.chacha20]
+opt-level = 3
+
+[profile.release.package.chacha20poly1305]
+opt-level = 3
+
+[profile.release.package.crypto-bigint]
+opt-level = 3
+
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+
+[profile.release.package.ghash]
+opt-level = 3
+
+[profile.release.package.hmac]
+opt-level = 3
+
+[profile.release.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.release.package.mail-parser]
+opt-level = 3
+
+[profile.release.package.ml-kem]
+opt-level = 3
+
+[profile.release.package.num-bigint-dig]
+opt-level = 3
+
+[profile.release.package.openssl-sys]
+opt-level = 3
+
+[profile.release.package.p256]
+opt-level = 3
+
+[profile.release.package.p384]
+opt-level = 3
+
+[profile.release.package.p521]
+opt-level = 3
+
+[profile.release.package.pbkdf2]
+opt-level = 3
+
+[profile.release.package.pgp]
+opt-level = 3
+
+[profile.release.package.poly1305]
+opt-level = 3
+
+[profile.release.package.polyval]
+opt-level = 3
+
+[profile.release.package.rsa]
+opt-level = 3
+
+[profile.release.package.sha1]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.sha3]
+opt-level = 3
+
+[profile.release.package.keccak]
+opt-level = 3
+
+[profile.release.package.x25519-dalek]
+opt-level = 3
