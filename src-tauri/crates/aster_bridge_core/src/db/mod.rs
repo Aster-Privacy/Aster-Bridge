@@ -2121,12 +2121,7 @@ impl Database {
                 "INSERT INTO envelope_nonces (aster_id, nonce, first_seen) VALUES (?1, ?2, ?3)",
                 rusqlite::params![aster_id, envelope_nonce, now],
             )?;
-            let _ = conn.execute(
-                "DELETE FROM envelope_nonces WHERE rowid NOT IN (
-                    SELECT rowid FROM envelope_nonces ORDER BY rowid DESC LIMIT 50000
-                 )",
-                [],
-            );
+            let _ = prune_envelope_nonces(conn, ENVELOPE_NONCES_KEPT, ENVELOPE_NONCES_SLACK);
             Ok(true)
         })
     }
@@ -2583,6 +2578,26 @@ impl Database {
 }
 
 const SQL_IN_CHUNK: usize = 500;
+
+const ENVELOPE_NONCES_KEPT: i64 = 50_000;
+const ENVELOPE_NONCES_SLACK: i64 = 1_024;
+const ENVELOPE_NONCES_SPAN_SQL: &str = "SELECT COALESCE(
+    (SELECT MAX(rowid) FROM envelope_nonces) - (SELECT MIN(rowid) FROM envelope_nonces),
+    0
+)";
+
+fn prune_envelope_nonces(conn: &Connection, kept: i64, slack: i64) -> rusqlite::Result<usize> {
+    let span: i64 = conn.query_row(ENVELOPE_NONCES_SPAN_SQL, [], |r| r.get(0))?;
+    if span < kept + slack {
+        return Ok(0);
+    }
+    conn.execute(
+        "DELETE FROM envelope_nonces WHERE rowid <= (
+            SELECT rowid FROM envelope_nonces ORDER BY rowid DESC LIMIT 1 OFFSET ?1
+         )",
+        [kept],
+    )
+}
 
 fn sql_placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
@@ -3835,6 +3850,61 @@ mod db_tests {
         let archive = db.list_cached_messages("archive").unwrap();
         assert_eq!(archive.len(), 1);
         assert_eq!(archive[0].aster_id, "b1");
+    }
+
+    #[test]
+    fn envelope_nonce_pruning_keeps_the_newest_rows() {
+        let (_d, db) = open_db();
+        let insert = |n: i64| {
+            db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO envelope_nonces (aster_id, nonce, first_seen) VALUES (?1, 'n', 0)",
+                    [format!("id-{}", n)],
+                )
+            })
+            .unwrap();
+        };
+        let remaining = || -> Vec<String> {
+            db.with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT aster_id FROM envelope_nonces ORDER BY rowid")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+        };
+        let prune = || db.with_conn(|conn| prune_envelope_nonces(conn, 10, 4)).unwrap();
+
+        for n in 1..=14 {
+            insert(n);
+        }
+        assert_eq!(prune(), 0, "under the slack nothing is scanned or deleted");
+        assert_eq!(remaining().len(), 14);
+
+        insert(15);
+        assert_eq!(prune(), 5);
+        let expected: Vec<String> = (6..=15).map(|n| format!("id-{}", n)).collect();
+        assert_eq!(remaining(), expected);
+
+        for n in 16..=40 {
+            insert(n);
+        }
+        db.with_conn(|conn| conn.execute("DELETE FROM envelope_nonces WHERE aster_id IN ('id-38', 'id-39')", []))
+            .unwrap();
+        prune();
+        let expected: Vec<String> = (29..=40)
+            .filter(|n| *n != 38 && *n != 39)
+            .map(|n| format!("id-{}", n))
+            .collect();
+        assert_eq!(remaining(), expected, "gaps never shrink the window below the newest rows");
+
+        let plan: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", ENVELOPE_NONCES_SPAN_SQL))?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN envelope_nonces")), "{:?}", plan);
     }
 
     #[test]
