@@ -1227,7 +1227,7 @@ enum Prepared {
     Ready(PreparedMessage),
 }
 
-const RATCHET_PLACEHOLDER: &str = "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
+pub(crate) const RATCHET_PLACEHOLDER: &str = "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
      Open it in the Aster web or mobile app to decrypt.]";
 
 fn prepare_mail_item(

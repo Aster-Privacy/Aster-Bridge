@@ -819,6 +819,15 @@ impl Database {
               WHERE attachments_state = 0 AND raw_headers LIKE '%\"attachments\":[{%';",
         ).map_err(|e| e.to_string())?;
 
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_sealed ON message_cache(created_at)
+              WHERE {};
+             CREATE INDEX IF NOT EXISTS idx_message_cache_bundle ON message_cache(created_at)
+              WHERE {};",
+            body_is_predicate(crate::sync::poller::RATCHET_PLACEHOLDER),
+            body_starts_with_predicate(crate::crypto::ratchet_recovery::SUBJECT_BUNDLE_MARKER),
+        )).map_err(|e| e.to_string())?;
+
         conn.execute_batch(OUTBOX_TABLE_SQL).map_err(|e| e.to_string())?;
         repair_outbox_table(conn)?;
         conn.execute_batch(history::HISTORY_SCHEMA_SQL).map_err(|e| e.to_string())?;
@@ -1128,10 +1137,11 @@ impl Database {
     pub fn list_ids_with_body(&self, body_text: &str, limit: usize) -> Result<Vec<String>, String> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT aster_id FROM message_cache WHERE body_cached=1 AND body_text=?1 ORDER BY created_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![body_text, limit], |row| row.get::<_, String>(0))?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT aster_id FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT ?1",
+                body_is_predicate(body_text),
+            ))?;
+            let rows = stmt.query_map([limit], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -1147,10 +1157,11 @@ impl Database {
     ) -> Result<Vec<(String, String)>, String> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT aster_id, body_text FROM message_cache WHERE body_cached=1 AND instr(substr(body_text, 1, 64), ?1) > 0 ORDER BY created_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![marker, limit], |row| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT aster_id, body_text FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT ?1",
+                body_starts_with_predicate(marker),
+            ))?;
+            let rows = stmt.query_map([limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             let mut out = Vec::new();
@@ -2599,6 +2610,21 @@ fn prune_envelope_nonces(conn: &Connection, kept: i64, slack: i64) -> rusqlite::
     )
 }
 
+fn sql_text_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn body_is_predicate(body_text: &str) -> String {
+    format!("body_cached = 1 AND body_text = {}", sql_text_literal(body_text))
+}
+
+fn body_starts_with_predicate(marker: &str) -> String {
+    format!(
+        "body_cached = 1 AND instr(substr(body_text, 1, 64), {}) > 0",
+        sql_text_literal(marker)
+    )
+}
+
 fn sql_placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
@@ -3905,6 +3931,39 @@ mod db_tests {
             })
             .unwrap();
         assert!(!plan.iter().any(|step| step.starts_with("SCAN envelope_nonces")), "{:?}", plan);
+    }
+
+    #[test]
+    fn sealed_and_bundle_scans_use_their_partial_indexes() {
+        let (_d, db) = open_db();
+        let placeholder = crate::sync::poller::RATCHET_PLACEHOLDER;
+        let marker = crate::crypto::ratchet_recovery::SUBJECT_BUNDLE_MARKER;
+        for (index, predicate) in [
+            ("idx_message_cache_sealed", body_is_predicate(placeholder)),
+            ("idx_message_cache_bundle", body_starts_with_predicate(marker)),
+        ] {
+            let plan: Vec<String> = db
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare(&format!(
+                        "EXPLAIN QUERY PLAN SELECT aster_id FROM message_cache WHERE {} ORDER BY created_at DESC LIMIT 10",
+                        predicate
+                    ))?;
+                    let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            assert!(plan.iter().any(|step| step.contains(index)), "{}: {:?}", index, plan);
+        }
+
+        insert(&db, "plain", "inbox");
+        insert(&db, "sealed", "inbox");
+        insert(&db, "bundle", "inbox");
+        db.update_cached_body("sealed", placeholder, None).unwrap();
+        db.update_cached_body("bundle", &format!("{} rest", marker), None).unwrap();
+        assert_eq!(db.list_ids_with_body(placeholder, 10).unwrap(), vec!["sealed".to_string()]);
+        let bundles = db.list_bodies_starting_with(marker, 10).unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].0, "bundle");
     }
 
     #[test]
