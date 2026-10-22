@@ -1227,24 +1227,28 @@ impl Database {
         })
     }
 
-    pub fn write_batch<R>(&self, f: impl FnOnce(&WriteBatch<'_>) -> R) -> R {
+    pub fn write_batch<R>(&self, f: impl Fn(&WriteBatch<'_>) -> R) -> R {
         without_starving_the_runtime(|| {
             let conn = match self.conn.lock() {
                 Ok(conn) => conn,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => tx,
-                Err(e) => {
-                    tracing::warn!("write batch runs without a transaction: {}", e);
-                    return f(&WriteBatch { conn: &conn });
+            match conn.unchecked_transaction() {
+                Ok(tx) => {
+                    let out = f(&WriteBatch { conn: &tx });
+                    match tx.commit() {
+                        Ok(()) => return out,
+                        Err(e) => {
+                            tracing::warn!("write batch commit failed, writing one at a time: {}", e);
+                            if !conn.is_autocommit() {
+                                let _ = conn.execute_batch("ROLLBACK");
+                            }
+                        }
+                    }
                 }
-            };
-            let out = f(&WriteBatch { conn: &tx });
-            if let Err(e) = tx.commit() {
-                tracing::warn!("write batch commit failed: {}", e);
+                Err(e) => tracing::warn!("write batch runs without a transaction: {}", e),
             }
-            out
+            f(&WriteBatch { conn: &conn })
         })
     }
 
@@ -4028,6 +4032,36 @@ mod db_tests {
         assert_eq!(meta.len(), 1);
         assert!(meta[0].body_text.is_none());
         assert_eq!(meta[0].subject.as_deref(), Some("subj"));
+    }
+
+    #[test]
+    fn write_batch_reports_real_results_when_the_commit_fails() {
+        let (_d, db) = open_db();
+        insert(&db, "c1", "inbox");
+        insert(&db, "c2", "inbox");
+        db.assign_uid_if_missing("inbox", "c1").unwrap();
+        db.assign_uid_if_missing("inbox", "c2").unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TEMP TABLE fk_parent (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TABLE fk_child (parent INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TEMP TRIGGER fail_on_flag_five AFTER UPDATE OF flags ON message_cache
+                   WHEN NEW.flags = 5
+                   BEGIN INSERT INTO fk_child (parent) VALUES (1); END;",
+            )
+        })
+        .unwrap();
+        let results = db.write_batch(|batch| {
+            (
+                batch.update_message_flags(1, "inbox", 5),
+                batch.update_message_flags(2, "inbox", 4),
+            )
+        });
+        assert!(results.0.is_err());
+        assert!(results.1.is_ok());
+        assert_eq!(db.get_cached_message("c1").unwrap().unwrap().flags, 0);
+        assert_eq!(db.get_cached_message("c2").unwrap().unwrap().flags, 4);
     }
 
     #[test]

@@ -1742,9 +1742,9 @@ where
                             store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
                                 .await;
                         let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
-                        let mut seen_changes: Vec<(String, bool)> = Vec::new();
-                        let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
-                        db.write_batch(|batch| {
+                        let (seen_changes, stored_rows) = db.write_batch(|batch| {
+                            let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                            let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
                             for uid in &uids {
                                 if let Some((seq, m)) = view.by_uid(*uid) {
                                     let old_flags = m.flags as u32;
@@ -1771,6 +1771,7 @@ where
                                     stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
                                 }
                             }
+                            (seen_changes, stored_rows)
                         });
                         if !silent {
                             let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
@@ -1787,7 +1788,7 @@ where
                             }
                             writer.write_all(untagged.as_bytes()).await?;
                         }
-                        push_read_status(&client, &session, seen_changes);
+                        push_read_status(&db, &client, &session, seen_changes);
                         match tag_store.failure {
                             Some(text) => write_no(&mut writer, &tag, text).await?,
                             None => write_ok(&mut writer, &tag, "UID STORE completed").await?,
@@ -1918,9 +1919,9 @@ where
                             .await;
                     store_failure = tag_store.failure;
                     let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
-                    let mut seen_changes: Vec<(String, bool)> = Vec::new();
-                    let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
-                    db.write_batch(|batch| {
+                    let (seen_changes, stored_rows) = db.write_batch(|batch| {
+                        let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                        let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
                         for s in &seqs {
                             if let Some(m) = view.by_seq(*s) {
                                 let old_flags = m.flags as u32;
@@ -1947,6 +1948,7 @@ where
                                 stored_rows.push((*s, m.aster_id.clone(), new_flags));
                             }
                         }
+                        (seen_changes, stored_rows)
                     });
                     if !silent {
                         let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
@@ -1957,7 +1959,7 @@ where
                         }
                         writer.write_all(untagged.as_bytes()).await?;
                     }
-                    push_read_status(&client, &session, seen_changes);
+                    push_read_status(&db, &client, &session, seen_changes);
                 }
                 match store_failure {
                     Some(text) => write_no(&mut writer, &tag, text).await?,
@@ -2572,33 +2574,102 @@ async fn delete_on_server(
 }
 
 const READ_STATUS_CONCURRENCY: usize = 8;
+const READ_STATUS_RATE_LIMIT_RETRIES: u32 = 3;
 
 fn push_read_status(
+    db: &Arc<Database>,
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
     changes: Vec<(String, bool)>,
 ) {
-    use futures_util::StreamExt;
-
     if changes.is_empty() {
         return;
     }
+    let db = db.clone();
     let client = client.clone();
     let session = session.clone();
     crate::shutdown::current().spawn(async move {
+        let mut wanted: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for (aster_id, is_read) in changes {
+            if wanted.insert(aster_id.clone(), is_read).is_none() {
+                order.push(aster_id);
+            }
+        }
+        for is_read in [true, false] {
+            let ids: Vec<String> = order.iter().filter(|id| wanted[*id] == is_read).cloned().collect();
+            for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+                push_read_status_chunk(&db, &client, &session, chunk.to_vec(), is_read).await;
+            }
+        }
+    });
+}
+
+fn read_status_still_wanted(db: &Database, aster_id: &str, is_read: bool) -> bool {
+    db.get_message_flags_by_id(aster_id)
+        .map_or(true, |flags| ((flags & 1) != 0) == is_read)
+}
+
+async fn push_read_status_chunk(
+    db: &Database,
+    client: &ApiClient,
+    session: &Arc<RwLock<Session>>,
+    mut ids: Vec<String>,
+    is_read: bool,
+) {
+    use futures_util::StreamExt;
+
+    let flags = serde_json::json!({ "is_read": is_read });
+    let mut attempt = 0u32;
+    loop {
+        ids.retain(|id| read_status_still_wanted(db, id, is_read));
+        if ids.is_empty() {
+            return;
+        }
         let token = session.read().await.access_token.to_string();
-        futures_util::stream::iter(changes)
-            .for_each_concurrent(READ_STATUS_CONCURRENCY, |(aster_id, is_read)| {
-                let client = &client;
-                let token = &token;
-                async move {
-                    if let Err(e) = client.set_read_status(token, &aster_id, is_read).await {
+        match client.bulk_set_mailbox_flags(&token, &ids, &flags).await {
+            Ok(_) => return,
+            Err(e) if crate::imap::append::is_rate_limited(&e) => {
+                if attempt >= READ_STATUS_RATE_LIMIT_RETRIES {
+                    tracing::warn!("read-status sync for {} messages stopped by rate limiting: {}", ids.len(), e);
+                    return;
+                }
+                let wait = crate::imap::append::rate_limit_backoff(attempt);
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            Err(e) => {
+                tracing::debug!("bulk read-status sync failed, sending one at a time: {}", e);
+                break;
+            }
+        }
+    }
+    futures_util::stream::iter(ids)
+        .for_each_concurrent(READ_STATUS_CONCURRENCY, |aster_id| async move {
+            let mut attempt = 0u32;
+            loop {
+                if !read_status_still_wanted(db, &aster_id, is_read) {
+                    return;
+                }
+                let token = session.read().await.access_token.to_string();
+                match client.set_read_status(&token, &aster_id, is_read).await {
+                    Ok(()) => return,
+                    Err(e)
+                        if crate::imap::append::is_rate_limited(&e)
+                            && attempt < READ_STATUS_RATE_LIMIT_RETRIES =>
+                    {
+                        let wait = crate::imap::append::rate_limit_backoff(attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    }
+                    Err(e) => {
                         tracing::warn!("read-status sync failed for {}: {}", aster_id, e);
+                        return;
                     }
                 }
-            })
-            .await;
-    });
+            }
+        })
+        .await;
 }
 
 async fn expunge_targets(
@@ -2643,7 +2714,7 @@ async fn expunge_targets_silent(
         }
     }
     db.write_batch(|batch| {
-        for aster_id in deleted {
+        for aster_id in &deleted {
             let _ = batch.delete_message_by_aster_id(aster_id);
         }
     });
@@ -3498,10 +3569,10 @@ async fn handle_copy_move(
         let target = target_internal.clone();
         let entries = selected.clone();
         crate::shutdown::spawn_blocking_held(move || {
-            let mut src: Vec<u32> = Vec::new();
-            let mut tgt: Vec<u32> = Vec::new();
-            let mut all_assigned = true;
             db.write_batch(|batch| {
+                let mut src: Vec<u32> = Vec::new();
+                let mut tgt: Vec<u32> = Vec::new();
+                let mut all_assigned = true;
                 for (_, m) in &entries {
                     let _ = batch.upsert_cached_message(
                         &m.aster_id,
@@ -3524,8 +3595,8 @@ async fn handle_copy_move(
                         }
                     }
                 }
-            });
-            (src, tgt, all_assigned)
+                (src, tgt, all_assigned)
+            })
         })
         .await
     };
@@ -4515,6 +4586,7 @@ async fn handle_fetch(
         writer.write_all(&out).await?;
     }
     push_read_status(
+        db,
         client,
         session,
         fetch_seen_pushes.into_iter().map(|aster_id| (aster_id, true)).collect(),
@@ -9507,6 +9579,42 @@ mod tests {
                 break;
             }
             assert!(started.elapsed() < Duration::from_secs(4), "only {} of 24 pushed", pushed);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn store_pushes_read_status_in_bulk_chunks() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_mock(
+            MockOpts {
+                bulk_metadata: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        for n in 1..=150 {
+            seed(&db, &format!("bk-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1:150 +FLAGS.SILENT (\\Seen)").await;
+        assert_eq!(resp, "s1 OK STORE completed");
+
+        let started = std::time::Instant::now();
+        loop {
+            let log = calls.lock().await.clone();
+            let mut bulk: Vec<String> = log
+                .iter()
+                .filter(|(m, _)| m == "BULK_PATCH")
+                .map(|(_, count)| count.clone())
+                .collect();
+            if bulk.len() == 2 {
+                bulk.sort();
+                assert_eq!(bulk, vec!["100".to_string(), "50".to_string()]);
+                assert!(!log.iter().any(|(m, _)| m == "PATCH"), "{:?}", log);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(4), "{:?}", log);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
