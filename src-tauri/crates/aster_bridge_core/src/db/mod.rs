@@ -529,6 +529,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "message_keywords",
     "message_tag",
     "custom_tag",
+    "custom_tag_alias",
     "custom_folder",
     "message_attachment",
     "message_fts",
@@ -745,8 +746,14 @@ impl Database {
                 tag_token TEXT NOT NULL,
                 PRIMARY KEY (aster_id, tag_token)
              );
-             CREATE INDEX IF NOT EXISTS idx_message_tag_token ON message_tag(tag_token);",
+             CREATE INDEX IF NOT EXISTS idx_message_tag_token ON message_tag(tag_token);
+             CREATE TABLE IF NOT EXISTS custom_tag_alias (
+                keyword TEXT PRIMARY KEY COLLATE NOCASE,
+                tag_token TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_custom_tag_alias_token ON custom_tag_alias(tag_token);",
         ).map_err(|e| e.to_string())?;
+        rebuild_tag_aliases(conn).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS envelope_nonces (
@@ -1184,8 +1191,39 @@ fn set_message_keywords_on(conn: &Connection, aster_id: &str, keywords: &[String
             "INSERT OR IGNORE INTO message_keywords (aster_id, keyword)
              SELECT ?1, ?2 WHERE NOT EXISTS (
                 SELECT 1 FROM custom_tag WHERE keyword = ?2
+             ) AND NOT EXISTS (
+                SELECT 1 FROM custom_tag_alias WHERE keyword = ?2
              )",
             rusqlite::params![aster_id, keyword],
+        )?;
+    }
+    Ok(())
+}
+
+fn custom_tags_on(conn: &Connection) -> rusqlite::Result<Vec<CustomTag>> {
+    let mut stmt = conn.prepare(
+        "SELECT tag_token, server_id, name, keyword FROM custom_tag ORDER BY tag_token",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(CustomTag {
+                tag_token: r.get(0)?,
+                server_id: r.get(1)?,
+                name: r.get(2)?,
+                keyword: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn rebuild_tag_aliases(conn: &Connection) -> rusqlite::Result<()> {
+    let tags = custom_tags_on(conn)?;
+    conn.execute("DELETE FROM custom_tag_alias", [])?;
+    for (keyword, tag_token) in crate::tags::alias_rows(&tags) {
+        conn.execute(
+            "INSERT OR IGNORE INTO custom_tag_alias (keyword, tag_token) VALUES (?1, ?2)",
+            rusqlite::params![keyword, tag_token],
         )?;
     }
     Ok(())
@@ -1718,12 +1756,16 @@ impl Database {
                      SELECT a.aster_id, t.keyword FROM message_tag a
                      JOIN custom_tag t ON t.tag_token = a.tag_token
                      WHERE a.aster_id IN ({0}) AND t.keyword IS NOT NULL
+                     UNION
+                     SELECT a.aster_id, l.keyword FROM message_tag a
+                     JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+                     WHERE a.aster_id IN ({0})
                      ORDER BY 2",
                     placeholders,
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(
-                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())),
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter()).chain(chunk.iter())),
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                 )?;
                 for row in rows {
@@ -1747,6 +1789,11 @@ impl Database {
                  JOIN custom_tag t ON t.tag_token = a.tag_token
                  JOIN message_cache m ON m.aster_id = a.aster_id
                  WHERE m.folder = ?1 AND t.keyword IS NOT NULL
+                 UNION
+                 SELECT a.aster_id, l.keyword FROM message_tag a
+                 JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+                 JOIN message_cache m ON m.aster_id = a.aster_id
+                 WHERE m.folder = ?1
                  ORDER BY 2",
             )?;
             let mut out: HashMap<String, Vec<String>> = HashMap::new();
@@ -1790,22 +1837,7 @@ impl Database {
     }
 
     pub fn list_custom_tags(&self) -> Result<Vec<CustomTag>, String> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT tag_token, server_id, name, keyword FROM custom_tag ORDER BY tag_token",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(CustomTag {
-                        tag_token: r.get(0)?,
-                        server_id: r.get(1)?,
-                        name: r.get(2)?,
-                        keyword: r.get(3)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+        self.with_conn(custom_tags_on)
     }
 
     pub fn replace_custom_tags(&self, tags: &[CustomTag]) -> Result<bool, String> {
@@ -1828,11 +1860,16 @@ impl Database {
                 "DELETE FROM message_tag WHERE tag_token NOT IN (SELECT tag_token FROM custom_tag)",
                 [],
             )?;
+            rebuild_tag_aliases(&tx)?;
             tx.execute(
                 "DELETE FROM message_keywords WHERE EXISTS (
                     SELECT 1 FROM message_tag a
                     JOIN custom_tag t ON t.tag_token = a.tag_token
                     WHERE a.aster_id = message_keywords.aster_id AND t.keyword = message_keywords.keyword
+                 ) OR EXISTS (
+                    SELECT 1 FROM message_tag a
+                    JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+                    WHERE a.aster_id = message_keywords.aster_id AND l.keyword = message_keywords.keyword
                  )",
                 [],
             )?;
@@ -1843,7 +1880,8 @@ impl Database {
 
     pub fn upsert_custom_tag(&self, tag: &CustomTag) -> Result<(), String> {
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO custom_tag (tag_token, server_id, name, keyword)
                  VALUES (?1, ?2, ?3, CASE WHEN EXISTS (
                     SELECT 1 FROM custom_tag WHERE keyword = ?4 AND tag_token != ?1
@@ -1854,7 +1892,8 @@ impl Database {
                     keyword = excluded.keyword",
                 rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
             )?;
-            Ok(())
+            rebuild_tag_aliases(&tx)?;
+            tx.commit()
         })
     }
 
@@ -1870,6 +1909,7 @@ impl Database {
             };
             tx.execute("DELETE FROM message_tag WHERE tag_token = ?1", [tag_token])?;
             tx.execute("DELETE FROM custom_tag WHERE tag_token = ?1", [tag_token])?;
+            rebuild_tag_aliases(&tx)?;
             tx.commit()?;
             Ok(ids)
         })
@@ -1937,9 +1977,11 @@ impl Database {
                     rusqlite::params![id, tag_token],
                 )?;
                 tx.execute(
-                    "DELETE FROM message_keywords WHERE aster_id = ?1 AND keyword IN (
+                    "DELETE FROM message_keywords WHERE aster_id = ?1 AND (keyword IN (
                         SELECT keyword FROM custom_tag WHERE tag_token = ?2 AND keyword IS NOT NULL
-                     )",
+                     ) OR keyword IN (
+                        SELECT keyword FROM custom_tag_alias WHERE tag_token = ?2
+                     ))",
                     rusqlite::params![id, tag_token],
                 )?;
             }
@@ -2595,6 +2637,7 @@ impl Database {
                  DELETE FROM message_keywords;
                  DELETE FROM message_tag;
                  DELETE FROM custom_tag;
+                 DELETE FROM custom_tag_alias;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -4844,6 +4887,75 @@ mod db_tests {
         db.replace_custom_tags(&[custom_tag("tok-b", "B2", Some("B2"))]).unwrap();
         assert_eq!(db.message_keywords("t-c").unwrap(), vec!["B2"]);
         assert!(db.messages_with_tag("tok-a").unwrap().is_empty());
+    }
+
+    fn named_tag(token: &str, name: &str) -> CustomTag {
+        custom_tag(token, name, crate::tags::keyword_for_name(name).as_deref())
+    }
+
+    #[test]
+    fn imap_keywords_carry_the_client_forms_of_a_label() {
+        let (dir, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&[named_tag("tok-fun", "\u{1F37F} Entretenimento")]).unwrap();
+        let own = crate::tags::keyword_for_name("\u{1F37F} Entretenimento").unwrap();
+        let legacy = "&2dzffw-_entretenimento".to_string();
+        let readable = "=f0=9f=8d=bf=20entretenimento".to_string();
+
+        db.set_message_keywords("t-x", &[legacy.to_uppercase(), readable.clone(), "$label1".to_string()])
+            .unwrap();
+        assert_eq!(db.message_keywords("t-x").unwrap(), vec!["$label1"]);
+
+        let ids = vec!["t-y".to_string()];
+        db.add_message_tag(&ids, "tok-fun").unwrap();
+        let mut expected = vec![own.clone(), legacy.clone(), readable.clone()];
+        expected.sort();
+        assert_eq!(db.message_keywords("t-y").unwrap(), vec![own.clone()]);
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+        let mut fetched = db.keywords_for_messages(&ids).unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+
+        db.with_conn(|conn| conn.execute("DELETE FROM custom_tag_alias", [])).unwrap();
+        assert_eq!(db.folder_keywords("inbox").unwrap().remove("t-y").unwrap(), vec![own.clone()]);
+        drop(db);
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, expected);
+
+        db.delete_custom_tag("tok-fun").unwrap();
+        db.upsert_custom_tag(&named_tag("tok-later", "Mais tarde")).unwrap();
+        db.add_message_tag(&ids, "tok-later").unwrap();
+        let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        fetched.sort();
+        assert_eq!(fetched, vec!["Mais&ACA-tarde", "mais=20tarde", "mais_tarde"]);
+        let stale: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM custom_tag_alias WHERE tag_token = 'tok-fun'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn a_stored_client_form_moves_onto_its_label() {
+        let (_d, db) = open_db();
+        insert(&db, "t-z", "inbox");
+        db.set_message_keywords("t-z", &["mais_tarde".to_string(), "$label2".to_string()]).unwrap();
+        db.replace_custom_tags(&[named_tag("tok-later", "Mais tarde")]).unwrap();
+        db.add_message_tag(&["t-z".to_string()], "tok-later").unwrap();
+        assert_eq!(db.message_keywords("t-z").unwrap(), vec!["$label2", "Mais&ACA-tarde"]);
+
+        db.set_message_keywords("t-z", &["MAIS=20TARDE".to_string(), "$label2".to_string()]).unwrap();
+        assert_eq!(db.message_keywords("t-z").unwrap(), vec!["$label2", "Mais&ACA-tarde"]);
     }
 
     #[test]

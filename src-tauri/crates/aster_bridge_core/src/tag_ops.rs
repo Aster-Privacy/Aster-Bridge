@@ -25,7 +25,7 @@ use crate::error::BridgeError;
 pub const MAX_CREATED_PER_COMMAND: usize = 10;
 pub const MAX_MIGRATION_ATTEMPTS: u32 = 5;
 
-const MIGRATION_STATE_KEY: &str = "local_keyword_migration";
+const MIGRATION_STATE_KEY: &str = "local_keyword_migration_v2";
 const MIGRATION_DONE: &str = "done";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,9 +373,15 @@ pub async fn migrate_local_keywords(
     let Ok(stored) = db.local_keyword_messages() else {
         return Vec::new();
     };
+    let Ok(tags) = db.list_custom_tags() else {
+        return Vec::new();
+    };
     let groups: Vec<(String, Vec<String>)> = stored
         .into_iter()
-        .filter(|(keyword, _)| crate::tags::name_for_keyword(keyword).is_some())
+        .filter(|(keyword, _)| {
+            crate::tags::name_for_keyword(keyword).is_some()
+                || crate::tags::find_by_keyword(&tags, keyword).is_some()
+        })
         .collect();
     if groups.is_empty() {
         let _ = db.set_sync_state(MIGRATION_STATE_KEY, MIGRATION_DONE);
@@ -1009,6 +1015,102 @@ mod tests {
         let before = calls.lock().await.len();
         assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
         assert_eq!(calls.lock().await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn client_generated_keywords_reuse_the_existing_labels() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&[
+            stored_tag("tok-fun", "\u{1F37F} Entretenimento"),
+            stored_tag("tok-later", "Mais tarde"),
+        ])
+        .unwrap();
+        cache(&db, &["m-1"]);
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+
+        let added = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["&2dzffw-_entretenimento", "mais=20tarde", "&2dzffw-_unknown"]),
+            &mut budget,
+        )
+        .await;
+        assert!(added.failed.is_empty(), "{:?}", added.error);
+        assert_eq!(added.unmapped, strings(&["&2dzffw-_unknown"]));
+        assert_eq!(added.changed, ids);
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+        assert_eq!(
+            db.message_tags(&ids).unwrap().get("m-1").unwrap(),
+            &strings(&["tok-fun", "tok-later"])
+        );
+
+        let removed = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            -1,
+            &strings(&["MAIS_TARDE"]),
+            &mut budget,
+        )
+        .await;
+        assert_eq!(removed.changed, ids);
+        assert_eq!(db.message_tags(&ids).unwrap().get("m-1").unwrap(), &strings(&["tok-fun"]));
+
+        let replaced = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            0,
+            &strings(&["mais_tarde", "$label1"]),
+            &mut budget,
+        )
+        .await;
+        assert!(replaced.failed.is_empty(), "{:?}", replaced.error);
+        assert_eq!(db.message_tags(&ids).unwrap().get("m-1").unwrap(), &strings(&["tok-later"]));
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stored_client_keywords_move_onto_their_labels() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1"]);
+        db.set_message_keywords(
+            "m-1",
+            &strings(&["&2dzffw-_entretenimento", "mais=20tarde", "$label1", "&2dzffw-_unknown"]),
+        )
+        .unwrap();
+        db.replace_custom_tags(&[
+            stored_tag("tok-fun", "\u{1F37F} Entretenimento"),
+            stored_tag("tok-later", "Mais tarde"),
+        ])
+        .unwrap();
+
+        let changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+
+        assert_eq!(changed, strings(&["m-1"]));
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 2);
+        assert_eq!(
+            db.message_tags(&strings(&["m-1"])).unwrap().get("m-1").unwrap(),
+            &strings(&["tok-fun", "tok-later"])
+        );
+        let mut expected = strings(&["$label1", "&2dzffw-_unknown", "Mais&ACA-tarde"]);
+        expected.push(crate::tags::keyword_for_name("\u{1F37F} Entretenimento").unwrap());
+        expected.sort();
+        let mut stored = db.message_keywords("m-1").unwrap();
+        stored.sort();
+        assert_eq!(stored, expected);
     }
 
     #[tokio::test]

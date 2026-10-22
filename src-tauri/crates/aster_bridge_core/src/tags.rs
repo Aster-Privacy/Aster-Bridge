@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
 use crate::api_client::TagDefinition;
 use crate::db::CustomTag;
@@ -53,6 +54,12 @@ const RESERVED_KEYWORDS: [&str; 17] = [
     "NotPhishing",
 ];
 const ATOM_SPECIALS: &[u8] = b"(){%*\"\\]";
+const LEGACY_KEY_REPLACED: &[char] = &[' ', '(', ')', '/', '{', '%', '*', '<', '>', '\\', '"'];
+const READABLE_KEY_ESCAPED: &[u8] = b"=()[]{}%*\"\\<>;&";
+const READABLE_KEY_ESCAPE: char = '=';
+const MAX_READABLE_KEY_LEN: usize = 50;
+const HASHED_KEY_PREFIX: &str = "&x-moz-";
+const HASHED_KEY_BYTES: usize = 16;
 
 pub fn validate_name(name: &str) -> Result<(), &'static str> {
     if name.trim().is_empty() {
@@ -160,6 +167,124 @@ pub fn keyword_text(keyword: &str) -> Option<String> {
     decode_keyword(keyword)
 }
 
+fn is_atom_keyword(keyword: &str) -> bool {
+    !keyword.is_empty()
+        && keyword.len() <= MAX_KEYWORD_LEN
+        && keyword
+            .bytes()
+            .all(|b| b > 0x20 && b < 0x7f && !ATOM_SPECIALS.contains(&b))
+}
+
+fn is_folded_shift_key(keyword: &str) -> bool {
+    !keyword.bytes().any(|b| b.is_ascii_uppercase())
+        && keyword
+            .split(SHIFT)
+            .skip(1)
+            .filter_map(|run| run.split(UNSHIFT).next())
+            .any(|run| run.bytes().any(|b| b.is_ascii_lowercase()))
+}
+
+fn legacy_client_key(text: &str) -> String {
+    let replaced: String = text
+        .chars()
+        .map(|c| if LEGACY_KEY_REPLACED.contains(&c) { '_' } else { c })
+        .collect();
+    crate::imap::mutf7::encode(&replaced).to_ascii_lowercase()
+}
+
+fn readable_client_key(text: &str) -> String {
+    let mut key = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte > 0x20 && byte < 0x7f && !READABLE_KEY_ESCAPED.contains(&byte) {
+            key.push(byte.to_ascii_lowercase() as char);
+        } else {
+            key.push_str(&format!("{}{:02x}", READABLE_KEY_ESCAPE, byte));
+        }
+    }
+    if key.is_empty() {
+        key.push_str("tag");
+    }
+    if key.len() > MAX_READABLE_KEY_LEN {
+        let digest = Sha256::digest(text.as_bytes());
+        key = HASHED_KEY_PREFIX.to_string();
+        for byte in &digest[..HASHED_KEY_BYTES] {
+            key.push_str(&format!("{:02x}", byte));
+        }
+    }
+    key
+}
+
+fn readable_key_text(keyword: &str) -> Option<String> {
+    if !keyword.contains(READABLE_KEY_ESCAPE) || keyword.contains(SHIFT) {
+        return None;
+    }
+    let bytes = keyword.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == READABLE_KEY_ESCAPE as u8 {
+            let pair = bytes.get(index + 1..index + 3)?;
+            if !pair.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let text = String::from_utf8(out).ok()?;
+    (readable_client_key(&text) == keyword.to_ascii_lowercase()).then_some(text)
+}
+
+pub fn client_keywords(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in [legacy_client_key(text), readable_client_key(text)] {
+        if is_atom_keyword(&key)
+            && !is_local_keyword(&key)
+            && !out.iter().any(|known| known.eq_ignore_ascii_case(&key))
+        {
+            out.push(key);
+        }
+    }
+    out
+}
+
+pub fn keyword_aliases(keyword: &str) -> Vec<String> {
+    let Some(text) = decode_keyword(keyword) else {
+        return Vec::new();
+    };
+    client_keywords(&text)
+        .into_iter()
+        .filter(|alias| !alias.eq_ignore_ascii_case(keyword))
+        .collect()
+}
+
+pub fn alias_rows(tags: &[CustomTag]) -> Vec<(String, String)> {
+    let mut ordered: Vec<&CustomTag> = tags.iter().collect();
+    ordered.sort_by(|a, b| a.tag_token.cmp(&b.tag_token));
+    let owned: Vec<&str> = tags
+        .iter()
+        .filter_map(|tag| tag.keyword.as_deref())
+        .filter(|keyword| !is_folded_shift_key(keyword))
+        .collect();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for tag in ordered {
+        let Some(keyword) = tag.keyword.as_deref() else {
+            continue;
+        };
+        for alias in keyword_aliases(keyword) {
+            let taken = owned.iter().any(|known| known.eq_ignore_ascii_case(&alias))
+                || rows.iter().any(|(known, _)| known.eq_ignore_ascii_case(&alias));
+            if !taken {
+                rows.push((alias, tag.tag_token.clone()));
+            }
+        }
+    }
+    rows
+}
+
 pub fn label_paths(parents: &HashMap<String, (String, Option<String>)>) -> HashMap<String, String> {
     parents
         .iter()
@@ -185,6 +310,12 @@ pub fn label_paths(parents: &HashMap<String, (String, Option<String>)>) -> HashM
 
 pub fn name_for_keyword(keyword: &str) -> Option<String> {
     if is_local_keyword(keyword) || keyword.starts_with('\\') {
+        return None;
+    }
+    if let Some(name) = readable_key_text(keyword) {
+        return keyword_for_name(&name).is_some().then_some(name);
+    }
+    if is_folded_shift_key(keyword) {
         return None;
     }
     let name = decode_keyword(keyword)?;
@@ -237,11 +368,19 @@ pub fn tags_from_definitions(
 }
 
 pub fn find_by_keyword<'a>(tags: &'a [CustomTag], keyword: &str) -> Option<&'a CustomTag> {
-    tags.iter().find(|tag| {
+    let own = tags.iter().find(|tag| {
         tag.keyword
             .as_deref()
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-    })
+    });
+    if own.is_some_and(|tag| !tag.keyword.as_deref().is_some_and(is_folded_shift_key)) {
+        return own;
+    }
+    alias_rows(tags)
+        .into_iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(keyword))
+        .and_then(|(_, token)| tags.iter().find(|tag| tag.tag_token == token))
+        .or(own)
 }
 
 #[cfg(test)]
@@ -425,5 +564,111 @@ mod tests {
             find_by_keyword(&tags, "WORK").map(|found| found.tag_token.as_str()),
             Some("a")
         );
+    }
+
+    fn keyed(token: &str, name: &str) -> CustomTag {
+        CustomTag {
+            keyword: keyword_for_name(name),
+            ..tag(token, name)
+        }
+    }
+
+    #[test]
+    fn client_keywords_match_both_generated_forms() {
+        assert_eq!(
+            client_keywords("\u{1F37F} Entretenimento"),
+            vec!["&2dzffw-_entretenimento", "=f0=9f=8d=bf=20entretenimento"]
+        );
+        assert_eq!(client_keywords("Mais tarde"), vec!["mais_tarde", "mais=20tarde"]);
+        assert_eq!(
+            client_keywords("\u{1F6CB}\u{FE0F} Mais tarde"),
+            vec!["&2d3ey,4p-_mais_tarde", "=f0=9f=9b=8b=ef=b8=8f=20mais=20tarde"]
+        );
+        assert_eq!(
+            client_keywords("Faturas do condom\u{ED}nio (2026)"),
+            vec![
+                "faturas_do_condom&ao0-nio__2026_",
+                "faturas=20do=20condom=c3=adnio=20=282026=29"
+            ]
+        );
+        assert_eq!(client_keywords("R&D"), vec!["r&-d", "r=26d"]);
+        assert_eq!(client_keywords("work"), vec!["work"]);
+        assert!(client_keywords("Junk").is_empty());
+        assert!(client_keywords("$label1").is_empty());
+
+        let long = "Contas a pagar do apartamento novo em Lisboa e Porto";
+        let keys = client_keywords(long);
+        assert_eq!(keys[1], "&x-moz-820dd116da2f78e411079a56b845175b");
+        assert_eq!(keys[1].len(), 39);
+        assert_eq!(keys[0], "contas_a_pagar_do_apartamento_novo_em_lisboa_e_porto");
+    }
+
+    #[test]
+    fn aliases_skip_the_label_keyword_itself() {
+        let own = keyword_for_name("Mais tarde").unwrap();
+        assert_eq!(keyword_aliases(&own), vec!["mais_tarde", "mais=20tarde"]);
+        assert!(keyword_aliases("Work").is_empty());
+    }
+
+    #[test]
+    fn client_forms_never_become_new_label_names() {
+        assert_eq!(name_for_keyword("&2dzffw-_entretenimento"), None);
+        assert_eq!(name_for_keyword("&x-moz-820dd116da2f78e411079a56b845175b"), None);
+        assert_eq!(name_for_keyword("mais=20tarde").as_deref(), Some("mais tarde"));
+        assert_eq!(
+            name_for_keyword("=f0=9f=8d=bf=20entretenimento").as_deref(),
+            Some("\u{1F37F} entretenimento")
+        );
+        assert_eq!(name_for_keyword("mais_tarde").as_deref(), Some("mais_tarde"));
+        let own = keyword_for_name("\u{1F37F} Entretenimento").unwrap();
+        assert_eq!(name_for_keyword(&own).as_deref(), Some("\u{1F37F} Entretenimento"));
+    }
+
+    #[test]
+    fn client_forms_resolve_to_their_label() {
+        let tags = vec![
+            keyed("t1", "\u{1F37F} Entretenimento"),
+            keyed("t2", "Mais tarde"),
+            keyed("t3", "Contas a pagar do apartamento novo em Lisboa e Porto"),
+        ];
+        let resolve = |keyword: &str| find_by_keyword(&tags, keyword).map(|t| t.tag_token.clone());
+        assert_eq!(resolve("&2dzffw-_entretenimento").as_deref(), Some("t1"));
+        assert_eq!(resolve("=F0=9F=8D=BF=20ENTRETENIMENTO").as_deref(), Some("t1"));
+        assert_eq!(resolve("mais_tarde").as_deref(), Some("t2"));
+        assert_eq!(resolve("mais=20tarde").as_deref(), Some("t2"));
+        assert_eq!(resolve("&x-moz-820dd116da2f78e411079a56b845175b").as_deref(), Some("t3"));
+        assert_eq!(resolve("mais tarde"), None);
+        assert_eq!(resolve("$label5"), None);
+    }
+
+    #[test]
+    fn a_label_made_from_a_client_form_yields_to_the_real_label() {
+        let garbage_name = keyword_text("&2dzffw-_entretenimento").unwrap();
+        let garbage = keyed("a-garbage", &garbage_name);
+        assert!(garbage.keyword.as_deref().unwrap().eq_ignore_ascii_case("&2dzffw-_entretenimento"));
+        let tags = vec![garbage, keyed("z-real", "\u{1F37F} Entretenimento")];
+        assert_eq!(
+            find_by_keyword(&tags, "&2dzffw-_entretenimento").map(|t| t.tag_token.as_str()),
+            Some("z-real")
+        );
+        let rows = alias_rows(&tags);
+        assert!(rows
+            .iter()
+            .any(|(alias, token)| alias == "&2dzffw-_entretenimento" && token == "z-real"));
+        assert_eq!(
+            find_by_keyword(&tags, tags[0].keyword.as_deref().unwrap()).map(|t| t.tag_token.as_str()),
+            Some("z-real")
+        );
+    }
+
+    #[test]
+    fn a_real_keyword_beats_another_label_alias() {
+        let tags = vec![keyed("a", "Mais tarde"), keyed("b", "mais_tarde")];
+        assert_eq!(find_by_keyword(&tags, "mais_tarde").map(|t| t.tag_token.as_str()), Some("b"));
+        assert_eq!(find_by_keyword(&tags, "mais=20tarde").map(|t| t.tag_token.as_str()), Some("a"));
+        let rows = alias_rows(&tags);
+        assert!(!rows.iter().any(|(alias, _)| alias == "mais_tarde"));
+        let first = vec![keyed("a", "Mais tarde"), keyed("b", "mais tarde")];
+        assert_eq!(alias_rows(&first).iter().filter(|(_, token)| token == "b").count(), 0);
     }
 }
