@@ -661,7 +661,7 @@ where
                         tracing::warn!(
                             "rejecting MAIL FROM: the address is not one of this account's send identities"
                         );
-                        writer.write_all(b"553 5.1.8 Sender address rejected: not authenticated identity\r\n").await?;
+                        writer.write_all(b"553 5.1.8 Sender address rejected: not an enabled address, alias, or domain address of this account\r\n").await?;
                         continue;
                     }
                     smtp.mail_from = Some(session_email);
@@ -1036,6 +1036,49 @@ pub async fn build_send_payload_blocking(
     .map_err(|e| crate::error::BridgeError::Smtp(format!("payload build did not finish: {}", e)))?
 }
 
+fn header_from_address(raw_message: &[u8]) -> Option<String> {
+    let parsed = mail_parser::MessageParser::default().parse_headers(raw_message)?;
+    let from = parsed.from()?;
+    let mut addresses = from.iter().filter_map(|a| a.address());
+    let address = addresses.next()?.trim().to_string();
+    (addresses.next().is_none() && !address.is_empty()).then_some(address)
+}
+
+fn has_enabled_identity(s: &Session, address: &str) -> bool {
+    s.find_send_identity(address).is_some_and(|i| i.enabled)
+}
+
+pub(crate) async fn prefer_header_identity(
+    raw_message: &[u8],
+    from: Option<String>,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+) -> Option<String> {
+    let Some(header) = header_from_address(raw_message) else {
+        return from;
+    };
+    let known = {
+        let s = session.read().await;
+        let envelope = from.as_deref().filter(|v| !v.is_empty());
+        let envelope_is_primary = envelope.is_none_or(|v| v.eq_ignore_ascii_case(&s.email));
+        if !envelope_is_primary || header.eq_ignore_ascii_case(&s.email) {
+            return from;
+        }
+        has_enabled_identity(&s, &header)
+    };
+    if !known {
+        crate::auth::session::refresh_send_identities(session, client).await;
+        if !has_enabled_identity(&*session.read().await, &header) {
+            tracing::info!(
+                "the From header names an address this account can't send as, sending from the envelope sender"
+            );
+            return from;
+        }
+    }
+    tracing::info!("sending as the From header identity instead of the primary envelope sender");
+    Some(header)
+}
+
 pub async fn build_threaded_send_payload(
     raw_message: &[u8],
     from: Option<String>,
@@ -1044,6 +1087,7 @@ pub async fn build_threaded_send_payload(
     client: &ApiClient,
     db: &Database,
 ) -> std::result::Result<(serde_json::Value, zeroize::Zeroizing<String>), crate::error::BridgeError> {
+    let from = prefer_header_identity(raw_message, from, session, client).await;
     let (session_email, sender_identity, access_token, passphrase, identity_key) = {
         let s = session.read().await;
         let default_address = s.default_sender_address();
@@ -1871,6 +1915,58 @@ iQEz
         assert_eq!(payload["sender_email"], "alias@example.com");
         assert_eq!(payload["sender_alias_hash"], "AAAA");
         assert_eq!(payload["sender_display_name"], "Sales");
+    }
+
+    fn header_fixture() -> crate::sign_in_notice::test_support::Fixture {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let fixture = crate::sign_in_notice::test_support::fixture();
+        let identity = |address: &str, kind, enabled| SendIdentity {
+            address: address.to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind,
+            enabled,
+            sender_id: address.to_string(),
+        };
+        fixture.session.try_write().unwrap().send_identities = vec![
+            identity("tester@aster.test", SendIdentityKind::Primary, true),
+            identity("alias@aster.test", SendIdentityKind::Alias, true),
+            identity("other@aster.test", SendIdentityKind::Alias, true),
+            identity("off@aster.test", SendIdentityKind::Alias, false),
+            identity("me@mydomain.example", SendIdentityKind::CustomDomain, true),
+        ];
+        fixture
+    }
+
+    async fn pick(fixture: &crate::sign_in_notice::test_support::Fixture, header: &str, envelope: Option<&str>) -> Option<String> {
+        let raw = format!("From: Someone <{}>\r\nTo: rcpt@example.com\r\nSubject: hi\r\n\r\nbody\r\n", header);
+        prefer_header_identity(raw.as_bytes(), envelope.map(str::to_string), &fixture.session, &fixture.client).await
+    }
+
+    #[test]
+    fn header_from_address_needs_exactly_one_address() {
+        assert_eq!(header_from_address(b"From: A <a@x.test>\r\n\r\nb").as_deref(), Some("a@x.test"));
+        assert_eq!(header_from_address(b"From: a@x.test, b@x.test\r\n\r\nb"), None);
+        assert_eq!(header_from_address(b"Subject: none\r\n\r\nb"), None);
+    }
+
+    #[tokio::test]
+    async fn header_alias_wins_over_a_primary_envelope() {
+        let f = header_fixture();
+        assert_eq!(pick(&f, "alias@aster.test", Some("tester@aster.test")).await.as_deref(), Some("alias@aster.test"));
+        assert_eq!(pick(&f, "ALIAS@aster.test", Some("Tester@Aster.test")).await.as_deref(), Some("ALIAS@aster.test"));
+        assert_eq!(pick(&f, "me@mydomain.example", None).await.as_deref(), Some("me@mydomain.example"));
+        assert_eq!(pick(&f, "alias@aster.test", Some("")).await.as_deref(), Some("alias@aster.test"));
+    }
+
+    #[tokio::test]
+    async fn envelope_is_kept_when_the_header_cannot_send() {
+        let f = header_fixture();
+        assert_eq!(pick(&f, "alias@aster.test", Some("other@aster.test")).await.as_deref(), Some("other@aster.test"));
+        assert_eq!(pick(&f, "tester@aster.test", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "off@aster.test", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "stranger@example.com", Some("tester@aster.test")).await.as_deref(), Some("tester@aster.test"));
+        assert_eq!(pick(&f, "stranger@example.com", None).await, None);
     }
 
     #[test]
