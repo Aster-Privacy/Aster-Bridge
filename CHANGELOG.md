@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.11 - 2026-10-23
+
+### Fixed
+- When your mail app sends from one of your aliases, the message now goes out from that alias. Previously some mail apps sent it from your main address instead.
+- Aliases you created in the Aster Mail apps for Android and iOS now work as sending addresses in Aster Bridge. Previously sending from them failed with a "Sender address rejected" error.
+- Tags you add to a message in your mail app now apply the matching Aster label. Previously some mail apps named their tags in a way that Aster Bridge didn't recognize, so the tag never reached Aster.
+- Large mailboxes open, search, and sync faster, and Aster Bridge uses less memory while your mail app downloads messages.
+
 ## 1.0.10 - 2026-10-18
 
 ### Fixed
