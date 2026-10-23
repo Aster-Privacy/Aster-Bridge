@@ -891,6 +891,7 @@ pub fn build_send_payload_with_own_key(
             .iter()
             .chain(bcc_list.iter())
             .all(|address| crate::crypto::internal_send::is_internal_address(address));
+    let mut self_to_placeholder = None;
     let effective_to = if to_list.is_empty() && sealed_bcc_only {
         Vec::new()
     } else if to_list.is_empty() {
@@ -898,7 +899,14 @@ pub fn build_send_payload_with_own_key(
             .filter(|i| i.kind != crate::auth::session::SendIdentityKind::Primary)
             .map(|i| i.address.clone())
             .unwrap_or_else(|| session_email.to_string());
+        let addressed_self = cc_list
+            .iter()
+            .chain(bcc_list.iter())
+            .any(|a| a.eq_ignore_ascii_case(&own_address));
         bcc_list.retain(|a| !a.eq_ignore_ascii_case(&own_address));
+        if custom_domain_sender && !addressed_self {
+            self_to_placeholder = Some(own_address.clone());
+        }
         vec![own_address]
     } else {
         to_list
@@ -957,6 +965,9 @@ pub fn build_send_payload_with_own_key(
         "sender_email": sender_email,
         "client_source": "bridge",
     });
+    if let Some(own_address) = self_to_placeholder {
+        payload[crate::crypto::internal_send::SELF_TO_PLACEHOLDER] = serde_json::json!(own_address);
+    }
 
     if let Some(id) = non_primary {
         if let Some(ref hash) = id.auth_hash_b64 {

@@ -312,6 +312,7 @@ pub(super) async fn step(
         let _ = db.set_sync_state(HISTORY_MODE_KEY, "all");
     }
     let keys = Keys::of(session).await;
+    crate::crypto::internal_send::note_aster_sender_scope(db, &*session.read().await);
     if let Some(step) = retry_undecrypted(db, client, &keys, now).await {
         return step;
     }
