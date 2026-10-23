@@ -214,7 +214,7 @@ pub async fn build_send_identities(
                         tracing::warn!(
                             alias_id = %a.id,
                             domain = %a.domain,
-                            "dropping alias send identity: local part did not decrypt ({});                              sending from this alias will be rejected as an unknown identity",
+                            "dropping alias send identity: local part did not decrypt ({}); sending from this alias will be rejected as an unknown identity",
                             match other {
                                 Ok(_) => "decrypted empty".to_string(),
                                 Err(e) => e.to_string(),

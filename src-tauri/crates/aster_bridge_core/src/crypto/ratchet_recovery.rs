@@ -44,7 +44,9 @@ const MASTER_KEY_VAULT_FORMAT: u32 = 2;
 const STORAGE_KDF_VERSION_STRETCHED: u32 = 2;
 const MAX_LEGACY_KEKS: usize = 64;
 const MAX_STORAGE_KEYS: usize = 512;
-const PREVIOUS_KEY_CONTEXTS: [&str; 10] = [
+const PREVIOUS_KEY_CONTEXTS: [&str; 12] = [
+    "astermail-envelope-v1",
+    "astermail-import-v1",
     "astermail-tags-v1",
     "astermail-labels-v1",
     "astermail-preferences-v1",
@@ -173,31 +175,34 @@ pub fn derive_storage_base_keys(
         }
     };
 
-    let master = if vault.vault_format.unwrap_or(1) >= MASTER_KEY_VAULT_FORMAT {
+    let data_kek = || {
         vault
             .data_kek
             .as_deref()
             .filter(|s| !s.is_empty())
             .and_then(|s| b64_decode(s).ok())
             .and_then(to_key)
-    } else {
-        None
     };
+    let is_master = vault.vault_format.unwrap_or(1) >= MASTER_KEY_VAULT_FORMAT;
 
-    push_unique(&mut keys, master);
+    if is_master {
+        push_unique(&mut keys, data_kek());
+    }
     push_unique(&mut keys, password_derived(stretched));
     if stretched {
         push_unique(&mut keys, password_derived(false));
+    }
+    if !is_master {
+        push_unique(&mut keys, data_kek());
     }
 
     for entry in vault.legacy_keks.iter().flatten().take(MAX_LEGACY_KEKS) {
         push_unique(&mut keys, b64_decode(&entry.k).ok().and_then(to_key));
     }
 
-    let previous = vault
-        .previous_keys
-        .iter()
-        .flatten()
+    let previous = std::iter::once(&vault.identity_key)
+        .filter(|k| !k.is_empty())
+        .chain(vault.previous_keys.iter().flatten())
         .chain(vault.legacy_identity_keys.iter().flatten());
     for prev in previous {
         for context in PREVIOUS_KEY_CONTEXTS {
@@ -1016,14 +1021,42 @@ mod tests {
         assert!(has(&legacy));
         assert!(has(Sha256::digest(b"old-identityastermail-tags-v1").as_slice()));
         assert!(has(Sha256::digest(b"older-identityastermail-recovery-email-v1").as_slice()));
-        assert_eq!(keys.len(), 1 + 2 + 1 + 2 * PREVIOUS_KEY_CONTEXTS.len());
+        assert!(has(Sha256::digest(b"old-identityastermail-envelope-v1").as_slice()));
+        assert_eq!(keys.len(), 1 + 2 + 1 + 3 * PREVIOUS_KEY_CONTEXTS.len());
 
-        let v1_vault = vault_from(json!({ "data_kek": b64(&master) }));
+        let v1_vault = vault_from(json!({ "data_kek": b64(&master), "identity_key": "current-identity" }));
         let v1_keys = derive_storage_base_keys(&v1_vault, pass, 1000);
-        assert_eq!(v1_keys.len(), 1);
         assert_eq!(v1_keys[0].as_slice(), derive_storage_key_v1(pass).unwrap().as_slice());
+        assert_eq!(v1_keys[1].as_slice(), &master);
+        assert!(v1_keys.iter().any(|k| k.as_slice() == Sha256::digest(b"current-identityastermail-import-v1").as_slice()));
+        assert_eq!(v1_keys.len(), 2 + PREVIOUS_KEY_CONTEXTS.len());
 
-        assert!(derive_storage_base_keys(&vault_from(json!({})), b"", 1000).is_empty());
+        assert!(derive_storage_base_keys(&vault_from(json!({ "identity_key": "" })), b"", 1000).is_empty());
+    }
+
+    fn seal_alias(key: &[u8], local_part: &str) -> (String, String) {
+        use aes_gcm::aead::{Aead, KeyInit};
+        let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).unwrap();
+        let nonce = [9u8; 12];
+        let sealed = cipher.encrypt(aes_gcm::Nonce::from_slice(&nonce), local_part.as_bytes()).unwrap();
+        (b64(&sealed), b64(&nonce))
+    }
+
+    #[test]
+    fn aliases_sealed_by_the_phone_apps_decrypt_on_the_bridge() {
+        use crate::crypto::alias::{decrypt_alias_local_part, storage_key_candidates};
+        let pass = b"pass";
+        let master = [5u8; 32];
+        let vault = vault_from(json!({ "data_kek": b64(&master), "identity_key": "current-identity" }));
+        let candidates = storage_key_candidates(pass, &derive_storage_base_keys(&vault, pass, 1000));
+        let envelope = Sha256::digest(b"current-identityastermail-envelope-v1");
+        let import = Sha256::digest(b"current-identityastermail-import-v1");
+        for key in [&master[..], envelope.as_slice(), import.as_slice()] {
+            let (sealed, nonce) = seal_alias(key, "sales");
+            assert_eq!(decrypt_alias_local_part(&candidates, &sealed, &nonce, false).unwrap(), "sales");
+        }
+        let (sealed, nonce) = seal_alias(&[6u8; 32], "sales");
+        assert!(decrypt_alias_local_part(&candidates, &sealed, &nonce, false).is_err());
     }
 
     #[test]
@@ -1032,7 +1065,7 @@ mod tests {
         let dupes: Vec<String> = (0..100).map(|_| "same".to_string()).collect();
         let vault = vault_from(json!({ "legacy_keks": many, "previous_keys": dupes }));
         let keys = derive_storage_base_keys(&vault, b"pass", 1000);
-        assert_eq!(keys.len(), 1 + MAX_LEGACY_KEKS + PREVIOUS_KEY_CONTEXTS.len());
+        assert_eq!(keys.len(), 1 + MAX_LEGACY_KEKS + 2 * PREVIOUS_KEY_CONTEXTS.len());
         assert!(keys.len() <= MAX_STORAGE_KEYS);
     }
 
