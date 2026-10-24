@@ -65,7 +65,7 @@ pub fn decrypt_envelope_with_previous_keys(
     previous_keys: &[String],
     inbound_keys: &[InboundKeyCandidate],
 ) -> Result<String> {
-    decrypt_envelope_noting_inbound(
+    decrypt_envelope_noting_origin(
         encrypted_data_b64,
         nonce_b64,
         passphrase,
@@ -76,14 +76,27 @@ pub fn decrypt_envelope_with_previous_keys(
     .map(|(plaintext, _)| plaintext)
 }
 
-pub fn decrypt_envelope_noting_inbound(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeOrigin {
+    SelfAuthored,
+    Inbound,
+    UnsignedPgp,
+}
+
+impl EnvelopeOrigin {
+    pub fn authenticated(self) -> bool {
+        self == EnvelopeOrigin::SelfAuthored
+    }
+}
+
+pub fn decrypt_envelope_noting_origin(
     encrypted_data_b64: &str,
     nonce_b64: Option<&str>,
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[InboundKeyCandidate],
-) -> Result<(String, bool)> {
+) -> Result<(String, EnvelopeOrigin)> {
     let nonce_bytes = match nonce_b64 {
         Some(n) if !n.is_empty() => STANDARD
             .decode(n)
@@ -92,12 +105,12 @@ pub fn decrypt_envelope_noting_inbound(
     };
 
     if nonce_bytes.is_empty() {
-        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase)
-            .map(|plaintext| (plaintext, false));
+        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase);
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
-        return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase).map(|plaintext| (plaintext, false));
+        return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
+            .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored));
     }
 
     if nonce_bytes.len() == NONCE_LEN && !inbound_keys.is_empty() {
@@ -107,7 +120,7 @@ pub fn decrypt_envelope_noting_inbound(
                 Some(&INBOUND_ECDH_MARKER) | Some(&INBOUND_PQ_HYBRID_MARKER)
             ) {
                 if let Ok(result) = decrypt_inbound_envelope(&data, &nonce_bytes, inbound_keys) {
-                    return Ok((result, true));
+                    return Ok((result, EnvelopeOrigin::Inbound));
                 }
             }
         }
@@ -118,11 +131,12 @@ pub fn decrypt_envelope_noting_inbound(
         .chain(previous_keys.iter().map(String::as_str))
     {
         if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, &nonce_bytes, ik) {
-            return Ok((result, false));
+            return Ok((result, EnvelopeOrigin::SelfAuthored));
         }
     }
 
-    decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase).map(|plaintext| (plaintext, false))
+    decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
+        .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored))
 }
 
 pub(crate) fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Result<String> {
@@ -227,16 +241,17 @@ fn decrypt_pgp_envelope(
     identity_key: Option<&str>,
     previous_keys: &[String],
     passphrase: &[u8],
-) -> Result<String> {
+) -> Result<(String, EnvelopeOrigin)> {
     let data = STANDARD
         .decode(encrypted_data_b64)
         .map_err(|e| BridgeError::Crypto(format!("data decode: {}", e)))?;
 
     if let Ok(text) = String::from_utf8(data) {
         if text.starts_with("-----BEGIN PGP") {
-            let decrypted = decrypt_own_pgp(&text, identity_key, previous_keys, passphrase)?;
-            return String::from_utf8(decrypted.to_vec())
-                .map_err(|e| BridgeError::Crypto(format!("PGP utf8: {}", e)));
+            let (decrypted, origin) = open_own_pgp(&text, identity_key, previous_keys, passphrase)?;
+            let plaintext = String::from_utf8(decrypted.to_vec())
+                .map_err(|e| BridgeError::Crypto(format!("PGP utf8: {}", e)))?;
+            return Ok((plaintext, origin));
         }
     }
 
@@ -276,12 +291,7 @@ pub(crate) fn sealed_fixture(plaintext: &str) -> (String, String) {
     (STANDARD.encode(ciphertext), STANDARD.encode(nonce_bytes))
 }
 
-pub(crate) fn decrypt_own_pgp(
-    armored: &str,
-    identity_key: Option<&str>,
-    previous_keys: &[String],
-    passphrase: &[u8],
-) -> Result<Zeroizing<Vec<u8>>> {
+fn own_pgp_keys(identity_key: Option<&str>, previous_keys: &[String]) -> Result<Vec<aster_crypto::KeyPair>> {
     let ik = identity_key
         .ok_or_else(|| BridgeError::Crypto("PGP decrypt requires identity key".to_string()))?;
     let own_keys: Vec<aster_crypto::KeyPair> = std::iter::once(ik)
@@ -291,6 +301,41 @@ pub(crate) fn decrypt_own_pgp(
     if own_keys.is_empty() {
         return Err(BridgeError::Crypto("PGP key parse failed".to_string()));
     }
+    Ok(own_keys)
+}
+
+fn open_own_pgp(
+    armored: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    passphrase: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, EnvelopeOrigin)> {
+    let own_keys = own_pgp_keys(identity_key, previous_keys)?;
+    let key_refs: Vec<&aster_crypto::KeyPair> = own_keys.iter().collect();
+    let own_public: Vec<aster_crypto::PublicKey> = own_keys.iter().map(|k| k.public_key()).collect();
+    let public_refs: Vec<&aster_crypto::PublicKey> = own_public.iter().collect();
+    let passphrase_text = Zeroizing::new(std::str::from_utf8(passphrase).unwrap_or("").to_string());
+    for candidate in [passphrase_text.as_str(), ""] {
+        if let Ok(plain) = aster_crypto::decrypt_and_verify_with_passphrase(
+            armored.as_bytes(),
+            &key_refs,
+            &public_refs,
+            candidate,
+        ) {
+            return Ok((Zeroizing::new(plain), EnvelopeOrigin::SelfAuthored));
+        }
+    }
+    decrypt_own_pgp(armored, identity_key, previous_keys, passphrase)
+        .map(|plain| (plain, EnvelopeOrigin::UnsignedPgp))
+}
+
+pub(crate) fn decrypt_own_pgp(
+    armored: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    passphrase: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let own_keys = own_pgp_keys(identity_key, previous_keys)?;
     let key_refs: Vec<&aster_crypto::KeyPair> = own_keys.iter().collect();
     let passphrase = Zeroizing::new(std::str::from_utf8(passphrase).unwrap_or("").to_string());
     for candidate in [passphrase.as_str(), ""] {
@@ -729,6 +774,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opened, "legacy");
+    }
+
+    fn origin_of(envelope: &str, nonce: Option<&str>, owner: &aster_crypto::KeyPair) -> EnvelopeOrigin {
+        decrypt_envelope_noting_origin(
+            envelope,
+            nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(&owner.to_armored().unwrap()),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .1
+    }
+
+    #[test]
+    fn a_pgp_envelope_signed_by_the_owner_is_self_authored() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let sealed = crate::crypto::sent_copy::seal_sent_envelope(
+            "{\"subject\":\"sent\"}",
+            &owner.to_armored().unwrap(),
+            VAULT_PASSPHRASE.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(origin_of(&sealed, None, &owner), EnvelopeOrigin::SelfAuthored);
+    }
+
+    #[test]
+    fn a_pgp_envelope_signed_by_a_previous_owner_key_is_self_authored() {
+        let old_key = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let new_key = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let sealed = crate::crypto::sent_copy::seal_sent_envelope(
+            "old sent",
+            &old_key.to_armored().unwrap(),
+            VAULT_PASSPHRASE.as_bytes(),
+        )
+        .unwrap();
+        let (plaintext, origin) = decrypt_envelope_noting_origin(
+            &sealed,
+            Some(""),
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(&new_key.to_armored().unwrap()),
+            &[old_key.to_armored().unwrap()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plaintext, "old sent");
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+    }
+
+    #[test]
+    fn an_unsigned_pgp_envelope_is_not_authenticated() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let envelope = pgp_envelope_for(&owner, "{\"subject\":\"forged\"}");
+        let origin = origin_of(&envelope, None, &owner);
+        assert_eq!(origin, EnvelopeOrigin::UnsignedPgp);
+        assert!(!origin.authenticated());
+    }
+
+    #[test]
+    fn a_pgp_envelope_signed_by_someone_else_is_not_authenticated() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let stranger = aster_crypto::generate_keypair("Bob", "bob@astermail.org").unwrap();
+        let armored = aster_crypto::encrypt_and_sign_with_passphrase(
+            b"{\"subject\":\"signed by bob\"}",
+            &[&owner.public_key()],
+            &stranger,
+            "",
+        )
+        .unwrap();
+        let envelope = STANDARD.encode(armored);
+        assert_eq!(origin_of(&envelope, None, &owner), EnvelopeOrigin::UnsignedPgp);
+    }
+
+    #[test]
+    fn passphrase_and_identity_key_envelopes_are_self_authored() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let pbkdf2 = encrypt_pbkdf2_envelope("{}", VAULT_PASSPHRASE.as_bytes()).unwrap();
+        assert_eq!(
+            origin_of(&pbkdf2, Some(&pbkdf2_envelope_nonce_marker()), &owner),
+            EnvelopeOrigin::SelfAuthored
+        );
+        let (data, nonce) = sealed_fixture("{}");
+        let (_, origin) =
+            decrypt_envelope_noting_origin(&data, Some(&nonce), b"p", Some(FIXTURE_IDENTITY_KEY), &[], &[]).unwrap();
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
     }
 
     #[test]

@@ -1805,6 +1805,13 @@ impl ApiClient {
         access_token: &str,
         body: &serde_json::Value,
     ) -> Result<()> {
+        let mut stripped = None;
+        if body.get(crate::crypto::internal_send::SELF_TO_PLACEHOLDER).is_some() {
+            let mut copy = body.clone();
+            crate::crypto::internal_send::take_self_to_placeholder(&mut copy);
+            stripped = Some(copy);
+        }
+        let body = stripped.as_ref().unwrap_or(body);
         let resp = self.client
             .post(format!("{}/bridge/v1/send", self.base_url))
             .bearer_auth(access_token)

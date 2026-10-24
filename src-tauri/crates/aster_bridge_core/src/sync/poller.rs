@@ -26,7 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
-use crate::crypto::envelope::{decrypt_envelope_noting_inbound, decrypt_envelope_with_previous_keys};
+use crate::crypto::envelope::{decrypt_envelope_noting_origin, decrypt_envelope_with_previous_keys};
 use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
 use crate::db::{
     CachedAttachment, CachedMessage, CachedSyncState, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
@@ -1285,7 +1285,7 @@ fn prepare_mail_item(
         });
     }
 
-    let plaintext_result = decrypt_envelope_noting_inbound(
+    let plaintext_result = decrypt_envelope_noting_origin(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
@@ -1295,10 +1295,10 @@ fn prepare_mail_item(
     );
 
     let mut unencrypted = false;
-    let mut from_inbound = false;
+    let mut origin_kind = None;
     let plaintext = match plaintext_result {
-        Ok((p, inbound)) => {
-            from_inbound = inbound;
+        Ok((p, origin)) => {
+            origin_kind = Some(origin);
             p
         }
         Err(_) => {
@@ -1352,10 +1352,13 @@ fn prepare_mail_item(
     }
 
     let sender_address = envelope_sender_address(&parsed);
-    let sender_unverified = from_inbound
+    let authenticated = origin_kind.is_some_and(crate::crypto::envelope::EnvelopeOrigin::authenticated);
+    let server_delivered_system_mail = origin_kind == Some(crate::crypto::envelope::EnvelopeOrigin::Inbound)
+        && crate::crypto::internal_send::is_aster_system_address(&sender_address);
+    let sender_unverified = !authenticated
         && !is_ratchet_envelope
-        && crate::crypto::internal_send::is_internal_address(&sender_address)
-        && !crate::crypto::internal_send::is_aster_system_address(&sender_address);
+        && !server_delivered_system_mail
+        && crate::crypto::internal_send::claims_aster_identity(db, &sender_address);
 
     let subject = json_str(&parsed, "subject");
     let sender = extract_from_field(&parsed);
@@ -2671,6 +2674,7 @@ async fn run_sync_pass(
 
     let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
+        crate::crypto::internal_send::note_aster_sender_scope(db, &s);
         (
             s.access_token.clone(),
             Zeroizing::new(s.vault_passphrase.clone()),
@@ -4440,6 +4444,139 @@ mod tests {
         let item = item_with_envelope("sealed-aster", &json);
         assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
         assert!(!crate::message_render::sender_unverified(&cached_meta(&db, "sealed-aster")));
+    }
+
+    fn pgp_item(id: &str, armored: Vec<u8>) -> MailItem {
+        let mut item = item_with_envelope(id, &serde_json::json!({}));
+        item.encrypted_envelope = STANDARD.encode(armored);
+        item.envelope_nonce = String::new();
+        item
+    }
+
+    #[test]
+    fn pgp_mail_claiming_an_aster_sender_is_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let owner = aster_crypto::generate_keypair("Me", "me@astermail.org").unwrap();
+        let owner_armored = owner.to_armored().unwrap();
+        let owner_public = owner.public_key();
+        let cases = [
+            ("pgp-aster", "Bob <bob@astermail.org>", true),
+            ("pgp-aster-cx", "BOB@aster.cx", true),
+            ("pgp-outside", "carol@example.com", false),
+            ("pgp-noreply", "Aster <noreply@astermail.org>", true),
+            ("pgp-no-reply", "no-reply@aster.cx", true),
+            ("pgp-system", "system@astermail.org", true),
+            ("pgp-updates", "Updates@Aster.cx", true),
+        ];
+        for (id, from, expected) in cases {
+            let json = serde_json::json!({"from": from, "subject": "s", "body_text": "b"});
+            let armored = aster_crypto::encrypt_message(json.to_string().as_bytes(), &[&owner_public]).unwrap();
+            let item = pgp_item(id, armored);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", Some(&owner_armored), &[], &[]).was_new, "{id}");
+            assert_eq!(crate::message_render::sender_unverified(&cached_meta(&db, id)), expected, "{id}");
+        }
+
+        let stranger = aster_crypto::generate_keypair("Bob", "bob@astermail.org").unwrap();
+        let json = serde_json::json!({"from": "bob@astermail.org", "body_text": "b"});
+        let signed_by_stranger = aster_crypto::encrypt_and_sign_with_passphrase(
+            json.to_string().as_bytes(),
+            &[&owner_public],
+            &stranger,
+            "",
+        )
+        .unwrap();
+        let item = pgp_item("pgp-stranger-signed", signed_by_stranger);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", Some(&owner_armored), &[], &[]).was_new);
+        assert!(crate::message_render::sender_unverified(&cached_meta(&db, "pgp-stranger-signed")));
+    }
+
+    #[test]
+    fn a_pgp_sent_copy_signed_by_the_owner_is_not_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let owner = crate::crypto::account_key::tests::protected_keypair("pass");
+        let owner_armored = owner.to_armored().unwrap();
+        let json = serde_json::json!({"from": "Me <me@astermail.org>", "subject": "s", "body_text": "b"});
+        let sealed = crate::crypto::sent_copy::seal_sent_envelope(&json.to_string(), &owner_armored, b"pass").unwrap();
+        let mut item = item_with_envelope("own-sent", &json);
+        item.encrypted_envelope = sealed;
+        item.envelope_nonce = String::new();
+        assert!(cache_mail_item(&db, "sent", &item, b"pass", Some(&owner_armored), &[], &[]).was_new);
+        assert!(!crate::message_render::sender_unverified(&cached_meta(&db, "own-sent")));
+    }
+
+    #[test]
+    fn unauthenticated_mail_from_a_known_hosted_custom_domain_is_marked_unverified() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let keys = [inbound_candidate(&recipient)];
+        let send = |db: &Database, id: &str, from: &str| {
+            let json = serde_json::json!({"from": from, "body_text": "b"});
+            assert!(cache_mail_item(db, "inbox", &inbound_item(id, &json, &recipient), b"pass", IK, &[], &keys).was_new);
+            crate::message_render::sender_unverified(&cached_meta(db, id))
+        };
+
+        assert!(!send(&db, "before-scope", "dana@hosted.example"));
+
+        db.set_aster_sender_scope(crate::crypto::internal_send::AsterSenderScope {
+            account_id: "account-1".to_string(),
+            custom_domains: vec!["mydomain.example".to_string()],
+        });
+        db.recipient_pin_put(
+            &crate::crypto::recipient_trust::pin_id("account-1", "dana@hosted.example"),
+            &crate::crypto::recipient_trust::RecipientPin { hosted: true, ..Default::default() },
+        )
+        .unwrap();
+
+        assert!(send(&db, "pinned-hosted", "Dana <Dana@Hosted.example>"));
+        assert!(send(&db, "own-domain", "colleague@mydomain.example"));
+        assert!(!send(&db, "unpinned-custom", "erin@other.example"));
+        assert!(!send(&db, "other-account-pin", "frank@hosted.example"));
+        db.recipient_pin_put(
+            &crate::crypto::recipient_trust::pin_id("account-1", "gina@outside.example"),
+            &crate::crypto::recipient_trust::RecipientPin { hosted: false, ..Default::default() },
+        )
+        .unwrap();
+        assert!(!send(&db, "external-pin", "gina@outside.example"));
+        assert!(send(&db, "builtin", "bob@astermail.org"));
+        assert!(!send(&db, "system", "updates@astermail.org"));
+    }
+
+    #[test]
+    fn unencrypted_mail_claiming_an_aster_sender_is_marked_unverified() {
+        let (_dir, db) = temp_db();
+        for (id, from, expected) in [
+            ("clear-aster", "bob@astermail.org", true),
+            ("clear-outside", "carol@example.com", false),
+            ("clear-system", "noreply@aster.cx", true),
+        ] {
+            let item = unencrypted_item(id, &serde_json::json!({"from": from, "body_text": "b"}));
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+            assert_eq!(crate::message_render::sender_unverified(&cached_meta(&db, id)), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_sender_scope_comes_from_the_custom_domain_identities_only() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let identity = |address: &str, kind| SendIdentity {
+            address: address.to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind,
+            enabled: true,
+            sender_id: "id".to_string(),
+        };
+        let session_handle = mock_session();
+        let mut session = session_handle.blocking_write();
+        session.send_identities = vec![
+            identity("me@astermail.org", SendIdentityKind::Primary),
+            identity("alias@aster.cx", SendIdentityKind::Alias),
+            identity("me@MyDomain.example", SendIdentityKind::CustomDomain),
+            identity("sales@mydomain.example", SendIdentityKind::CustomDomain),
+        ];
+        let scope = crate::crypto::internal_send::AsterSenderScope::from_session(&session);
+        assert_eq!(scope.account_id, session.user_id.to_string());
+        assert_eq!(scope.custom_domains, vec!["mydomain.example".to_string()]);
     }
 
     #[test]

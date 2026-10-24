@@ -553,6 +553,7 @@ pub struct Database {
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
     pub(crate) tag_writes: std::sync::atomic::AtomicU64,
     append_pins: Mutex<HashMap<String, AppendPin>>,
+    aster_sender_scope: Mutex<Option<crate::crypto::internal_send::AsterSenderScope>>,
 }
 
 struct AppendPin {
@@ -594,6 +595,7 @@ impl Database {
             tag_lock: tokio::sync::Mutex::new(()),
             tag_writes: std::sync::atomic::AtomicU64::new(0),
             append_pins: Mutex::new(HashMap::new()),
+            aster_sender_scope: Mutex::new(None),
         })
     }
 
@@ -1573,6 +1575,17 @@ impl Database {
             }
             Ok(())
         })
+    }
+
+    pub(crate) fn set_aster_sender_scope(&self, scope: crate::crypto::internal_send::AsterSenderScope) {
+        *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = Some(scope);
+    }
+
+    pub(crate) fn aster_sender_scope(&self) -> Option<crate::crypto::internal_send::AsterSenderScope> {
+        self.aster_sender_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn pin_appended(&self, aster_id: &str, folder: &str) {
@@ -3458,6 +3471,7 @@ impl Database {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = None;
         result?;
         self.scrub_free_space()?;
         match self.path.parent() {

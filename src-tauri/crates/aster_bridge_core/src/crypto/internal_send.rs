@@ -72,6 +72,98 @@ pub fn is_internal_address(address: &str) -> bool {
         .any(|domain| lower.ends_with(&format!("@{}", domain)))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsterSenderScope {
+    pub account_id: String,
+    pub custom_domains: Vec<String>,
+}
+
+impl AsterSenderScope {
+    pub fn from_session(session: &Session) -> Self {
+        let mut custom_domains: Vec<String> = session
+            .send_identities
+            .iter()
+            .filter(|identity| identity.kind == crate::auth::session::SendIdentityKind::CustomDomain)
+            .filter_map(|identity| address_domain(&identity.address))
+            .filter(|domain| !INTERNAL_DOMAINS.contains(&domain.as_str()))
+            .collect();
+        custom_domains.sort();
+        custom_domains.dedup();
+        Self {
+            account_id: session.user_id.to_string(),
+            custom_domains,
+        }
+    }
+}
+
+fn address_domain(address: &str) -> Option<String> {
+    let (local, domain) = address.trim().rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    (!local.is_empty() && !domain.is_empty()).then_some(domain)
+}
+
+pub fn note_aster_sender_scope(db: &Database, session: &Session) {
+    db.set_aster_sender_scope(AsterSenderScope::from_session(session));
+}
+
+pub fn claims_aster_identity(db: &Database, address: &str) -> bool {
+    let address = address.trim();
+    if address.is_empty() {
+        return false;
+    }
+    if is_internal_address(address) {
+        return true;
+    }
+    let Some(scope) = db.aster_sender_scope() else {
+        return false;
+    };
+    if address_domain(address).is_some_and(|domain| scope.custom_domains.contains(&domain)) {
+        return true;
+    }
+    matches!(
+        db.recipient_pin_get(&pin_id(&scope.account_id, address)),
+        Ok(Some(pin)) if pin.hosted
+    )
+}
+
+pub const SELF_TO_PLACEHOLDER: &str = "bridge_self_to_placeholder";
+
+pub fn take_self_to_placeholder(payload: &mut Value) -> Option<String> {
+    payload
+        .as_object_mut()?
+        .remove(SELF_TO_PLACEHOLDER)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn drop_sealed_self_placeholder(payload: &mut Value, own_address: &str, hosted: &HostedRecipients) {
+    let to_is_placeholder = matches!(
+        payload.get("to").and_then(Value::as_array).map(Vec::as_slice),
+        Some([only]) if only.as_str().is_some_and(|a| a.trim().eq_ignore_ascii_case(own_address.trim()))
+    );
+    if !to_is_placeholder {
+        return;
+    }
+    let others: Vec<String> = ["cc", "bcc"]
+        .iter()
+        .filter_map(|field| payload.get(*field).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
+        .collect();
+    let all_sealed = !others.is_empty()
+        && others.iter().all(|address| {
+            !address.eq_ignore_ascii_case(own_address.trim())
+                && (is_internal_address(address) || hosted.contains(address))
+                && !hosted.routed_like_external(address)
+        });
+    if all_sealed {
+        payload["to"] = json!([]);
+    }
+}
+
 pub fn payload_recipients(payload: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for field in ["to", "cc", "bcc"] {
@@ -586,7 +678,11 @@ async fn seal_internal_body_with(
     access_token: &str,
     require_post_quantum: bool,
 ) -> Result<()> {
+    let self_placeholder = take_self_to_placeholder(payload);
     let mut lookup = lookup_hosted_recipients(payload, session, client, db, access_token).await?;
+    if let Some(own_address) = self_placeholder {
+        drop_sealed_self_placeholder(payload, &own_address, &lookup.hosted);
+    }
     let split = split_recipients_with(payload, &lookup.hosted);
     if split.internal.is_empty() {
         return Ok(());
@@ -1871,6 +1967,171 @@ mod tests {
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
         }))
+    }
+
+    #[tokio::test]
+    async fn a_bcc_only_send_from_a_custom_domain_to_aster_users_is_sealed() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let identity = SendIdentity {
+            address: "me@mydomain.example".to_string(),
+            auth_hash_b64: Some("AAAA".to_string()),
+            display_name: None,
+            kind: SendIdentityKind::CustomDomain,
+            enabled: true,
+            sender_id: "domain-1".to_string(),
+        };
+        session.write().await.send_identities = vec![identity.clone()];
+
+        for (address, name) in [("bob@custom.example", "bob"), ("amy@astermail.org", "amy")] {
+            let account = owner(name);
+            let mut keys = recipient();
+            sign_v2(&mut keys.bundle, &account);
+            directory.set_key(address, Some(json!({"public_key": account.public_key, "internal": true})));
+            directory.set_bundle(address, Some(bundle_json(&keys.bundle)));
+        }
+
+        let raw = b"From: me@mydomain.example\r\nSubject: hi\r\n\r\nbody\r\n";
+        let build = |bcc: &[&str]| {
+            let recipients: Vec<String> = bcc.iter().map(|a| a.to_string()).collect();
+            crate::smtp::server::build_send_payload(
+                raw,
+                Some("me@mydomain.example"),
+                &recipients,
+                "sender@astermail.org",
+                Some(&identity),
+                b"pass",
+            )
+            .unwrap()
+        };
+        let seal = |mut payload: Value, required: bool| {
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                seal_internal_body_with(&mut payload, session, client, db, "token", required)
+                    .await
+                    .map(|_| payload)
+            }
+        };
+
+        let builtin = seal(build(&["amy@astermail.org"]), true).await.unwrap();
+        assert_eq!(builtin["to"], json!([]));
+        assert_eq!(builtin["is_e2e_encrypted"], json!(true));
+        assert!(builtin.get(SELF_TO_PLACEHOLDER).is_none());
+
+        let hosted_payload = build(&["bob@custom.example"]);
+        assert_eq!(hosted_payload["to"], json!(["me@mydomain.example"]));
+        assert_eq!(hosted_payload[SELF_TO_PLACEHOLDER], json!("me@mydomain.example"));
+        let hosted = seal(hosted_payload, true).await.unwrap();
+        assert_eq!(hosted["to"], json!([]));
+        assert_eq!(hosted["bcc"], json!(["bob@custom.example"]));
+        assert_eq!(hosted["is_e2e_encrypted"], json!(true));
+        assert!(hosted.get("internal_encrypted_body").is_none());
+        assert!(hosted["recipient_bodies"]["bob@custom.example"]
+            .as_str()
+            .unwrap()
+            .contains("double_ratchet_v2"));
+        assert!(hosted.get(SELF_TO_PLACEHOLDER).is_none());
+
+        let both = seal(build(&["bob@custom.example", "amy@astermail.org"]), true).await.unwrap();
+        assert_eq!(both["to"], json!([]));
+        assert_eq!(both["is_e2e_encrypted"], json!(true));
+
+        let with_outside = build(&["bob@custom.example", "stranger@example.com"]);
+        assert!(seal(with_outside.clone(), true).await.is_err());
+        let readable = seal(with_outside, false).await.unwrap();
+        assert_eq!(readable["to"], json!(["me@mydomain.example"]));
+        assert_eq!(readable["is_e2e_encrypted"], json!(false));
+        assert!(readable.get(SELF_TO_PLACEHOLDER).is_none());
+
+        let unknown = seal(build(&["erin@nowhere.example"]), false).await.unwrap();
+        assert_eq!(unknown["to"], json!(["me@mydomain.example"]));
+        assert!(unknown.get(SELF_TO_PLACEHOLDER).is_none());
+
+        let addressed_self = build(&["me@mydomain.example", "bob@custom.example"]);
+        assert!(addressed_self.get(SELF_TO_PLACEHOLDER).is_none());
+        let kept = seal(addressed_self, false).await.unwrap();
+        assert_eq!(kept["to"], json!(["me@mydomain.example"]));
+        assert_eq!(kept["is_e2e_encrypted"], json!(false));
+
+        let primary = crate::smtp::server::build_send_payload(
+            b"From: sender@astermail.org\r\nSubject: hi\r\n\r\nbody\r\n",
+            Some("sender@astermail.org"),
+            &["bob@custom.example".to_string()],
+            "sender@astermail.org",
+            None,
+            b"pass",
+        )
+        .unwrap();
+        assert_eq!(primary["to"], json!(["sender@astermail.org"]));
+        assert_eq!(primary["bcc"], json!(["bob@custom.example"]));
+        assert!(primary.get(SELF_TO_PLACEHOLDER).is_none());
+    }
+
+    #[test]
+    fn the_self_placeholder_is_dropped_only_when_every_other_recipient_is_sealed() {
+        let hosted = HostedRecipients {
+            hosted: vec!["bob@custom.example".to_string()],
+            routed_like_external: vec!["carol@alias.example".to_string()],
+        };
+        let mut payload = json!({
+            "to": ["me@mydomain.example"],
+            "bcc": ["bob@custom.example", "a@astermail.org"],
+            SELF_TO_PLACEHOLDER: "me@mydomain.example",
+        });
+        let own = take_self_to_placeholder(&mut payload).unwrap();
+        assert!(payload.get(SELF_TO_PLACEHOLDER).is_none());
+        drop_sealed_self_placeholder(&mut payload, &own, &hosted);
+        assert_eq!(payload["to"], json!([]));
+
+        for bcc in [
+            json!(["bob@custom.example", "x@example.com"]),
+            json!(["carol@alias.example"]),
+            json!([]),
+            json!(["Me@MyDomain.example", "bob@custom.example"]),
+        ] {
+            let mut payload = json!({"to": ["me@mydomain.example"], "bcc": bcc.clone()});
+            drop_sealed_self_placeholder(&mut payload, "me@mydomain.example", &hosted);
+            assert_eq!(payload["to"], json!(["me@mydomain.example"]), "{bcc}");
+        }
+
+        let mut explicit_to = json!({"to": ["someone@astermail.org"], "bcc": ["bob@custom.example"]});
+        drop_sealed_self_placeholder(&mut explicit_to, "me@mydomain.example", &hosted);
+        assert_eq!(explicit_to["to"], json!(["someone@astermail.org"]));
+        assert!(take_self_to_placeholder(&mut json!({"to": []})).is_none());
+    }
+
+    #[test]
+    fn a_claimed_aster_identity_covers_built_in_own_and_pinned_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        assert!(claims_aster_identity(&db, "bob@astermail.org"));
+        assert!(claims_aster_identity(&db, "Bob@Aster.CX"));
+        assert!(!claims_aster_identity(&db, "dana@hosted.example"));
+        assert!(!claims_aster_identity(&db, "not an address"));
+
+        db.set_aster_sender_scope(AsterSenderScope {
+            account_id: "account-1".to_string(),
+            custom_domains: vec!["mydomain.example".to_string()],
+        });
+        db.recipient_pin_put(
+            &pin_id("account-1", "dana@hosted.example"),
+            &RecipientPin { hosted: true, ..RecipientPin::default() },
+        )
+        .unwrap();
+        db.recipient_pin_put(&pin_id("account-2", "eve@hosted.example"), &RecipientPin::default())
+            .unwrap();
+        assert!(claims_aster_identity(&db, "dana@hosted.example"));
+        assert!(claims_aster_identity(&db, "DANA@Hosted.Example"));
+        assert!(claims_aster_identity(&db, "anyone@MyDomain.example."));
+        assert!(!claims_aster_identity(&db, "eve@hosted.example"));
+        assert!(!claims_aster_identity(&db, "frank@hosted.example"));
+        assert!(!claims_aster_identity(&db, "x@example.com"));
     }
 
     #[tokio::test]

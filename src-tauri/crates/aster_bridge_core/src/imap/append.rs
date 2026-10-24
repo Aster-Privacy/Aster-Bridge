@@ -929,6 +929,7 @@ async fn import_message(
 ) -> std::result::Result<AppendOutcome, String> {
     let (token, identity_key, passphrase, inbound_keys) = {
         let s = session.read().await;
+        crate::crypto::internal_send::note_aster_sender_scope(db, &s);
         (
             s.access_token.to_string(),
             s.identity_key.clone(),
