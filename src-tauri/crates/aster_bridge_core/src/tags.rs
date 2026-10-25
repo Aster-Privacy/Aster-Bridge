@@ -525,7 +525,7 @@ pub fn is_label_keyword(keyword: &str) -> bool {
     !is_local_keyword(keyword) || builtin_slot(keyword).is_some()
 }
 
-fn match_key(text: &str) -> String {
+pub(crate) fn match_key(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)

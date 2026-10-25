@@ -176,6 +176,23 @@ async fn create(
     )
 }
 
+pub fn find_label_by_name(db: &Database, name: &str) -> Result<Option<CustomTag>, TagOpError> {
+    let name = clean_name(name)?;
+    let tags = db.list_custom_tags().map_err(TagOpError::Server)?;
+    if let Some(tag) = find_by_name(&tags, &name) {
+        return Ok(Some(tag.clone()));
+    }
+    let wanted = crate::tags::match_key(&name);
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let mut close = tags.iter().filter(|tag| crate::tags::match_key(&tag.name) == wanted);
+    match (close.next(), close.next()) {
+        (Some(tag), None) => Ok(Some(tag.clone())),
+        _ => Ok(None),
+    }
+}
+
 pub async fn create_label(
     db: &Database,
     client: &ApiClient,
@@ -184,9 +201,8 @@ pub async fn create_label(
     name: &str,
 ) -> Result<CustomTag, TagOpError> {
     let name = clean_name(name)?;
-    let tags = db.list_custom_tags().map_err(TagOpError::Server)?;
-    if let Some(tag) = find_by_name(&tags, &name) {
-        return Ok(tag.clone());
+    if let Some(tag) = find_label_by_name(db, &name)? {
+        return Ok(tag);
     }
     let identity_key = identity_key.ok_or(TagOpError::Locked)?;
     create(db, client, access_token, identity_key, &name, None).await
@@ -1377,5 +1393,27 @@ mod tests {
         assert!(changed.contains(&"m-1".to_string()), "{:?}", changed);
         assert_eq!(db.messages_with_tag(&made.tag_token).unwrap(), strings(&["m-1"]));
         assert_eq!(count(&calls, "create").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_label_is_found_by_its_name_without_the_emoji() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&[
+            stored_tag("tok-todo", "\u{1F477} Por fazer"),
+            stored_tag("tok-later-a", "\u{23F0} Mais tarde"),
+            stored_tag("tok-later-b", "Mais tarde!"),
+        ])
+        .unwrap();
+
+        let found = find_label_by_name(&db, "por fazer").unwrap().unwrap();
+        assert_eq!(found.tag_token, "tok-todo");
+        assert_eq!(find_label_by_name(&db, "\u{1F477} Por fazer").unwrap().unwrap().tag_token, "tok-todo");
+        assert!(find_label_by_name(&db, "Mais tarde").unwrap().is_none());
+        assert!(find_label_by_name(&db, "\u{1F477}").unwrap().is_none());
+        assert!(find_label_by_name(&db, "Despesas").unwrap().is_none());
+
+        let reused = create_label(&db, &client, "stub", Some("test-ik"), "Por fazer").await.unwrap();
+        assert_eq!(reused.tag_token, "tok-todo");
+        assert_eq!(count(&calls, "create").await, 0);
     }
 }
