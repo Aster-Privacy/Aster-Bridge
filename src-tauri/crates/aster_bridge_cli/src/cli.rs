@@ -127,6 +127,8 @@ pub enum Command {
     RepairCache,
     #[command(subcommand, about = "Accept a recipient's changed encryption key")]
     RecipientKey(RecipientKeyCommand),
+    #[command(subcommand, about = "Choose the labels that built-in email app tags sync to")]
+    Tags(TagsCommand),
     #[command(subcommand, about = "Run Aster Bridge in the background at sign-in")]
     Service(ServiceCommand),
     #[command(about = "Explain an error code")]
@@ -193,6 +195,29 @@ pub enum ConfigCommand {
     Get { key: Option<String> },
     #[command(about = "Change a setting")]
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TagsCommand {
+    #[command(about = "Show the label each built-in tag syncs to")]
+    List,
+    #[command(about = "Choose the label a built-in tag syncs to")]
+    Set {
+        #[arg(
+            value_name = "TAG",
+            value_parser = clap::value_parser!(u8).range(1..=5),
+            help = "Built-in tag number, from 1 to 5"
+        )]
+        slot: u8,
+        #[arg(long, conflicts_with_all = ["off", "label"], help = "Sync to the label whose name matches the tag's default name")]
+        auto: bool,
+        #[arg(long, conflicts_with_all = ["auto", "label"], help = "Keep this tag on this computer only")]
+        off: bool,
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["auto", "off"], help = "Sync to the label with this name")]
+        label: Option<String>,
+        #[arg(long, requires = "label", help = "Create the label if it doesn't exist")]
+        create: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -266,5 +291,25 @@ mod tests {
         let cli = Cli::try_parse_from(["aster-bridge", "status", "--json", "--data-dir", "x"]).unwrap();
         assert!(cli.global.json);
         assert_eq!(cli.global.data_dir, Some(PathBuf::from("x")));
+    }
+
+    #[test]
+    fn tags_set_parses_one_choice() {
+        let cli = Cli::try_parse_from(["aster-bridge", "tags", "set", "4", "--label", "Por fazer", "--create"])
+            .unwrap();
+        match cli.command {
+            Command::Tags(TagsCommand::Set { slot, auto, off, label, create }) => {
+                assert_eq!(slot, 4);
+                assert!(!auto && !off && create);
+                assert_eq!(label.as_deref(), Some("Por fazer"));
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "set", "1", "--auto", "--off"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "set", "1", "--off", "--label", "x"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "set", "1", "--create"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "set", "0", "--auto"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "set", "6", "--auto"]).is_err());
+        assert!(Cli::try_parse_from(["aster-bridge", "tags", "list"]).is_ok());
     }
 }

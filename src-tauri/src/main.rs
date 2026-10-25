@@ -746,6 +746,118 @@ async fn set_default_sender(
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct BuiltinTagSlotEntry {
+    slot: usize,
+    mode: &'static str,
+    chosen_token: Option<String>,
+    matched_token: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BuiltinTagLabel {
+    tag_token: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct BuiltinTagSlotsResponse {
+    slots: Vec<BuiltinTagSlotEntry>,
+    labels: Vec<BuiltinTagLabel>,
+}
+
+fn builtin_tag_slots_on(db: &db::Database) -> Result<BuiltinTagSlotsResponse, String> {
+    let assigned = db.builtin_tag_slots()?;
+    let overrides = db.builtin_tag_slot_overrides()?;
+    let mut labels: Vec<BuiltinTagLabel> = db
+        .list_custom_tags()?
+        .into_iter()
+        .map(|tag| BuiltinTagLabel { tag_token: tag.tag_token, name: tag.name })
+        .collect();
+    labels.sort_by_key(|label| label.name.to_lowercase());
+    let slots = assigned
+        .into_iter()
+        .enumerate()
+        .map(|(index, matched_token)| {
+            let slot = index + 1;
+            let (mode, chosen_token) = match overrides.get(&slot) {
+                Some(aster_bridge_core::tags::SlotOverride::Off) => ("off", None),
+                Some(aster_bridge_core::tags::SlotOverride::Label(token))
+                    if matched_token.as_deref() == Some(token.as_str()) =>
+                {
+                    ("label", Some(token.clone()))
+                }
+                _ => ("auto", None),
+            };
+            BuiltinTagSlotEntry { slot, mode, chosen_token, matched_token }
+        })
+        .collect();
+    Ok(BuiltinTagSlotsResponse { slots, labels })
+}
+
+#[tauri::command]
+async fn get_builtin_tag_slots(state: State<'_, AppState>) -> Result<BuiltinTagSlotsResponse, String> {
+    let db = state.0.lock().await.db.clone();
+    builtin_tag_slots_on(&db)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_builtin_tag_slot(
+    state: State<'_, AppState>,
+    slot: usize,
+    mode: String,
+    tag_token: Option<String>,
+) -> Result<BuiltinTagSlotsResponse, String> {
+    let choice = match (mode.as_str(), tag_token) {
+        ("auto", _) => None,
+        ("off", _) => Some(aster_bridge_core::tags::SlotOverride::Off),
+        ("label", Some(token)) if !token.is_empty() => Some(aster_bridge_core::tags::SlotOverride::Label(token)),
+        _ => return Err("unknown tag choice".to_string()),
+    };
+    let (db, trigger) = {
+        let guard = state.0.lock().await;
+        (guard.db.clone(), guard.runtime.as_ref().and_then(|r| r.sync_trigger()))
+    };
+    let changed = db.set_builtin_tag_slot(slot, choice.as_ref())?;
+    if !changed.is_empty() {
+        let refs: Vec<&str> = changed.iter().map(|id| id.as_str()).collect();
+        let _ = db.jmap_record_updated_batch("Email", &refs);
+    }
+    if let Some(trigger) = trigger {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let _ = trigger.send(sync::poller::SyncTrigger { done: tx }).await;
+    }
+    builtin_tag_slots_on(&db)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn create_builtin_tag_label(
+    state: State<'_, AppState>,
+    slot: usize,
+    name: String,
+) -> Result<BuiltinTagSlotsResponse, String> {
+    if !(1..=aster_bridge_core::tags::BUILTIN_TAG_SLOTS).contains(&slot) {
+        return Err("unknown tag slot".to_string());
+    }
+    let (db, client, session_arc) = {
+        let guard = state.0.lock().await;
+        let session_arc = guard.session.clone().ok_or_else(|| "not authenticated".to_string())?;
+        (guard.db.clone(), guard.client.clone(), session_arc)
+    };
+    let (token, identity_key) = {
+        let s = session_arc.read().await;
+        ((*s.access_token).clone(), s.identity_key.clone())
+    };
+    let label = aster_bridge_core::tag_ops::create_label(&db, &client, &token, identity_key.as_deref(), &name)
+        .await
+        .map_err(|e| match e {
+            aster_bridge_core::tag_ops::TagOpError::LimitReached => "label_limit".to_string(),
+            aster_bridge_core::tag_ops::TagOpError::Invalid(_) => "label_invalid".to_string(),
+            _ => "label_failed".to_string(),
+        })?;
+    set_builtin_tag_slot(state, slot, "label".to_string(), Some(label.tag_token)).await
+}
+
 #[tauri::command]
 async fn get_app_passwords(state: State<'_, AppState>) -> Result<Vec<AppPasswordEntry>, String> {
     let guard = state.0.lock().await;
@@ -1564,6 +1676,9 @@ fn main() {
             list_send_identities,
             get_default_sender,
             set_default_sender,
+            get_builtin_tag_slots,
+            set_builtin_tag_slot,
+            create_builtin_tag_label,
             get_app_passwords,
             generate_app_password,
             delete_app_password,

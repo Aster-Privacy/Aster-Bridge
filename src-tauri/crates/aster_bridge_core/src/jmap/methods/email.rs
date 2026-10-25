@@ -692,8 +692,9 @@ enum PatchOutcome {
     Rejected(Value),
 }
 
-fn is_tag_keyword(keyword: &str) -> bool {
-    keyword_bit(keyword) == 0 && !crate::tags::is_local_keyword(keyword)
+fn is_tag_keyword(keyword: &str, slots: &[Option<String>]) -> bool {
+    keyword_bit(keyword) == 0
+        && (!crate::tags::is_local_keyword(keyword) || crate::tags::slot_is_mapped(slots, keyword))
 }
 
 fn tag_error(e: crate::tag_ops::TagOpError) -> Value {
@@ -738,12 +739,12 @@ fn invalid_keywords() -> Value {
     })
 }
 
-fn enabled_tag_keywords(patch_obj: &serde_json::Map<String, Value>) -> Vec<String> {
+fn enabled_tag_keywords(patch_obj: &serde_json::Map<String, Value>, slots: &[Option<String>]) -> Vec<String> {
     let enabled = |v: &Value| v.as_bool().unwrap_or(false);
     if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
         return kw_obj
             .iter()
-            .filter(|(k, v)| enabled(v) && is_tag_keyword(k))
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k, slots))
             .map(|(k, _)| k.clone())
             .collect();
     }
@@ -751,19 +752,21 @@ fn enabled_tag_keywords(patch_obj: &serde_json::Map<String, Value>) -> Vec<Strin
         .iter()
         .filter(|(_, v)| enabled(v))
         .filter_map(|(k, _)| k.strip_prefix("/keywords/"))
-        .filter(|keyword| is_tag_keyword(keyword))
+        .filter(|keyword| is_tag_keyword(keyword, slots))
         .map(|keyword| keyword.to_string())
         .collect()
 }
 
 fn has_unmappable_keyword(db: &crate::db::Database, patch_obj: &serde_json::Map<String, Value>) -> bool {
-    let wanted = enabled_tag_keywords(patch_obj);
+    let slots = db.builtin_tag_slots().unwrap_or_default();
+    let wanted = enabled_tag_keywords(patch_obj, &slots);
     if wanted.is_empty() {
         return false;
     }
     let tags = db.list_custom_tags().unwrap_or_default();
     wanted.iter().any(|keyword| {
-        crate::tags::find_by_keyword(&tags, keyword).is_none()
+        crate::tags::slot_tag(&tags, &slots, keyword).is_none()
+            && crate::tags::find_by_keyword(&tags, keyword).is_none()
             && crate::tags::name_for_keyword(keyword).is_none()
     })
 }
@@ -776,11 +779,12 @@ async fn apply_tag_keywords(
     label_budget: &mut usize,
 ) -> Result<(), Value> {
     let enabled = |v: &Value| v.as_bool().unwrap_or(false);
+    let slots = ctx.db.builtin_tag_slots().unwrap_or_default();
     let mut steps: Vec<(i8, Vec<String>)> = Vec::new();
     if let Some(kw_obj) = patch_obj.get("keywords").and_then(|v| v.as_object()) {
         let given: Vec<String> = kw_obj
             .iter()
-            .filter(|(k, v)| enabled(v) && is_tag_keyword(k))
+            .filter(|(k, v)| enabled(v) && is_tag_keyword(k, &slots))
             .map(|(k, _)| k.clone())
             .collect();
         steps.push((0, given));
@@ -788,7 +792,7 @@ async fn apply_tag_keywords(
         let mut adds: Vec<String> = Vec::new();
         let mut removes: Vec<String> = Vec::new();
         for (k, v) in patch_obj {
-            let Some(keyword) = k.strip_prefix("/keywords/").filter(|kw| is_tag_keyword(kw)) else {
+            let Some(keyword) = k.strip_prefix("/keywords/").filter(|kw| is_tag_keyword(kw, &slots)) else {
                 continue;
             };
             if enabled(v) {

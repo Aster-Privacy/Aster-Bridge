@@ -530,6 +530,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "message_tag",
     "custom_tag",
     "custom_tag_alias",
+    "builtin_tag_slot",
     "custom_folder",
     "message_attachment",
     "message_fts",
@@ -753,7 +754,11 @@ impl Database {
                 keyword TEXT PRIMARY KEY COLLATE NOCASE,
                 tag_token TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_custom_tag_alias_token ON custom_tag_alias(tag_token);",
+             CREATE INDEX IF NOT EXISTS idx_custom_tag_alias_token ON custom_tag_alias(tag_token);
+             CREATE TABLE IF NOT EXISTS builtin_tag_slot (
+                slot INTEGER PRIMARY KEY,
+                tag_token TEXT
+             );",
         ).map_err(|e| e.to_string())?;
         rebuild_tag_aliases(conn).map_err(|e| e.to_string())?;
 
@@ -1219,15 +1224,54 @@ fn custom_tags_on(conn: &Connection) -> rusqlite::Result<Vec<CustomTag>> {
     Ok(rows)
 }
 
+fn tag_slot_overrides_on(conn: &Connection) -> rusqlite::Result<HashMap<usize, crate::tags::SlotOverride>> {
+    let mut stmt = conn.prepare("SELECT slot, tag_token FROM builtin_tag_slot")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(slot, token)| {
+            let slot = usize::try_from(slot).ok()?;
+            let choice = match token {
+                Some(token) => crate::tags::SlotOverride::Label(token),
+                None => crate::tags::SlotOverride::Off,
+            };
+            Some((slot, choice))
+        })
+        .collect())
+}
+
+fn slot_assignments_on(conn: &Connection) -> rusqlite::Result<Vec<Option<String>>> {
+    let tags = custom_tags_on(conn)?;
+    Ok(crate::tags::slot_assignments(&tags, &tag_slot_overrides_on(conn)?))
+}
+
 fn rebuild_tag_aliases(conn: &Connection) -> rusqlite::Result<()> {
     let tags = custom_tags_on(conn)?;
+    let overrides = tag_slot_overrides_on(conn)?;
     conn.execute("DELETE FROM custom_tag_alias", [])?;
-    for (keyword, tag_token) in crate::tags::alias_rows(&tags) {
+    let rows = crate::tags::alias_rows(&tags)
+        .into_iter()
+        .chain(crate::tags::slot_alias_rows(&tags, &overrides));
+    for (keyword, tag_token) in rows {
         conn.execute(
             "INSERT OR IGNORE INTO custom_tag_alias (keyword, tag_token) VALUES (?1, ?2)",
             rusqlite::params![keyword, tag_token],
         )?;
     }
+    conn.execute(
+        "DELETE FROM message_keywords WHERE EXISTS (
+            SELECT 1 FROM message_tag a
+            JOIN custom_tag t ON t.tag_token = a.tag_token
+            WHERE a.aster_id = message_keywords.aster_id AND t.keyword = message_keywords.keyword
+         ) OR EXISTS (
+            SELECT 1 FROM message_tag a
+            JOIN custom_tag_alias l ON l.tag_token = a.tag_token
+            WHERE a.aster_id = message_keywords.aster_id AND l.keyword = message_keywords.keyword
+         )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1874,18 +1918,6 @@ impl Database {
                 [],
             )?;
             rebuild_tag_aliases(&tx)?;
-            tx.execute(
-                "DELETE FROM message_keywords WHERE EXISTS (
-                    SELECT 1 FROM message_tag a
-                    JOIN custom_tag t ON t.tag_token = a.tag_token
-                    WHERE a.aster_id = message_keywords.aster_id AND t.keyword = message_keywords.keyword
-                 ) OR EXISTS (
-                    SELECT 1 FROM message_tag a
-                    JOIN custom_tag_alias l ON l.tag_token = a.tag_token
-                    WHERE a.aster_id = message_keywords.aster_id AND l.keyword = message_keywords.keyword
-                 )",
-                [],
-            )?;
             tx.commit()?;
             Ok(true)
         })
@@ -1923,6 +1955,76 @@ impl Database {
             tx.execute("DELETE FROM message_tag WHERE tag_token = ?1", [tag_token])?;
             tx.execute("DELETE FROM custom_tag WHERE tag_token = ?1", [tag_token])?;
             rebuild_tag_aliases(&tx)?;
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
+    pub fn builtin_tag_slots(&self) -> Result<Vec<Option<String>>, String> {
+        self.with_conn(slot_assignments_on)
+    }
+
+    pub fn builtin_tag_slot_overrides(&self) -> Result<HashMap<usize, crate::tags::SlotOverride>, String> {
+        self.with_conn(tag_slot_overrides_on)
+    }
+
+    pub fn set_builtin_tag_slot(
+        &self,
+        slot: usize,
+        choice: Option<&crate::tags::SlotOverride>,
+    ) -> Result<Vec<String>, String> {
+        if !(1..=crate::tags::BUILTIN_TAG_SLOTS).contains(&slot) {
+            return Err("unknown tag slot".to_string());
+        }
+        let token = match choice {
+            Some(crate::tags::SlotOverride::Label(token)) => Some(token.clone()),
+            _ => None,
+        };
+        if let Some(token) = &token {
+            if !self.list_custom_tags()?.iter().any(|tag| tag.tag_token == *token) {
+                return Err("unknown label".to_string());
+            }
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let before = slot_assignments_on(&tx)?;
+            let slot_value = slot as i64;
+            if choice.is_none() {
+                tx.execute("DELETE FROM builtin_tag_slot WHERE slot = ?1", [slot_value])?;
+            } else {
+                if let Some(token) = &token {
+                    tx.execute(
+                        "DELETE FROM builtin_tag_slot WHERE tag_token = ?1 AND slot != ?2",
+                        rusqlite::params![token, slot_value],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO builtin_tag_slot (slot, tag_token) VALUES (?1, ?2)
+                     ON CONFLICT(slot) DO UPDATE SET tag_token = excluded.tag_token",
+                    rusqlite::params![slot_value, token],
+                )?;
+            }
+            rebuild_tag_aliases(&tx)?;
+            let after = slot_assignments_on(&tx)?;
+            let mut moved: Vec<&str> = Vec::new();
+            for (old, new) in before.iter().zip(after.iter()) {
+                if old != new {
+                    moved.extend(old.as_deref());
+                    moved.extend(new.as_deref());
+                }
+            }
+            let mut ids: Vec<String> = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT aster_id FROM message_tag WHERE tag_token = ?1")?;
+                for token in moved {
+                    for id in stmt.query_map([token], |r| r.get::<_, String>(0))? {
+                        let id = id?;
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
             tx.commit()?;
             Ok(ids)
         })
@@ -2651,6 +2753,7 @@ impl Database {
                  DELETE FROM message_tag;
                  DELETE FROM custom_tag;
                  DELETE FROM custom_tag_alias;
+                 DELETE FROM builtin_tag_slot;
                  DELETE FROM message_attachment;
                  DELETE FROM message_fts;
                  DELETE FROM uid_map;
@@ -4833,7 +4936,10 @@ mod db_tests {
         assert_eq!(db.message_keywords("t-a").unwrap(), vec!["$label1", "Work"]);
         assert_eq!(db.message_keywords("t-b").unwrap(), vec!["Work"]);
         let inbox = db.folder_keywords("inbox").unwrap();
-        assert_eq!(inbox.get("t-a").unwrap(), &vec!["$label1".to_string(), "Work".to_string()]);
+        assert_eq!(
+            inbox.get("t-a").unwrap(),
+            &vec!["$label1".to_string(), "$label2".to_string(), "Work".to_string()]
+        );
         assert_eq!(
             db.message_tags(&ids).unwrap().get("t-a").unwrap(),
             &vec!["tok-hidden".to_string(), "tok-work".to_string()]
@@ -4946,7 +5052,7 @@ mod db_tests {
         db.add_message_tag(&ids, "tok-later").unwrap();
         let mut fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
         fetched.sort();
-        assert_eq!(fetched, vec!["Mais&ACA-tarde", "mais=20tarde", "mais_tarde"]);
+        assert_eq!(fetched, vec!["$label5", "Mais&ACA-tarde", "mais=20tarde", "mais_tarde"]);
         let stale: i64 = db
             .with_conn(|conn| {
                 conn.query_row(
@@ -5468,5 +5574,88 @@ mod db_tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, vec!["bridge.dbx".to_string()]);
+    }
+
+    fn slot_tags() -> Vec<CustomTag> {
+        vec![
+            named_tag("t-atencao", "Aten\u{E7}\u{E3}o"),
+            named_tag("t-trabalho", "\u{1F4BC} Trabalho"),
+            named_tag("t-tarde", "Mais tarde"),
+            named_tag("t-despesas", "Despesas"),
+        ]
+    }
+
+    #[test]
+    fn builtin_tag_keywords_follow_their_matched_labels() {
+        let (_d, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&slot_tags()).unwrap();
+        assert_eq!(
+            db.builtin_tag_slots().unwrap(),
+            vec![None, Some("t-trabalho".to_string()), None, None, Some("t-tarde".to_string())]
+        );
+
+        db.add_message_tag(&["t-x".to_string()], "t-tarde").unwrap();
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label5".to_string()), "{:?}", fetched);
+        let fetched = db.keywords_for_messages(&["t-x".to_string()]).unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label5".to_string()), "{:?}", fetched);
+
+        db.set_message_keywords("t-y", &["$Label5".to_string(), "$label1".to_string(), "$label3".to_string()])
+            .unwrap();
+        assert_eq!(db.message_keywords("t-y").unwrap(), vec!["$label1", "$label3"]);
+    }
+
+    #[test]
+    fn choosing_a_label_for_a_builtin_tag_maps_moves_and_turns_off() {
+        let (_d, db) = open_db();
+        insert(&db, "t-x", "inbox");
+        insert(&db, "t-y", "inbox");
+        db.replace_custom_tags(&slot_tags()).unwrap();
+        db.add_message_tag(&["t-x".to_string()], "t-atencao").unwrap();
+        db.add_message_tag(&["t-y".to_string()], "t-trabalho").unwrap();
+
+        assert!(db.set_builtin_tag_slot(0, Some(&crate::tags::SlotOverride::Off)).is_err());
+        assert!(db.set_builtin_tag_slot(6, Some(&crate::tags::SlotOverride::Off)).is_err());
+        assert!(db
+            .set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("t-missing".to_string())))
+            .is_err());
+
+        let changed = db
+            .set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("t-atencao".to_string())))
+            .unwrap();
+        assert_eq!(changed, vec!["t-x".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[0].as_deref(), Some("t-atencao"));
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label1".to_string()), "{:?}", fetched);
+
+        let changed = db
+            .set_builtin_tag_slot(4, Some(&crate::tags::SlotOverride::Label("t-atencao".to_string())))
+            .unwrap();
+        assert_eq!(changed, vec!["t-x".to_string()]);
+        let slots = db.builtin_tag_slots().unwrap();
+        assert_eq!(slots[0], None);
+        assert_eq!(slots[3].as_deref(), Some("t-atencao"));
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-x").unwrap();
+        assert!(fetched.contains(&"$label4".to_string()), "{:?}", fetched);
+        assert!(!fetched.contains(&"$label1".to_string()), "{:?}", fetched);
+
+        let changed = db.set_builtin_tag_slot(2, Some(&crate::tags::SlotOverride::Off)).unwrap();
+        assert_eq!(changed, vec!["t-y".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[1], None);
+        let fetched = db.folder_keywords("inbox").unwrap().remove("t-y").unwrap();
+        assert!(!fetched.contains(&"$label2".to_string()), "{:?}", fetched);
+
+        let changed = db.set_builtin_tag_slot(2, None).unwrap();
+        assert_eq!(changed, vec!["t-y".to_string()]);
+        assert_eq!(db.builtin_tag_slots().unwrap()[1].as_deref(), Some("t-trabalho"));
+        assert!(db.set_builtin_tag_slot(2, None).unwrap().is_empty());
+
+        db.replace_custom_tags(&slot_tags()[1..]).unwrap();
+        assert_eq!(db.builtin_tag_slots().unwrap()[3], None);
+
+        db.clear_all_user_data().unwrap();
+        assert!(db.builtin_tag_slot_overrides().unwrap().is_empty());
     }
 }

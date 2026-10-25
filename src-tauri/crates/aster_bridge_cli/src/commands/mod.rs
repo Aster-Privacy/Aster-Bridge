@@ -29,6 +29,7 @@ pub mod serve;
 pub mod service;
 pub mod status;
 pub mod stop;
+pub mod tags;
 
 use crate::cli::{Cli, Command, SyncCommand, TlsCommand};
 use crate::context::{self, Context};
@@ -64,6 +65,7 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
         Command::Config(command) => misc::config(&ctx, command).await,
         Command::RepairCache => misc::repair_cache(&ctx).await,
         Command::RecipientKey(command) => recipient_key::run(&ctx, command).await,
+        Command::Tags(command) => tags::run(&ctx, command).await,
         Command::Service(command) => service::run(&ctx, command).await,
         Command::Errors { code } => misc::errors(&ctx.out, code.as_deref()),
         Command::Version => misc::version(&ctx.out),

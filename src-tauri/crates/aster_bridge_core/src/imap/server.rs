@@ -866,7 +866,7 @@ async fn store_tag_keywords(
     }
     let keywords: Vec<String> = given
         .iter()
-        .filter(|keyword| !crate::tags::is_local_keyword(keyword))
+        .filter(|keyword| crate::tags::is_label_keyword(keyword))
         .cloned()
         .collect();
     let (access_token, identity_key) = {
@@ -8087,6 +8087,75 @@ mod tests {
         let resp = imap_cmd_lines(&mut reader, &mut writer, "t7", "STORE 2 FLAGS (\\Seen)").await;
         assert!(!resp.contains("$label2") && !resp.contains("Work"), "{}", resp);
         assert_eq!(db.message_keywords("tag-2").unwrap(), Vec::<String>::new());
+    }
+
+    fn label_named(token: &str, name: &str) -> crate::db::CustomTag {
+        crate::db::CustomTag {
+            tag_token: token.to_string(),
+            server_id: format!("id-{}", token),
+            name: name.to_string(),
+            keyword: crate::tags::keyword_for_name(name),
+        }
+    }
+
+    fn fetched_line(resp: &str, seq: u32) -> &str {
+        let prefix = format!("* {} FETCH", seq);
+        resp.lines().find(|l| l.starts_with(&prefix)).unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn builtin_tags_reach_the_matching_labels_end_to_end() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "bt-1", "inbox", "first");
+        seed(&db, "bt-2", "inbox", "second");
+        db.replace_custom_tags(&[
+            label_named("tok-attention", "\u{26A0}\u{FE0F} Aten\u{E7}\u{E3}o"),
+            label_named("tok-later", "\u{23F0} Mais tarde"),
+            label_named("tok-spend", "\u{1F4B8} Despesas"),
+        ])
+        .unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b1", "UID STORE 1 +FLAGS ($label5)").await;
+        assert!(resp.contains("b1 OK"), "{}", resp);
+        assert!(resp.contains("$label5"), "{}", resp);
+        assert_eq!(db.messages_with_tag("tok-later").unwrap(), vec!["bt-1".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-later|1"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b2", "STORE 1 +FLAGS ($label1)").await;
+        assert!(resp.contains("b2 OK"), "{}", resp);
+        assert!(db.messages_with_tag("tok-attention").unwrap().is_empty());
+        assert!(db.message_keywords("bt-1").unwrap().contains(&"$label1".to_string()));
+
+        db.set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("tok-attention".to_string())))
+            .unwrap();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b3", "STORE 2 +FLAGS ($label1)").await;
+        assert!(resp.contains("b3 OK"), "{}", resp);
+        assert_eq!(db.messages_with_tag("tok-attention").unwrap(), vec!["bt-2".to_string()]);
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "ADD_TAG" && v == "tok-attention|1"), "{:?}", log);
+
+        let (mut reader2, mut writer2) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n1", "FETCH 1:2 (FLAGS)").await;
+        assert!(fetched_line(&resp, 1).contains("$label5"), "{}", resp);
+        assert!(fetched_line(&resp, 2).contains("$label1"), "{}", resp);
+        assert!(!fetched_line(&resp, 2).contains("$label5"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n2", "SEARCH KEYWORD $label5").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader2, &mut writer2, "n3", "SEARCH KEYWORD $LABEL1").await;
+        assert!(resp.lines().any(|l| l.trim() == "* SEARCH 1 2"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "b4", "STORE 1 -FLAGS ($label5)").await;
+        assert!(resp.contains("b4 OK"), "{}", resp);
+        assert!(!resp.contains("$label5"), "{}", resp);
+        assert!(db.messages_with_tag("tok-later").unwrap().is_empty());
+        let log = calls.lock().await.clone();
+        assert!(log.iter().any(|(m, v)| m == "REMOVE_TAG" && v == "tok-later|1"), "{:?}", log);
+        assert!(!log.iter().any(|(m, _)| m == "CREATE_TAG"), "{:?}", log);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 3);
     }
 
     fn work_label() -> crate::db::CustomTag {

@@ -2503,7 +2503,16 @@ async fn sync_custom_tags(
             affected.extend(db.messages_with_tag(&old.tag_token)?);
         }
     }
+    let slots_before = db.builtin_tag_slots()?;
     db.replace_custom_tags(&tags)?;
+    let slots_after = db.builtin_tag_slots()?;
+    for (old, new) in slots_before.iter().zip(slots_after.iter()) {
+        if old != new {
+            for token in old.iter().chain(new.iter()) {
+                affected.extend(db.messages_with_tag(token)?);
+            }
+        }
+    }
     Ok(affected)
 }
 

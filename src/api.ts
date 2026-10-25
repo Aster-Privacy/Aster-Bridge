@@ -414,3 +414,29 @@ export async function get_default_sender(): Promise<string | null> {
 export async function set_default_sender(sender_id: string | null): Promise<void> {
   return tauri_invoke("set_default_sender", { sender_id });
 }
+
+export type BuiltinTagMode = "auto" | "label" | "off";
+
+export interface BuiltinTagSlot {
+  slot: number;
+  mode: BuiltinTagMode;
+  chosen_token: string | null;
+  matched_token: string | null;
+}
+
+export interface BuiltinTagSlots {
+  slots: BuiltinTagSlot[];
+  labels: { tag_token: string; name: string }[];
+}
+
+export async function get_builtin_tag_slots(): Promise<BuiltinTagSlots> {
+  return tauri_invoke<BuiltinTagSlots>("get_builtin_tag_slots");
+}
+
+export async function create_builtin_tag_label(slot: number, name: string): Promise<BuiltinTagSlots> {
+  return tauri_invoke<BuiltinTagSlots>("create_builtin_tag_label", { slot, name });
+}
+
+export async function set_builtin_tag_slot(slot: number, mode: BuiltinTagMode, tag_token: string | null): Promise<BuiltinTagSlots> {
+  return tauri_invoke<BuiltinTagSlots>("set_builtin_tag_slot", { slot, mode, tag_token });
+}

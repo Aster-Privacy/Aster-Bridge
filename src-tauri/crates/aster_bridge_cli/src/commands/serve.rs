@@ -669,6 +669,22 @@ impl Shared {
                 &self.passwords,
                 args.get("id").and_then(Value::as_str).unwrap_or_default(),
             ),
+            "builtin_tags_list" => super::tags::list_on(&self.db),
+            "builtin_tags_set" => {
+                let (slot, choice) = super::tags::TagChoice::from_args(&args)?;
+                let (token, identity_key) = {
+                    let session = self.session.read().await;
+                    (session.access_token.clone(), session.identity_key.clone())
+                };
+                let result =
+                    super::tags::set_on(&self.db, &self.client, &token, identity_key.as_deref(), slot, choice)
+                        .await?;
+                if let Some(trigger) = self.running.sync_trigger() {
+                    let (done, _) = tokio::sync::oneshot::channel();
+                    let _ = trigger.try_send(aster_bridge_core::sync::poller::SyncTrigger { done });
+                }
+                Ok(result)
+            }
             "stop" => {
                 self.stop.notify_one();
                 Ok(json!({ "stopping": true }))

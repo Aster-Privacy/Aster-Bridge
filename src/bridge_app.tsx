@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict } from "@/api";
@@ -1694,6 +1694,126 @@ function StarIcon({ filled }: { filled: boolean }) {
   );
 }
 
+const BUILTIN_TAG_DEFAULT_KEYS = ["builtin_tag_important", "builtin_tag_work", "builtin_tag_personal", "builtin_tag_to_do", "builtin_tag_later"];
+
+function BuiltinTagsGroup() {
+  const { t } = useTranslation();
+  const [data, set_data] = useState<api.BuiltinTagSlots | null>(null);
+  const [saving, set_saving] = useState<number | null>(null);
+  const [creating, set_creating] = useState<number | null>(null);
+  const [new_name, set_new_name] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get_builtin_tag_slots()
+      .then((d) => { if (!cancelled) set_data(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  if (!data || data.labels.length === 0) return null;
+
+  const label_name = (token: string | null) => data.labels.find((l) => l.tag_token === token)?.name ?? null;
+
+  const create_label = async (slot: number) => {
+    const name = new_name.trim();
+    if (!name || saving !== null) return;
+    set_saving(slot);
+    try {
+      set_data(await api.create_builtin_tag_label(slot, name));
+      set_creating(null);
+      set_new_name("");
+      show_toast(t("builtin_tags_updated"), "success");
+    } catch (e) {
+      const code = String(e);
+      show_toast(
+        code.includes("label_limit") ? t("builtin_tag_label_limit") : code.includes("label_invalid") ? t("builtin_tag_label_invalid") : t("failed_to_update"),
+        "error",
+      );
+    } finally {
+      set_saving(null);
+    }
+  };
+
+  const choose = async (slot: number, value: string) => {
+    if (saving !== null) return;
+    if (value === "create") {
+      set_creating(slot);
+      set_new_name("");
+      return;
+    }
+    set_creating(null);
+    const mode: api.BuiltinTagMode = value === "auto" || value === "off" ? value : "label";
+    const token = mode === "label" ? value.slice("label:".length) : null;
+    set_saving(slot);
+    try {
+      set_data(await api.set_builtin_tag_slot(slot, mode, token));
+      show_toast(t("builtin_tags_updated"), "success");
+    } catch {
+      show_toast(t("failed_to_update"), "error");
+    } finally {
+      set_saving(null);
+    }
+  };
+
+  return (
+    <SettingsGroup title={t("section_builtin_tags")} icon={<TagIcon />} hint={t("builtin_tags_hint")}>
+      {data.slots.map((entry) => {
+        const matched = label_name(entry.matched_token);
+        const value = entry.mode === "label" && entry.chosen_token ? `label:${entry.chosen_token}` : entry.mode === "off" ? "off" : "auto";
+        return (
+          <div key={entry.slot}>
+          <SettingRow
+            label={t("builtin_tag_slot", { slot: entry.slot })}
+            sublabel={t("builtin_tag_default_name", { name: t(BUILTIN_TAG_DEFAULT_KEYS[entry.slot - 1] ?? "builtin_tag_later") })}
+          >
+            <select
+              aria-label={t("builtin_tag_slot", { slot: entry.slot })}
+              value={value}
+              disabled={saving !== null}
+              onChange={(e) => void choose(entry.slot, e.target.value)}
+              className="bridge_field w-48 h-8 px-2 text-[13px] text-txt-primary"
+            >
+              <option value="auto">
+                {entry.mode === "auto" && matched ? t("builtin_tag_auto_matched", { label: matched }) : t("builtin_tag_auto")}
+              </option>
+              {data.labels.map((l) => (
+                <option key={l.tag_token} value={`label:${l.tag_token}`}>{l.name}</option>
+              ))}
+              <option value="create">{t("builtin_tag_new_label")}</option>
+              <option value="off">{t("builtin_tag_off")}</option>
+            </select>
+          </SettingRow>
+          {creating === entry.slot && (
+            <form
+              className="flex items-center gap-2 pb-3"
+              onSubmit={(e) => { e.preventDefault(); void create_label(entry.slot); }}
+            >
+              <input
+                type="text"
+                autoFocus
+                value={new_name}
+                maxLength={100}
+                onChange={(e) => set_new_name(e.target.value)}
+                aria-label={t("builtin_tag_new_label_name")}
+                placeholder={t("builtin_tag_new_label_name")}
+                className="bridge_field flex-1 h-8 px-2.5 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
+              />
+              <Button type="submit" variant="depth" is_loading={saving === entry.slot} disabled={!new_name.trim() || saving !== null}>
+                {t("builtin_tag_create")}
+              </Button>
+              <Button type="button" variant="secondary" onClick={() => set_creating(null)}>
+                {t("cancel")}
+              </Button>
+            </form>
+          )}
+          </div>
+        );
+      })}
+    </SettingsGroup>
+  );
+}
+
 function IdentitiesGroup() {
   const { t } = useTranslation();
   const [identities, set_identities] = useState<api.SendIdentity[] | null>(null);
@@ -2179,6 +2299,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       </SettingsGroup>
 
       <IdentitiesGroup />
+
+      <BuiltinTagsGroup />
 
       <SettingsGroup title={t("section_email_client_setup")} icon={<EnvelopeIcon />}>
         {["Thunderbird", "Outlook", "Apple Mail"].map((client) => (
