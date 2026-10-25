@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.12 - 2026-10-25
+
+### Fixed
+- The built-in tags in your mail app now apply matching Aster labels. Each tag matches a label with the same name, and you can choose a different label for any tag in **Settings** under **Built-in tags**. Previously only tags you created yourself reached Aster.
+- Messages you download over POP3 now arrive complete when a line in the message starts with a period.
+- When you send a message with only Bcc recipients, Aster users at a custom domain now receive it sealed end to end.
+- PGP and plain-text messages that claim to come from an Aster address but can't prove it are now marked as unverified.
+
 ## 1.0.11 - 2026-10-23
 
 ### Fixed
