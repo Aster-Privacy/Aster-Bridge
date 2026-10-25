@@ -25,7 +25,7 @@ use crate::error::BridgeError;
 pub const MAX_CREATED_PER_COMMAND: usize = 10;
 pub const MAX_MIGRATION_ATTEMPTS: u32 = 5;
 
-const MIGRATION_STATE_KEY: &str = "local_keyword_migration_v2";
+const MIGRATION_STATE_KEY: &str = "local_keyword_migration_v3";
 const MIGRATION_DONE: &str = "done";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,15 +176,36 @@ async fn create(
     )
 }
 
+pub async fn create_label(
+    db: &Database,
+    client: &ApiClient,
+    access_token: &str,
+    identity_key: Option<&str>,
+    name: &str,
+) -> Result<CustomTag, TagOpError> {
+    let name = clean_name(name)?;
+    let tags = db.list_custom_tags().map_err(TagOpError::Server)?;
+    if let Some(tag) = find_by_name(&tags, &name) {
+        return Ok(tag.clone());
+    }
+    let identity_key = identity_key.ok_or(TagOpError::Locked)?;
+    create(db, client, access_token, identity_key, &name, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resolve(
     db: &Database,
     client: &ApiClient,
     access_token: &str,
     identity_key: Option<&str>,
     tags: &mut Vec<CustomTag>,
+    slots: &[Option<String>],
     keyword: &str,
     budget: &mut usize,
 ) -> Result<Option<String>, TagOpError> {
+    if crate::tags::builtin_slot(keyword).is_some() {
+        return Ok(crate::tags::slot_tag(tags.as_slice(), slots, keyword).map(|tag| tag.tag_token.clone()));
+    }
     if let Some(tag) = crate::tags::find_by_keyword(tags.as_slice(), keyword) {
         return Ok(Some(tag.tag_token.clone()));
     }
@@ -214,6 +235,14 @@ async fn resolve(
     let token = tag.tag_token.clone();
     tags.push(tag);
     Ok(Some(token))
+}
+
+fn find_label<'a>(tags: &'a [CustomTag], slots: &[Option<String>], keyword: &str) -> Option<&'a CustomTag> {
+    if crate::tags::builtin_slot(keyword).is_some() {
+        crate::tags::slot_tag(tags, slots, keyword)
+    } else {
+        crate::tags::find_by_keyword(tags, keyword)
+    }
 }
 
 fn push_unique(list: &mut Vec<String>, values: &[String]) {
@@ -267,25 +296,25 @@ pub async fn apply_keywords(
     }
     let _guard = db.tag_lock.lock().await;
     db.tag_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut tags = match db.list_custom_tags() {
-        Ok(tags) => tags,
+    let (mut tags, slots) = match db.list_custom_tags().and_then(|tags| Ok((tags, db.builtin_tag_slots()?))) {
+        Ok(loaded) => loaded,
         Err(e) => {
             let label_keywords = keywords
                 .iter()
-                .filter(|keyword| !crate::tags::is_local_keyword(keyword));
+                .filter(|keyword| crate::tags::is_label_keyword(keyword));
             fail_all(&mut outcome, label_keywords, e);
             return outcome;
         }
     };
     let mut wanted: Vec<(String, String)> = Vec::new();
     for keyword in keywords {
-        if crate::tags::is_local_keyword(keyword) {
+        if !crate::tags::is_label_keyword(keyword) {
             continue;
         }
         let token = if op == -1 {
-            crate::tags::find_by_keyword(&tags, keyword).map(|tag| tag.tag_token.clone())
+            find_label(&tags, &slots, keyword).map(|tag| tag.tag_token.clone())
         } else {
-            match resolve(db, client, access_token, identity_key, &mut tags, keyword, budget).await {
+            match resolve(db, client, access_token, identity_key, &mut tags, &slots, keyword, budget).await {
                 Ok(Some(token)) => Some(token),
                 Ok(None) => {
                     push_unique(&mut outcome.unmapped, std::slice::from_ref(keyword));
@@ -365,26 +394,33 @@ pub async fn migrate_local_keywords(
     access_token: &str,
     identity_key: Option<&str>,
 ) -> Vec<String> {
+    let Ok(tags) = db.list_custom_tags() else {
+        return Vec::new();
+    };
+    let Ok(slots) = db.builtin_tag_slots() else {
+        return Vec::new();
+    };
+    let done = format!("{}:{}", MIGRATION_DONE, slot_fingerprint(&slots));
     let state = db.get_sync_state(MIGRATION_STATE_KEY).ok().flatten();
-    if state.as_deref() == Some(MIGRATION_DONE) {
+    if state.as_deref() == Some(done.as_str()) {
         return Vec::new();
     }
     let attempts: u32 = state.and_then(|value| value.parse().ok()).unwrap_or(0);
     let Ok(stored) = db.local_keyword_messages() else {
         return Vec::new();
     };
-    let Ok(tags) = db.list_custom_tags() else {
-        return Vec::new();
-    };
     let groups: Vec<(String, Vec<String>)> = stored
         .into_iter()
         .filter(|(keyword, _)| {
+            if crate::tags::builtin_slot(keyword).is_some() {
+                return crate::tags::slot_tag(&tags, &slots, keyword).is_some();
+            }
             crate::tags::name_for_keyword(keyword).is_some()
                 || crate::tags::find_by_keyword(&tags, keyword).is_some()
         })
         .collect();
     if groups.is_empty() {
-        let _ = db.set_sync_state(MIGRATION_STATE_KEY, MIGRATION_DONE);
+        let _ = db.set_sync_state(MIGRATION_STATE_KEY, &done);
         return Vec::new();
     }
     if identity_key.is_none() {
@@ -422,16 +458,24 @@ pub async fn migrate_local_keywords(
         }
     }
     let next = if blocked {
-        MIGRATION_DONE.to_string()
+        done
     } else if paused {
         attempts.to_string()
     } else if failed && attempts + 1 < MAX_MIGRATION_ATTEMPTS {
         (attempts + 1).to_string()
     } else {
-        MIGRATION_DONE.to_string()
+        done
     };
     let _ = db.set_sync_state(MIGRATION_STATE_KEY, &next);
     changed
+}
+
+fn slot_fingerprint(slots: &[Option<String>]) -> String {
+    slots
+        .iter()
+        .map(|token| token.as_deref().unwrap_or("-"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub async fn copy_tags(
@@ -595,6 +639,10 @@ mod tests {
         calls.lock().await.iter().filter(|(k, _)| k == kind).count()
     }
 
+    fn done_for(db: &Database) -> String {
+        format!("{}:{}", MIGRATION_DONE, slot_fingerprint(&db.builtin_tag_slots().unwrap()))
+    }
+
     #[tokio::test]
     async fn a_failed_creation_does_not_block_an_existing_label() {
         let (_dir, db, client, calls) = setup(CreateMode::Fail).await;
@@ -693,7 +741,8 @@ mod tests {
             )
             .await;
             assert!(outcome.failed.is_empty(), "{:?}", outcome);
-            assert!(outcome.unmapped.is_empty(), "{:?}", outcome);
+            let unmapped = if op == -1 { Vec::new() } else { strings(&["$label1"]) };
+            assert_eq!(outcome.unmapped, unmapped, "{:?}", outcome);
             assert!(outcome.changed.is_empty(), "{:?}", outcome);
             assert_eq!(outcome.error, None);
             assert_eq!(budget, MAX_CREATED_PER_COMMAND);
@@ -1010,7 +1059,7 @@ mod tests {
         assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["$label1", "Fresh", "Work"]));
         assert_eq!(db.message_keywords("m-2").unwrap(), strings(&["NonJunk", "Work"]));
         assert_eq!(db.list_custom_tags().unwrap().len(), 2);
-        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(done_for(&db).as_str()));
 
         let before = calls.lock().await.len();
         assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
@@ -1133,7 +1182,7 @@ mod tests {
 
         assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
         assert_eq!(count(&calls, "create").await, 1);
-        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(done_for(&db).as_str()));
         assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["Fresh", "Other"]));
     }
 
@@ -1147,7 +1196,7 @@ mod tests {
             assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
         }
         assert_eq!(count(&calls, "create").await, MAX_MIGRATION_ATTEMPTS as usize);
-        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(done_for(&db).as_str()));
         assert_eq!(db.message_keywords("m-1").unwrap(), strings(&["Fresh"]));
     }
 
@@ -1167,7 +1216,7 @@ mod tests {
         assert_eq!(db.message_tags(&strings(&["m-1"])).unwrap().get("m-1").unwrap().len(), 12);
 
         migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
-        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(MIGRATION_DONE));
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(done_for(&db).as_str()));
         assert_eq!(count(&calls, "create").await, 12);
     }
 
@@ -1189,5 +1238,144 @@ mod tests {
         assert_eq!(log[0].0, "add");
         assert_eq!(log[0].1["ids"], serde_json::json!(["copy-1"]));
         assert_eq!(log[0].1["tag_token"], "tok-work");
+    }
+
+    fn builtin_slot_tags() -> Vec<CustomTag> {
+        vec![
+            stored_tag("tok-attention", "Aten\u{E7}\u{E3}o"),
+            stored_tag("tok-later", "\u{23F0} Mais tarde"),
+            stored_tag("tok-spend", "Despesas"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn builtin_tag_keywords_store_on_their_labels() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&builtin_slot_tags()).unwrap();
+        cache(&db, &["m-1"]);
+        let ids = strings(&["m-1"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+
+        let added = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["$label5", "$label1"]),
+            &mut budget,
+        )
+        .await;
+        assert!(added.failed.is_empty(), "{:?}", added);
+        assert_eq!(added.unmapped, strings(&["$label1"]));
+        assert_eq!(added.changed, ids);
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(budget, MAX_CREATED_PER_COMMAND);
+        assert_eq!(db.message_tags(&ids).unwrap().get("m-1").unwrap(), &strings(&["tok-later"]));
+        let log = calls.lock().await.clone();
+        assert!(
+            log.iter().any(|(kind, body)| kind == "add" && body["tag_token"] == "tok-later"),
+            "{:?}",
+            log
+        );
+
+        db.set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("tok-attention".to_string())))
+            .unwrap();
+        let chosen = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            1,
+            &strings(&["$LABEL1"]),
+            &mut budget,
+        )
+        .await;
+        assert!(chosen.unmapped.is_empty(), "{:?}", chosen);
+        let mut held = db.message_tags(&ids).unwrap().get("m-1").unwrap().clone();
+        held.sort();
+        assert_eq!(held, strings(&["tok-attention", "tok-later"]));
+
+        let removed = apply_keywords(
+            &db,
+            &client,
+            "stub",
+            Some("test-ik"),
+            &ids,
+            -1,
+            &strings(&["$label5"]),
+            &mut budget,
+        )
+        .await;
+        assert_eq!(removed.changed, ids);
+        assert_eq!(db.message_tags(&ids).unwrap().get("m-1").unwrap(), &strings(&["tok-attention"]));
+        assert_eq!(count(&calls, "remove").await, 1);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stored_builtin_tags_move_onto_labels_when_a_slot_is_mapped() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1", "m-2"]);
+        db.set_message_keywords("m-1", &strings(&["$label5", "$label1"])).unwrap();
+        db.set_message_keywords("m-2", &strings(&["$label1", "$label4"])).unwrap();
+        db.replace_custom_tags(&builtin_slot_tags()).unwrap();
+
+        let changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        assert_eq!(changed, strings(&["m-1"]));
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.message_tags(&strings(&["m-1"])).unwrap().get("m-1").unwrap(), &strings(&["tok-later"]));
+        let mut expected = vec!["$label1".to_string(), crate::tags::keyword_for_name("\u{23F0} Mais tarde").unwrap()];
+        expected.sort();
+        assert_eq!(db.message_keywords("m-1").unwrap(), expected);
+        assert_eq!(db.get_sync_state(MIGRATION_STATE_KEY).unwrap().as_deref(), Some(done_for(&db).as_str()));
+        assert!(migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await.is_empty());
+
+        db.set_builtin_tag_slot(1, Some(&crate::tags::SlotOverride::Label("tok-attention".to_string())))
+            .unwrap();
+        let mut changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        changed.sort();
+        assert_eq!(changed, strings(&["m-1", "m-2"]));
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.messages_with_tag("tok-attention").unwrap(), strings(&["m-1", "m-2"]));
+        let mut expected = vec!["$label4".to_string(), crate::tags::keyword_for_name("Aten\u{E7}\u{E3}o").unwrap()];
+        expected.sort();
+        assert_eq!(db.message_keywords("m-2").unwrap(), expected);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_label_made_for_a_builtin_tag_is_created_once() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        db.replace_custom_tags(&builtin_slot_tags()).unwrap();
+        cache(&db, &["m-1"]);
+        db.set_message_keywords("m-1", &strings(&["$label4"])).unwrap();
+
+        assert!(matches!(
+            create_label(&db, &client, "stub", None, "Por fazer").await,
+            Err(TagOpError::Locked)
+        ));
+        assert!(matches!(
+            create_label(&db, &client, "stub", Some("test-ik"), "   ").await,
+            Err(TagOpError::Invalid(_))
+        ));
+        let made = create_label(&db, &client, "stub", Some("test-ik"), " Por fazer ").await.unwrap();
+        assert_eq!(made.name, "Por fazer");
+        assert_eq!(count(&calls, "create").await, 1);
+        let again = create_label(&db, &client, "stub", Some("test-ik"), "por fazer").await.unwrap();
+        assert_eq!(again.tag_token, made.tag_token);
+        let existing = create_label(&db, &client, "stub", Some("test-ik"), "despesas").await.unwrap();
+        assert_eq!(existing.tag_token, "tok-spend");
+        assert_eq!(count(&calls, "create").await, 1);
+        assert_eq!(db.list_custom_tags().unwrap().len(), 4);
+
+        db.set_builtin_tag_slot(4, Some(&crate::tags::SlotOverride::Label(made.tag_token.clone())))
+            .unwrap();
+        let changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        assert!(changed.contains(&"m-1".to_string()), "{:?}", changed);
+        assert_eq!(db.messages_with_tag(&made.tag_token).unwrap(), strings(&["m-1"]));
+        assert_eq!(count(&calls, "create").await, 1);
     }
 }

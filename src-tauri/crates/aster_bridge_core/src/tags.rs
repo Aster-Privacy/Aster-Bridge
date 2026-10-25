@@ -60,6 +60,119 @@ const READABLE_KEY_ESCAPE: char = '=';
 const MAX_READABLE_KEY_LEN: usize = 50;
 const HASHED_KEY_PREFIX: &str = "&x-moz-";
 const HASHED_KEY_BYTES: usize = 16;
+pub const BUILTIN_TAG_SLOTS: usize = 5;
+const BUILTIN_KEYWORD_PREFIX: &str = "$label";
+const BUILTIN_TAG_NAMES: [&[&str]; BUILTIN_TAG_SLOTS] = [
+    &[
+        "A-bouez", "Aktar", "Belangrijk", "Belangrik", "Cudromach", "D\u{F4}le\u{17E}it\u{E9}",
+        "D\u{16F}le\u{17E}it\u{E9}", "Fontos", "Garrantzitsua", "I r\u{EB}nd\u{EB}sish\u{EB}m",
+        "Iimportante", "Important", "Importante", "Impurtant", "K'atzinel", "Mikilv\u{E6}gt",
+        "Muhim", "Penting", "Pomembno", "Pwysig", "Quan tr\u{1ECD}ng", "Svarbus", "Svar\u{12B}gi",
+        "T\u{E1}bhachtach", "T\u{E4}htis", "T\u{E4}rke\u{E4}", "Va\u{17E}no", "Vigtig", "Viktig",
+        "Viktigt", "Wa\u{17C}ne", "Wa\u{17E}ny", "Wichtich", "Wichtig", "\u{D6}nemli",
+        "\u{3A3}\u{3B7}\u{3BC}\u{3B1}\u{3BD}\u{3C4}\u{3B9}\u{3BA}\u{3CC}",
+        "\u{412}\u{430}\u{436}\u{43B}\u{438}\u{432}\u{435}", "\u{412}\u{430}\u{436}\u{43D}\u{430}",
+        "\u{412}\u{430}\u{436}\u{43D}\u{43E}", "\u{412}\u{430}\u{436}\u{43D}\u{43E}\u{435}",
+        "\u{412}\u{430}\u{436}\u{43D}\u{44B}", "\u{41C}\u{430}\u{4A3}\u{44B}\u{437}\u{434}\u{44B}",
+        "\u{53F}\u{561}\u{580}\u{565}\u{582}\u{578}\u{580}",
+        "\u{53F}\u{561}\u{580}\u{587}\u{578}\u{580}", "\u{5D7}\u{5E9}\u{5D5}\u{5D1}",
+        "\u{645}\u{647}\u{645}", "\u{E2A}\u{E33}\u{E04}\u{E31}\u{E0D}",
+        "\u{10DB}\u{10DC}\u{10D8}\u{10E8}\u{10D5}\u{10DC}\u{10D4}\u{10DA}\u{10DD}\u{10D5}\u{10D0}\u{10DC}\u{10D8}",
+        "\u{179F}\u{17C6}\u{1781}\u{17B6}\u{1793}\u{17CB}", "\u{91CD}\u{8981}", "\u{C911}\u{C694}",
+    ],
+    &[
+        "Amahil", "Arbeid", "Arbejde", "Arbete", "Darbo", "Darbs", "Dienstlich",
+        "D\u{17A}\u{11B}\u{142}o", "Feina", "Gwaith", "Ish", "Kerja", "Labor", "Labour", "Lanekoa",
+        "Lavoro", "Lavur", "L\u{E0}m vi\u{1EC7}c", "Munka", "Obair", "Pekerjaan", "Posao", "Praca",
+        "Pracovn\u{ED}", "Pune", "Samaj", "Serviciu", "Slu\u{17E}ba", "Trabajo", "Trabalho",
+        "Traballo", "Trabayu", "Travail", "Ty\u{F6}", "T\u{F6}\u{F6}", "Vinna", "Werk", "Work",
+        "Wurk", "Zamestnanie", "\u{130}\u{15F}", "\u{179}\u{11B}\u{142}o",
+        "\u{395}\u{3C1}\u{3B3}\u{3B1}\u{3C3}\u{3AF}\u{3B1}", "\u{416}\u{4B1}\u{43C}\u{44B}\u{441}",
+        "\u{41F}\u{43E}\u{441}\u{430}\u{43E}", "\u{41F}\u{440}\u{430}\u{446}\u{430}",
+        "\u{420}\u{430}\u{431}\u{43E}\u{442}\u{430}",
+        "\u{420}\u{430}\u{431}\u{43E}\u{447}\u{435}\u{435}",
+        "\u{420}\u{43E}\u{431}\u{43E}\u{447}\u{435}",
+        "\u{421}\u{43B}\u{443}\u{436}\u{435}\u{431}\u{43D}\u{43E}",
+        "\u{531}\u{577}\u{56D}\u{561}\u{57F}\u{561}\u{576}\u{584}\u{561}\u{575}\u{56B}\u{576}",
+        "\u{5E2}\u{5D1}\u{5D5}\u{5D3}\u{5D4}", "\u{627}\u{644}\u{639}\u{645}\u{644}",
+        "\u{6A9}\u{627}\u{631}", "\u{E17}\u{E35}\u{E48}\u{E17}\u{E33}\u{E07}\u{E32}\u{E19}",
+        "\u{10E1}\u{10D0}\u{10DB}\u{10E3}\u{10E8}\u{10D0}\u{10DD}",
+        "\u{1780}\u{17B6}\u{179A}\u{1784}\u{17B6}\u{179A}\u{200B}", "\u{4ED5}\u{4E8B}",
+        "\u{5546}\u{52D9}", "\u{5DE5}\u{4F5C}", "\u{C9C1}\u{C7A5}",
+    ],
+    &[
+        "Asmeninis", "C\u{E1} nh\u{E2}n", "Ichinan", "Isiklik", "Ki\u{15F}isel", "Li\u{10D}no",
+        "Oma", "Osebno", "Osobiste", "Osobno", "Osobn\u{E9}", "Osobn\u{ED}", "Pearsanta",
+        "Peribadi", "Persoal", "Persoanlik", "Personal", "Personale", "Personales", "Personel",
+        "Personleg", "Personlig", "Personnel", "Personol", "Person\u{12B}gs", "Persoonlijk",
+        "Persoonlik", "Persunal", "Pers\u{F3}nulegt", "Pers\u{F6}nlich", "Pertsonala", "Pessoal",
+        "Pribadi", "Privat", "Shaxsiy", "Szem\u{E9}lyes", "Udmawan", "Wosobinski",
+        "W\u{F3}sobinski", "\u{3A0}\u{3C1}\u{3BF}\u{3C3}\u{3C9}\u{3C0}\u{3B9}\u{3BA}\u{3CC}",
+        "\u{410}\u{441}\u{430}\u{431}\u{456}\u{441}\u{442}\u{44B}", "\u{416}\u{435}\u{43A}\u{435}",
+        "\u{41B}\u{438}\u{447}\u{43D}\u{430}", "\u{41B}\u{438}\u{447}\u{43D}\u{43E}",
+        "\u{41B}\u{438}\u{447}\u{43D}\u{43E}\u{435}",
+        "\u{41E}\u{441}\u{43E}\u{431}\u{438}\u{441}\u{442}\u{435}",
+        "\u{531}\u{576}\u{571}\u{576}\u{561}\u{56F}\u{561}\u{576}", "\u{5D0}\u{5D9}\u{5E9}\u{5D9}",
+        "\u{634}\u{62E}\u{635}\u{64A}", "\u{634}\u{62E}\u{635}\u{6CC}",
+        "\u{E2A}\u{E48}\u{E27}\u{E19}\u{E1A}\u{E38}\u{E04}\u{E04}\u{E25}",
+        "\u{10DE}\u{10D8}\u{10E0}\u{10D0}\u{10D3}\u{10D8}",
+        "\u{1795}\u{17D2}\u{1791}\u{17B6}\u{179B}\u{17CB}\u{200B}\u{1781}\u{17D2}\u{179B}\u{17BD}\u{1793}",
+        "\u{30D7}\u{30E9}\u{30A4}\u{30D9}\u{30FC}\u{30C8}", "\u{79C1}\u{4EBA}", "\u{AC1C}\u{C778}",
+    ],
+    &[
+        "A facer", "Ad ittumeg", "Att g\u{F6}ra", "Bajarish", "Da far", "Da fare", "Dabar",
+        "Dar\u{101}mais", "De f\u{103}cut", "Do zrobienia", "Egiteke", "Huskeliste", "I'w Gwneud",
+        "K vy\u{159}\u{ED}zen\u{ED}", "K'o chi Nib'an", "Le D\u{E9}anamh", "Moetdoen", "Nadawki",
+        "Noch te dwaan", "Nog te doen", "Opravek", "Para hacer", "Pendente", "Per fer",
+        "Perlu Buat", "Por facer", "Por hacer", "P\u{EB}r T\u{2019}u B\u{EB}r\u{EB}",
+        "Ri dh\u{E8}anamh", "S\u{1EBD} l\u{E0}m", "Teend\u{151}k", "Teht\u{E4}v\u{E4}", "To Do",
+        "ToDo", "Tugas", "Verk\u{FE}\u{E1}ttur", "Vybavi\u{165}", "War Ober", "Yap\u{131}lacak",
+        "Za obaviti", "Zu erledigen", "\u{C0} faire", "\u{C5} gjere", "\u{C5} gj\u{F8}re",
+        "\u{DC}lesanne",
+        "\u{395}\u{3BA}\u{3BA}\u{3C1}\u{3B5}\u{3BC}\u{3CC}\u{3C4}\u{3B7}\u{3C4}\u{3B1}",
+        "\u{414}\u{43B}\u{44F} \u{432}\u{44B}\u{43A}\u{430}\u{43D}\u{430}\u{43D}\u{43D}\u{44F}",
+        "\u{414}\u{43E} \u{432}\u{438}\u{43A}\u{43E}\u{43D}\u{430}\u{43D}\u{43D}\u{44F}",
+        "\u{416}\u{430}\u{441}\u{430}\u{443} \u{4AF}\u{448}\u{456}\u{43D}",
+        "\u{417}\u{430} \u{438}\u{437}\u{43F}\u{44A}\u{43B}\u{43D}\u{435}\u{43D}\u{438}\u{435}",
+        "\u{417}\u{430} \u{443}\u{440}\u{430}\u{434}\u{438}\u{442}\u{438}",
+        "\u{417}\u{430}\u{434}\u{430}\u{447}\u{430}",
+        "\u{41A} \u{438}\u{441}\u{43F}\u{43E}\u{43B}\u{43D}\u{435}\u{43D}\u{438}\u{44E}",
+        "\u{531}\u{576}\u{565}\u{56C}",
+        "\u{5D3}\u{5D1}\u{5E8}\u{5D9}\u{5DD} \u{5DC}\u{5E2}\u{5E9}\u{5D5}\u{5EA}",
+        "\u{627}\u{646}\u{62C}\u{627}\u{645}\u{200C}\u{62F}\u{627}\u{62F}\u{646}\u{6CC}",
+        "\u{644}\u{644}\u{642}\u{64A}\u{627}\u{645} \u{628}\u{647}",
+        "\u{E2A}\u{E34}\u{E48}\u{E07}\u{E17}\u{E35}\u{E48}\u{E15}\u{E49}\u{E2D}\u{E07}\u{E17}\u{E33}",
+        "\u{10D2}\u{10D0}\u{10E1}\u{10D0}\u{10D9}\u{10D4}\u{10D7}\u{10D4}\u{10D1}\u{10D4}\u{10DA}\u{10D8}",
+        "\u{1780}\u{17B7}\u{1785}\u{17D2}\u{1785}\u{1780}\u{17B6}\u{179A}\u{200B}\u{178F}\u{17D2}\u{179A}\u{17BC}\u{179C}\u{200B}\u{1792}\u{17D2}\u{179C}\u{17BE}",
+        "\u{5F85}\u{529E}", "\u{5F85}\u{8FA6}\u{4E8B}\u{9805}", "\u{D560}\u{C77C}",
+    ],
+    &[
+        "An ceann tamaill", "Despu\u{E9}s", "Diweddarach", "Diwezhatoc'h", "En attente", "Geroago",
+        "Hiljem", "Jub'a' chik na", "Kasneje", "Kasnije", "Kemudian", "Keyinroq",
+        "K\u{E9}s\u{151}bb", "Later", "Letter", "Mai t\u{E2}rziu", "Mais tarde", "My\u{F6}hemmin",
+        "M\u{E1}is tarde", "M\u{E1}s sero", "M\u{E1}s tarde", "M\u{E9}s tard", "Nanti",
+        "Nesk\u{F4}r", "N\u{ED}os D\u{E9}ana\u{ED}", "Pi\u{F9} tardi", "Pli tard", "Plus tarde",
+        "Pozd\u{11B}ji", "Pozd\u{17A}i\u{161}o", "P\u{EB}r m\u{EB} von\u{EB}", "P\u{F3}zd\u{17A}ej",
+        "P\u{F3}\u{17A}niej", "Seinare", "Seinna", "Senare", "Senere", "Sonra", "Sp\u{E4}ter",
+        "Ticki", "V\u{113}l\u{101}k", "V\u{117}liau", "\u{110}\u{1EC3} sau",
+        "\u{391}\u{3C1}\u{3B3}\u{3CC}\u{3C4}\u{3B5}\u{3C1}\u{3B1}",
+        "\u{412}\u{456}\u{434}\u{43A}\u{43B}\u{430}\u{434}\u{435}\u{43D}\u{43E}",
+        "\u{41A}\u{430}\u{441}\u{43D}\u{438}\u{458}\u{435}",
+        "\u{41A}\u{435}\u{439}\u{456}\u{43D}\u{456}\u{440}\u{435}\u{43A}",
+        "\u{41E}\u{442}\u{43B}\u{43E}\u{436}\u{435}\u{43D}\u{43E}",
+        "\u{41F}\u{430}\u{437}\u{43D}\u{435}\u{439}",
+        "\u{41F}\u{43E}-\u{43A}\u{44A}\u{441}\u{43D}\u{43E}",
+        "\u{41F}\u{43E}\u{434}\u{43E}\u{446}\u{43D}\u{430}",
+        "\u{531}\u{57E}\u{565}\u{56C}\u{56B} \u{578}\u{582}\u{577}",
+        "\u{531}\u{582}\u{565}\u{56C}\u{56B} \u{578}\u{582}\u{577}",
+        "\u{5DE}\u{5D0}\u{5D5}\u{5D7}\u{5E8} \u{5D9}\u{5D5}\u{5EA}\u{5E8}",
+        "\u{628}\u{639}\u{62F}\u{627}\u{64B}", "\u{644}\u{627}\u{62D}\u{642}\u{64B}\u{627}",
+        "\u{E20}\u{E32}\u{E22}\u{E2B}\u{E25}\u{E31}\u{E07}",
+        "\u{10D2}\u{10D0}\u{10D3}\u{10D0}\u{10D3}\u{10D4}\u{10D1}\u{10E3}\u{10DA}\u{10D8}",
+        "\u{1796}\u{17C1}\u{179B}\u{1780}\u{17D2}\u{179A}\u{17C4}\u{1799}", "\u{5F8C}\u{3067}",
+        "\u{7A0D}\u{540E}", "\u{7A0D}\u{5F8C}\u{8655}\u{7406}", "\u{C5F0}\u{AE30}",
+    ],
+];
 
 pub fn validate_name(name: &str) -> Result<(), &'static str> {
     if name.trim().is_empty() {
@@ -383,6 +496,121 @@ pub fn find_by_keyword<'a>(tags: &'a [CustomTag], keyword: &str) -> Option<&'a C
         .or(own)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotOverride {
+    Label(String),
+    Off,
+}
+
+pub fn builtin_slot(keyword: &str) -> Option<usize> {
+    let prefix = keyword.get(..BUILTIN_KEYWORD_PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(BUILTIN_KEYWORD_PREFIX) {
+        return None;
+    }
+    let digit = &keyword[BUILTIN_KEYWORD_PREFIX.len()..];
+    if digit.len() != 1 {
+        return None;
+    }
+    digit
+        .parse::<usize>()
+        .ok()
+        .filter(|slot| (1..=BUILTIN_TAG_SLOTS).contains(slot))
+}
+
+pub fn builtin_keyword(slot: usize) -> String {
+    format!("{}{}", BUILTIN_KEYWORD_PREFIX, slot)
+}
+
+pub fn is_label_keyword(keyword: &str) -> bool {
+    !is_local_keyword(keyword) || builtin_slot(keyword).is_some()
+}
+
+fn match_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+pub fn matches_builtin_name(slot: usize, name: &str) -> bool {
+    let key = match_key(name);
+    !key.is_empty()
+        && BUILTIN_TAG_NAMES
+            .get(slot.wrapping_sub(1))
+            .is_some_and(|names| names.iter().any(|known| match_key(known) == key))
+}
+
+fn is_top_level(tag: &CustomTag) -> bool {
+    tag.keyword
+        .as_deref()
+        .and_then(keyword_text)
+        .is_some_and(|text| text == tag.name)
+}
+
+pub fn slot_assignments(
+    tags: &[CustomTag],
+    overrides: &HashMap<usize, SlotOverride>,
+) -> Vec<Option<String>> {
+    let mut assigned: Vec<Option<String>> = vec![None; BUILTIN_TAG_SLOTS];
+    let mut fixed = [false; BUILTIN_TAG_SLOTS];
+    let mut used: HashSet<String> = HashSet::new();
+    for slot in 1..=BUILTIN_TAG_SLOTS {
+        match overrides.get(&slot) {
+            Some(SlotOverride::Off) => fixed[slot - 1] = true,
+            Some(SlotOverride::Label(token))
+                if tags.iter().any(|tag| tag.tag_token == *token) && used.insert(token.clone()) =>
+            {
+                assigned[slot - 1] = Some(token.clone());
+                fixed[slot - 1] = true;
+            }
+            _ => {}
+        }
+    }
+    let mut ordered: Vec<&CustomTag> = tags.iter().collect();
+    ordered.sort_by(|a, b| {
+        is_top_level(b)
+            .cmp(&is_top_level(a))
+            .then_with(|| a.tag_token.cmp(&b.tag_token))
+    });
+    for slot in 1..=BUILTIN_TAG_SLOTS {
+        if fixed[slot - 1] {
+            continue;
+        }
+        let found = ordered
+            .iter()
+            .find(|tag| !used.contains(&tag.tag_token) && matches_builtin_name(slot, &tag.name));
+        if let Some(tag) = found {
+            used.insert(tag.tag_token.clone());
+            assigned[slot - 1] = Some(tag.tag_token.clone());
+        }
+    }
+    assigned
+}
+
+pub fn slot_alias_rows(
+    tags: &[CustomTag],
+    overrides: &HashMap<usize, SlotOverride>,
+) -> Vec<(String, String)> {
+    slot_assignments(tags, overrides)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, token)| Some((builtin_keyword(index + 1), token?)))
+        .collect()
+}
+
+pub fn slot_is_mapped(slots: &[Option<String>], keyword: &str) -> bool {
+    builtin_slot(keyword).is_some_and(|slot| slots.get(slot - 1).is_some_and(Option::is_some))
+}
+
+pub fn slot_tag<'a>(
+    tags: &'a [CustomTag],
+    slots: &[Option<String>],
+    keyword: &str,
+) -> Option<&'a CustomTag> {
+    let token = slots.get(builtin_slot(keyword)? - 1)?.as_deref()?;
+    tags.iter().find(|tag| tag.tag_token == token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +898,141 @@ mod tests {
         assert!(!rows.iter().any(|(alias, _)| alias == "mais_tarde"));
         let first = vec![keyed("a", "Mais tarde"), keyed("b", "mais tarde")];
         assert_eq!(alias_rows(&first).iter().filter(|(_, token)| token == "b").count(), 0);
+    }
+
+    #[test]
+    fn builtin_tag_keywords_are_recognized_in_any_case() {
+        assert_eq!(builtin_slot("$label1"), Some(1));
+        assert_eq!(builtin_slot("$LABEL5"), Some(5));
+        assert_eq!(builtin_slot("$Label3"), Some(3));
+        for keyword in ["$label0", "$label6", "$label10", "$label", "label1", "$labels", "$Forwarded"] {
+            assert_eq!(builtin_slot(keyword), None, "{}", keyword);
+        }
+        assert!(is_label_keyword("$label4"));
+        assert!(!is_label_keyword("$Forwarded"));
+        assert!(!is_label_keyword("Junk"));
+        assert!(is_label_keyword("Work"));
+        assert_eq!(builtin_keyword(2), "$label2");
+    }
+
+    #[test]
+    fn builtin_names_match_in_every_language_and_ignore_decoration() {
+        assert!(matches_builtin_name(5, "Mais tarde"));
+        assert!(matches_builtin_name(5, "\u{1F6CB}\u{FE0F} Mais tarde"));
+        assert!(matches_builtin_name(5, "LATER"));
+        assert!(matches_builtin_name(2, "\u{1F4BC} Trabalho"));
+        assert!(matches_builtin_name(3, "Pessoal"));
+        assert!(matches_builtin_name(1, "Wichtig"));
+        assert!(matches_builtin_name(4, "To-Do"));
+        assert!(matches_builtin_name(4, "\u{5F85}\u{529E}"));
+        assert!(!matches_builtin_name(5, "Trabalho"));
+        assert!(!matches_builtin_name(1, "\u{1F534} Aten\u{E7}\u{E3}o"));
+        assert!(!matches_builtin_name(4, "Por fazer"));
+        assert!(!matches_builtin_name(1, "\u{1F534}"));
+        assert!(!matches_builtin_name(0, "Important"));
+        assert!(!matches_builtin_name(6, "Important"));
+    }
+
+    #[test]
+    fn no_language_name_belongs_to_two_builtin_tags() {
+        for (index, names) in BUILTIN_TAG_NAMES.iter().enumerate() {
+            for name in names.iter() {
+                assert!(!match_key(name).is_empty(), "{}", name);
+                for other in 1..=BUILTIN_TAG_SLOTS {
+                    if other != index + 1 {
+                        assert!(!matches_builtin_name(other, name), "{} in {}", name, other);
+                    }
+                }
+            }
+        }
+    }
+
+    fn raul_tags() -> Vec<CustomTag> {
+        vec![
+            keyed("t-atencao", "\u{1F534} Aten\u{E7}\u{E3}o"),
+            keyed("t-trabalho", "\u{1F4BC} Trabalho"),
+            keyed("t-pessoal", "\u{1F3E0} Pessoal"),
+            keyed("t-fazer", "\u{1F4DD} Por fazer"),
+            keyed("t-tarde", "\u{1F6CB}\u{FE0F} Mais tarde"),
+            keyed("t-despesas", "\u{1F4B8} Despesas"),
+            keyed("t-entretenimento", "\u{1F37F} Entretenimento"),
+        ]
+    }
+
+    fn slot_tokens(tags: &[CustomTag], overrides: &HashMap<usize, SlotOverride>) -> Vec<Option<&'static str>> {
+        let known = ["t-atencao", "t-trabalho", "t-pessoal", "t-fazer", "t-tarde", "a", "b", "c", "z"];
+        slot_assignments(tags, overrides)
+            .into_iter()
+            .map(|token| token.map(|token| *known.iter().find(|k| **k == token).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn builtin_tags_match_labels_by_name_and_by_choice() {
+        let tags = raul_tags();
+        assert_eq!(
+            slot_tokens(&tags, &HashMap::new()),
+            vec![None, Some("t-trabalho"), Some("t-pessoal"), None, Some("t-tarde")]
+        );
+        let overrides = HashMap::from([
+            (1, SlotOverride::Label("t-atencao".to_string())),
+            (4, SlotOverride::Label("t-fazer".to_string())),
+        ]);
+        assert_eq!(
+            slot_tokens(&tags, &overrides),
+            vec![
+                Some("t-atencao"),
+                Some("t-trabalho"),
+                Some("t-pessoal"),
+                Some("t-fazer"),
+                Some("t-tarde")
+            ]
+        );
+        let rows = slot_alias_rows(&tags, &overrides);
+        assert!(rows.contains(&("$label1".to_string(), "t-atencao".to_string())));
+        assert!(rows.contains(&("$label5".to_string(), "t-tarde".to_string())));
+        assert_eq!(rows.len(), 5);
+        let slots = slot_assignments(&tags, &overrides);
+        assert_eq!(slot_tag(&tags, &slots, "$LABEL4").map(|t| t.tag_token.as_str()), Some("t-fazer"));
+        assert_eq!(slot_tag(&tags, &slots, "$label6"), None);
+        assert_eq!(slot_tag(&tags, &slots, "Work"), None);
+    }
+
+    #[test]
+    fn a_slot_turned_off_or_given_a_missing_label_behaves_as_chosen() {
+        let tags = raul_tags();
+        let overrides = HashMap::from([
+            (5, SlotOverride::Off),
+            (2, SlotOverride::Label("gone".to_string())),
+        ]);
+        assert_eq!(
+            slot_tokens(&tags, &overrides),
+            vec![None, Some("t-trabalho"), Some("t-pessoal"), None, None]
+        );
+    }
+
+    #[test]
+    fn a_chosen_label_is_not_also_matched_by_name() {
+        let tags = raul_tags();
+        let overrides = HashMap::from([(1, SlotOverride::Label("t-tarde".to_string()))]);
+        assert_eq!(
+            slot_tokens(&tags, &overrides),
+            vec![Some("t-tarde"), Some("t-trabalho"), Some("t-pessoal"), None, None]
+        );
+        let twice = HashMap::from([
+            (1, SlotOverride::Label("t-tarde".to_string())),
+            (4, SlotOverride::Label("t-tarde".to_string())),
+        ]);
+        assert_eq!(slot_tokens(&tags, &twice)[3], None);
+    }
+
+    #[test]
+    fn a_top_level_label_wins_a_name_match_over_a_nested_one() {
+        let mut tags = vec![tag("a", "Clients"), tag("b", "Later"), tag("z", "Later")];
+        let parents = parent_map(&[("a", "Clients", None), ("b", "Later", Some("a")), ("z", "Later", None)]);
+        assign_keywords(&mut tags, &label_paths(&parents));
+        assert_eq!(slot_tokens(&tags, &HashMap::new())[4], Some("z"));
+        let flat = vec![keyed("c", "later"), keyed("b", "Later")];
+        assert_eq!(slot_tokens(&flat, &HashMap::new())[4], Some("b"));
     }
 }
