@@ -58,7 +58,20 @@ interface TauriUpdate {
       event: "Started" | "Progress" | "Finished";
       data?: { contentLength?: number; chunkLength?: number };
     }) => void,
+    options?: { timeout?: number },
   ) => Promise<void>;
+  close?: () => Promise<void>;
+}
+
+const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+
+let pending_update: TauriUpdate | null = null;
+
+function remember_update(update: TauriUpdate | null): void {
+  if (pending_update && pending_update !== update && pending_update.close) {
+    pending_update.close().catch(() => undefined);
+  }
+  pending_update = update;
 }
 
 async function load_updater(): Promise<{ check: () => Promise<TauriUpdate | null> }> {
@@ -74,6 +87,7 @@ async function load_process(): Promise<{ relaunch: () => Promise<void> }> {
 export async function check_for_update(): Promise<UpdateInfo | null> {
   const { check } = await load_updater();
   const result = await check();
+  remember_update(result);
   if (!result) return null;
   return {
     version: result.version,
@@ -99,22 +113,35 @@ export function update_progress_percent(progress: UpdateProgress): number | null
 export async function download_and_install(
   on_progress?: (progress: UpdateProgress) => void,
 ): Promise<void> {
-  const { check } = await load_updater();
-  const update = await check();
-  if (!update) return;
+  let update = pending_update;
+  if (!update) {
+    const { check } = await load_updater();
+    update = await check();
+    remember_update(update);
+  }
+  if (!update) throw new Error("update_no_longer_available");
   let downloaded = 0;
   let total: number | null = null;
-  await update.downloadAndInstall((event) => {
-    if (event.event === "Started") {
-      total = event.data?.contentLength ?? null;
-      on_progress?.({ downloaded, total, phase: "downloading" });
-    } else if (event.event === "Progress") {
-      downloaded += event.data?.chunkLength ?? 0;
-      on_progress?.({ downloaded, total, phase: "downloading" });
-    } else {
-      on_progress?.({ downloaded: total ?? downloaded, total, phase: "installing" });
-    }
-  });
+  try {
+    await update.downloadAndInstall(
+      (event) => {
+        if (event.event === "Started") {
+          total = event.data?.contentLength ?? null;
+          downloaded = 0;
+          on_progress?.({ downloaded, total, phase: "downloading" });
+        } else if (event.event === "Progress") {
+          downloaded += event.data?.chunkLength ?? 0;
+          on_progress?.({ downloaded, total, phase: "downloading" });
+        } else {
+          on_progress?.({ downloaded: total ?? downloaded, total, phase: "installing" });
+        }
+      },
+      { timeout: DOWNLOAD_TIMEOUT_MS },
+    );
+  } catch (caught) {
+    remember_update(null);
+    throw caught;
+  }
   const { relaunch } = await load_process();
   await relaunch();
 }
