@@ -22,7 +22,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
@@ -41,12 +41,13 @@ import {
 } from "@/lib/theme_sync";
 import {
   check_for_update,
-  download_and_install,
   is_desktop_runtime,
   get_last_notified_version,
   mark_version_notified,
   type UpdateInfo,
 } from "./updater";
+import { UpdateCard } from "./update_card";
+import { use_update_installer } from "./use_update_installer";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
 import { notify_native } from "@/notify";
 import { listen_tauri } from "@/lib/tauri_events";
@@ -435,7 +436,8 @@ const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 function UpdateBanner() {
   const [info, set_info] = useState<UpdateInfo | null>(null);
   const [dismissed, set_dismissed] = useState(false);
-  const [installing, set_installing] = useState(false);
+  const { state: install_state, start: start_install } = use_update_installer();
+  const reduce_motion = useReducedMotion();
 
   useEffect(() => {
     if (!is_desktop_runtime()) return;
@@ -446,10 +448,10 @@ function UpdateBanner() {
         if (cancelled || !result) return;
         if (get_last_notified_version() !== result.version) {
           set_info(result);
-          notify_native(i18next.t("notif_update_title"), i18next.t("update_available", { version: result.version }));
+          notify_native(i18next.t("notif_update_title"), i18next.t("update_card_available", { version: result.version }));
         }
       } catch {
-        // Offline or endpoint unreachable - retry on next interval.
+        return;
       }
     };
     run();
@@ -460,60 +462,34 @@ function UpdateBanner() {
     };
   }, []);
 
-  if (!info || dismissed) return null;
-
-  const handle_install = async () => {
-    set_installing(true);
-    try {
-      await download_and_install();
-    } catch {
-      set_installing(false);
-      show_toast(i18next.t("toast_update_failed"), "error");
-    }
-  };
-
   const handle_dismiss = () => {
+    if (!info) return;
     mark_version_notified(info.version);
     set_dismissed(true);
   };
 
   return (
-    <div
-      className="aster_floating fixed bottom-4 end-4 z-[9999] max-w-sm p-3"
-    >
-      <div className="flex items-start gap-3">
-        <ArrowDownTrayIcon className="w-5 h-5 mt-0.5 text-txt-primary flex-shrink-0" />
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-txt-primary">
-            {i18next.t("update_available", { version: info.version })}
-          </p>
-          <div className="mt-2 flex items-center gap-2">
-            <Button
-              is_loading={installing}
-              size="sm"
-              variant="depth"
-              onClick={handle_install}
-            >
-              {i18next.t("update_install")}
-            </Button>
-            <Button
-              disabled={installing}
-              size="sm"
-              variant="secondary"
-              onClick={handle_dismiss}
-            >
-              {i18next.t("update_dismiss")}
-            </Button>
-          </div>
-        </div>
-        <button
-          aria-label={i18next.t("dismiss")}
-          className="p-1 text-txt-muted hover:text-txt-primary"
-          onClick={handle_dismiss}
-        >
-          <XMarkIcon className="w-4 h-4" />
-        </button>
-      </div>
+    <div className="pointer-events-none fixed bottom-4 end-4 z-[9999]">
+      <AnimatePresence>
+        {info && !dismissed && (
+          <motion.div
+            key={info.version}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="pointer-events-auto"
+            exit={reduce_motion ? { opacity: 0 } : { opacity: 0, y: 12, scale: 0.97 }}
+            initial={reduce_motion ? { opacity: 0 } : { opacity: 0, y: 24, scale: 0.96 }}
+            transition={reduce_motion ? { duration: 0.15 } : { type: "spring", stiffness: 380, damping: 32, mass: 0.9 }}
+          >
+            <UpdateCard
+              install={install_state}
+              notes={info.notes}
+              version={info.version}
+              on_dismiss={handle_dismiss}
+              on_install={start_install}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1947,7 +1923,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const [require_post_quantum, set_require_post_quantum] = useState(false);
   const [update_info, set_update_info] = useState<UpdateInfo | null>(null);
   const [update_checking, set_update_checking] = useState(false);
-  const [update_installing, set_update_installing] = useState(false);
+  const { state: update_install_state, start: start_update_install } = use_update_installer();
+  const update_installing = update_install_state.phase !== "idle" && update_install_state.phase !== "failed";
   const [app_version, set_app_version] = useState("");
   const [show_reset_modal, set_show_reset_modal] = useState(false);
   const [resetting, set_resetting] = useState(false);
@@ -2257,16 +2234,6 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     return () => window.removeEventListener("aster_menu_action", handler);
   });
 
-  const handle_install_update = async () => {
-    set_update_installing(true);
-    try {
-      await download_and_install();
-    } catch {
-      show_toast(t("toast_update_failed"), "error");
-      set_update_installing(false);
-    }
-  };
-
   const handle_reset = async () => {
     set_resetting(true);
     try {
@@ -2445,13 +2412,15 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       <SettingsGroup title={t("section_updates")} icon={<ArrowDownTrayIcon />}>
         {update_info && (
           <div className="py-3">
-            <p className="text-[14px] font-medium text-txt-primary mb-0.5">{t("update_available", { version: update_info.version })}</p>
-            {update_info.notes && (
-              <p className="text-[12px] text-txt-muted mb-2.5 line-clamp-3 leading-snug">{update_info.notes}</p>
-            )}
-            <Button variant="depth" size="sm" is_loading={update_installing} onClick={handle_install_update}>
-              {t("update_install")}
-            </Button>
+            <div className="rounded-[var(--aster-radius-item,12px)] bg-brand/[0.07] p-3.5">
+              <UpdateCard
+                install={update_install_state}
+                notes={update_info.notes}
+                variant="inline"
+                version={update_info.version}
+                on_install={start_update_install}
+              />
+            </div>
           </div>
         )}
         <SettingRow label={t("updates_app_row")} sublabel={app_version ? `${t("app_version")} ${app_version}` : undefined}>
