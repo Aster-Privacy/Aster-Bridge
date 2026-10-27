@@ -83,11 +83,38 @@ export async function check_for_update(): Promise<UpdateInfo | null> {
   };
 }
 
-export async function download_and_install(): Promise<void> {
+export type UpdatePhase = "downloading" | "installing";
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+  phase: UpdatePhase;
+}
+
+export function update_progress_percent(progress: UpdateProgress): number | null {
+  if (!progress.total || progress.total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round((progress.downloaded / progress.total) * 100)));
+}
+
+export async function download_and_install(
+  on_progress?: (progress: UpdateProgress) => void,
+): Promise<void> {
   const { check } = await load_updater();
   const update = await check();
   if (!update) return;
-  await update.downloadAndInstall();
+  let downloaded = 0;
+  let total: number | null = null;
+  await update.downloadAndInstall((event) => {
+    if (event.event === "Started") {
+      total = event.data?.contentLength ?? null;
+      on_progress?.({ downloaded, total, phase: "downloading" });
+    } else if (event.event === "Progress") {
+      downloaded += event.data?.chunkLength ?? 0;
+      on_progress?.({ downloaded, total, phase: "downloading" });
+    } else {
+      on_progress?.({ downloaded: total ?? downloaded, total, phase: "installing" });
+    }
+  });
   const { relaunch } = await load_process();
   await relaunch();
 }
