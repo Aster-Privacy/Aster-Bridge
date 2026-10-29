@@ -965,6 +965,7 @@ struct ImapConnection {
     selected_folder: Option<String>,
     uids: Vec<u32>,
     read_only: bool,
+    copied_out: std::collections::HashSet<String>,
 }
 
 impl ImapConnection {
@@ -1281,6 +1282,7 @@ where
         selected_folder: None,
         uids: Vec::new(),
         read_only: false,
+        copied_out: std::collections::HashSet::new(),
     };
 
     let mut line = String::new();
@@ -1549,7 +1551,7 @@ where
                                     && (authcid.is_empty() || s.accepts_login_name(&authcid))
                             };
                             if username_ok {
-                                if let Some(pw_id) = passwords.verify_and_id_async(&password).await {
+                                if let Some(pw_id) = passwords.verify_and_id_cached(&authcid, &password).await {
                                     conn.state = ImapState::Authenticated;
                                     passwords.record_use(&pw_id, Some("imap"));
                                     crate::sign_in_notice::record_signed_in("imap");
@@ -1742,8 +1744,9 @@ where
                             store_tag_keywords(&db, &client, &session, &stored_ids, op, store_keywords.as_deref())
                                 .await;
                         let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
-                        let (seen_changes, stored_rows) = db.write_batch(|batch| {
+                        let (seen_changes, star_changes, stored_rows) = db.write_batch(|batch| {
                             let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                            let mut star_changes: Vec<(String, bool)> = Vec::new();
                             let mut stored_rows: Vec<(usize, u32, String, u32)> = Vec::new();
                             for uid in &uids {
                                 if let Some((seq, m)) = view.by_uid(*uid) {
@@ -1768,10 +1771,13 @@ where
                                     if (old_flags & 1) != (new_flags & 1) {
                                         seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                                     }
+                                    if (old_flags & 4) != (new_flags & 4) {
+                                        star_changes.push((m.aster_id.clone(), (new_flags & 4) != 0));
+                                    }
                                     stored_rows.push((seq, *uid, m.aster_id.clone(), new_flags));
                                 }
                             }
-                            (seen_changes, stored_rows)
+                            (seen_changes, star_changes, stored_rows)
                         });
                         if !silent {
                             let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
@@ -1789,6 +1795,7 @@ where
                             writer.write_all(untagged.as_bytes()).await?;
                         }
                         push_read_status(&db, &client, &session, seen_changes);
+                        push_star_status(&db, &client, &session, star_changes);
                         match tag_store.failure {
                             Some(text) => write_no(&mut writer, &tag, text).await?,
                             None => write_ok(&mut writer, &tag, "UID STORE completed").await?,
@@ -1919,8 +1926,9 @@ where
                             .await;
                     store_failure = tag_store.failure;
                     let folder_keywords = db.folder_keywords(&folder).unwrap_or_default();
-                    let (seen_changes, stored_rows) = db.write_batch(|batch| {
+                    let (seen_changes, star_changes, stored_rows) = db.write_batch(|batch| {
                         let mut seen_changes: Vec<(String, bool)> = Vec::new();
+                        let mut star_changes: Vec<(String, bool)> = Vec::new();
                         let mut stored_rows: Vec<(u32, String, u32)> = Vec::new();
                         for s in &seqs {
                             if let Some(m) = view.by_seq(*s) {
@@ -1945,10 +1953,13 @@ where
                                 if (old_flags & 1) != (new_flags & 1) {
                                     seen_changes.push((m.aster_id.clone(), (new_flags & 1) != 0));
                                 }
+                                if (old_flags & 4) != (new_flags & 4) {
+                                    star_changes.push((m.aster_id.clone(), (new_flags & 4) != 0));
+                                }
                                 stored_rows.push((*s, m.aster_id.clone(), new_flags));
                             }
                         }
-                        (seen_changes, stored_rows)
+                        (seen_changes, star_changes, stored_rows)
                     });
                     if !silent {
                         let stored_keywords = db.folder_keywords(&folder).unwrap_or_default();
@@ -1960,6 +1971,7 @@ where
                         writer.write_all(untagged.as_bytes()).await?;
                     }
                     push_read_status(&db, &client, &session, seen_changes);
+                    push_star_status(&db, &client, &session, star_changes);
                 }
                 match store_failure {
                     Some(text) => write_no(&mut writer, &tag, text).await?,
@@ -2134,7 +2146,7 @@ where
                         .filter(|m| m.flags & 8 != 0)
                         .map(|m| (m.imap_uid, m.aster_id.clone()))
                         .collect();
-                    expunge_targets_silent(&db, &client, &session, &folder, targets).await;
+                    expunge_targets_silent(&db, &client, &session, &folder, &conn.copied_out, targets).await;
                 }
                 conn.state = ImapState::Authenticated;
                 conn.selected_mailbox = None;
@@ -2573,6 +2585,38 @@ async fn delete_on_server(
     }
 }
 
+async fn expunge_on_server(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    folder: &str,
+    aster_id: &str,
+    copied_out: &std::collections::HashSet<String>,
+) -> bool {
+    if matches!(folder, "trash" | "spam" | "drafts") || copied_out.contains(aster_id) {
+        return delete_on_server(db, client, session, folder, aster_id).await;
+    }
+    let Some(flags) = move_flags_for("trash") else {
+        return false;
+    };
+    let token = session.read().await.access_token.to_string();
+    if let Some(source_token) = crate::folders::token_of_label(folder) {
+        let ids = vec![aster_id.to_string()];
+        if let Err(e) = relabel_with_backoff(client, &token, &ids, None, Some(source_token)).await {
+            tracing::warn!("server trash move failed for {}: {}", aster_id, e);
+            return false;
+        }
+    }
+    match set_flags_with_backoff(client, &token, aster_id, &flags).await {
+        Ok(()) => true,
+        Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => true,
+        Err(e) => {
+            tracing::warn!("server trash move failed for {}: {}", aster_id, e);
+            false
+        }
+    }
+}
+
 const READ_STATUS_CONCURRENCY: usize = 8;
 const READ_STATUS_RATE_LIMIT_RETRIES: u32 = 3;
 
@@ -2581,6 +2625,26 @@ fn push_read_status(
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
     changes: Vec<(String, bool)>,
+) {
+    push_flag_status(db, client, session, changes, "is_read", 1);
+}
+
+fn push_star_status(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+) {
+    push_flag_status(db, client, session, changes, "is_starred", 4);
+}
+
+fn push_flag_status(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    changes: Vec<(String, bool)>,
+    field: &'static str,
+    bit: i64,
 ) {
     if changes.is_empty() {
         return;
@@ -2599,15 +2663,21 @@ fn push_read_status(
         for is_read in [true, false] {
             let ids: Vec<String> = order.iter().filter(|id| wanted[*id] == is_read).cloned().collect();
             for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
-                push_read_status_chunk(&db, &client, &session, chunk.to_vec(), is_read).await;
+                push_read_status_chunk(&db, &client, &session, chunk.to_vec(), is_read, field, bit).await;
             }
         }
     });
 }
 
-fn read_status_still_wanted(db: &Database, aster_id: &str, is_read: bool) -> bool {
+fn read_status_still_wanted(db: &Database, aster_id: &str, is_read: bool, bit: i64) -> bool {
     db.get_message_flags_by_id(aster_id)
-        .map_or(true, |flags| ((flags & 1) != 0) == is_read)
+        .map_or(true, |flags| ((flags & bit) != 0) == is_read)
+}
+
+fn flag_push_should_retry(error: &crate::error::BridgeError) -> bool {
+    crate::imap::append::is_rate_limited(error)
+        || crate::smtp::server::is_transient_send_error(error)
+        || matches!(error, crate::error::BridgeError::Api(msg) if msg.starts_with("401"))
 }
 
 async fn push_read_status_chunk(
@@ -2616,13 +2686,15 @@ async fn push_read_status_chunk(
     session: &Arc<RwLock<Session>>,
     mut ids: Vec<String>,
     is_read: bool,
+    field: &'static str,
+    bit: i64,
 ) {
     use futures_util::StreamExt;
 
-    let flags = serde_json::json!({ "is_read": is_read });
+    let flags = serde_json::json!({ field: is_read });
     let mut attempt = 0u32;
     loop {
-        ids.retain(|id| read_status_still_wanted(db, id, is_read));
+        ids.retain(|id| read_status_still_wanted(db, id, is_read, bit));
         if ids.is_empty() {
             return;
         }
@@ -2631,7 +2703,7 @@ async fn push_read_status_chunk(
             Ok(_) => return,
             Err(e) if crate::imap::append::is_rate_limited(&e) => {
                 if attempt >= READ_STATUS_RATE_LIMIT_RETRIES {
-                    tracing::warn!("read-status sync for {} messages stopped by rate limiting: {}", ids.len(), e);
+                    tracing::warn!("{} sync for {} messages stopped by rate limiting: {}", field, ids.len(), e);
                     return;
                 }
                 let wait = crate::imap::append::rate_limit_backoff(attempt);
@@ -2639,7 +2711,7 @@ async fn push_read_status_chunk(
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             }
             Err(e) => {
-                tracing::debug!("bulk read-status sync failed, sending one at a time: {}", e);
+                tracing::debug!("bulk {} sync failed, sending one at a time: {}", field, e);
                 break;
             }
         }
@@ -2648,14 +2720,17 @@ async fn push_read_status_chunk(
         .for_each_concurrent(READ_STATUS_CONCURRENCY, |aster_id| async move {
             let mut attempt = 0u32;
             loop {
-                if !read_status_still_wanted(db, &aster_id, is_read) {
+                if !read_status_still_wanted(db, &aster_id, is_read, bit) {
                     return;
                 }
                 let token = session.read().await.access_token.to_string();
-                match client.set_read_status(&token, &aster_id, is_read).await {
+                match client
+                    .set_mailbox_flags(&token, &aster_id, serde_json::json!({ field: is_read }))
+                    .await
+                {
                     Ok(()) => return,
                     Err(e)
-                        if crate::imap::append::is_rate_limited(&e)
+                        if flag_push_should_retry(&e)
                             && attempt < READ_STATUS_RATE_LIMIT_RETRIES =>
                     {
                         let wait = crate::imap::append::rate_limit_backoff(attempt);
@@ -2663,7 +2738,7 @@ async fn push_read_status_chunk(
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     }
                     Err(e) => {
-                        tracing::warn!("read-status sync failed for {}: {}", aster_id, e);
+                        tracing::warn!("{} sync failed for {}: {}", field, aster_id, e);
                         return;
                     }
                 }
@@ -2683,7 +2758,7 @@ async fn expunge_targets(
 ) -> std::io::Result<()> {
     let mut deleted: Vec<u32> = Vec::new();
     for (uid, aster_id) in &targets {
-        if delete_on_server(db, client, session, folder, aster_id).await {
+        if expunge_on_server(db, client, session, folder, aster_id, &conn.copied_out).await {
             deleted.push(*uid);
         }
     }
@@ -2705,17 +2780,18 @@ async fn expunge_targets_silent(
     client: &Arc<ApiClient>,
     session: &Arc<RwLock<Session>>,
     folder: &str,
+    copied_out: &std::collections::HashSet<String>,
     targets: Vec<(u32, String)>,
 ) {
-    let mut deleted: Vec<&str> = Vec::new();
-    for (_, aster_id) in &targets {
-        if delete_on_server(db, client, session, folder, aster_id).await {
-            deleted.push(aster_id);
+    let mut deleted: Vec<u32> = Vec::new();
+    for (uid, aster_id) in &targets {
+        if expunge_on_server(db, client, session, folder, aster_id, copied_out).await {
+            deleted.push(*uid);
         }
     }
     db.write_batch(|batch| {
-        for aster_id in &deleted {
-            let _ = batch.delete_message_by_aster_id(aster_id);
+        for uid in &deleted {
+            let _ = batch.delete_message_by_uid(*uid as i64, folder);
         }
     });
 }
@@ -2981,21 +3057,18 @@ async fn handle_login(
         return Ok(false);
     }
 
-    let login_parts: Vec<&str> = args.splitn(2, ' ').collect();
-    if login_parts.len() < 2 {
+    let Some((username, password)) = parse_login_args(args) else {
         write_bad(writer, tag, "LOGIN requires user and password").await?;
         return Ok(false);
-    }
-
-    let username = login_parts[0].trim_matches('"');
-    let password = login_parts[1].trim_matches('"');
+    };
+    let (username, password) = (username.as_str(), password.as_str());
 
     if !session.read().await.accepts_login_name(username) {
         write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
         return Ok(false);
     }
 
-    if let Some(pw_id) = passwords.verify_and_id_async(password).await {
+    if let Some(pw_id) = passwords.verify_and_id_cached(username, password).await {
         conn.state = ImapState::Authenticated;
         passwords.record_use(&pw_id, Some("imap"));
         crate::sign_in_notice::record_signed_in("imap");
@@ -3006,6 +3079,26 @@ async fn handle_login(
         write_no(writer, tag, &format!("[AUTHENTICATIONFAILED] {}", crate::sign_in_notice::BAD_CREDENTIALS_TEXT)).await?;
         Ok(false)
     }
+}
+
+fn parse_login_args(args: &str) -> Option<(String, String)> {
+    let args = args.trim_start();
+    let (username, rest) = if args.starts_with('"') {
+        parse_imap_atom_or_quoted(args)
+    } else {
+        let (user, rest) = args.split_once(' ')?;
+        (user.to_string(), rest)
+    };
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let password = if rest.starts_with('"') {
+        parse_imap_atom_or_quoted(rest).0
+    } else {
+        rest.to_string()
+    };
+    Some((username, password))
 }
 
 pub(crate) fn parse_imap_atom_or_quoted(s: &str) -> (String, &str) {
@@ -3822,6 +3915,7 @@ async fn handle_copy(
             let _ = db.set_message_keywords(aster_id, keywords);
         }
     }
+    conn.copied_out.extend(selected.iter().map(|m| m.aster_id.clone()));
     let label_pairs: Vec<(String, String)> = selected
         .iter()
         .zip(copies.iter())
@@ -4066,6 +4160,7 @@ fn filter_header_fields(header: &str, fields: &[String]) -> String {
 fn iso_to_imap_date(s: &str) -> String {
     const MONTHS: &[&str] = &["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
     if let Some(dt) = parse_datetime_lenient(s) {
+        let dt = dt.with_timezone(&chrono::Utc);
         let m = MONTHS.get(dt.date_naive().month0() as usize).unwrap_or(&"Jan");
         return format!("{:02}-{}-{} {:02}:{:02}:{:02} +0000",
             dt.date_naive().day(), m, dt.date_naive().year(),
@@ -4735,6 +4830,32 @@ mod tests {
             crate::sign_in_notice::last_insecure().map(|l| l.protocol),
             Some("imap")
         );
+    }
+
+    #[test]
+    fn login_args_accept_quoted_strings_with_spaces_and_escapes() {
+        assert_eq!(
+            parse_login_args("tester@aster.test abcd-efgh-ijkl-mnop"),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"tester@aster.test\" \"abcd-efgh-ijkl-mnop\""),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"tester@aster.test\" \"pw with space\""),
+            Some(("tester@aster.test".to_string(), "pw with space".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("\"a \\\"b\\\" c@aster.test\" \"p\\\\w\\\"d\""),
+            Some(("a \"b\" c@aster.test".to_string(), "p\\w\"d".to_string()))
+        );
+        assert_eq!(
+            parse_login_args("tester@aster.test \"abcd-efgh-ijkl-mnop\""),
+            Some(("tester@aster.test".to_string(), "abcd-efgh-ijkl-mnop".to_string()))
+        );
+        assert_eq!(parse_login_args("tester@aster.test"), None);
+        assert_eq!(parse_login_args("\"tester@aster.test\""), None);
     }
 
     #[tokio::test]
@@ -8668,6 +8789,18 @@ mod tests {
     }
 
     #[test]
+    fn iso_to_imap_date_converts_offset_to_utc() {
+        assert_eq!(
+            iso_to_imap_date("Mon, 05 Oct 2026 09:00:00 -0700"),
+            "05-Oct-2026 16:00:00 +0000"
+        );
+        assert_eq!(
+            iso_to_imap_date("2026-10-06T01:30:00+02:00"),
+            "05-Oct-2026 23:30:00 +0000"
+        );
+    }
+
+    #[test]
     fn iso_to_imap_date_accepts_rfc2822() {
         let s = iso_to_imap_date("Wed, 21 May 2026 10:30:00 +0000");
         assert!(s.starts_with("21-May-2026"), "got {}", s);
@@ -8675,7 +8808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expunge_deletes_on_server_and_locally() {
+    async fn expunge_in_inbox_moves_to_trash_on_server() {
         let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
         seed(&db, "ex-1", "inbox", "one");
         seed(&db, "ex-2", "inbox", "two");
@@ -8691,15 +8824,93 @@ mod tests {
         assert!(db.get_cached_message("ex-2").unwrap().is_some());
         let captured = calls.lock().await.clone();
         assert!(
-            captured.iter().any(|(m, id)| m == "DELETE" && id == "ex-1"),
+            captured.iter().any(|(m, id)| m == "PATCH" && id == "ex-1"),
+            "trash move missing: {:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, _)| m == "DELETE"),
+            "inbox expunge deleted permanently: {:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn expunge_in_trash_deletes_permanently() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "tr-1", "trash", "one");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t1", "SELECT Trash").await;
+        assert!(resp.contains("t1 OK"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "t2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "t3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "missing expunge: {}", resp);
+
+        assert!(db.get_cached_message("tr-1").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, id)| m == "DELETE" && id == "tr-1"),
             "server delete missing: {:?}",
             captured
         );
     }
 
     #[tokio::test]
+    async fn close_in_inbox_moves_deleted_messages_to_trash() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "cl-1", "inbox", "one");
+        seed(&db, "cl-2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        imap_cmd_lines(&mut reader, &mut writer, "c1", "STORE 2 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "CLOSE").await;
+        assert!(resp.contains("c2 OK"), "{}", resp);
+
+        assert!(db.get_cached_message("cl-1").unwrap().is_some());
+        assert!(db.get_cached_message("cl-2").unwrap().is_none());
+        let captured = calls.lock().await.clone();
+        assert!(captured.iter().any(|(m, id)| m == "PATCH" && id == "cl-2"), "{:?}", captured);
+        assert!(!captured.iter().any(|(m, _)| m == "DELETE"), "{:?}", captured);
+    }
+
+    #[tokio::test]
+    async fn expunge_after_copy_removes_the_source_without_a_trash_copy() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "msg-copied", "copied", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "k1", "COPY 1 Archive").await;
+        assert!(resp.contains("k1 OK"), "{}", resp);
+        imap_cmd_lines(&mut reader, &mut writer, "k2", "STORE 1 +FLAGS (\\Deleted)").await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "k3", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+
+        let captured = calls.lock().await.clone();
+        assert!(
+            captured.iter().any(|(m, id)| m == "DELETE" && id == "msg-copied"),
+            "{:?}",
+            captured
+        );
+        assert!(
+            !captured.iter().any(|(m, id)| m == "PATCH" && id == "msg-copied"),
+            "{:?}",
+            captured
+        );
+    }
+
+    #[tokio::test]
     async fn expunge_backend_failure_keeps_message() {
-        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(true).await;
+        let (addr, db, _tx, _calls, _dir) = start_test_server_mock(
+            MockOpts {
+                fail: true,
+                fail_metadata: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
         seed(&db, "ex-keep", "inbox", "one");
         let (mut reader, mut writer) = login_and_select(addr).await;
 
@@ -8729,7 +8940,7 @@ mod tests {
         assert!(db.get_cached_message("ux-2").unwrap().is_none());
         let captured = calls.lock().await.clone();
         assert!(!captured.iter().any(|(_, id)| id == "ux-1"));
-        assert!(captured.iter().any(|(m, id)| m == "DELETE" && id == "ux-2"));
+        assert!(captured.iter().any(|(m, id)| m == "PATCH" && id == "ux-2"));
     }
 
     #[tokio::test]
@@ -9334,6 +9545,7 @@ mod tests {
             selected_folder: Some("inbox".to_string()),
             uids: session_uids,
             read_only: false,
+            copied_out: std::collections::HashSet::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         report_mailbox_changes(&mut out, &mut conn, &current, true).await.unwrap();
@@ -9688,6 +9900,54 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(4), "{:?}", log);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn store_flagged_sends_the_star_to_the_server() {
+        let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "st-1", "inbox", "s");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let star_patches = |log: &[(String, String)]| {
+            log.iter().filter(|(m, id)| m == "PATCH" && id == "st-1").count()
+        };
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1 +FLAGS (\\Flagged)").await;
+        assert!(resp.contains("s1 OK"), "{}", resp);
+        let started = std::time::Instant::now();
+        while star_patches(&calls.lock().await) < 1 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", calls.lock().await);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let uid = db.get_cached_message("st-1").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "s2",
+            &format!("UID STORE {} -FLAGS (\\Flagged)", uid),
+        )
+        .await;
+        assert!(resp.contains("s2 OK"), "{}", resp);
+        while star_patches(&calls.lock().await) < 2 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", calls.lock().await);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s3", "STORE 1 +FLAGS (\\Answered)").await;
+        assert!(resp.contains("s3 OK"), "{}", resp);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(star_patches(&calls.lock().await), 2, "{:?}", calls.lock().await);
+    }
+
+    #[test]
+    fn flag_pushes_retry_transient_failures_only() {
+        use crate::error::BridgeError;
+        assert!(flag_push_should_retry(&BridgeError::Api("429 Too Many Requests: slow".into())));
+        assert!(flag_push_should_retry(&BridgeError::Api("503 Service Unavailable: x".into())));
+        assert!(flag_push_should_retry(&BridgeError::Api("401 Unauthorized: x".into())));
+        assert!(flag_push_should_retry(&BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(!flag_push_should_retry(&BridgeError::Api("404 Not Found: x".into())));
+        assert!(!flag_push_should_retry(&BridgeError::Api("400 Bad Request: x".into())));
     }
 
     #[tokio::test]
