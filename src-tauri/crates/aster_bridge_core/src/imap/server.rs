@@ -2649,6 +2649,9 @@ fn push_flag_status(
     if changes.is_empty() {
         return;
     }
+    if let Err(e) = db.record_pending_flag_pushes(&changes, bit) {
+        tracing::warn!("could not queue {} sync: {}", field, e);
+    }
     let db = db.clone();
     let client = client.clone();
     let session = session.clone();
@@ -2663,10 +2666,64 @@ fn push_flag_status(
         for is_read in [true, false] {
             let ids: Vec<String> = order.iter().filter(|id| wanted[*id] == is_read).cloned().collect();
             for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
-                push_read_status_chunk(&db, &client, &session, chunk.to_vec(), is_read, field, bit).await;
+                push_read_status_chunk(
+                    &db,
+                    &client,
+                    &session,
+                    chunk.to_vec(),
+                    is_read,
+                    field,
+                    bit,
+                    READ_STATUS_RATE_LIMIT_RETRIES,
+                )
+                .await;
             }
         }
     });
+}
+
+const PENDING_FLAG_PUSH_BATCH: usize = 500;
+const PENDING_FLAG_PUSH_SETTLE_MS: i64 = 120_000;
+const PENDING_FLAG_PUSH_MAX_ATTEMPTS: i64 = 20;
+
+fn flag_field(bit: i64) -> Option<&'static str> {
+    match bit {
+        1 => Some("is_read"),
+        4 => Some("is_starred"),
+        _ => None,
+    }
+}
+
+pub(crate) async fn retry_pending_flag_pushes(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+) {
+    match db.drop_exhausted_flag_pushes(PENDING_FLAG_PUSH_MAX_ATTEMPTS) {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("gave up syncing {} flag changes to the server", n),
+        Err(e) => tracing::warn!("could not prune queued flag changes: {}", e),
+    }
+    let rows = match db.pending_flag_pushes(PENDING_FLAG_PUSH_SETTLE_MS, PENDING_FLAG_PUSH_BATCH) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("could not read queued flag changes: {}", e);
+            return;
+        }
+    };
+    let mut groups: std::collections::BTreeMap<(i64, bool), Vec<String>> = std::collections::BTreeMap::new();
+    for (aster_id, bit, value) in rows {
+        groups.entry((bit, value)).or_default().push(aster_id);
+    }
+    for ((bit, value), ids) in groups {
+        let Some(field) = flag_field(bit) else {
+            let _ = db.clear_pending_flag_pushes(&ids, bit, value);
+            continue;
+        };
+        for chunk in ids.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+            push_read_status_chunk(db, client, session, chunk.to_vec(), value, field, bit, 0).await;
+        }
+    }
 }
 
 fn read_status_still_wanted(db: &Database, aster_id: &str, is_read: bool, bit: i64) -> bool {
@@ -2680,6 +2737,7 @@ fn flag_push_should_retry(error: &crate::error::BridgeError) -> bool {
         || matches!(error, crate::error::BridgeError::Api(msg) if msg.starts_with("401"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_read_status_chunk(
     db: &Database,
     client: &ApiClient,
@@ -2688,22 +2746,32 @@ async fn push_read_status_chunk(
     is_read: bool,
     field: &'static str,
     bit: i64,
+    retries: u32,
 ) {
     use futures_util::StreamExt;
 
     let flags = serde_json::json!({ field: is_read });
     let mut attempt = 0u32;
     loop {
-        ids.retain(|id| read_status_still_wanted(db, id, is_read, bit));
+        let (wanted, superseded): (Vec<String>, Vec<String>) =
+            ids.into_iter().partition(|id| read_status_still_wanted(db, id, is_read, bit));
+        let _ = db.clear_pending_flag_pushes(&superseded, bit, is_read);
+        ids = wanted;
         if ids.is_empty() {
             return;
         }
         let token = session.read().await.access_token.to_string();
         match client.bulk_set_mailbox_flags(&token, &ids, &flags).await {
-            Ok(_) => return,
+            Ok(_) => {
+                let _ = db.clear_pending_flag_pushes(&ids, bit, is_read);
+                return;
+            }
             Err(e) if crate::imap::append::is_rate_limited(&e) => {
-                if attempt >= READ_STATUS_RATE_LIMIT_RETRIES {
+                if attempt >= retries {
                     tracing::warn!("{} sync for {} messages stopped by rate limiting: {}", field, ids.len(), e);
+                    for aster_id in &ids {
+                        let _ = db.note_failed_flag_push(aster_id, bit, is_read);
+                    }
                     return;
                 }
                 let wait = crate::imap::append::rate_limit_backoff(attempt);
@@ -2719,8 +2787,10 @@ async fn push_read_status_chunk(
     futures_util::stream::iter(ids)
         .for_each_concurrent(READ_STATUS_CONCURRENCY, |aster_id| async move {
             let mut attempt = 0u32;
+            let done = std::slice::from_ref(&aster_id);
             loop {
                 if !read_status_still_wanted(db, &aster_id, is_read, bit) {
+                    let _ = db.clear_pending_flag_pushes(done, bit, is_read);
                     return;
                 }
                 let token = session.read().await.access_token.to_string();
@@ -2728,17 +2798,22 @@ async fn push_read_status_chunk(
                     .set_mailbox_flags(&token, &aster_id, serde_json::json!({ field: is_read }))
                     .await
                 {
-                    Ok(()) => return,
-                    Err(e)
-                        if flag_push_should_retry(&e)
-                            && attempt < READ_STATUS_RATE_LIMIT_RETRIES =>
-                    {
+                    Ok(()) => {
+                        let _ = db.clear_pending_flag_pushes(done, bit, is_read);
+                        return;
+                    }
+                    Err(crate::error::BridgeError::Api(ref msg)) if msg.starts_with("404") => {
+                        let _ = db.clear_pending_flag_pushes(done, bit, is_read);
+                        return;
+                    }
+                    Err(e) if flag_push_should_retry(&e) && attempt < retries => {
                         let wait = crate::imap::append::rate_limit_backoff(attempt);
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     }
                     Err(e) => {
                         tracing::warn!("{} sync failed for {}: {}", field, aster_id, e);
+                        let _ = db.note_failed_flag_push(&aster_id, bit, is_read);
                         return;
                     }
                 }
