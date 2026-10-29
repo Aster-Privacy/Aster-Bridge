@@ -760,6 +760,10 @@ impl Database {
                 tag_token TEXT
              );",
         ).map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "ALTER TABLE custom_tag ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         rebuild_tag_aliases(conn).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
@@ -1209,7 +1213,7 @@ fn set_message_keywords_on(conn: &Connection, aster_id: &str, keywords: &[String
 
 fn custom_tags_on(conn: &Connection) -> rusqlite::Result<Vec<CustomTag>> {
     let mut stmt = conn.prepare(
-        "SELECT tag_token, server_id, name, keyword FROM custom_tag ORDER BY tag_token",
+        "SELECT tag_token, server_id, name, keyword, position FROM custom_tag ORDER BY tag_token",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -1218,6 +1222,7 @@ fn custom_tags_on(conn: &Connection) -> rusqlite::Result<Vec<CustomTag>> {
                 server_id: r.get(1)?,
                 name: r.get(2)?,
                 keyword: r.get(3)?,
+                position: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1909,8 +1914,8 @@ impl Database {
             tx.execute("DELETE FROM custom_tag", [])?;
             for tag in &incoming {
                 tx.execute(
-                    "INSERT INTO custom_tag (tag_token, server_id, name, keyword) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
+                    "INSERT INTO custom_tag (tag_token, server_id, name, keyword, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword, tag.position],
                 )?;
             }
             tx.execute(
@@ -1927,15 +1932,16 @@ impl Database {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
-                "INSERT INTO custom_tag (tag_token, server_id, name, keyword)
+                "INSERT INTO custom_tag (tag_token, server_id, name, keyword, position)
                  VALUES (?1, ?2, ?3, CASE WHEN EXISTS (
                     SELECT 1 FROM custom_tag WHERE keyword = ?4 AND tag_token != ?1
-                 ) THEN NULL ELSE ?4 END)
+                 ) THEN NULL ELSE ?4 END, ?5)
                  ON CONFLICT(tag_token) DO UPDATE SET
                     server_id = excluded.server_id,
                     name = excluded.name,
-                    keyword = excluded.keyword",
-                rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword],
+                    keyword = excluded.keyword,
+                    position = excluded.position",
+                rusqlite::params![tag.tag_token, tag.server_id, tag.name, tag.keyword, tag.position],
             )?;
             rebuild_tag_aliases(&tx)?;
             tx.commit()
@@ -3603,6 +3609,7 @@ pub struct CustomTag {
     pub server_id: String,
     pub name: String,
     pub keyword: Option<String>,
+    pub position: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4908,6 +4915,7 @@ mod db_tests {
             server_id: format!("id-{}", token),
             name: name.to_string(),
             keyword: keyword.map(str::to_string),
+            position: 0,
         }
     }
 
