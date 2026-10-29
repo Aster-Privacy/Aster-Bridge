@@ -112,7 +112,7 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
                 .is_some_and(|stored| stored.eq_ignore_ascii_case(&message_id))
         });
     }
-    if row.attempts == 0 {
+    if row.attempts == 0 || envelope_addrs.is_empty() {
         return false;
     }
     sent.iter().any(|m| {
@@ -132,10 +132,9 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
         match m.recipients.as_deref() {
             Some(r) => {
                 let r_lower = r.to_lowercase();
-                envelope_addrs.is_empty()
-                    || envelope_addrs.iter().any(|a| r_lower.contains(a.as_str()))
+                envelope_addrs.iter().any(|a| r_lower.contains(a.as_str()))
             }
-            None => true,
+            None => false,
         }
     })
 }
@@ -543,6 +542,28 @@ mod tests {
         )
         .unwrap();
         assert!(sent_copy_exists(&db, &row));
+    }
+
+    #[test]
+    fn sent_copy_without_recipients_never_matches() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        db.upsert_cached_message(
+            "sc-7",
+            "sent",
+            Some("status report"),
+            Some("me@aster.test"),
+            None,
+            Some("2026-08-01T10:00:30+00:00"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let row = outbox_row_for("status report", "bob@example.com", queued);
+        assert!(!sent_copy_exists(&db, &row));
     }
 
     fn stub_session() -> Arc<RwLock<Session>> {
