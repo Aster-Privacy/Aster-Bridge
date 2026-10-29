@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.14 - 2026-10-29
+
+### Fixed
+- Aster Bridge includes the latest security updates for the components it uses to download updates, connect securely, and display its window.
+
 ## 1.0.13 - 2026-10-29
 
 ### What's new
