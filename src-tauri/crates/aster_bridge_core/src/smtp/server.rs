@@ -41,10 +41,35 @@ pub fn is_transient_send_error(err: &BridgeError) -> bool {
                     return true;
                 }
             }
-            false
+            msg.starts_with("409") && msg.contains(SEND_IN_PROGRESS_TEXT)
         }
         _ => false,
     }
+}
+
+const SEND_IN_PROGRESS_TEXT: &str = "still being sent";
+
+pub fn send_idempotency_key(raw_message: &[u8], from: Option<&str>, recipients: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut envelope: Vec<String> = recipients
+        .iter()
+        .flat_map(|r| r.split(','))
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    envelope.sort();
+    envelope.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"aster-bridge-send-v1\0");
+    hasher.update(from.unwrap_or("").trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(envelope.join("\n").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw_message);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid().to_string()
 }
 
 const MAX_LINE_LENGTH: usize = 998;
@@ -1157,6 +1182,7 @@ pub async fn build_threaded_send_payload(
     client: &ApiClient,
     db: &Database,
 ) -> std::result::Result<(serde_json::Value, zeroize::Zeroizing<String>), crate::error::BridgeError> {
+    let client_send_id = send_idempotency_key(raw_message, from.as_deref(), &recipients);
     let from = prefer_header_identity(raw_message, from, session, client).await;
     let (session_email, sender_identity, access_token, passphrase, identity_key) = {
         let s = session.read().await;
@@ -1193,6 +1219,9 @@ pub async fn build_threaded_send_payload(
     crate::smtp::branding::apply_branding_preference(&mut payload, session, client, &access_token).await;
     crate::crypto::internal_send::seal_internal_body(&mut payload, session, client, db, &access_token)
         .await?;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("client_send_id".to_string(), serde_json::Value::String(client_send_id));
+    }
     Ok((payload, access_token))
 }
 
@@ -1234,6 +1263,45 @@ mod tests {
     #[test]
     fn io_errors_are_transient() {
         assert!(is_transient_send_error(&io_err()));
+    }
+
+    #[test]
+    fn a_send_still_in_progress_is_transient() {
+        let in_flight = BridgeError::Api(
+            "409 Conflict: {\"error\":\"This message is still being sent\",\"code\":\"CONFLICT\"}".to_string(),
+        );
+        assert!(is_transient_send_error(&in_flight));
+        let other = BridgeError::Api("409 Conflict: {\"error\":\"duplicate\"}".to_string());
+        assert!(!is_transient_send_error(&other));
+    }
+
+    #[test]
+    fn the_send_key_matches_between_the_direct_send_and_the_outbox_retry() {
+        let raw = b"Message-ID: <a@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let direct = vec!["Bob@Example.com".to_string(), "carol@example.com".to_string()];
+        let queued: Vec<String> = direct.join(",").split(',').map(|s| s.to_string()).collect();
+        let key = send_idempotency_key(raw, Some("me@aster.test"), &direct);
+        assert_eq!(key, send_idempotency_key(raw, Some("me@aster.test"), &queued));
+        assert_eq!(
+            key,
+            send_idempotency_key(raw, Some("me@aster.test"), &["carol@example.com,bob@example.com".to_string()])
+        );
+        assert_eq!(
+            send_idempotency_key(raw, Some(""), &direct),
+            send_idempotency_key(raw, None, &direct)
+        );
+        assert!(uuid::Uuid::parse_str(&key).is_ok());
+    }
+
+    #[test]
+    fn different_sends_get_different_keys() {
+        let raw = b"Message-ID: <a@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let rcpt = vec!["bob@example.com".to_string()];
+        let key = send_idempotency_key(raw, Some("me@aster.test"), &rcpt);
+        assert_ne!(key, send_idempotency_key(raw, Some("me@aster.test"), &["dan@example.com".to_string()]));
+        assert_ne!(key, send_idempotency_key(raw, Some("alias@aster.test"), &rcpt));
+        let other = b"Message-ID: <b@aster.test>\r\nSubject: hi\r\n\r\nbody\r\n";
+        assert_ne!(key, send_idempotency_key(other, Some("me@aster.test"), &rcpt));
     }
 
     #[tokio::test(start_paused = true)]

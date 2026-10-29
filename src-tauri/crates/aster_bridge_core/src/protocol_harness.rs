@@ -630,6 +630,11 @@ async fn protocol_feature_matrix() {
             .iter()
             .any(|p| p["subject"] == "Harness plain" && p["body"].as_str().unwrap_or("").contains("hello from thunderbird"));
         cl.check("SMTP relays subject+body to backend", relayed_ok, format!("{} payload(s) captured", posted.len()));
+        let keyed = posted.iter().any(|p| {
+            p["subject"] == "Harness plain"
+                && p["client_send_id"].as_str().is_some_and(|id| Uuid::parse_str(id).is_ok())
+        });
+        cl.check("SMTP send carries an idempotency key", keyed, "client_send_id");
         drop(posted);
 
         // PGP/MIME rejected with a clear reason (no silent gutting)
