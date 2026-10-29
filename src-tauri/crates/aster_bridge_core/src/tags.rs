@@ -61,6 +61,7 @@ const MAX_READABLE_KEY_LEN: usize = 50;
 const HASHED_KEY_PREFIX: &str = "&x-moz-";
 const HASHED_KEY_BYTES: usize = 16;
 pub const BUILTIN_TAG_SLOTS: usize = 5;
+const POSITIONAL_MIN_ANCHORS: usize = 3;
 const BUILTIN_KEYWORD_PREFIX: &str = "$label";
 const BUILTIN_TAG_NAMES: [&[&str]; BUILTIN_TAG_SLOTS] = [
     &[
@@ -457,7 +458,8 @@ pub fn tags_from_definitions(
     let mut tags: Vec<CustomTag> = definitions
         .iter()
         .filter(|definition| !definition.tag_token.is_empty())
-        .filter_map(|definition| {
+        .enumerate()
+        .filter_map(|(index, definition)| {
             let name = crate::crypto::tag::decrypt_tag_name(
                 &definition.encrypted_name,
                 &definition.name_nonce,
@@ -473,6 +475,7 @@ pub fn tags_from_definitions(
                 server_id: definition.id.clone(),
                 name,
                 keyword: None,
+                position: i64::try_from(index).unwrap_or(i64::MAX),
             })
         })
         .collect();
@@ -584,7 +587,57 @@ pub fn slot_assignments(
             assigned[slot - 1] = Some(tag.tag_token.clone());
         }
     }
+    fill_slots_by_position(tags, &fixed, &mut assigned, &mut used);
     assigned
+}
+
+fn fill_slots_by_position(
+    tags: &[CustomTag],
+    fixed: &[bool; BUILTIN_TAG_SLOTS],
+    assigned: &mut [Option<String>],
+    used: &mut HashSet<String>,
+) {
+    let mut listed: Vec<&CustomTag> = tags.iter().filter(|tag| is_top_level(tag)).collect();
+    listed.sort_by_key(|tag| tag.position);
+    if listed.windows(2).any(|pair| pair[0].position == pair[1].position) {
+        return;
+    }
+    let index_of = |token: &str| listed.iter().position(|tag| tag.tag_token == token);
+    let anchors: Vec<(usize, usize)> = assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| Some((index + 1, index_of(token.as_deref()?)?)))
+        .collect();
+    let Some(&(first_slot, first_index)) = anchors.first() else {
+        return;
+    };
+    let offset = first_index as i64 - first_slot as i64;
+    if anchors
+        .iter()
+        .any(|&(slot, index)| index as i64 - slot as i64 != offset)
+    {
+        return;
+    }
+    for slot in 1..=BUILTIN_TAG_SLOTS {
+        if fixed[slot - 1] || assigned[slot - 1].is_some() {
+            continue;
+        }
+        let enclosed = anchors.iter().any(|&(anchor, _)| anchor < slot)
+            && anchors.iter().any(|&(anchor, _)| anchor > slot);
+        if !enclosed && anchors.len() < POSITIONAL_MIN_ANCHORS {
+            continue;
+        }
+        let Some(tag) = usize::try_from(slot as i64 + offset)
+            .ok()
+            .and_then(|index| listed.get(index))
+        else {
+            continue;
+        };
+        let named_elsewhere = (1..=BUILTIN_TAG_SLOTS).any(|other| matches_builtin_name(other, &tag.name));
+        if !named_elsewhere && used.insert(tag.tag_token.clone()) {
+            assigned[slot - 1] = Some(tag.tag_token.clone());
+        }
+    }
 }
 
 pub fn slot_alias_rows(
@@ -621,6 +674,7 @@ mod tests {
             server_id: format!("id-{}", token),
             name: name.to_string(),
             keyword: None,
+            position: 0,
         }
     }
 
@@ -1034,5 +1088,85 @@ mod tests {
         assert_eq!(slot_tokens(&tags, &HashMap::new())[4], Some("z"));
         let flat = vec![keyed("c", "later"), keyed("b", "Later")];
         assert_eq!(slot_tokens(&flat, &HashMap::new())[4], Some("b"));
+    }
+
+    fn listed(rows: &[(&str, &str)]) -> Vec<CustomTag> {
+        rows.iter()
+            .enumerate()
+            .map(|(index, (token, name))| CustomTag {
+                position: index as i64,
+                ..keyed(token, name)
+            })
+            .collect()
+    }
+
+    fn raul_listed() -> Vec<CustomTag> {
+        listed(&[
+            ("t-atencao", "\u{1F6A8} Aten\u{E7}\u{E3}o"),
+            ("t-trabalho", "\u{1F4BC} Trabalho"),
+            ("t-pessoal", "\u{1F9D1} Pessoal"),
+            ("t-fazer", "\u{1F477} Por fazer"),
+            ("t-tarde", "\u{1F6CB}\u{FE0F} Mais tarde"),
+            ("a", "\u{1F911} Despesas"),
+            ("b", "\u{1F37F} Entretenimento"),
+        ])
+    }
+
+    #[test]
+    fn renamed_builtin_tags_follow_the_label_order() {
+        let tags = raul_listed();
+        assert_eq!(
+            slot_tokens(&tags, &HashMap::new()),
+            vec![
+                Some("t-atencao"),
+                Some("t-trabalho"),
+                Some("t-pessoal"),
+                Some("t-fazer"),
+                Some("t-tarde")
+            ]
+        );
+        let slots = slot_assignments(&tags, &HashMap::new());
+        assert_eq!(slot_tag(&tags, &slots, "$label4").map(|t| t.tag_token.as_str()), Some("t-fazer"));
+    }
+
+    #[test]
+    fn a_chosen_or_disabled_slot_keeps_priority_over_the_label_order() {
+        let tags = raul_listed();
+        let overrides = HashMap::from([(4, SlotOverride::Off), (1, SlotOverride::Label("b".to_string()))]);
+        assert_eq!(
+            slot_tokens(&tags, &overrides),
+            vec![Some("b"), Some("t-trabalho"), Some("t-pessoal"), None, Some("t-tarde")]
+        );
+    }
+
+    #[test]
+    fn a_slot_between_name_matches_follows_the_label_order() {
+        let tags = listed(&[("a", "Work"), ("b", "Personal"), ("c", "Errands"), ("z", "Later")]);
+        assert_eq!(slot_tokens(&tags, &HashMap::new()), vec![None, Some("a"), Some("b"), Some("c"), Some("z")]);
+    }
+
+    #[test]
+    fn the_label_order_is_ignored_when_it_is_weak_or_inconsistent() {
+        let open_ended = listed(&[("a", "Work"), ("b", "Personal"), ("c", "Receipts")]);
+        assert_eq!(slot_tokens(&open_ended, &HashMap::new()), vec![None, Some("a"), Some("b"), None, None]);
+
+        let shuffled = listed(&[("a", "Work"), ("c", "Errands"), ("b", "Personal"), ("z", "Later")]);
+        assert_eq!(slot_tokens(&shuffled, &HashMap::new()), vec![None, Some("a"), Some("b"), None, Some("z")]);
+
+        let unordered = raul_tags();
+        assert_eq!(
+            slot_tokens(&unordered, &HashMap::new()),
+            vec![None, Some("t-trabalho"), Some("t-pessoal"), None, Some("t-tarde")]
+        );
+
+        let named = listed(&[("c", "Important"), ("a", "Work"), ("b", "Personal"), ("z", "Later")]);
+        assert_eq!(slot_tokens(&named, &HashMap::new()), vec![Some("c"), Some("a"), Some("b"), None, Some("z")]);
+    }
+
+    #[test]
+    fn a_label_named_for_another_slot_is_not_taken_by_position() {
+        let tags = listed(&[("a", "Work"), ("b", "Personal"), ("c", "Important"), ("z", "Later")]);
+        let overrides = HashMap::from([(1, SlotOverride::Off)]);
+        assert_eq!(slot_tokens(&tags, &overrides), vec![None, Some("a"), Some("b"), None, Some("z")]);
     }
 }

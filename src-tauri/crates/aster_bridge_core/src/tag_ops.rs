@@ -171,6 +171,7 @@ async fn create(
             server_id,
             name,
             keyword: None,
+            position: i64::MAX,
         },
         parent.map(|(_, path)| path),
     )
@@ -644,6 +645,7 @@ mod tests {
             server_id: format!("id-{}", token),
             name: name.to_string(),
             keyword: crate::tags::keyword_for_name(name),
+            position: 0,
         }
     }
 
@@ -1360,6 +1362,57 @@ mod tests {
         expected.sort();
         assert_eq!(db.message_keywords("m-2").unwrap(), expected);
         assert_eq!(db.list_custom_tags().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn renamed_builtin_tags_reach_their_labels_once_the_order_is_known() {
+        let (_dir, db, client, calls) = setup(CreateMode::Accept).await;
+        cache(&db, &["m-1", "m-2"]);
+        db.set_message_keywords("m-1", &strings(&["$label4"])).unwrap();
+        db.set_message_keywords("m-2", &strings(&["$label1", "$label2"])).unwrap();
+        let names = [
+            ("tok-attention", "\u{1F6A8} Aten\u{E7}\u{E3}o"),
+            ("tok-work", "\u{1F4BC} Trabalho"),
+            ("tok-personal", "\u{1F9D1} Pessoal"),
+            ("tok-todo", "\u{1F477} Por fazer"),
+            ("tok-later", "\u{1F6CC} Mais tarde"),
+            ("tok-spend", "\u{1F911} Despesas"),
+        ];
+        let unordered: Vec<CustomTag> = names.iter().map(|(token, name)| stored_tag(token, name)).collect();
+        db.replace_custom_tags(&unordered).unwrap();
+        assert_eq!(db.builtin_tag_slots().unwrap()[3], None);
+
+        let ordered: Vec<CustomTag> = names
+            .iter()
+            .enumerate()
+            .map(|(index, (token, name))| CustomTag {
+                position: index as i64,
+                ..stored_tag(token, name)
+            })
+            .collect();
+        assert!(db.replace_custom_tags(&ordered).unwrap());
+        assert_eq!(
+            db.builtin_tag_slots().unwrap(),
+            ["tok-attention", "tok-work", "tok-personal", "tok-todo", "tok-later"]
+                .iter()
+                .map(|token| Some(token.to_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let mut changed = migrate_local_keywords(&db, &client, "stub", Some("test-ik")).await;
+        changed.sort();
+        assert_eq!(changed, strings(&["m-1", "m-2"]));
+        assert_eq!(count(&calls, "create").await, 0);
+        assert_eq!(db.messages_with_tag("tok-todo").unwrap(), strings(&["m-1"]));
+        assert_eq!(db.messages_with_tag("tok-attention").unwrap(), strings(&["m-2"]));
+        assert_eq!(db.messages_with_tag("tok-work").unwrap(), strings(&["m-2"]));
+
+        let ids = strings(&["m-2"]);
+        let mut budget = MAX_CREATED_PER_COMMAND;
+        let added = apply_keywords(&db, &client, "stub", Some("test-ik"), &ids, 1, &strings(&["$label4"]), &mut budget).await;
+        assert!(added.unmapped.is_empty(), "{:?}", added);
+        assert_eq!(db.messages_with_tag("tok-todo").unwrap(), strings(&["m-1", "m-2"]));
+        assert!(!db.replace_custom_tags(&ordered).unwrap());
     }
 
     #[tokio::test]

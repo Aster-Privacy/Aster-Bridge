@@ -1922,6 +1922,7 @@ mod tests {
                 server_id: "tag-1".to_string(),
                 name: "Work Stuff".to_string(),
                 keyword: crate::tags::keyword_for_name("Work Stuff"),
+                position: 0,
             }])
             .unwrap();
         ctx.db.add_message_tag(&["tg1".to_string()], "tok-work").unwrap();

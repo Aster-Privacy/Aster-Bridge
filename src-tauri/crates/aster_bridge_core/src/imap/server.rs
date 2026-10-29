@@ -8095,6 +8095,7 @@ mod tests {
             server_id: format!("id-{}", token),
             name: name.to_string(),
             keyword: crate::tags::keyword_for_name(name),
+            position: 0,
         }
     }
 
@@ -8164,6 +8165,7 @@ mod tests {
             server_id: "id-work".to_string(),
             name: "Work".to_string(),
             keyword: Some("Work".to_string()),
+            position: 0,
         }
     }
 
