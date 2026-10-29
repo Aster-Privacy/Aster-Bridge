@@ -453,27 +453,7 @@ where
                                 _ => "550 Send rejected\r\n".to_string(),
                             };
                             tracing::error!("Failed to send mail via API: {}", e);
-                            let log_line = format!(
-                                "[{}] {}\n",
-                                chrono::Utc::now().to_rfc3339(),
-                                crate::diagnostics::redact_line(&format!("SMTP send failed: {}", e))
-                            );
-                            if let Ok(dir) = crate::config::data_dir() {
-                                let path = dir.join("smtp_errors.log");
-                                let _ = std::fs::create_dir_all(path.parent().unwrap());
-                                const MAX_LOG_BYTES: u64 = 1_048_576;
-                                if let Ok(meta) = std::fs::metadata(&path) {
-                                    if meta.len() > MAX_LOG_BYTES {
-                                        let rotated = dir.join("smtp_errors.log.1");
-                                        let _ = std::fs::rename(&path, &rotated);
-                                    }
-                                }
-                                let _ = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(&path)
-                                    .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
-                            }
+                            log_send_failure(&format!("SMTP send failed: {}", e));
                             writer.write_all(smtp_reply.as_bytes()).await?;
                         }
                     }
@@ -1245,6 +1225,30 @@ async fn send_via_api(
     let stores_sent_copy = crate::smtp::reply_thread::stores_sent_copy(&payload);
     client.send_mail(&access_token, &payload).await?;
     Ok(stores_sent_copy)
+}
+
+pub(crate) fn log_send_failure(message: &str) {
+    const MAX_LOG_BYTES: u64 = 1_048_576;
+    let log_line = format!(
+        "[{}] {}\n",
+        chrono::Utc::now().to_rfc3339(),
+        crate::diagnostics::redact_line(message)
+    );
+    let Ok(dir) = crate::config::data_dir() else {
+        return;
+    };
+    let path = dir.join("smtp_errors.log");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_LOG_BYTES {
+            let _ = std::fs::rename(&path, dir.join("smtp_errors.log.1"));
+        }
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
 }
 
 async fn session_stores_sent_copy(session: &Arc<RwLock<Session>>) -> bool {
