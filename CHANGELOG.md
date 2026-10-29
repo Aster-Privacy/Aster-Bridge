@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.13 - 2026-10-29
+
+### What's new
+- When an update is available, Aster Bridge shows what's new in it. While the update installs, you can see the download progress and about how much time is left.
+
+### Fixed
+- When you rename a built-in tag in your mail app, it now applies the Aster label in the same place in your label list. Previously a renamed tag never reached Aster. To use a different label for a tag, go to **Settings** and choose it under **Built-in tags**.
+
 ## 1.0.12 - 2026-10-25
 
 ### Fixed
