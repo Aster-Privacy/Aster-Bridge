@@ -103,7 +103,128 @@ fn assert_cipher_active(conn: &Connection) -> Result<(), String> {
     }
 }
 
+const DB_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+fn sibling_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn plaintext_backup_path(db_path: &Path) -> PathBuf {
+    sibling_path(db_path, ".plain")
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn table_row_counts(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND rootpage > 0 \
+                 AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let mut counts = Vec::with_capacity(names.len());
+    for name in names {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {}", quote_identifier(&name)),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        counts.push((name, count));
+    }
+    Ok(counts)
+}
+
+fn holds_same_rows(conn: &Connection, expected: &[(String, i64)]) -> bool {
+    expected.iter().all(|(name, count)| {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {}", quote_identifier(name)),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|found| found == *count)
+        .unwrap_or(false)
+    })
+}
+
+fn export_encrypted(conn: &Connection, enc_path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    let mut hex = to_hex(key);
+    let export = conn.execute_batch(&format!(
+        "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";
+         SELECT sqlcipher_export('encrypted');
+         DETACH DATABASE encrypted;",
+        enc_path.to_string_lossy().replace('\'', "''"),
+        hex
+    ));
+    hex.zeroize();
+    export.map_err(|e| format!("sqlcipher_export: {}", e))
+}
+
+fn sync_file(path: &Path) {
+    let synced = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all());
+    if let Err(e) = synced {
+        tracing::warn!("could not flush {} to disk: {}", path.display(), e);
+    }
+}
+
+type RenameFn<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+fn move_db_files(from: &Path, to: &Path, rename: RenameFn<'_>) -> std::io::Result<()> {
+    for suffix in DB_FILE_SUFFIXES {
+        let source = sibling_path(from, suffix);
+        if source.exists() {
+            rename(&source, &sibling_path(to, suffix))?;
+        }
+    }
+    Ok(())
+}
+
+fn shred_db_files(db_path: &Path) -> Result<(), String> {
+    let mut failed = Vec::new();
+    for suffix in DB_FILE_SUFFIXES {
+        let path = sibling_path(db_path, suffix);
+        if !path.is_file() {
+            continue;
+        }
+        best_effort_overwrite(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            failed.push(format!("{} ({})", path.display(), e));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not delete {}", failed.join(", ")))
+    }
+}
+
 fn migrate_plaintext_to_encrypted(db_path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    migrate_plaintext_with_rename(db_path, key, &|from: &Path, to: &Path| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn migrate_plaintext_with_rename(
+    db_path: &Path,
+    key: &[u8; 32],
+    rename: RenameFn<'_>,
+) -> Result<(), String> {
     let plaintext = Connection::open(db_path).map_err(|e| e.to_string())?;
     if !is_readable(&plaintext) {
         return Err(
@@ -113,47 +234,104 @@ fn migrate_plaintext_to_encrypted(db_path: &Path, key: &[u8; 32]) -> Result<(), 
     }
 
     let _ = plaintext.pragma_update(None, "journal_mode", "DELETE");
+    let expected = table_row_counts(&plaintext)?;
 
     let enc_path = db_path.with_extension("db.enc");
     let _ = std::fs::remove_file(&enc_path);
 
-    let mut hex = to_hex(key);
-    let export = plaintext.execute_batch(&format!(
-        "ATTACH DATABASE '{}' AS encrypted KEY \"x'{}'\";
-         SELECT sqlcipher_export('encrypted');
-         DETACH DATABASE encrypted;",
-        enc_path.to_string_lossy().replace('\'', "''"),
-        hex
-    ));
-    hex.zeroize();
-    export.map_err(|e| format!("sqlcipher_export: {}", e))?;
+    let exported = export_encrypted(&plaintext, &enc_path, key);
     drop(plaintext);
+    if let Err(e) = exported {
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(e);
+    }
+    sync_file(&enc_path);
 
-    {
+    let verified = (|| -> Result<bool, String> {
         let verify = Connection::open(&enc_path).map_err(|e| e.to_string())?;
         apply_key(&verify, key)?;
-        if assert_cipher_active(&verify).is_err() || !is_readable(&verify) {
-            drop(verify);
+        Ok(assert_cipher_active(&verify).is_ok()
+            && is_readable(&verify)
+            && table_row_counts(&verify).map(|found| found == expected).unwrap_or(false))
+    })();
+    if !matches!(verified, Ok(true)) {
+        let _ = std::fs::remove_file(&enc_path);
+        return Err("encrypted migration copy failed verification".to_string());
+    }
+
+    let backup = plaintext_backup_path(db_path);
+    if backup.exists() {
+        let aside = sibling_path(db_path, &format!(".plain.{}", unix_millis()));
+        if let Err(e) = move_db_files(&backup, &aside, rename) {
             let _ = std::fs::remove_file(&enc_path);
-            return Err("encrypted migration copy failed verification".to_string());
+            return Err(format!("move an older plaintext copy aside: {}", e));
         }
     }
 
-    best_effort_overwrite(db_path);
-    best_effort_overwrite(&db_path.with_extension("db-wal"));
-    best_effort_overwrite(&db_path.with_extension("db-shm"));
-    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    if let Err(e) = move_db_files(db_path, &backup, rename) {
+        let _ = move_db_files(&backup, db_path, rename);
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(format!("set the plaintext database aside: {}", e));
+    }
 
-    std::fs::rename(&enc_path, db_path).map_err(|e| {
-        format!(
-            "swap encrypted db into place (data preserved at {}): {}",
-            enc_path.display(),
-            e
-        )
-    })?;
+    if let Err(e) = rename(&enc_path, db_path) {
+        let restored = move_db_files(&backup, db_path, rename);
+        let _ = std::fs::remove_file(&enc_path);
+        return Err(match restored {
+            Ok(()) => format!("swap encrypted db into place: {}", e),
+            Err(r) => format!(
+                "swap encrypted db into place: {} (plaintext kept at {}: {})",
+                e,
+                backup.display(),
+                r
+            ),
+        });
+    }
+    crate::atomic_file::sync_parent_dir(db_path);
 
+    if let Err(e) = shred_db_files(&backup) {
+        tracing::warn!("encrypted database is in place but the plaintext copy remains: {}", e);
+    }
     Ok(())
+}
+
+fn restore_plaintext_backup(db_path: &Path) -> Result<(), String> {
+    let backup = plaintext_backup_path(db_path);
+    tracing::warn!(
+        "an earlier switch to the encrypted database did not finish; restoring {}",
+        backup.display()
+    );
+    for suffix in ["-wal", "-shm"] {
+        let stray = sibling_path(db_path, suffix);
+        if stray.exists() && !sibling_path(&backup, suffix).exists() {
+            let _ = std::fs::remove_file(&stray);
+        }
+    }
+    move_db_files(&backup, db_path, &|from: &Path, to: &Path| std::fs::rename(from, to))
+        .map_err(|e| format!("restore plaintext database from {}: {}", backup.display(), e))
+}
+
+fn discard_copied_plaintext_backup(conn: &Connection, db_path: &Path) {
+    let backup = plaintext_backup_path(db_path);
+    if !backup.is_file() {
+        return;
+    }
+    let expected = match Connection::open(&backup) {
+        Ok(plain) if is_readable(&plain) => table_row_counts(&plain),
+        _ => Err("not readable as plaintext".to_string()),
+    };
+    match expected {
+        Ok(expected) if holds_same_rows(conn, &expected) => {
+            if let Err(e) = shred_db_files(&backup) {
+                tracing::warn!("could not remove the plaintext copy: {}", e);
+            }
+        }
+        Ok(_) => tracing::warn!(
+            "keeping {} because the encrypted database does not hold the same rows",
+            backup.display()
+        ),
+        Err(e) => tracing::warn!("keeping {}: {}", backup.display(), e),
+    }
 }
 
 fn best_effort_overwrite(path: &Path) {
@@ -437,6 +615,9 @@ fn quarantine_incompatible_db(db_path: &Path, reason: &str) -> Result<(), String
 }
 
 fn open_keyed(db_path: &Path, key: &[u8; 32]) -> Result<Connection, String> {
+    if !db_path.exists() && plaintext_backup_path(db_path).is_file() {
+        restore_plaintext_backup(db_path)?;
+    }
     if db_path.exists() {
         let probe = Connection::open(db_path).map_err(|e| e.to_string())?;
         apply_key(&probe, key)?;
@@ -457,6 +638,7 @@ fn open_keyed(db_path: &Path, key: &[u8; 32]) -> Result<Connection, String> {
     if !is_readable(&conn) {
         return Err("failed to open encrypted database".to_string());
     }
+    discard_copied_plaintext_backup(&conn, db_path);
     Ok(conn)
 }
 
@@ -4124,6 +4306,160 @@ mod encryption_tests {
             )
             .unwrap();
         assert_eq!(value, "42", "WAL-mode plaintext data must survive migration");
+    }
+
+    fn seed_plaintext(path: &Path) {
+        let plain = Connection::open(path).unwrap();
+        plain
+            .execute_batch(
+                "CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO sync_state (key, value) VALUES ('cursor', '42'), ('folder', 'inbox');",
+            )
+            .unwrap();
+    }
+
+    fn plaintext_value(path: &Path, key: &str) -> Option<String> {
+        let plain = Connection::open(path).unwrap();
+        plain
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .unwrap()
+    }
+
+    fn stored_value(db: &Database, key: &str) -> Option<String> {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .unwrap()
+    }
+
+    fn migration_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("bridge.db.plain") || n.starts_with("bridge.db.enc"))
+            .collect()
+    }
+
+    fn encrypted_copy_beside(db_path: &Path, key: &[u8; 32]) -> PathBuf {
+        let enc_path = sibling_path(db_path, ".copy");
+        let plain = Connection::open(db_path).unwrap();
+        export_encrypted(&plain, &enc_path, key).unwrap();
+        enc_path
+    }
+
+    #[test]
+    fn migration_keeps_every_row_and_leaves_no_plaintext_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [11u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        assert_eq!(stored_value(&db, "folder").as_deref(), Some("inbox"));
+        drop(db);
+
+        assert!(migration_leftovers(dir.path()).is_empty());
+        let bare = Connection::open(&db_path).unwrap();
+        assert!(!is_readable(&bare));
+    }
+
+    #[test]
+    fn failed_swap_leaves_the_plaintext_database_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [12u8; 32];
+        let enc_path = db_path.with_extension("db.enc");
+        let failing_rename = |from: &Path, to: &Path| {
+            if from == enc_path.as_path() {
+                Err(std::io::Error::other("injected rename failure"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        };
+        assert!(migrate_plaintext_with_rename(&db_path, &key, &failing_rename).is_err());
+
+        assert_eq!(plaintext_value(&db_path, "cursor").as_deref(), Some("42"));
+        assert_eq!(plaintext_value(&db_path, "folder").as_deref(), Some("inbox"));
+        assert!(migration_leftovers(dir.path()).is_empty());
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn failed_export_leaves_the_plaintext_database_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let blocker = db_path.with_extension("db.enc");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("child"), b"x").unwrap();
+
+        let key = [13u8; 32];
+        assert!(migrate_plaintext_to_encrypted(&db_path, &key).is_err());
+        assert_eq!(plaintext_value(&db_path, "cursor").as_deref(), Some("42"));
+        assert!(!plaintext_backup_path(&db_path).exists());
+    }
+
+    #[test]
+    fn interrupted_swap_is_restored_and_finished_on_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&plaintext_backup_path(&db_path));
+
+        let key = [14u8; 32];
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        assert_eq!(stored_value(&db, "folder").as_deref(), Some("inbox"));
+        drop(db);
+        assert!(migration_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn leftover_plaintext_copy_is_removed_once_its_rows_are_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [15u8; 32];
+        let enc_path = encrypted_copy_beside(&db_path, &key);
+        std::fs::rename(&db_path, plaintext_backup_path(&db_path)).unwrap();
+        std::fs::rename(&enc_path, &db_path).unwrap();
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        drop(db);
+        assert!(migration_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn leftover_plaintext_copy_with_other_rows_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bridge.db");
+        seed_plaintext(&db_path);
+
+        let key = [16u8; 32];
+        let enc_path = encrypted_copy_beside(&db_path, &key);
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("INSERT INTO sync_state (key, value) VALUES ('extra', '1');")
+            .unwrap();
+        let backup = plaintext_backup_path(&db_path);
+        std::fs::rename(&db_path, &backup).unwrap();
+        std::fs::rename(&enc_path, &db_path).unwrap();
+
+        let db = Database::open_with_key(dir.path(), &key).unwrap();
+        assert_eq!(stored_value(&db, "cursor").as_deref(), Some("42"));
+        drop(db);
+        assert_eq!(plaintext_value(&backup, "extra").as_deref(), Some("1"));
     }
 
     #[test]

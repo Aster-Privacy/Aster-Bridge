@@ -185,6 +185,70 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn seal_verified(
+    magic: &[u8; 8],
+    plaintext: &[u8],
+    wrap_key: &[u8; 32],
+    reloaded_key: Option<[u8; 32]>,
+) -> Result<Vec<u8>, String> {
+    let reloaded = reloaded_key
+        .ok_or_else(|| "wrap key did not read back from the keystore".to_string())?;
+    let blob = aead_seal(wrap_key, magic, plaintext)?;
+    let mut opened = aead_open(&reloaded, magic, &blob)?;
+    let same = opened.as_slice() == plaintext;
+    opened.zeroize();
+    if !same {
+        return Err("sealed copy did not read back to the same bytes".to_string());
+    }
+    Ok(blob)
+}
+
+fn replace_with_verified(path: &Path, blob: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let tmp = crate::atomic_file::temp_path_beside(path);
+    let written = (|| -> Result<(), String> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(blob).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        if std::fs::read(&tmp).map_err(|e| e.to_string())? != blob {
+            return Err("sealed copy did not read back from disk".to_string());
+        }
+        if let Err(e) = set_file_permissions_restrictive(&tmp) {
+            tracing::warn!("could not restrict {}: {}", tmp.display(), e);
+        }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    crate::atomic_file::replace(&tmp, path)?;
+    crate::atomic_file::sync_parent_dir(path);
+    Ok(())
+}
+
+fn reseal_with_keys(
+    path: &Path,
+    magic: &[u8; 8],
+    plaintext: &[u8],
+    wrap_key: &[u8; 32],
+    reloaded_key: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let blob = seal_verified(magic, plaintext, wrap_key, reloaded_key)?;
+    replace_with_verified(path, &blob)
+}
+
+fn reseal_legacy_file(path: &Path, magic: &[u8; 8], plaintext: &[u8]) -> Result<(), String> {
+    let wrap_key = wrap_key_load_or_create()?;
+    let reloaded_key = wrap_key_load()?;
+    reseal_with_keys(path, magic, plaintext, &wrap_key, reloaded_key)
+}
+
 fn load_stored(data_dir: &Path) -> Result<Option<StoredIdentity>, String> {
     let path = identity_file_path(data_dir);
     if !path.exists() {
@@ -201,11 +265,19 @@ fn load_stored(data_dir: &Path) -> Result<Option<StoredIdentity>, String> {
         return Ok(Some(stored));
     }
 
-    let bytes = URL_SAFE_NO_PAD.decode(&data).map_err(|e| e.to_string())?;
-    let stored: StoredIdentity = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if let Err(e) = save_stored(data_dir, &stored) {
+    let mut bytes = URL_SAFE_NO_PAD.decode(&data).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_slice::<StoredIdentity>(&bytes).map_err(|e| e.to_string());
+    let stored = match parsed {
+        Ok(stored) => stored,
+        Err(e) => {
+            bytes.zeroize();
+            return Err(e);
+        }
+    };
+    if let Err(e) = reseal_legacy_file(&path, MAGIC_ID, &bytes) {
         tracing::warn!("identity legacy-to-v2 migration deferred: {}", e);
     }
+    bytes.zeroize();
     Ok(Some(stored))
 }
 
@@ -463,12 +535,23 @@ fn keyring_load() -> std::result::Result<Option<Vec<u8>>, String> {
     }
 }
 
+fn keyring_holds(expected: &[u8]) -> bool {
+    match keyring_load() {
+        Ok(Some(mut stored)) => {
+            let same = stored.as_slice() == expected;
+            stored.zeroize();
+            same
+        }
+        _ => false,
+    }
+}
+
 fn keyring_delete() -> std::result::Result<(), String> {
     crate::secrets::delete(KEYRING_USER)
 }
 
 pub fn store_passphrase(data_dir: &Path, passphrase: &[u8]) -> Result<(), String> {
-    if keyring_store(passphrase).is_ok() {
+    if keyring_store(passphrase).is_ok() && keyring_holds(passphrase) {
         let path = passphrase_file_path(data_dir);
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -505,17 +588,14 @@ pub fn load_passphrase(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
         b64url_decode(s)?
     };
 
-    if keyring_store(&bytes).is_ok() {
+    if keyring_store(&bytes).is_ok() && keyring_holds(&bytes) {
         let _ = std::fs::remove_file(&path);
     } else if !was_sealed {
-        let resealed = wrap_key_load_or_create().ok().and_then(|wrap_key| {
-            let blob = aead_seal(&wrap_key, MAGIC_PP, &bytes).ok()?;
-            atomic_write(&path, &blob).ok()?;
-            let _ = set_file_permissions_restrictive(&path);
-            Some(())
-        });
-        if resealed.is_none() {
-            tracing::warn!("could not re-seal legacy passphrase file; it remains in plaintext on disk");
+        if let Err(e) = reseal_legacy_file(&path, MAGIC_PP, &bytes) {
+            tracing::warn!(
+                "could not re-seal legacy passphrase file; it remains in plaintext on disk: {}",
+                e
+            );
         }
     }
 
@@ -607,6 +687,74 @@ mod tests {
     #[test]
     fn aead_open_short_input_is_rejected() {
         assert!(aead_open(&[0u8; 32], MAGIC_ID, b"tiny").is_err());
+    }
+
+    fn temp_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn legacy_identity_file_is_resealed_after_it_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = identity_file_path(dir.path());
+        let json = br#"{"device_id":null}"#;
+        std::fs::write(&path, b64url(json)).unwrap();
+
+        let key = [21u8; 32];
+        reseal_with_keys(&path, MAGIC_ID, json, &key, Some(key)).unwrap();
+
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!(&sealed[..8], MAGIC_ID);
+        assert_eq!(aead_open(&key, MAGIC_ID, &sealed).unwrap(), json);
+        assert!(temp_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_passphrase_file_is_resealed_after_it_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = passphrase_file_path(dir.path());
+        let passphrase = b"correct horse battery staple";
+        std::fs::write(&path, b64url(passphrase)).unwrap();
+
+        let key = [22u8; 32];
+        reseal_with_keys(&path, MAGIC_PP, passphrase, &key, Some(key)).unwrap();
+
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!(aead_open(&key, MAGIC_PP, &sealed).unwrap(), passphrase);
+    }
+
+    #[test]
+    fn a_wrap_key_that_reads_back_differently_keeps_the_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = passphrase_file_path(dir.path());
+        let passphrase = b"correct horse battery staple";
+        let legacy = b64url(passphrase);
+        std::fs::write(&path, &legacy).unwrap();
+
+        assert!(reseal_with_keys(&path, MAGIC_PP, passphrase, &[23u8; 32], Some([24u8; 32])).is_err());
+        assert!(reseal_with_keys(&path, MAGIC_PP, passphrase, &[23u8; 32], None).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), legacy.as_bytes());
+        assert!(temp_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_failed_replace_keeps_the_original_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("occupied");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("child"), b"legacy").unwrap();
+
+        let key = [25u8; 32];
+        assert!(reseal_with_keys(&path, MAGIC_ID, b"payload", &key, Some(key)).is_err());
+
+        assert_eq!(std::fs::read(path.join("child")).unwrap(), b"legacy");
+        assert!(temp_leftovers(dir.path()).is_empty());
     }
 
     fn test_identity() -> DeviceIdentity {
