@@ -377,7 +377,7 @@ const en = {
 
   provision_title: "Allow access?",
   provision_allow: "Allow",
-  provision_confirm: "Allow \"{{label}}\" to access your Aster Bridge? This will copy credentials to your clipboard.",
+  provision_confirm: "A link opened outside Aster Bridge wants to set up a mail app named \"{{label}}\". Aster Bridge can't confirm which site or app opened the link, so if you didn't start this setup, click Cancel. If you allow it, Aster Bridge creates an app password and copies the mail settings to your clipboard.",
   sign_out_title: "Sign out?",
   sign_out_body: "You'll be signed out of Aster Bridge on this device.",
 
