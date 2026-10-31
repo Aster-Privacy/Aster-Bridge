@@ -68,7 +68,7 @@ pub async fn run(
             sock_addr.port(),
             true,
         );
-        let listener = tokio::net::TcpListener::bind(sock_addr)
+        let listener = crate::port_picker::bind_loopback_listener(addr)
             .await
             .map_err(|e| format!("bind {} failed: {}", sock_addr, e))?;
         tracing::info!("JMAP server listening on https://{}", sock_addr);

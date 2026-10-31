@@ -1402,7 +1402,16 @@ where
 
         let tag = parts[0].to_string();
         let command = parts[1].to_uppercase();
-        if command.starts_with("LOGIN") || command.starts_with("AUTH") {
+        let carries_private_args = command.starts_with("LOGIN")
+            || command.starts_with("AUTH")
+            || command == "SEARCH"
+            || command == "ESEARCH"
+            || (command == "UID"
+                && parts
+                    .get(2)
+                    .map(|rest| rest.trim_start().to_uppercase().starts_with("SEARCH"))
+                    .unwrap_or(false));
+        if carries_private_args {
             tracing::debug!("IMAP <- {} {} <redacted>", tag, command);
         } else {
             tracing::debug!("IMAP <- {}", trimmed);
