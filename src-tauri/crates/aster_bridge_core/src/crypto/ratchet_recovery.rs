@@ -1060,6 +1060,87 @@ mod tests {
     }
 
     #[test]
+    fn stretched_storage_key_matches_web_at_production_iterations() {
+        let v: Value = serde_json::from_str(STORAGE_VECTORS).unwrap();
+        let pass = v["passphrase"].as_str().unwrap().as_bytes();
+        assert_eq!(STORAGE_STRETCH_ITERATIONS, 600_000);
+        let v2 = derive_storage_key_v2(pass, STORAGE_STRETCH_ITERATIONS).unwrap();
+        assert_eq!(b64(v2.as_slice()), v["storage_v2_production_iterations"].as_str().unwrap());
+        let v1 = derive_storage_key_v1(pass).unwrap();
+        assert_eq!(b64(v1.as_slice()), v["storage_v1"].as_str().unwrap());
+        assert_eq!(v1.as_slice(), &crate::crypto::alias::derive_storage_key(pass));
+    }
+
+    #[test]
+    fn stretched_vaults_read_stretched_and_older_fields() {
+        use crate::crypto::alias::{decrypt_display_name, storage_key_candidates};
+        let pass = b"pass";
+        let v1 = derive_storage_key_v1(pass).unwrap();
+        let v2 = derive_storage_key_v2(pass, 1000).unwrap();
+        let (stretched_field, stretched_nonce) = seal_alias(v2.as_slice(), "Stretched Name");
+        let (older_field, older_nonce) = seal_alias(v1.as_slice(), "Older Name");
+
+        let vault = vault_from(json!({ "kdf_version": 2 }));
+        let candidates = storage_key_candidates(pass, &derive_storage_base_keys(&vault, pass, 1000));
+        assert_eq!(candidates[0].as_slice(), v2.as_slice());
+        assert_eq!(
+            decrypt_display_name(&candidates, &stretched_field, &stretched_nonce).unwrap(),
+            "Stretched Name"
+        );
+        assert_eq!(
+            decrypt_display_name(&candidates, &older_field, &older_nonce).unwrap(),
+            "Older Name"
+        );
+    }
+
+    #[test]
+    fn other_kdf_versions_never_use_the_stretched_key() {
+        use crate::crypto::alias::{decrypt_display_name, storage_key_candidates};
+        let pass = b"pass";
+        let v1 = derive_storage_key_v1(pass).unwrap();
+        let v2 = derive_storage_key_v2(pass, 1000).unwrap();
+        let (stretched_field, stretched_nonce) = seal_alias(v2.as_slice(), "Stretched Name");
+        let (older_field, older_nonce) = seal_alias(v1.as_slice(), "Older Name");
+
+        let versions = [
+            json!({}),
+            json!({ "kdf_version": null }),
+            json!({ "kdf_version": 1 }),
+            json!({ "kdf_version": 3 }),
+            json!({ "kdf_version": "2" }),
+        ];
+        for extra in versions {
+            let vault = vault_from(extra);
+            let keys = derive_storage_base_keys(&vault, pass, 1000);
+            assert!(keys.iter().all(|k| k.as_slice() != v2.as_slice()));
+            let candidates = storage_key_candidates(pass, &keys);
+            assert_eq!(
+                decrypt_display_name(&candidates, &older_field, &older_nonce).unwrap(),
+                "Older Name"
+            );
+            assert!(decrypt_display_name(&candidates, &stretched_field, &stretched_nonce).is_err());
+        }
+    }
+
+    #[test]
+    fn without_vault_keys_only_the_older_key_is_tried() {
+        use crate::crypto::alias::{decrypt_display_name, storage_key_candidates};
+        let pass = b"pass";
+        let v1 = derive_storage_key_v1(pass).unwrap();
+        let v2 = derive_storage_key_v2(pass, 1000).unwrap();
+        let (stretched_field, stretched_nonce) = seal_alias(v2.as_slice(), "Stretched Name");
+        let (older_field, older_nonce) = seal_alias(v1.as_slice(), "Older Name");
+
+        let candidates = storage_key_candidates(pass, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            decrypt_display_name(&candidates, &older_field, &older_nonce).unwrap(),
+            "Older Name"
+        );
+        assert!(decrypt_display_name(&candidates, &stretched_field, &stretched_nonce).is_err());
+    }
+
+    #[test]
     fn storage_base_keys_are_capped_and_deduplicated() {
         let many: Vec<Value> = (0..200).map(|i| json!({ "k": b64(&[i as u8; 32]) })).collect();
         let dupes: Vec<String> = (0..100).map(|_| "same".to_string()).collect();
