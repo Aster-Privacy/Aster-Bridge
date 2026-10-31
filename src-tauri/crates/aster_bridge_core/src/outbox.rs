@@ -26,7 +26,7 @@ use crate::api_client::ApiClient;
 use crate::auth::session::Session;
 use crate::db::{Database, OutboxRow};
 use crate::error::BridgeError;
-use crate::smtp::server::{build_threaded_send_payload, is_transient_send_error};
+use crate::smtp::server::{build_threaded_send_payload, is_transient_send_error, log_send_failure};
 
 const TICK_SECS: u64 = 30;
 const MAX_ATTEMPTS: i64 = 7;
@@ -84,6 +84,129 @@ pub async fn try_send_row(
     client.send_mail(&access_token, &payload).await
 }
 
+const NOTICE_REASON_MAX_CHARS: usize = 300;
+
+fn failure_reason(err: &BridgeError) -> String {
+    let reason = match err {
+        BridgeError::PlanUpgradeRequired(msg)
+        | BridgeError::MessageTooLarge(msg)
+        | BridgeError::RecipientKey(msg) => msg.clone(),
+        BridgeError::Network(_) | BridgeError::Io(_) => {
+            "Aster Bridge couldn't reach the Aster server.".to_string()
+        }
+        BridgeError::Api(msg) => {
+            let (status, body) = msg.split_once(": ").unwrap_or((msg.as_str(), ""));
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|m| format!("{} ({})", m, status))
+                })
+                .unwrap_or_else(|| status.to_string())
+        }
+        other => other.to_string(),
+    };
+    let reason = crate::protocol_text::response_text(&reason);
+    reason.trim().chars().take(NOTICE_REASON_MAX_CHARS).collect()
+}
+
+fn header_text(value: &str) -> String {
+    crate::protocol_text::response_text(value).trim().to_string()
+}
+
+fn encoded_header_text(value: &str) -> String {
+    use base64::Engine;
+    if value.is_ascii() {
+        value.to_string()
+    } else {
+        format!(
+            "=?UTF-8?B?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+        )
+    }
+}
+
+fn failed_send_notice(row: &OutboxRow, reason: &str, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    use mail_parser::MessageParser;
+    let parsed = MessageParser::default().parse(&row.raw_mime);
+    let subject = parsed
+        .as_ref()
+        .and_then(|p| p.subject())
+        .map(header_text)
+        .filter(|s| !s.is_empty());
+    let original_id = parsed
+        .as_ref()
+        .and_then(|p| p.message_id())
+        .map(header_text)
+        .filter(|s| !s.is_empty());
+    let recipients: Vec<String> = row
+        .envelope_to
+        .split(',')
+        .map(header_text)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out = String::new();
+    out.push_str(&format!("Date: {}\r\n", now.to_rfc2822()));
+    out.push_str("From: Aster Bridge <mailer-daemon@localhost>\r\n");
+    let owner = header_text(&row.envelope_from);
+    if !owner.is_empty() {
+        out.push_str(&format!("To: <{}>\r\n", owner));
+    }
+    let notice_subject = match &subject {
+        Some(s) => format!("Undelivered: {}", s),
+        None => "Undelivered message".to_string(),
+    };
+    out.push_str(&format!("Subject: {}\r\n", encoded_header_text(&notice_subject)));
+    out.push_str(&format!(
+        "Message-ID: <failed-send-{}-{}@localhost>\r\n",
+        row.id,
+        now.timestamp_millis()
+    ));
+    if let Some(id) = &original_id {
+        out.push_str(&format!("In-Reply-To: <{}>\r\nReferences: <{}>\r\n", id, id));
+    }
+    out.push_str("Auto-Submitted: auto-generated\r\n");
+    out.push_str("MIME-Version: 1.0\r\n");
+    out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    out.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    out.push_str("Aster Bridge couldn't send this message.\r\n\r\n");
+    if let Some(s) = &subject {
+        out.push_str(&format!("Subject: {}\r\n", s));
+    }
+    if !recipients.is_empty() {
+        out.push_str(&format!("To: {}\r\n", recipients.join(", ")));
+    }
+    out.push_str(&format!("Reason: {}\r\n\r\n", reason));
+    out.push_str("To try again, send the message again from your mail app.\r\n");
+    out.into_bytes()
+}
+
+async fn report_failed_send(
+    row: &OutboxRow,
+    err: &BridgeError,
+    session: &Arc<RwLock<Session>>,
+    client: &Arc<ApiClient>,
+    db: &Arc<Database>,
+) {
+    log_send_failure(&format!("Queued SMTP send {} failed: {}", row.id, err));
+    let notice = failed_send_notice(row, &failure_reason(err), chrono::Utc::now());
+    if let Err(e) = crate::imap::append::append_imported_message(
+        db,
+        client,
+        session,
+        "inbox",
+        &notice,
+        &crate::imap::append::AppendFlags::default(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("outbox id={} failure notice not delivered: {}", row.id, e);
+    }
+}
+
 pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
     use mail_parser::MessageParser;
     let Some(parsed) = MessageParser::default().parse(&row.raw_mime) else {
@@ -112,7 +235,7 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
                 .is_some_and(|stored| stored.eq_ignore_ascii_case(&message_id))
         });
     }
-    if row.attempts == 0 {
+    if row.attempts == 0 || envelope_addrs.is_empty() {
         return false;
     }
     sent.iter().any(|m| {
@@ -132,10 +255,9 @@ pub fn sent_copy_exists(db: &Database, row: &OutboxRow) -> bool {
         match m.recipients.as_deref() {
             Some(r) => {
                 let r_lower = r.to_lowercase();
-                envelope_addrs.is_empty()
-                    || envelope_addrs.iter().any(|a| r_lower.contains(a.as_str()))
+                envelope_addrs.iter().any(|a| r_lower.contains(a.as_str()))
             }
-            None => true,
+            None => false,
         }
     })
 }
@@ -181,6 +303,7 @@ async fn process_one(
                 tracing::warn!("outbox id={} permanent failure: {}", row.id, err_msg);
                 let _ = db.outbox_mark_failed(row.id, &err_msg);
                 crate::sync::poller::notify_send_failed();
+                report_failed_send(row, &e, session, client, db).await;
                 return;
             }
             let next_attempts = row.attempts + 1;
@@ -188,6 +311,7 @@ async fn process_one(
                 tracing::warn!("outbox id={} exhausted retries: {}", row.id, err_msg);
                 let _ = db.outbox_mark_failed(row.id, &err_msg);
                 crate::sync::poller::notify_send_failed();
+                report_failed_send(row, &e, session, client, db).await;
             } else {
                 let _ = db.outbox_bump_attempt(row.id, &err_msg);
             }
@@ -545,6 +669,28 @@ mod tests {
         assert!(sent_copy_exists(&db, &row));
     }
 
+    #[test]
+    fn sent_copy_without_recipients_never_matches() {
+        let (_dir, db) = test_db();
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00+00:00")
+            .unwrap()
+            .timestamp();
+        db.upsert_cached_message(
+            "sc-7",
+            "sent",
+            Some("status report"),
+            Some("me@aster.test"),
+            None,
+            Some("2026-08-01T10:00:30+00:00"),
+            10,
+            Some("body"),
+            Some("{}"),
+        )
+        .unwrap();
+        let row = outbox_row_for("status report", "bob@example.com", queued);
+        assert!(!sent_copy_exists(&db, &row));
+    }
+
     fn stub_session() -> Arc<RwLock<Session>> {
         Arc::new(RwLock::new(Session {
             data_kek: None,
@@ -618,6 +764,85 @@ mod tests {
         let row = db.outbox_get(id).unwrap().unwrap();
         assert_eq!(row.status, "sent");
         assert_eq!(row.attempts, 0);
+    }
+
+    fn notice_envelope(row: &OutboxRow, reason: &str) -> serde_json::Value {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-29T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let notice = failed_send_notice(row, reason, now);
+        let message = crate::imap::append::build_imported_message(&notice, "inbox", None, now)
+            .expect("the failure notice did not parse");
+        assert!(message.message_id.starts_with("failed-send-1-"));
+        assert_eq!(message.item_type, "received");
+        serde_json::from_str(&message.envelope_json).unwrap()
+    }
+
+    #[test]
+    fn failure_notice_names_the_message_recipients_and_reason() {
+        let mut row = outbox_row_for("status report", "bob@example.com, carol@example.com", 0);
+        row.raw_mime = b"Message-ID: <orig@client.example>\r\nFrom: me@aster.test\r\nTo: bob@example.com\r\nSubject: status report\r\n\r\nbody".to_vec();
+        let envelope = notice_envelope(&row, "Recipient not found (422 Unprocessable Entity)");
+        assert_eq!(envelope["subject"], "Undelivered: status report");
+        assert_eq!(envelope["to"][0], "me@aster.test");
+        let body = envelope["body_text"].as_str().unwrap();
+        assert!(body.contains("couldn't send this message"));
+        assert!(body.contains("To: bob@example.com, carol@example.com"));
+        assert!(body.contains("Reason: Recipient not found (422 Unprocessable Entity)"));
+        assert!(!body.contains("body"));
+        let headers = envelope["raw_headers"].as_array().unwrap();
+        assert!(headers.iter().any(|h| h["name"] == "In-Reply-To"
+            && h["value"].as_str().unwrap().contains("orig@client.example")));
+    }
+
+    #[test]
+    fn failure_notice_encodes_a_non_ascii_subject() {
+        let row = outbox_row_for("Résumé für Anna", "bob@example.com", 0);
+        let notice = failed_send_notice(&row, "refused", chrono::Utc::now());
+        let text = String::from_utf8(notice).unwrap();
+        let header = text.lines().find(|l| l.starts_with("Subject: ")).unwrap();
+        assert!(header.is_ascii());
+        assert!(header.contains("=?UTF-8?B?"));
+        let envelope = notice_envelope(&row, "refused");
+        assert_eq!(envelope["subject"], "Undelivered: Résumé für Anna");
+    }
+
+    #[test]
+    fn failure_notice_without_a_subject_still_has_one() {
+        let mut row = outbox_row_for("", "bob@example.com", 0);
+        row.raw_mime = b"From: me@aster.test\r\nTo: bob@example.com\r\n\r\nbody".to_vec();
+        let envelope = notice_envelope(&row, "refused");
+        assert_eq!(envelope["subject"], "Undelivered message");
+    }
+
+    #[test]
+    fn failure_notice_cannot_be_given_extra_headers() {
+        let mut row = outbox_row_for("hi", "bob@example.com\r\nBcc: eve@example.com", 0);
+        row.envelope_from = "me@aster.test\r\nX-Injected: yes".to_string();
+        let notice = failed_send_notice(&row, "bad\r\nX-Reason: injected", chrono::Utc::now());
+        let text = String::from_utf8(notice).unwrap();
+        let (headers, _) = text.split_once("\r\n\r\n").unwrap();
+        assert!(!headers.lines().any(|l| l.starts_with("Bcc:") || l.starts_with("X-")));
+    }
+
+    #[test]
+    fn failure_reason_reads_the_server_message() {
+        let err = BridgeError::Api(
+            r#"422 Unprocessable Entity: {"error":"Recipient not found"}"#.to_string(),
+        );
+        assert_eq!(failure_reason(&err), "Recipient not found (422 Unprocessable Entity)");
+        let err = BridgeError::Api(r#"500 Internal Server Error: {"error":"#.to_string());
+        assert_eq!(failure_reason(&err), "500 Internal Server Error");
+        let err = BridgeError::RecipientKey("bob@example.com changed keys".to_string());
+        assert_eq!(failure_reason(&err), "bob@example.com changed keys");
+    }
+
+    #[test]
+    fn failure_reason_is_one_bounded_line() {
+        let err = BridgeError::Smtp(format!("line one\nline two {}", "x".repeat(1000)));
+        let reason = failure_reason(&err);
+        assert!(!reason.contains('\n'));
+        assert_eq!(reason.chars().count(), NOTICE_REASON_MAX_CHARS);
     }
 
     #[tokio::test]

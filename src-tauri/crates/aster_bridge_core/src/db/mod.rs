@@ -327,6 +327,7 @@ const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
             "status",
         ],
     ),
+    ("pending_flag_push", &["aster_id", "bit", "value", "attempts", "queued_at"]),
 ];
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
@@ -544,6 +545,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "envelope_nonces",
     "recipient_key_pin",
     "outbox",
+    "pending_flag_push",
     "sqlite_sequence",
 ];
 
@@ -851,6 +853,16 @@ impl Database {
         conn.execute_batch(history::HISTORY_SCHEMA_SQL).map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_outbox_status_queued ON outbox(status, queued_at);",
+        ).map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_flag_push (
+                aster_id TEXT NOT NULL,
+                bit INTEGER NOT NULL,
+                value INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                queued_at INTEGER NOT NULL,
+                PRIMARY KEY (aster_id, bit)
+             );",
         ).map_err(|e| e.to_string())?;
 
         conn.execute_batch(
@@ -1784,6 +1796,105 @@ impl Database {
             )?;
             Ok(())
         })
+    }
+
+    pub fn record_pending_flag_pushes(&self, changes: &[(String, bool)], bit: i64) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let now = unix_millis() as i64;
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO pending_flag_push (aster_id, bit, value, attempts, queued_at)
+                     VALUES (?1, ?2, ?3, 0, ?4)
+                     ON CONFLICT(aster_id, bit) DO UPDATE SET
+                        value = excluded.value, attempts = 0, queued_at = excluded.queued_at",
+                )?;
+                for (aster_id, value) in changes {
+                    stmt.execute(rusqlite::params![aster_id, bit, *value as i64, now])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn clear_pending_flag_pushes(&self, aster_ids: &[String], bit: i64, value: bool) -> Result<(), String> {
+        if aster_ids.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "DELETE FROM pending_flag_push WHERE aster_id = ?1 AND bit = ?2 AND value = ?3",
+                )?;
+                for aster_id in aster_ids {
+                    stmt.execute(rusqlite::params![aster_id, bit, value as i64])?;
+                }
+            }
+            tx.commit()
+        })
+    }
+
+    pub fn note_failed_flag_push(&self, aster_id: &str, bit: i64, value: bool) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE pending_flag_push SET attempts = attempts + 1
+                 WHERE aster_id = ?1 AND bit = ?2 AND value = ?3",
+                rusqlite::params![aster_id, bit, value as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn drop_exhausted_flag_pushes(&self, max_attempts: i64) -> Result<usize, String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM pending_flag_push WHERE attempts >= ?1",
+                rusqlite::params![max_attempts],
+            )
+        })
+    }
+
+    pub fn pending_flag_pushes(&self, min_age_ms: i64, limit: usize) -> Result<Vec<(String, i64, bool)>, String> {
+        let queued_before = unix_millis() as i64 - min_age_ms;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT aster_id, bit, value FROM pending_flag_push
+                 WHERE queued_at <= ?1 ORDER BY queued_at LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![queued_before, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0))
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn pending_flag_values(&self, aster_ids: &[&str]) -> Result<HashMap<String, Vec<(i64, bool)>>, String> {
+        let mut out: HashMap<String, Vec<(i64, bool)>> = HashMap::new();
+        if aster_ids.is_empty() {
+            return Ok(out);
+        }
+        self.with_conn(|conn| {
+            for chunk in aster_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT aster_id, bit, value FROM pending_flag_push WHERE aster_id IN ({})",
+                    placeholders
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0))
+                })?;
+                for row in rows {
+                    let (id, bit, value) = row?;
+                    out.entry(id).or_default().push((bit, value));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// IMAP keywords (user-defined flags such as Thunderbird's `$label1`
@@ -2769,7 +2880,8 @@ impl Database {
                  DELETE FROM jmap_change_log;
                  DELETE FROM jmap_blob;
                  DELETE FROM envelope_nonces;
-                 DELETE FROM outbox;",
+                 DELETE FROM outbox;
+                 DELETE FROM pending_flag_push;",
             )?;
             conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
             Ok(())
@@ -4061,6 +4173,57 @@ mod db_tests {
     fn insert(db: &Database, aster_id: &str, folder: &str) {
         db.upsert_cached_message(aster_id, folder, Some("subj"), Some("from@x"), Some("to@x"), Some("2026-01-01"), 10, Some("body"), Some("headers"))
             .unwrap();
+    }
+
+    #[test]
+    fn pending_flag_push_keeps_the_latest_value_per_bit() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true), ("m2".to_string(), true)], 1)
+            .unwrap();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true)], 4).unwrap();
+        db.note_failed_flag_push("m1", 1, true).unwrap();
+        db.record_pending_flag_pushes(&[("m1".to_string(), false)], 1).unwrap();
+        let mut rows = db.pending_flag_pushes(0, 100).unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("m1".to_string(), 1, false),
+                ("m1".to_string(), 4, true),
+                ("m2".to_string(), 1, true),
+            ]
+        );
+        assert!(db.pending_flag_pushes(60_000, 100).unwrap().is_empty());
+        let values = db.pending_flag_values(&["m1", "absent"]).unwrap();
+        let mut m1 = values["m1"].clone();
+        m1.sort();
+        assert_eq!(m1, vec![(1, false), (4, true)]);
+        assert!(!values.contains_key("absent"));
+    }
+
+    #[test]
+    fn pending_flag_push_clears_only_the_value_that_was_sent() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), false)], 1).unwrap();
+        db.clear_pending_flag_pushes(&["m1".to_string()], 1, true).unwrap();
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap().len(), 1);
+        db.clear_pending_flag_pushes(&["m1".to_string()], 4, false).unwrap();
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap().len(), 1);
+        db.clear_pending_flag_pushes(&["m1".to_string()], 1, false).unwrap();
+        assert!(db.pending_flag_pushes(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_flag_push_is_dropped_after_too_many_failures() {
+        let (_d, db) = open_db();
+        db.record_pending_flag_pushes(&[("m1".to_string(), true), ("m2".to_string(), true)], 1)
+            .unwrap();
+        for _ in 0..3 {
+            db.note_failed_flag_push("m1", 1, true).unwrap();
+        }
+        db.note_failed_flag_push("m2", 1, false).unwrap();
+        assert_eq!(db.drop_exhausted_flag_pushes(3).unwrap(), 1);
+        assert_eq!(db.pending_flag_pushes(0, 100).unwrap(), vec![("m2".to_string(), 1, true)]);
     }
 
     #[test]

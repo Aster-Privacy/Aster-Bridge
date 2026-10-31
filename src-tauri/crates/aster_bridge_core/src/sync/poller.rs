@@ -1141,11 +1141,26 @@ fn reconcile_server_flags(db: &Database, item: &MailItem) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    let new_flags = server_flags(current, item);
+    let mut new_flags = server_flags(current, item);
+    if let Ok(pending) = db.pending_flag_values(&[item.id.as_str()]) {
+        if let Some(pending) = pending.get(&item.id) {
+            new_flags = with_pending_flags(new_flags, pending);
+        }
+    }
     if new_flags == current {
         return false;
     }
     db.set_message_flags_by_id(&item.id, new_flags).is_ok()
+}
+
+fn with_pending_flags(flags: i64, pending: &[(i64, bool)]) -> i64 {
+    pending.iter().fold(flags, |flags, (bit, value)| {
+        if *value {
+            flags | bit
+        } else {
+            flags & !bit
+        }
+    })
 }
 
 fn server_flags(current: i64, item: &MailItem) -> i64 {
@@ -2666,6 +2681,7 @@ async fn run_sync_pass(
     deep: bool,
 ) -> Result<(), String> {
     let pass_started = std::time::Instant::now();
+    crate::imap::server::retry_pending_flag_pushes(db, client, session).await;
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
     let mut seen_ids: HashSet<String> = HashSet::new();
@@ -2971,6 +2987,16 @@ async fn run_sync_pass(
                             }
                         }
                     }
+                    let flag_update_ids: Vec<&str> =
+                        flag_updates.iter().map(|(item, _, _)| item.id.as_str()).collect();
+                    if let Ok(pending) = db.pending_flag_values(&flag_update_ids) {
+                        for (item, _, flags) in flag_updates.iter_mut() {
+                            if let Some(pending) = pending.get(&item.id) {
+                                *flags = with_pending_flags(*flags, pending);
+                            }
+                        }
+                    }
+                    flag_updates.retain(|(_, expected, flags)| expected != flags);
                     let writes: Vec<(String, i64, i64)> = flag_updates
                         .iter()
                         .map(|(item, expected, flags)| (item.id.clone(), *expected, *flags))
@@ -5752,6 +5778,30 @@ mod tests {
         let mut no_body = state.clone();
         no_body.body_cached = false;
         assert!(cached_shortcut(Some(&no_body), "inbox", &item).is_none());
+    }
+
+    #[test]
+    fn server_flags_wait_for_a_pending_local_change() {
+        let (_dir, db) = temp_db();
+        let mut item = item_with_envelope("pending-a", &serde_json::json!({"subject": "s", "body_text": "b"}));
+        cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]);
+        let base = db.get_message_flags_by_id("pending-a").unwrap() & !5;
+        db.set_message_flags_by_id("pending-a", base | 1 | 4).unwrap();
+        db.record_pending_flag_pushes(&[("pending-a".to_string(), true)], 1).unwrap();
+        item.is_read = Some(false);
+        item.is_starred = Some(false);
+        assert!(reconcile_server_flags(&db, &item));
+        assert_eq!(db.get_message_flags_by_id("pending-a").unwrap(), base | 1);
+        db.clear_pending_flag_pushes(&["pending-a".to_string()], 1, true).unwrap();
+        assert!(reconcile_server_flags(&db, &item));
+        assert_eq!(db.get_message_flags_by_id("pending-a").unwrap(), base);
+    }
+
+    #[test]
+    fn pending_flags_override_only_their_own_bits() {
+        assert_eq!(with_pending_flags(0b1000, &[(1, true)]), 0b1001);
+        assert_eq!(with_pending_flags(0b1101, &[(1, false), (4, true)]), 0b1100);
+        assert_eq!(with_pending_flags(0b0101, &[]), 0b0101);
     }
 
     #[test]

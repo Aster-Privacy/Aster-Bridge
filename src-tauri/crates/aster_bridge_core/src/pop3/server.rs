@@ -334,7 +334,8 @@ where
     }
 
     let mut authenticated = false;
-    let mut user_received = false;
+    let mut user_name: Option<String> = None;
+    let mut refreshed_identities = false;
     let mut messages: Vec<crate::db::CachedMessage> = Vec::new();
     let mut attachment_meta: std::collections::HashMap<String, Vec<CachedAttachment>> =
         std::collections::HashMap::new();
@@ -376,7 +377,7 @@ where
                         writer.write_all(format!("-ERR [PRIVACYREQUIRED] {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
                         continue;
                     }
-                    user_received = true;
+                    user_name = Some(args.clone());
                     writer.write_all(b"+OK user accepted\r\n").await?;
                 }
                 "APOP" => {
@@ -415,11 +416,21 @@ where
                         writer.write_all(format!("-ERR [PRIVACYREQUIRED] {}\r\n", crate::sign_in_notice::TLS_REQUIRED_TEXT).as_bytes()).await?;
                         continue;
                     }
-                    if !user_received {
+                    let Some(name) = user_name.clone() else {
                         writer.write_all(b"-ERR USER required first\r\n").await?;
                         continue;
+                    };
+                    let mut pw_match = passwords.verify_and_id_cached(&name, &args).await;
+                    if pw_match.is_some() && !session.read().await.accepts_login_name(&name) {
+                        if !refreshed_identities {
+                            refreshed_identities = true;
+                            crate::auth::session::refresh_send_identities(&session, &client).await;
+                        }
+                        if !session.read().await.accepts_login_name(&name) {
+                            pw_match = None;
+                        }
                     }
-                    if let Some(pw_id) = passwords.verify_and_id_async(&args).await {
+                    if let Some(pw_id) = pw_match {
                         if POP3_SESSION_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                             writer.write_all(b"-ERR [IN-USE] Maildrop already locked by another session\r\n").await?;
                             break;
@@ -587,11 +598,16 @@ where
             }
             "QUIT" => {
                 let token = session.read().await.access_token.to_string();
+                let mut any_failed = false;
                 for (i, del) in deleted.iter().enumerate() {
                     if *del {
                         if let Some(msg) = messages.get(i) {
                             let server_gone = match client
-                                .delete_mail_item_permanent(&token, &msg.aster_id)
+                                .set_mailbox_flags(
+                                    &token,
+                                    &msg.aster_id,
+                                    serde_json::json!({"is_trashed": true, "is_archived": false}),
+                                )
                                 .await
                             {
                                 Ok(()) => true,
@@ -603,11 +619,17 @@ where
                             };
                             if server_gone {
                                 let _ = db.delete_message_by_aster_id(&msg.aster_id);
+                            } else {
+                                any_failed = true;
                             }
                         }
                     }
                 }
-                writer.write_all(b"+OK Aster Bridge POP3 server signing off\r\n").await?;
+                if any_failed {
+                    writer.write_all(b"-ERR [SYS/TEMP] some deleted messages not removed\r\n").await?;
+                } else {
+                    writer.write_all(b"+OK Aster Bridge POP3 server signing off\r\n").await?;
+                }
                 break;
             }
             _ => {
@@ -684,6 +706,17 @@ mod tests {
             crate::sign_in_notice::last_insecure().map(|l| l.protocol),
             Some("pop3")
         );
+    }
+
+    #[tokio::test]
+    async fn a_valid_password_with_another_username_is_refused() {
+        let out = pop3_transcript("USER stranger@aster.test\r\nPASS abcd-efgh-ijkl-mnop\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("-ERR Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("maildrop ready"), "{:?}", out);
     }
 
     #[tokio::test]
@@ -1102,21 +1135,38 @@ mod tests {
 
     type BackendCalls = Arc<tokio::sync::Mutex<Vec<String>>>;
 
-    async fn spawn_mock_backend() -> (String, BackendCalls) {
+    async fn spawn_mock_backend(fail: bool) -> (String, BackendCalls) {
         use axum::extract::Path as AxumPath;
-        use axum::{routing::delete, Json, Router};
+        use axum::response::IntoResponse;
+        use axum::{routing::{delete, patch}, Json, Router};
         let calls: BackendCalls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let cap = calls.clone();
-        let app = Router::new().route(
-            "/mail/v1/messages/:id",
-            delete(move |AxumPath(id): AxumPath<String>| {
-                let cap = cap.clone();
-                async move {
-                    cap.lock().await.push(id);
-                    Json(serde_json::json!({"success": true}))
-                }
-            }),
-        );
+        let cap_patch = calls.clone();
+        let app = Router::new()
+            .route(
+                "/mail/v1/messages/:id",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let cap = cap.clone();
+                    async move {
+                        cap.lock().await.push(format!("DELETE {}", id));
+                        Json(serde_json::json!({"success": true}))
+                    }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id/metadata",
+                patch(move |AxumPath(id): AxumPath<String>, Json(body): Json<serde_json::Value>| {
+                    let cap = cap_patch.clone();
+                    async move {
+                        cap.lock().await.push(format!("PATCH {} {}", id, body));
+                        if fail {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                        } else {
+                            Json(serde_json::json!({"success": true})).into_response()
+                        }
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1384,9 +1434,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dele_quit_deletes_on_server_and_locally() {
+    async fn dele_quit_moves_to_trash_on_server_and_removes_locally() {
         let _serial = AUTHENTICATED_SESSION_TESTS.lock().await;
         wait_for_maildrop_release().await;
+        let (quit, calls, db, _dir) = dele_then_quit(false).await;
+        assert!(quit.starts_with("+OK"), "{}", quit);
+        for _ in 0..40 {
+            if db.get_cached_message("pop-1").unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(db.get_cached_message("pop-1").unwrap().is_none());
+        let log = calls.lock().await.clone();
+        assert_eq!(log.len(), 1, "{:?}", log);
+        assert!(log[0].starts_with("PATCH pop-1 ") && log[0].contains(r#""is_trashed":true"#), "{:?}", log);
+        wait_for_maildrop_release().await;
+    }
+
+    #[tokio::test]
+    async fn quit_reports_a_failed_server_delete() {
+        let _serial = AUTHENTICATED_SESSION_TESTS.lock().await;
+        wait_for_maildrop_release().await;
+        let (quit, _calls, db, _dir) = dele_then_quit(true).await;
+        assert_eq!(quit, "-ERR [SYS/TEMP] some deleted messages not removed\r\n");
+        assert!(db.get_cached_message("pop-1").unwrap().is_some());
+        wait_for_maildrop_release().await;
+    }
+
+    async fn dele_then_quit(fail: bool) -> (String, BackendCalls, Arc<Database>, tempfile::TempDir) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
 
@@ -1426,7 +1502,7 @@ mod tests {
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
         }));
-        let (base, calls) = spawn_mock_backend().await;
+        let (base, calls) = spawn_mock_backend(fail).await;
         let client = Arc::new(ApiClient::new_with_base_url(&base));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1464,16 +1540,6 @@ mod tests {
         w.flush().await.unwrap();
         line.clear();
         reader.read_line(&mut line).await.unwrap();
-        assert!(line.starts_with("+OK"));
-
-        for _ in 0..40 {
-            if db.get_cached_message("pop-1").unwrap().is_none() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert!(db.get_cached_message("pop-1").unwrap().is_none());
-        assert_eq!(calls.lock().await.clone(), vec!["pop-1".to_string()]);
-        wait_for_maildrop_release().await;
+        (line, calls, db, dir)
     }
 }
