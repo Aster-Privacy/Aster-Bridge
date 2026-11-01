@@ -2,6 +2,15 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.15 - 2026-11-01
+
+### Fixed
+- When you delete a message in your mail app, Aster Bridge moves it to Trash in Aster over both IMAP and POP3, and it tells your mail app if the move fails.
+- Stars, flags, and message dates stay in sync with Aster. If a change can't reach Aster right away, Aster Bridge keeps it and tries again.
+- If a send fails after your mail app hands it off, Aster Bridge tells you in your inbox and in the error log, and a retried send never goes out twice.
+- When a link opened outside Aster Bridge asks to set up a mail app, Aster Bridge explains that it can't confirm where the request came from, so you can cancel a setup you didn't start.
+- The calendar, contacts, and JMAP servers in Aster Bridge accept connections only from apps on your computer, and Aster Bridge keeps less detail about your searches in its logs.
+
 ## 1.0.14 - 2026-10-29
 
 ### Fixed
