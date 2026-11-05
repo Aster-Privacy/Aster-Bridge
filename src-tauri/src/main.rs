@@ -20,6 +20,8 @@
 //
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(unix, not(target_os = "macos")))]
+mod a11y_bus;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod shell;
@@ -1592,6 +1594,7 @@ fn main() {
         {
             std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
         }
+        a11y_bus::configure();
     }
 
     let preliminary_cfg = config::load_config();
