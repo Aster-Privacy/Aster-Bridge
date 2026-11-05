@@ -2,6 +2,11 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.16 - 2026-11-05
+
+### Fixed
+- On Linux, Aster Bridge opens normally when the desktop session still points accessibility tools to another account, instead of closing with a segmentation fault.
+
 ## 1.0.15 - 2026-11-01
 
 ### Fixed
