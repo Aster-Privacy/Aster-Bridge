@@ -26,8 +26,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::api_client::{ApiClient, MailItem, MailListQuery};
 use crate::auth::session::Session;
-use crate::crypto::envelope::{decrypt_envelope_noting_origin, decrypt_envelope_with_previous_keys};
-use crate::crypto::attachment::{decrypt_attachment, AttachmentKeyEntry};
+use crate::crypto::envelope::{
+    decrypt_envelope_noting_origin_with_external_key, decrypt_envelope_with_external_key,
+    decrypt_envelope_with_previous_keys,
+};
+use crate::crypto::attachment::{decrypt_attachment_with_external_key, AttachmentKeyEntry};
+use crate::crypto::external_pgp_key::ExternalPgpKey;
 use crate::db::{
     CachedAttachment, CachedMessage, CachedSyncState, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
     ATTACHMENTS_STORED,
@@ -551,6 +555,7 @@ fn backfill_cached_addresses(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
 ) -> bool {
     let Ok(Some(cached)) = db.get_cached_message(&item.id) else {
         return false;
@@ -561,13 +566,14 @@ fn backfill_cached_addresses(
     if meta.contains_key(ADDRESS_META_VERSION_KEY) || meta.contains_key("draft_api") {
         return false;
     }
-    let Ok(plaintext) = decrypt_envelope_with_previous_keys(
+    let Ok(plaintext) = decrypt_envelope_with_external_key(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
         previous_keys,
         inbound_keys,
+        external_key,
     ) else {
         return false;
     };
@@ -602,6 +608,7 @@ async fn fetch_and_decrypt_attachments(
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
+    external_key: Option<&ExternalPgpKey>,
     timeout: Option<std::time::Duration>,
 ) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
     let resp = client
@@ -618,6 +625,7 @@ async fn fetch_and_decrypt_attachments(
     let passphrase = Zeroizing::new(passphrase.to_vec());
     let identity_key = identity_key.map(str::to_string);
     let previous_keys = Zeroizing::new(previous_keys.to_vec());
+    let external_key = external_key.cloned();
     tokio::task::spawn_blocking(move || {
         decrypt_listed_rows(
             &rows,
@@ -625,6 +633,7 @@ async fn fetch_and_decrypt_attachments(
             &passphrase,
             identity_key.as_deref(),
             &previous_keys,
+            external_key.as_ref(),
         )
     })
     .await
@@ -637,6 +646,7 @@ fn decrypt_listed_rows(
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
+    external_key: Option<&ExternalPgpKey>,
 ) -> std::result::Result<Vec<CachedAttachment>, AttachmentFetchError> {
     let mut out: Vec<CachedAttachment> = Vec::with_capacity(rows.len());
     for (position, row) in rows.iter().enumerate() {
@@ -652,8 +662,15 @@ fn decrypt_listed_rows(
             );
             continue;
         }
-        let att = decrypt_attachment(row, entry.as_ref(), passphrase, identity_key, previous_keys)
-            .map_err(classify_decrypt_error)?;
+        let att = decrypt_attachment_with_external_key(
+            row,
+            entry.as_ref(),
+            passphrase,
+            identity_key,
+            previous_keys,
+            external_key,
+        )
+        .map_err(classify_decrypt_error)?;
         out.push(CachedAttachment {
             seq: att.seq,
             name: att.filename,
@@ -681,18 +698,20 @@ async fn refresh_attachment_keys(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
 ) -> std::result::Result<(Vec<EnvelopeAttachment>, bool), AttachmentFetchError> {
     let item = client
         .fetch_mail_item(access_token, aster_id)
         .await
         .map_err(classify_api_error)?;
-    let plaintext = decrypt_envelope_with_previous_keys(
+    let plaintext = decrypt_envelope_with_external_key(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
         previous_keys,
         inbound_keys,
+        external_key,
     )
     .map_err(|_| AttachmentFetchError::Content("envelope decrypt failed".to_string()))?;
     let parsed: serde_json::Value = serde_json::from_str(&plaintext)
@@ -726,6 +745,7 @@ async fn download_backlog_item(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
 ) -> BacklogDownload {
     let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
     let mut meta_json = msg.raw_headers.clone();
@@ -749,6 +769,7 @@ async fn download_backlog_item(
             identity_key,
             previous_keys,
             inbound_keys,
+            external_key,
         )
         .await
         {
@@ -780,6 +801,7 @@ async fn download_backlog_item(
         passphrase,
         identity_key,
         previous_keys,
+        external_key,
         Some(crate::api_client::ATTACHMENT_TRANSFER_TIMEOUT),
     )
     .await;
@@ -801,6 +823,7 @@ async fn backfill_pending_attachments(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
     skip: &HashSet<String>,
 ) -> Vec<String> {
     use futures_util::StreamExt;
@@ -857,6 +880,7 @@ async fn backfill_pending_attachments(
                     identity_key,
                     previous_keys,
                     inbound_keys,
+                    external_key,
                 )
                 .await;
                 (position, download)
@@ -1245,6 +1269,7 @@ enum Prepared {
 pub(crate) const RATCHET_PLACEHOLDER: &str = "[This message is end-to-end encrypted with Aster's double-ratchet protocol. \
      Open it in the Aster web or mobile app to decrypt.]";
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_mail_item(
     db: &Database,
     folder: &str,
@@ -1253,6 +1278,7 @@ fn prepare_mail_item(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
 ) -> Prepared {
     if !is_valid_item_id(&item.id) {
         tracing::warn!("rejecting message with invalid id format");
@@ -1270,6 +1296,7 @@ fn prepare_mail_item(
             identity_key,
             previous_keys,
             inbound_keys,
+            external_key,
         );
         let flags_changed = reconcile_server_flags(db, item);
         return Prepared::Done(CacheOutcome {
@@ -1285,10 +1312,12 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
-    let failure_key = failed_envelope_key(
-        &envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys),
-        item,
-    );
+    let mut key_fingerprint = envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys);
+    if let Some(external) = external_key {
+        key_fingerprint.push(':');
+        key_fingerprint.push_str(external.fingerprint());
+    }
+    let failure_key = failed_envelope_key(&key_fingerprint, item);
     if failed_recently(failed_envelopes(), &failure_key, std::time::Instant::now()) {
         return Prepared::Done(CacheOutcome {
             inbound_decrypt_failed: crate::crypto::inbound::is_inbound_payload(
@@ -1300,13 +1329,14 @@ fn prepare_mail_item(
         });
     }
 
-    let plaintext_result = decrypt_envelope_noting_origin(
+    let plaintext_result = decrypt_envelope_noting_origin_with_external_key(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
         passphrase,
         identity_key,
         previous_keys,
         inbound_keys,
+        external_key,
     );
 
     let mut unencrypted = false;
@@ -1618,12 +1648,27 @@ pub(crate) fn cache_mail_item(
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
 ) -> CacheOutcome {
-    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
+    cache_mail_item_with_external_key(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cache_mail_item_with_external_key(
+    db: &Database,
+    folder: &str,
+    item: &MailItem,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
+) -> CacheOutcome {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys, external_key) {
         Prepared::Done(outcome) => outcome,
         Prepared::Ready(prepared) => commit_mail_item(db, folder, item, prepared, None),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cache_history_item(
     db: &Database,
     folder: &str,
@@ -1632,8 +1677,9 @@ fn cache_history_item(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
 ) -> CacheOutcome {
-    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys) {
+    match prepare_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys, external_key) {
         Prepared::Done(outcome) => outcome,
         Prepared::Ready(prepared) => commit_history_item(db, folder, item, prepared),
     }
@@ -2324,13 +2370,23 @@ fn retry_failed_inbound_items(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
     listed_since: std::time::Instant,
 ) -> (Vec<String>, Vec<String>) {
     let mut new_ids = Vec::new();
     let mut updated_ids = Vec::new();
     for (folder, item) in failed {
         let Some(outcome) = db.unless_listing_predates_append(&item.id, folder, listed_since, || {
-            cache_mail_item(db, folder, item, passphrase, identity_key, previous_keys, inbound_keys)
+            cache_mail_item_with_external_key(
+                db,
+                folder,
+                item,
+                passphrase,
+                identity_key,
+                previous_keys,
+                inbound_keys,
+                external_key,
+            )
         }) else {
             continue;
         };
@@ -2711,6 +2767,7 @@ async fn run_sync_pass(
             s.ratchet_recovery.clone(),
         )
     };
+    let external_key = session.read().await.external_pgp_key.clone();
     let sync_keys = recovery.sync_keys();
     let escrow_keys = recovery.escrow_keys();
     let ratchet_ctx = InternalDecryptContext {
@@ -2894,6 +2951,7 @@ async fn run_sync_pass(
                                     identity_key.as_deref(),
                                     &previous_keys,
                                     &inbound_keys,
+                                    external_key.as_ref(),
                                 )
                             })
                         else {
@@ -2919,6 +2977,7 @@ async fn run_sync_pass(
                                         &passphrase,
                                         identity_key.as_deref(),
                                         &previous_keys,
+                                        external_key.as_ref(),
                                         None,
                                     )
                                     .await
@@ -3074,6 +3133,7 @@ async fn run_sync_pass(
                 fresh_identity_key.as_deref(),
                 &fresh_previous_keys,
                 &fresh_inbound_keys,
+                external_key.as_ref(),
                 pass_started,
             );
             if !healed_new.is_empty() {
@@ -3098,6 +3158,7 @@ async fn run_sync_pass(
             identity_key.as_deref(),
             &previous_keys,
             &inbound_keys,
+            external_key.as_ref(),
             &attachments_handled,
         )
         .await;
@@ -3746,6 +3807,7 @@ mod tests {
             IK,
             &[],
             &[],
+            None,
             &HashSet::new(),
         )
         .await;
@@ -4184,7 +4246,7 @@ mod tests {
         let fresh_keys = [inbound_candidate(&recipient)];
         let failed = vec![("inbox".to_string(), item.clone())];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &fresh_keys, std::time::Instant::now());
+            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &fresh_keys, None, std::time::Instant::now());
         assert_eq!(new_ids, vec!["msg-heal".to_string()]);
         assert!(updated_ids.is_empty());
         let cached = db.get_cached_message("msg-heal").unwrap().unwrap();
@@ -4207,7 +4269,7 @@ mod tests {
 
         let failed = vec![("inbox".to_string(), item.clone())];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &keys, listed_at);
+            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &keys, None, listed_at);
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         let cached = db.get_cached_message("msg-appended").unwrap().unwrap();
@@ -4222,6 +4284,7 @@ mod tests {
             IK,
             &[],
             &keys,
+            None,
             std::time::Instant::now(),
         );
         let cached = db.get_cached_message("msg-appended").unwrap().unwrap();
@@ -4242,7 +4305,7 @@ mod tests {
 
         let failed = vec![("inbox".to_string(), item)];
         let (new_ids, updated_ids) =
-            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &stale_keys, std::time::Instant::now());
+            retry_failed_inbound_items(&db, &failed, b"pass", IK, &[], &stale_keys, None, std::time::Instant::now());
         assert!(new_ids.is_empty());
         assert!(updated_ids.is_empty());
         assert!(!db.body_cached("msg-unhealable"));
@@ -4877,6 +4940,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }))
     }
 
@@ -5001,6 +5065,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }))
     }
 
@@ -5944,7 +6009,7 @@ mod tests {
         let entries = parse_envelope_attachments(&serde_json::json!({"attachment_keys": [
             {"seq": 0, "key": STANDARD.encode(listed_key), "filename": "listed.txt", "size": 6}
         ]}));
-        let out = decrypt_listed_rows(&rows, &entries, b"pass", None, &[])
+        let out = decrypt_listed_rows(&rows, &entries, b"pass", None, &[], None)
             .unwrap_or_else(|_| panic!("listed row must decrypt"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].seq, 0);
@@ -5952,13 +6017,13 @@ mod tests {
         assert_eq!(out[0].data, b"listed");
 
         let only_injected = vec![sealed_row(1, &injected_key, b"injected by the server")];
-        assert!(decrypt_listed_rows(&only_injected, &entries, b"pass", None, &[]).is_err());
+        assert!(decrypt_listed_rows(&only_injected, &entries, b"pass", None, &[], None).is_err());
     }
 
     #[test]
     fn rows_are_all_read_when_the_envelope_lists_no_attachments() {
         let rows = vec![sealed_row(0, &[1u8; 32], b"a"), sealed_row(1, &[2u8; 32], b"b")];
-        let out = decrypt_listed_rows(&rows, &[], b"pass", None, &[])
+        let out = decrypt_listed_rows(&rows, &[], b"pass", None, &[], None)
             .unwrap_or_else(|_| panic!("legacy rows must decrypt"));
         assert_eq!(out.len(), 2);
     }
@@ -6627,6 +6692,7 @@ mod tests {
             IK,
             &[],
             &[],
+            None,
             &HashSet::new(),
         )
         .await;
@@ -6663,6 +6729,7 @@ mod tests {
             IK,
             &[],
             &[],
+            None,
             &HashSet::new(),
         )
         .await;
@@ -6710,6 +6777,7 @@ mod tests {
             IK,
             &[],
             &[],
+            None,
             &HashSet::new(),
         )
         .await;

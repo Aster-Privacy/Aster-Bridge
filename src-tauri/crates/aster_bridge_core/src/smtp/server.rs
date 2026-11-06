@@ -2424,6 +2424,7 @@ iQEz
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
         let client = Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:1"));
 

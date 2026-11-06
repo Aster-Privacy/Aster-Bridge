@@ -80,6 +80,7 @@ pub struct Session {
     pub account_keys: Vec<crate::crypto::account_key::AccountKey>,
     pub previous_keys: Zeroizing<Vec<String>>,
     pub ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial,
+    pub external_pgp_key: Option<crate::crypto::external_pgp_key::ExternalPgpKey>,
 }
 
 impl Session {
@@ -377,6 +378,25 @@ pub fn inbound_keys_equal(
             .all(|(x, y)| x.ecdh_secret_d == y.ecdh_secret_d && x.pq_decap_key == y.pq_decap_key)
 }
 
+async fn fetch_external_pgp_key(
+    client: &ApiClient,
+    access_token: &str,
+    user_id: &Uuid,
+    data_kek: Option<&Zeroizing<String>>,
+) -> Result<Option<crate::crypto::external_pgp_key::ExternalPgpKey>> {
+    let result = crate::crypto::external_pgp_key::load_external_pgp_key(
+        client,
+        access_token,
+        user_id,
+        data_kek.map(|k| k.as_str()),
+    )
+    .await;
+    if let Err(ref e) = result {
+        tracing::debug!("external PGP key fetch failed: {}", e);
+    }
+    result
+}
+
 fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     if let Some(ref mut k) = session.identity_key {
         k.zeroize();
@@ -482,6 +502,9 @@ pub async fn login_with_passphrase(
         }
         None => Vec::new(),
     };
+    let external_pgp_key = fetch_external_pgp_key(client, &access_token, &login_resp.user_id, data_kek.as_ref())
+        .await
+        .unwrap_or(None);
 
     Ok(Session {
         user_id: login_resp.user_id,
@@ -500,6 +523,7 @@ pub async fn login_with_passphrase(
         account_keys,
         previous_keys,
         ratchet_recovery,
+        external_pgp_key,
     })
 }
 
@@ -624,10 +648,19 @@ async fn sign_in_and_reload_vault(
         }
         Err(_) => Vec::new(),
     };
+    let loaded_external_key = match &material {
+        Ok(m) => Some(
+            fetch_external_pgp_key(client, &access_token, &login_resp.user_id, m.data_kek.as_ref()).await,
+        ),
+        Err(_) => None,
+    };
     let mut s = session.write().await;
     s.access_token = access_token;
     s.refresh_token = login_resp.refresh_token.map(Zeroizing::new);
     crate::crypto::account_key::merge_account_keys(&mut s.account_keys, loaded_account_keys);
+    if let Some(Ok(external_key)) = loaded_external_key {
+        s.external_pgp_key = external_key;
+    }
     match material {
         Ok(m) => apply_vault_key_material(&mut s, m),
         Err(e) => tracing::warn!(
@@ -763,6 +796,10 @@ pub async fn first_time_setup(
                     }
                     None => Vec::new(),
                 };
+                let external_pgp_key =
+                    fetch_external_pgp_key(client, &access_token, &login_resp.user_id, data_kek.as_ref())
+                        .await
+                        .unwrap_or(None);
 
                 return Ok(Session {
                     user_id: login_resp.user_id,
@@ -781,6 +818,7 @@ pub async fn first_time_setup(
                     account_keys,
                     previous_keys,
                     ratchet_recovery,
+                    external_pgp_key,
                 });
             }
             "expired" => {
@@ -813,6 +851,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }
     }
 
@@ -910,6 +949,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         };
         drop(s);
     }
