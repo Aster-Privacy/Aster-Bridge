@@ -844,6 +844,7 @@ async fn upload_attachments(
     client: &ApiClient,
     token: &str,
     passphrase: &[u8],
+    own_key: Option<&str>,
     mail_id: &str,
     attachments: &[ParsedAttachment],
 ) -> std::result::Result<(), String> {
@@ -851,8 +852,13 @@ async fn upload_attachments(
         let sealed = {
             let attachment = attachment.clone();
             let passphrase = passphrase.to_vec();
+            let own_key = own_key.map(str::to_string);
             tokio::task::spawn_blocking(move || {
-                crate::crypto::attachment::seal_attachment(&attachment, &passphrase)
+                crate::crypto::attachment::seal_attachment_with_own_key(
+                    &attachment,
+                    &passphrase,
+                    own_key.as_deref(),
+                )
             })
             .await
         };
@@ -1058,8 +1064,18 @@ async fn import_message(
     let aster_id = locate_stored_item(client, &token, &encrypted_envelope, stored_after).await?;
 
     if attachment_count > 0 {
-        if let Err(e) =
-            upload_attachments(client, &token, &passphrase, &aster_id, &message.attachments).await
+        let own_key = crate::crypto::sent_copy::format_writes_enabled(client, &token)
+            .await
+            .then_some(identity_key.as_str());
+        if let Err(e) = upload_attachments(
+            client,
+            &token,
+            &passphrase,
+            own_key,
+            &aster_id,
+            &message.attachments,
+        )
+        .await
         {
             if let Err(cleanup) = client.delete_mail_item_permanent(&token, &aster_id).await {
                 tracing::warn!(
@@ -1814,10 +1830,73 @@ mod tests {
         );
         let base = spawn_mock(app).await;
         let client = ApiClient::new_with_base_url(&base);
-        let err = upload_attachments(&client, "tok", b"pass", "mail-1", &[attachment("a.bin", 4)])
+        let err = upload_attachments(&client, "tok", b"pass", None, "mail-1", &[attachment("a.bin", 4)])
             .await
             .unwrap_err();
         assert!(err.contains("a.bin"), "{}", err);
+    }
+
+    async fn captured_attachment_upload(own_key: Option<&str>) -> serde_json::Value {
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        let seen: StdArc<StdMutex<Vec<serde_json::Value>>> = StdArc::default();
+        let app = axum::Router::new()
+            .route(
+                "/mail/v1/attachments/by-mail/:id",
+                post(
+                    |State(seen): State<StdArc<StdMutex<Vec<serde_json::Value>>>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        seen.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let base = spawn_mock(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        upload_attachments(
+            &client,
+            "tok",
+            APPEND_PASS.as_bytes(),
+            own_key,
+            "mail-1",
+            &[attachment("a.bin", 4)],
+        )
+        .await
+        .unwrap();
+        let body = seen.lock().unwrap().pop();
+        body.unwrap()
+    }
+
+    const APPEND_PASS: &str = "correct horse battery staple";
+
+    #[tokio::test]
+    async fn appended_attachment_meta_is_sealed_to_the_own_key_when_available() {
+        let key = crate::crypto::account_key::tests::protected_keypair(APPEND_PASS)
+            .to_armored()
+            .unwrap();
+        let body = captured_attachment_upload(Some(&key)).await;
+        let meta = STANDARD.decode(body["encrypted_meta"].as_str().unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&meta).starts_with("-----BEGIN PGP MESSAGE-----"));
+        assert_eq!(
+            STANDARD.decode(body["meta_nonce"].as_str().unwrap()).unwrap(),
+            vec![0u8; 12]
+        );
+    }
+
+    #[tokio::test]
+    async fn appended_attachment_meta_keeps_the_passphrase_envelope_without_an_own_key() {
+        let body = captured_attachment_upload(None).await;
+        let meta = STANDARD.decode(body["encrypted_meta"].as_str().unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&meta).contains("BEGIN PGP"));
+        let opened = crate::crypto::envelope::decrypt_pbkdf2_envelope(
+            body["encrypted_meta"].as_str().unwrap(),
+            APPEND_PASS.as_bytes(),
+        )
+        .unwrap();
+        assert!(opened.contains("a.bin"));
     }
 
     #[test]
