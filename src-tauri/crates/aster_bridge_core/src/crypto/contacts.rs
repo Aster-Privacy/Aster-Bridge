@@ -84,14 +84,21 @@ impl ContactsKeys {
         data_kek.copy_from_slice(&raw);
         raw.zeroize();
 
-        let hmac_key = derive_sub_key(&data_kek, HMAC_INFO);
-        let search_key = derive_sub_key(&data_kek, SEARCH_INFO);
+        let keys = Self::from_raw(&data_kek);
+        data_kek.zeroize();
+        Ok(keys)
+    }
 
-        Ok(Self {
-            data_kek,
-            hmac_key,
-            search_key,
-        })
+    pub fn from_raw(key: &[u8; 32]) -> Self {
+        Self {
+            data_kek: *key,
+            hmac_key: derive_sub_key(key, HMAC_INFO),
+            search_key: derive_sub_key(key, SEARCH_INFO),
+        }
+    }
+
+    pub fn same_key(&self, other: &[u8; 32]) -> bool {
+        self.data_kek.ct_eq(other).into()
     }
 
     pub fn integrity_hash(&self, encrypted_data: &str, data_nonce: &str, version: u32) -> String {

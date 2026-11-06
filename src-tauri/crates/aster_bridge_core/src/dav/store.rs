@@ -95,6 +95,43 @@ enum DecodeError {
     Decrypt(BridgeError),
 }
 
+struct ContactsKeyring {
+    current: ContactsKeys,
+    previous: Vec<ContactsKeys>,
+}
+
+impl ContactsKeyring {
+    fn new(current: ContactsKeys, previous: &[zeroize::Zeroizing<[u8; 32]>]) -> Self {
+        let mut ring: Vec<ContactsKeys> = Vec::new();
+        for key in previous {
+            if current.same_key(key) || ring.iter().any(|k| k.same_key(key)) {
+                continue;
+            }
+            ring.push(ContactsKeys::from_raw(key));
+        }
+        Self {
+            current,
+            previous: ring,
+        }
+    }
+}
+
+fn decode_with_keyring(
+    keyring: &ContactsKeyring,
+    record: &ContactRecord,
+) -> std::result::Result<ContactEntry, DecodeError> {
+    let first = match decode_record(&keyring.current, record) {
+        Ok(entry) => return Ok(entry),
+        Err(e) => e,
+    };
+    for keys in &keyring.previous {
+        if let Ok(entry) = decode_record(keys, record) {
+            return Ok(entry);
+        }
+    }
+    Err(first)
+}
+
 fn decode_record(
     keys: &ContactsKeys,
     record: &ContactRecord,
@@ -172,12 +209,21 @@ impl ContactsStore {
         ContactsKeys::from_data_kek_b64(data_kek)
     }
 
+    async fn keyring(&self) -> Result<ContactsKeyring> {
+        let current = self.keys().await?;
+        let session = self.session.read().await;
+        Ok(ContactsKeyring::new(
+            current,
+            &session.ratchet_recovery.storage_keys,
+        ))
+    }
+
     async fn access_token(&self) -> String {
         self.session.read().await.access_token.to_string()
     }
 
     async fn fetch_entries(&self) -> Result<Vec<ContactEntry>> {
-        let keys = self.keys().await?;
+        let keys = self.keyring().await?;
         let token = self.access_token().await;
 
         let mut entries = Vec::new();
@@ -192,7 +238,7 @@ impl ContactsStore {
                 .await?;
 
             for record in &page.items {
-                match decode_record(&keys, record) {
+                match decode_with_keyring(&keys, record) {
                     Ok(entry) => entries.push(entry),
                     Err(DecodeError::Integrity) => {
                         skipped_integrity += 1;
@@ -254,12 +300,12 @@ impl ContactsStore {
     }
 
     async fn fetch_entry(&self, contact_id: &str) -> Result<Option<ContactEntry>> {
-        let keys = self.keys().await?;
+        let keys = self.keyring().await?;
         let token = self.access_token().await;
         let Some(record) = self.client.get_contact(&token, contact_id).await? else {
             return Ok(None);
         };
-        match decode_record(&keys, &record) {
+        match decode_with_keyring(&keys, &record) {
             Ok(entry) => Ok(Some(entry)),
             Err(DecodeError::Integrity) => Err(BridgeError::Crypto(format!(
                 "contact {} failed its integrity check",
@@ -531,6 +577,117 @@ mod tests {
             tokens.contact,
             keys.contact_token("Ada", "Lovelace", &["ada@example.com".to_string()])
         );
+    }
+
+    fn record_sealed_with(keys: &ContactsKeys, payload: &Value) -> ContactRecord {
+        let sealed = keys.encrypt_data(payload).unwrap();
+        ContactRecord {
+            id: "contact-1".to_string(),
+            contact_token: "token".to_string(),
+            encrypted_data: sealed.encrypted_data,
+            data_nonce: sealed.data_nonce,
+            integrity_hash: Some(sealed.integrity_hash),
+            data_version: Some(CONTACT_DATA_VERSION),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn contacts_written_under_a_previous_key_still_open() {
+        let previous = zeroize::Zeroizing::new([9u8; 32]);
+        let record = record_sealed_with(
+            &ContactsKeys::from_raw(&previous),
+            &serde_json::json!({ "first_name": "Ada", "emails": ["ada@example.com"] }),
+        );
+        let current = ContactsKeys::from_raw(&[3u8; 32]);
+        assert!(matches!(decode_record(&current, &record), Err(DecodeError::Integrity)));
+
+        let keyring = ContactsKeyring::new(current, std::slice::from_ref(&previous));
+        let entry = decode_with_keyring(&keyring, &record).ok().expect("opens under the previous key");
+        assert!(entry.vcard.contains("ada@example.com"));
+    }
+
+    #[test]
+    fn contacts_keyring_prefers_the_current_key_and_skips_duplicates() {
+        let current_raw = zeroize::Zeroizing::new([3u8; 32]);
+        let other = zeroize::Zeroizing::new([4u8; 32]);
+        let keyring = ContactsKeyring::new(
+            ContactsKeys::from_raw(&current_raw),
+            &[current_raw.clone(), other.clone(), other.clone()],
+        );
+        assert_eq!(keyring.previous.len(), 1);
+
+        let record = record_sealed_with(
+            &ContactsKeys::from_raw(&current_raw),
+            &serde_json::json!({ "first_name": "Grace" }),
+        );
+        assert!(decode_with_keyring(&keyring, &record).is_ok());
+    }
+
+    #[test]
+    fn contacts_unreadable_under_every_key_report_the_current_key_error() {
+        let record = record_sealed_with(
+            &ContactsKeys::from_raw(&[7u8; 32]),
+            &serde_json::json!({ "first_name": "Nobody" }),
+        );
+        let keyring = ContactsKeyring::new(
+            ContactsKeys::from_raw(&[3u8; 32]),
+            &[zeroize::Zeroizing::new([4u8; 32])],
+        );
+        assert!(matches!(
+            decode_with_keyring(&keyring, &record),
+            Err(DecodeError::Integrity)
+        ));
+    }
+
+    fn store_with(data_kek: Option<[u8; 32]>, storage_keys: Vec<[u8; 32]>) -> ContactsStore {
+        let session = Session {
+            data_kek: data_kek.map(|k| {
+                zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(k))
+            }),
+            user_id: uuid::Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "tester@aster.test".to_string(),
+            access_token: zeroize::Zeroizing::new("stub".to_string()),
+            refresh_token: None,
+            vault_passphrase: b"vault-pass".to_vec(),
+            identity_key: None,
+            ratchet_identity_public: None,
+            ratchet_keys: Vec::new(),
+            inbound_keys: Vec::new(),
+            send_identities: Vec::new(),
+            default_sender_id: None,
+            account_keys: Vec::new(),
+            previous_keys: Default::default(),
+            ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial {
+                storage_keys: storage_keys.into_iter().map(zeroize::Zeroizing::new).collect(),
+                lane_candidates: Vec::new(),
+            },
+        };
+        ContactsStore::new(
+            Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:9")),
+            Arc::new(RwLock::new(session)),
+        )
+    }
+
+    #[tokio::test]
+    async fn contact_writes_use_the_data_kek_and_never_an_older_key() {
+        let store = store_with(Some([3u8; 32]), vec![[9u8; 32], [3u8; 32]]);
+        let keys = store.keys().await.unwrap();
+        assert!(keys.same_key(&[3u8; 32]));
+
+        let keyring = store.keyring().await.unwrap();
+        assert!(keyring.current.same_key(&[3u8; 32]));
+        assert_eq!(keyring.previous.len(), 1);
+        assert!(keyring.previous[0].same_key(&[9u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn contact_writes_refuse_to_fall_back_to_a_password_key() {
+        let store = store_with(None, vec![[9u8; 32]]);
+        assert!(store.keys().await.is_err());
+        assert!(store.keyring().await.is_err());
     }
 
     #[test]
