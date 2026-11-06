@@ -35,6 +35,16 @@ const USER_AGENT_OS: &str = if cfg!(target_os = "windows") {
 };
 const USER_AGENT: &str = concat!("AsterBridge/", env!("CARGO_PKG_VERSION"));
 
+pub const VAULT_LEVEL_HEADER: &str = "x-aster-vault-level";
+pub const VAULT_LEVEL: &str = "1";
+
+fn default_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
+    headers.insert(VAULT_LEVEL_HEADER, reqwest::header::HeaderValue::from_static(VAULT_LEVEL));
+    headers
+}
+
 fn user_agent() -> String {
     format!("{} ({})", USER_AGENT, USER_AGENT_OS)
 }
@@ -106,6 +116,26 @@ fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
     }
     let truncated: String = body.chars().take(ERR_BODY_MAX).collect();
     BridgeError::Api(format!("{}: {}", status, truncated))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultRecord {
+    pub encrypted_vault: String,
+    pub vault_nonce: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageKeyWrap {
+    pub key_id: String,
+    pub wrap: String,
+    #[serde(default)]
+    pub nonce: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageKeyWrapList {
+    #[serde(default)]
+    wraps: Vec<StorageKeyWrap>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -749,8 +779,7 @@ impl Default for ApiClient {
 
 impl ApiClient {
     pub fn new() -> Self {
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
+        let default_headers = default_headers();
         let client = crate::tls_pinning::pinned_client_builder(
             default_headers,
             &user_agent(),
@@ -766,8 +795,7 @@ impl ApiClient {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_base_url(base_url: &str) -> Self {
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        default_headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
+        let default_headers = default_headers();
         let client = Client::builder()
             .default_headers(default_headers)
             .user_agent(user_agent())
@@ -1984,6 +2012,49 @@ impl ApiClient {
         resp.json().await.map(Some).map_err(BridgeError::from)
     }
 
+    pub async fn get_vault(&self, access_token: &str) -> Result<Option<VaultRecord>> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/vault", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn list_storage_key_wraps(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<Vec<StorageKeyWrap>>> {
+        let resp = self
+            .client
+            .get(format!("{}/core/v1/auth/me/storage-key-wraps", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let list: StorageKeyWrapList = resp.json().await.map_err(BridgeError::from)?;
+        Ok(Some(list.wraps))
+    }
+
     pub async fn create_contact(
         &self,
         access_token: &str,
@@ -2078,6 +2149,85 @@ mod tests {
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z"
         })
+    }
+
+    #[test]
+    fn every_backend_request_carries_the_vault_level() {
+        let headers = default_headers();
+        assert_eq!(
+            headers.get(VAULT_LEVEL_HEADER).and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(headers.get_all(VAULT_LEVEL_HEADER).iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn vault_level_header_reaches_the_server() {
+        let seen: Arc<TokioMutex<Vec<Option<String>>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let cap = seen.clone();
+        let app = Router::new().route(
+            "/crypto/v1/keys/vault",
+            get(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    cap.lock().await.push(
+                        headers
+                            .get("x-aster-vault-level")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    Json(serde_json::json!({
+                        "encrypted_vault": "ZW5j",
+                        "vault_nonce": "bm9uY2U=",
+                        "vault_format": 2,
+                        "vault_sha256": "x"
+                    }))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let vault = client.get_vault("tok").await.unwrap().unwrap();
+        assert_eq!(vault.encrypted_vault, "ZW5j");
+        assert_eq!(vault.vault_nonce, "bm9uY2U=");
+        assert_eq!(seen.lock().await.as_slice(), &[Some("1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn storage_key_wraps_parse_and_rate_limit_is_not_an_error() {
+        let app = Router::new().route(
+            "/core/v1/auth/me/storage-key-wraps",
+            get(|| async {
+                Json(serde_json::json!({
+                    "wraps": [{
+                        "key_id": "00112233445566778899aabbccddeeff",
+                        "wrap": "d3JhcA==",
+                        "nonce": null,
+                        "identity_fingerprint": "ZnA=",
+                        "created_at": "2026-11-06T12:00:00Z"
+                    }]
+                }))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let wraps = client.list_storage_key_wraps("tok").await.unwrap().unwrap();
+        assert_eq!(wraps.len(), 1);
+        assert_eq!(wraps[0].key_id, "00112233445566778899aabbccddeeff");
+        assert!(wraps[0].nonce.is_none());
+
+        let limited = Router::new().route(
+            "/core/v1/auth/me/storage-key-wraps",
+            get(|| async { (StatusCode::TOO_MANY_REQUESTS, "slow down") }),
+        );
+        let base = spawn(limited).await;
+        let client = ApiClient::new_with_base_url(&base);
+        assert!(client.list_storage_key_wraps("tok").await.unwrap().is_none());
+
+        let missing = spawn(Router::new()).await;
+        let client = ApiClient::new_with_base_url(&missing);
+        assert!(client.list_storage_key_wraps("tok").await.unwrap().is_none());
+        assert!(client.get_vault("tok").await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::api_client::{ApiClient, ContactRecord, CreateContactRequest, UpdateContactRequest};
 use crate::auth::session::Session;
+use crate::auth::vault_freshness::VaultFreshness;
 use crate::crypto::contacts::{ContactsKeys, CONTACT_DATA_VERSION};
 use crate::error::{BridgeError, Result};
 
@@ -55,6 +56,7 @@ pub struct ContactsStore {
     session: Arc<RwLock<Session>>,
     cache: RwLock<Option<CachedListing>>,
     write_lock: Mutex<()>,
+    vault: VaultFreshness,
 }
 
 #[derive(Default)]
@@ -196,6 +198,7 @@ impl ContactsStore {
             session,
             cache: RwLock::new(None),
             write_lock: Mutex::new(()),
+            vault: VaultFreshness::new(),
         }
     }
 
@@ -261,6 +264,7 @@ impl ContactsStore {
         }
 
         if skipped_integrity > 0 || skipped_decrypt > 0 {
+            self.vault.mark_stale().await;
             tracing::warn!(
                 "skipped {} contacts this sync, {} failed an integrity check and {} could not be decrypted",
                 skipped_integrity + skipped_decrypt,
@@ -365,6 +369,8 @@ impl ContactsStore {
 
         let _guard = self.write_lock.lock().await;
 
+        self.vault.ensure_fresh(&self.client, &self.session).await;
+
         let existing = self.current(uid, preconditions).await?;
         if !preconditions.hold_for(existing.as_ref()) {
             return Ok(PutOutcome::PreconditionFailed);
@@ -385,7 +391,7 @@ impl ContactsStore {
         let sealed = keys.encrypt_data(&Value::Object(payload.clone()))?;
         let tokens = search_tokens(&keys, &payload);
 
-        let (contact_id, created) = match &existing {
+        let stored = match &existing {
             Some(entry) => {
                 self.client
                     .update_contact(
@@ -400,12 +406,11 @@ impl ContactsStore {
                             company_search_token: tokens.company,
                         },
                     )
-                    .await?;
-                (entry.contact_id.clone(), false)
+                    .await
+                    .map(|_| (entry.contact_id.clone(), false))
             }
             None => {
-                let response = self
-                    .client
+                self.client
                     .create_contact(
                         &token,
                         &CreateContactRequest {
@@ -419,8 +424,17 @@ impl ContactsStore {
                             data_version: CONTACT_DATA_VERSION,
                         },
                     )
-                    .await?;
-                (response.id, true)
+                    .await
+                    .map(|response| (response.id, true))
+            }
+        };
+        let (contact_id, created) = match stored {
+            Ok(stored) => stored,
+            Err(e) => {
+                if matches!(&e, BridgeError::Api(message) if message.starts_with("409")) {
+                    self.vault.mark_stale().await;
+                }
+                return Err(e);
             }
         };
 
@@ -688,6 +702,70 @@ mod tests {
         let store = store_with(None, vec![[9u8; 32]]);
         assert!(store.keys().await.is_err());
         assert!(store.keyring().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn contact_writes_follow_a_storage_key_rotated_on_another_device() {
+        use crate::auth::vault_freshness::tests::{seal_vault, session_with, spawn, vault_json, FakeServer};
+        use axum::routing::get;
+
+        let a = [3u8; 32];
+        let b = [4u8; 32];
+        let server = FakeServer::new(seal_vault(&vault_json("", b, &[a])), None);
+        let created: Arc<std::sync::Mutex<Option<Value>>> = Arc::new(std::sync::Mutex::new(None));
+        let create_rows = created.clone();
+        let get_rows = created.clone();
+        let app = server
+            .router()
+            .route(
+                "/contacts/v1",
+                get(|| async { axum::Json(serde_json::json!({ "items": [], "has_more": false })) })
+                    .post(move |axum::Json(body): axum::Json<Value>| {
+                        let rows = create_rows.clone();
+                        async move {
+                            let mut record = body.clone();
+                            let object = record.as_object_mut().unwrap();
+                            object.insert("id".to_string(), Value::from("c1"));
+                            object.insert("created_at".to_string(), Value::from("2026-11-06T00:00:00Z"));
+                            object.insert("updated_at".to_string(), Value::from("2026-11-06T00:00:00Z"));
+                            *rows.lock().unwrap() = Some(record);
+                            axum::Json(serde_json::json!({ "id": "c1" }))
+                        }
+                    }),
+            )
+            .route(
+                "/contacts/v1/c1",
+                get(move || {
+                    let rows = get_rows.clone();
+                    async move { axum::Json(rows.lock().unwrap().clone().unwrap()) }
+                }),
+            );
+        let base = spawn(app).await;
+        let store = ContactsStore::new(
+            Arc::new(ApiClient::new_with_base_url(&base)),
+            Arc::new(RwLock::new(session_with(Some(a), None))),
+        );
+
+        let vcard = "BEGIN:VCARD
+VERSION:3.0
+UID:ada
+FN:Ada
+EMAIL:ada@example.com
+END:VCARD
+";
+        let outcome = store.put("ada", vcard, &Preconditions::default()).await.unwrap();
+        assert!(matches!(outcome, PutOutcome::Stored(_, true)));
+
+        let row = created.lock().unwrap().clone().unwrap();
+        let encrypted = row["encrypted_data"].as_str().unwrap();
+        let nonce = row["data_nonce"].as_str().unwrap();
+        assert!(ContactsKeys::from_raw(&b).decrypt_data(encrypted, nonce).is_ok());
+        assert!(ContactsKeys::from_raw(&a).decrypt_data(encrypted, nonce).is_err());
+        assert_eq!(server.vault_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let keyring = store.keyring().await.unwrap();
+        assert!(keyring.current.same_key(&b));
+        assert!(keyring.previous.iter().any(|k| k.same_key(&a)));
     }
 
     #[test]

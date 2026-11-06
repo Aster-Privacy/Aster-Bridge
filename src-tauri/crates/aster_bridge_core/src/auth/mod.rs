@@ -21,3 +21,4 @@
 pub mod app_passwords;
 pub mod device_identity;
 pub mod session;
+pub mod vault_freshness;
