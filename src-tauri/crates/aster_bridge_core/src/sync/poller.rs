@@ -2321,6 +2321,39 @@ fn take_heal_permit(
     allowed
 }
 
+const EXTERNAL_KEY_REFRESH_SECS: u64 = 600;
+
+static EXTERNAL_KEY_REFRESH_LAST: OnceLock<StdMutex<HashMap<uuid::Uuid, std::time::Instant>>> =
+    OnceLock::new();
+
+fn take_external_key_refresh_permit(
+    state: &StdMutex<HashMap<uuid::Uuid, std::time::Instant>>,
+    user_id: uuid::Uuid,
+    now: std::time::Instant,
+) -> bool {
+    let Ok(mut guard) = state.lock() else {
+        return false;
+    };
+    let allowed = guard.get(&user_id).is_none_or(|t| {
+        now.duration_since(*t) >= std::time::Duration::from_secs(EXTERNAL_KEY_REFRESH_SECS)
+    });
+    if allowed {
+        guard.insert(user_id, now);
+    }
+    allowed
+}
+
+async fn refresh_external_key_if_due(session: &Arc<RwLock<Session>>, client: &Arc<ApiClient>) {
+    let user_id = session.read().await.user_id;
+    let state = EXTERNAL_KEY_REFRESH_LAST.get_or_init(|| StdMutex::new(HashMap::new()));
+    if !take_external_key_refresh_permit(state, user_id, std::time::Instant::now()) {
+        return;
+    }
+    if let Err(e) = crate::auth::session::refresh_external_pgp_key(session, client).await {
+        tracing::debug!("external PGP key refresh failed: {}", e);
+    }
+}
+
 async fn heal_inbound_keys(session: &Arc<RwLock<Session>>, client: &Arc<ApiClient>) -> bool {
     let state = INBOUND_HEAL_LAST.get_or_init(|| StdMutex::new(None));
     if !take_heal_permit(state, std::time::Instant::now()) {
@@ -2767,6 +2800,7 @@ async fn run_sync_pass(
             s.ratchet_recovery.clone(),
         )
     };
+    refresh_external_key_if_due(session, client).await;
     let external_key = session.read().await.external_pgp_key.clone();
     let sync_keys = recovery.sync_keys();
     let escrow_keys = recovery.escrow_keys();
@@ -3122,9 +3156,14 @@ async fn run_sync_pass(
             failed_inbound.len()
         );
         if heal_inbound_keys(session, client).await {
-            let (fresh_identity_key, fresh_previous_keys, fresh_inbound_keys) = {
+            let (fresh_identity_key, fresh_previous_keys, fresh_inbound_keys, fresh_external_key) = {
                 let s = session.read().await;
-                (s.identity_key.clone(), s.previous_keys.clone(), s.inbound_keys.clone())
+                (
+                    s.identity_key.clone(),
+                    s.previous_keys.clone(),
+                    s.inbound_keys.clone(),
+                    s.external_pgp_key.clone(),
+                )
             };
             let (healed_new, healed_updated) = retry_failed_inbound_items(
                 db,
@@ -3133,7 +3172,7 @@ async fn run_sync_pass(
                 fresh_identity_key.as_deref(),
                 &fresh_previous_keys,
                 &fresh_inbound_keys,
-                external_key.as_ref(),
+                fresh_external_key.as_ref(),
                 pass_started,
             );
             if !healed_new.is_empty() {
@@ -4227,6 +4266,21 @@ mod tests {
         assert!(!take_heal_permit(&state, start + secs(299)));
         assert!(take_heal_permit(&state, start + secs(300)));
         assert!(!take_heal_permit(&state, start + secs(301)));
+    }
+
+    #[test]
+    fn external_key_refresh_runs_once_per_window_for_each_account() {
+        let state = StdMutex::new(HashMap::new());
+        let start = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        assert!(take_external_key_refresh_permit(&state, first, start));
+        assert!(!take_external_key_refresh_permit(&state, first, start + secs(1)));
+        assert!(take_external_key_refresh_permit(&state, second, start + secs(1)));
+        assert!(!take_external_key_refresh_permit(&state, first, start + secs(599)));
+        assert!(take_external_key_refresh_permit(&state, first, start + secs(600)));
+        assert!(!take_external_key_refresh_permit(&state, second, start + secs(600)));
     }
 
     #[test]

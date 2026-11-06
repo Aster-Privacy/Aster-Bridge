@@ -397,6 +397,22 @@ async fn fetch_external_pgp_key(
     result
 }
 
+pub async fn refresh_external_pgp_key(
+    session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
+    client: &ApiClient,
+) -> Result<()> {
+    let (access_token, user_id, data_kek) = {
+        let s = session.read().await;
+        (s.access_token.clone(), s.user_id, s.data_kek.clone())
+    };
+    let loaded = fetch_external_pgp_key(client, &access_token, &user_id, data_kek.as_ref()).await?;
+    let mut s = session.write().await;
+    if s.user_id == user_id {
+        s.external_pgp_key = loaded;
+    }
+    Ok(())
+}
+
 fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     if let Some(ref mut k) = session.identity_key {
         k.zeroize();
@@ -1240,5 +1256,130 @@ mod tests {
         assert!(inbound_keys_equal(&a, &a.clone()));
         assert!(!inbound_keys_equal(&a, &b));
         assert!(!inbound_keys_equal(&a, &[]));
+    }
+
+    type ExternalKeyReply = std::sync::Arc<std::sync::Mutex<(u16, serde_json::Value)>>;
+
+    async fn spawn_external_key_server(reply: ExternalKeyReply) -> String {
+        use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+        let app = Router::new()
+            .route(
+                "/crypto/v1/keys/pgp/external",
+                get(|State(reply): State<ExternalKeyReply>| async move {
+                    let (status, body) = reply.lock().unwrap().clone();
+                    (StatusCode::from_u16(status).unwrap(), Json(body)).into_response()
+                }),
+            )
+            .with_state(reply);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn wrapped_external_record(data_kek: &str, user_id: &Uuid) -> (String, serde_json::Value) {
+        let secret_key = crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key();
+        let fingerprint = aster_crypto::import_secret_key_bytes(&secret_key)
+            .unwrap()
+            .fingerprint();
+        let wrapped = crate::crypto::external_pgp_key::wrap_external_key_for_tests(
+            data_kek,
+            user_id,
+            &fingerprint,
+            &secret_key,
+            [3u8; 12],
+        );
+        let body = serde_json::json!({
+            "key": {"fingerprint": fingerprint.to_ascii_uppercase(), "wrapped_private_key": wrapped}
+        });
+        (fingerprint.to_ascii_lowercase(), body)
+    }
+
+    async fn loaded_external_fingerprint(session: &std::sync::Arc<tokio::sync::RwLock<Session>>) -> Option<String> {
+        session
+            .read()
+            .await
+            .external_pgp_key
+            .as_ref()
+            .map(|k| k.fingerprint().to_string())
+    }
+
+    async fn session_with_external_key_server(
+        first_reply: serde_json::Value,
+        data_kek: &str,
+        user_id: Uuid,
+    ) -> (std::sync::Arc<tokio::sync::RwLock<Session>>, ApiClient, ExternalKeyReply) {
+        let reply: ExternalKeyReply = std::sync::Arc::new(std::sync::Mutex::new((200, first_reply)));
+        let base = spawn_external_key_server(reply.clone()).await;
+        let mut initial = sample_session();
+        initial.user_id = user_id;
+        initial.data_kek = Some(Zeroizing::new(data_kek.to_string()));
+        (
+            std::sync::Arc::new(tokio::sync::RwLock::new(initial)),
+            ApiClient::new_with_base_url(&base),
+            reply,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_replaced_external_key_is_picked_up_without_signing_in_again() {
+        let data_kek = STANDARD.encode([4u8; 32]);
+        let user_id = Uuid::new_v4();
+        let (first_fp, first_body) = wrapped_external_record(&data_kek, &user_id);
+        let (second_fp, second_body) = wrapped_external_record(&data_kek, &user_id);
+        let (session, client, reply) = session_with_external_key_server(first_body, &data_kek, user_id).await;
+
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, Some(first_fp));
+
+        *reply.lock().unwrap() = (200, second_body);
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, Some(second_fp));
+    }
+
+    #[tokio::test]
+    async fn a_removed_external_key_is_dropped_from_the_session() {
+        let data_kek = STANDARD.encode([5u8; 32]);
+        let user_id = Uuid::new_v4();
+        let (fp, body) = wrapped_external_record(&data_kek, &user_id);
+        let (session, client, reply) = session_with_external_key_server(body.clone(), &data_kek, user_id).await;
+
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, Some(fp.clone()));
+        *reply.lock().unwrap() = (200, serde_json::json!({"key": null}));
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, None);
+
+        *reply.lock().unwrap() = (200, body);
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, Some(fp));
+        *reply.lock().unwrap() = (404, serde_json::json!({"error": "not found"}));
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_external_key_refresh_keeps_the_loaded_key() {
+        let data_kek = STANDARD.encode([6u8; 32]);
+        let user_id = Uuid::new_v4();
+        let (fp, body) = wrapped_external_record(&data_kek, &user_id);
+        let (session, client, reply) = session_with_external_key_server(body, &data_kek, user_id).await;
+
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        *reply.lock().unwrap() = (500, serde_json::json!({"error": "unavailable"}));
+        assert!(refresh_external_pgp_key(&session, &client).await.is_err());
+        assert_eq!(loaded_external_fingerprint(&session).await, Some(fp));
+    }
+
+    #[tokio::test]
+    async fn an_external_key_wrapped_for_another_account_is_not_loaded() {
+        let data_kek = STANDARD.encode([7u8; 32]);
+        let (_, body) = wrapped_external_record(&data_kek, &Uuid::new_v4());
+        let (session, client, _reply) = session_with_external_key_server(body, &data_kek, Uuid::new_v4()).await;
+
+        refresh_external_pgp_key(&session, &client).await.unwrap();
+        assert_eq!(loaded_external_fingerprint(&session).await, None);
     }
 }
