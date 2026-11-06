@@ -1060,6 +1060,34 @@ mod tests {
     }
 
     #[test]
+    fn master_key_vaults_still_open_fields_from_every_older_key() {
+        use crate::crypto::alias::{decrypt_display_name, storage_key_candidates};
+        let pass = b"pass";
+        let master = [5u8; 32];
+        let legacy = [6u8; 32];
+        let vault = vault_from(json!({
+            "vault_format": 2,
+            "kdf_version": 2,
+            "data_kek": b64(&master),
+            "legacy_keks": [{ "k": b64(&legacy) }],
+        }));
+        let base = derive_storage_base_keys(&vault, pass, 1000);
+        assert_eq!(base[0].as_slice(), &master);
+        let candidates = storage_key_candidates(pass, &base);
+        let v1 = derive_storage_key_v1(pass).unwrap();
+        let v2 = derive_storage_key_v2(pass, 1000).unwrap();
+        for (key, name) in [
+            (&master[..], "Current"),
+            (v2.as_slice(), "Stretched"),
+            (v1.as_slice(), "Older"),
+            (&legacy[..], "Rotated"),
+        ] {
+            let (field, nonce) = seal_alias(key, name);
+            assert_eq!(decrypt_display_name(&candidates, &field, &nonce).unwrap(), name);
+        }
+    }
+
+    #[test]
     fn stretched_storage_key_matches_web_at_production_iterations() {
         let v: Value = serde_json::from_str(STORAGE_VECTORS).unwrap();
         let pass = v["passphrase"].as_str().unwrap().as_bytes();
