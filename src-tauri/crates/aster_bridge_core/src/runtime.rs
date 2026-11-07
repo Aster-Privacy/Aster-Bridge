@@ -829,6 +829,16 @@ impl BridgeRuntime {
                                 );
                                 true
                             }
+                            Err(e @ BridgeError::ClientUpgradeRequired(_)) => {
+                                tracing::warn!(
+                                    "the server needs a newer Aster Bridge; token refresh stopped: {}",
+                                    e
+                                );
+                                crate::account_state::record(
+                                    crate::account_state::AccountState::UpdateRequired,
+                                );
+                                return;
+                            }
                             Err(e) => {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
                                 tracing::warn!(

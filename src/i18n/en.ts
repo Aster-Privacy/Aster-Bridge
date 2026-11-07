@@ -310,6 +310,7 @@ const en = {
   toast_bridge_disconnected: "Bridge disconnected",
   toast_bridge_status_failed: "Aster Bridge couldn't connect or disconnect. Try again, or restart Aster Bridge.",
   toast_bridge_upgrade_required: "Upgrade to Star plan or higher to use Aster Bridge",
+  toast_bridge_update_required: "This version of Aster Bridge can't connect to your account. To continue, install the latest version. You stay signed in.",
   toast_password_created: "App password created",
   toast_password_create_failed: "Failed to create app password",
   toast_password_deleted: "App password deleted",

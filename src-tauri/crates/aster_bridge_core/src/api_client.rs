@@ -36,7 +36,7 @@ const USER_AGENT_OS: &str = if cfg!(target_os = "windows") {
 const USER_AGENT: &str = concat!("AsterBridge/", env!("CARGO_PKG_VERSION"));
 
 pub const VAULT_LEVEL_HEADER: &str = "x-aster-vault-level";
-pub const VAULT_LEVEL: &str = "1";
+pub const VAULT_LEVEL: &str = "2";
 
 fn default_headers() -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -88,6 +88,20 @@ fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
     if status == reqwest::StatusCode::UNAUTHORIZED {
         crate::auth::session::request_token_refresh();
     }
+    if status == reqwest::StatusCode::UPGRADE_REQUIRED || status == reqwest::StatusCode::CONFLICT {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if parsed.get("code").and_then(|v| v.as_str()) == Some("CLIENT_UPGRADE_REQUIRED") {
+                let msg = parsed
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("This version of Aster Bridge can't open your account.")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return BridgeError::ClientUpgradeRequired(msg);
+            }
+        }
+    }
     if status == reqwest::StatusCode::FORBIDDEN {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
             if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
@@ -122,6 +136,8 @@ fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
 pub struct VaultRecord {
     pub encrypted_vault: String,
     pub vault_nonce: String,
+    #[serde(default)]
+    pub vault_kdf_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -457,6 +473,8 @@ pub struct DeviceLoginResponse {
     pub refresh_token: Option<String>,
     pub encrypted_vault: String,
     pub vault_nonce: String,
+    #[serde(default)]
+    pub vault_kdf_iterations: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2156,7 +2174,7 @@ mod tests {
         let headers = default_headers();
         assert_eq!(
             headers.get(VAULT_LEVEL_HEADER).and_then(|v| v.to_str().ok()),
-            Some("1")
+            Some("2")
         );
         assert_eq!(headers.get_all(VAULT_LEVEL_HEADER).iter().count(), 1);
     }
@@ -2180,7 +2198,8 @@ mod tests {
                         "encrypted_vault": "ZW5j",
                         "vault_nonce": "bm9uY2U=",
                         "vault_format": 2,
-                        "vault_sha256": "x"
+                        "vault_sha256": "x",
+                        "vault_kdf_iterations": 600000
                     }))
                 }
             }),
@@ -2190,7 +2209,8 @@ mod tests {
         let vault = client.get_vault("tok").await.unwrap().unwrap();
         assert_eq!(vault.encrypted_vault, "ZW5j");
         assert_eq!(vault.vault_nonce, "bm9uY2U=");
-        assert_eq!(seen.lock().await.as_slice(), &[Some("1".to_string())]);
+        assert_eq!(vault.vault_kdf_iterations, Some(600_000));
+        assert_eq!(seen.lock().await.as_slice(), &[Some("2".to_string())]);
     }
 
     #[tokio::test]
@@ -2411,6 +2431,56 @@ mod tests {
             BridgeError::PlanUpgradeRequired(msg) => assert_eq!(msg, "Star plan needed"),
             other => panic!("expected PlanUpgradeRequired, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn client_upgrade_required_maps_for_426_and_409() {
+        for status in [StatusCode::UPGRADE_REQUIRED, StatusCode::CONFLICT] {
+            let app = Router::new().route(
+                "/core/v1/billing/plan",
+                get(move || async move {
+                    (
+                        status,
+                        Json(serde_json::json!({
+                            "error": "Update the app to continue.",
+                            "code": "CLIENT_UPGRADE_REQUIRED"
+                        })),
+                    )
+                        .into_response()
+                }),
+            );
+            let base = spawn(app).await;
+            let client = ApiClient::new_with_base_url(&base);
+            let err = client.get_plan_info("tok").await.unwrap_err();
+            match &err {
+                BridgeError::ClientUpgradeRequired(msg) => assert_eq!(msg, "Update the app to continue."),
+                other => panic!("expected ClientUpgradeRequired, got {:?}", other),
+            }
+            let text = err.to_string().to_lowercase();
+            assert!(!text.contains("401"));
+            assert!(!text.contains("unauthorized"));
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_level2_not_admitted_conflict_stays_an_api_error() {
+        let app = Router::new().route(
+            "/core/v1/billing/plan",
+            get(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "not admitted",
+                        "code": "VAULT_LEVEL2_NOT_ADMITTED"
+                    })),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.get_plan_info("tok").await.unwrap_err();
+        assert!(matches!(err, BridgeError::Api(_)));
     }
 
     #[tokio::test]

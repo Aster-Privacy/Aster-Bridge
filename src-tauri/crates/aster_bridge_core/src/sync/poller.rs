@@ -1285,10 +1285,14 @@ fn prepare_mail_item(
         return Prepared::Done(CacheOutcome::default());
     }
 
-    let failure_key = failed_envelope_key(
-        &envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys),
-        item,
-    );
+    let mut fingerprint = envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys);
+    if crate::crypto::envelope::is_storage_key_envelope_nonce(&item.envelope_nonce) {
+        fingerprint.push_str(&format!(
+            ":{}",
+            crate::crypto::envelope::storage_envelope_keys_generation()
+        ));
+    }
+    let failure_key = failed_envelope_key(&fingerprint, item);
     if failed_recently(failed_envelopes(), &failure_key, std::time::Instant::now()) {
         return Prepared::Done(CacheOutcome {
             inbound_decrypt_failed: crate::crypto::inbound::is_inbound_payload(

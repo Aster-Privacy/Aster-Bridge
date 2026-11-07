@@ -36,6 +36,111 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
 const ENVELOPE_VERSIONS: &[&str] = &["astermail-envelope-v1", "astermail-import-v1"];
+const STORAGE_KEY_ENVELOPE_MARKER: u8 = 0x02;
+const STORAGE_KEY_ENVELOPE_INFO: &[u8] = b"aster-envelope-v2";
+
+static STORAGE_ENVELOPE_KEYS: std::sync::RwLock<Vec<Zeroizing<[u8; 32]>>> =
+    std::sync::RwLock::new(Vec::new());
+static STORAGE_ENVELOPE_KEYS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn decode_storage_key(key_b64: &str) -> Option<Zeroizing<[u8; 32]>> {
+    let raw = Zeroizing::new(STANDARD.decode(key_b64.trim()).ok()?);
+    if raw.len() != 32 {
+        return None;
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&raw);
+    Some(key)
+}
+
+pub fn remember_storage_envelope_keys(
+    data_kek_b64: Option<&str>,
+    storage_keys: &[Zeroizing<[u8; 32]>],
+) {
+    let mut ring = STORAGE_ENVELOPE_KEYS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut merged: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(ring.len() + storage_keys.len() + 1);
+    for key in data_kek_b64
+        .and_then(decode_storage_key)
+        .into_iter()
+        .chain(storage_keys.iter().cloned())
+        .chain(ring.iter().cloned())
+    {
+        if !merged.iter().any(|known| **known == *key) {
+            merged.push(key);
+        }
+    }
+    let changed = merged.len() != ring.len()
+        || merged.iter().zip(ring.iter()).any(|(a, b)| **a != **b);
+    if changed {
+        *ring = merged;
+        STORAGE_ENVELOPE_KEYS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn forget_storage_envelope_keys() {
+    let mut ring = STORAGE_ENVELOPE_KEYS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !ring.is_empty() {
+        ring.clear();
+        STORAGE_ENVELOPE_KEYS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn is_storage_key_envelope_nonce(nonce_b64: &str) -> bool {
+    STANDARD
+        .decode(nonce_b64)
+        .map(|bytes| bytes.as_slice() == [STORAGE_KEY_ENVELOPE_MARKER])
+        .unwrap_or(false)
+}
+
+pub fn storage_envelope_keys_generation() -> u64 {
+    STORAGE_ENVELOPE_KEYS_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn remembered_storage_envelope_keys() -> Vec<Zeroizing<[u8; 32]>> {
+    STORAGE_ENVELOPE_KEYS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn decrypt_storage_key_envelope(
+    encrypted_data_b64: &str,
+    keys: &[Zeroizing<[u8; 32]>],
+) -> Result<String> {
+    let data = STANDARD
+        .decode(encrypted_data_b64)
+        .map_err(|e| BridgeError::Crypto(format!("data decode: {}", e)))?;
+
+    if data.len() < SALT_LEN + NONCE_LEN + 16 {
+        return Err(BridgeError::Crypto("envelope too short".to_string()));
+    }
+
+    let salt = &data[..SALT_LEN];
+    let nonce = Nonce::from_slice(&data[SALT_LEN..SALT_LEN + NONCE_LEN]);
+    let ciphertext = &data[SALT_LEN + NONCE_LEN..];
+
+    for key in keys {
+        let hk = Hkdf::<Sha256>::new(Some(salt), key.as_slice());
+        let mut okm = Zeroizing::new([0u8; 32]);
+        if hk.expand(STORAGE_KEY_ENVELOPE_INFO, okm.as_mut_slice()).is_err() {
+            continue;
+        }
+        let Ok(cipher) = Aes256Gcm::new_from_slice(okm.as_slice()) else {
+            continue;
+        };
+        if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+            return String::from_utf8(plaintext)
+                .map_err(|e| BridgeError::Crypto(format!("utf8 decode: {}", e)));
+        }
+    }
+
+    Err(BridgeError::Crypto("storage key envelope decrypt failed".to_string()))
+}
 
 pub const ENVELOPE_VERSION_DEFAULT: &str = "astermail-envelope-v1";
 pub const ENVELOPE_VERSION_IMPORT: &str = "astermail-import-v1";
@@ -110,6 +215,12 @@ pub fn decrypt_envelope_noting_origin(
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
         return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
+            .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored));
+    }
+
+    if nonce_bytes.len() == 1 && nonce_bytes[0] == STORAGE_KEY_ENVELOPE_MARKER {
+        let keys = remembered_storage_envelope_keys();
+        return decrypt_storage_key_envelope(encrypted_data_b64, &keys)
             .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored));
     }
 
@@ -875,5 +986,62 @@ mod tests {
             &[],
         )
         .is_err());
+    }
+
+    const V2_DATA_KEK: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const V2_LEGACY_KEK: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+    const V2_PLAINTEXT: &str = r#"{"subject":"Vector test","n":7}"#;
+    const V2_CURRENT: &str = "oKGio6SlpqeoqaqrrK2ur8DBwsPExcbHyMnKyxmUrphDVc4W9hq0u8Q/kCWAkTj6oNg/L8FnTtfoYrei0cSkxxjeICkSF8UMMji/";
+    const V2_LEGACY_ONLY: &str = "oKGio6SlpqeoqaqrrK2ur8DBwsPExcbHyMnKywLFIOOJnavHPVGWAESVDuvrt2eV3125NPGXHdSgj9M13jpUGS2PQGNB/A8W43oA";
+
+    fn v2_key(b64: &str) -> Zeroizing<[u8; 32]> {
+        decode_storage_key(b64).unwrap()
+    }
+
+    #[test]
+    fn v2_vector_opens_with_data_kek() {
+        let plain = decrypt_storage_key_envelope(V2_CURRENT, &[v2_key(V2_DATA_KEK)]).unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+    }
+
+    #[test]
+    fn v2_legacy_vector_needs_the_legacy_kek() {
+        assert!(decrypt_storage_key_envelope(V2_LEGACY_ONLY, &[v2_key(V2_DATA_KEK)]).is_err());
+        let plain = decrypt_storage_key_envelope(
+            V2_LEGACY_ONLY,
+            &[v2_key(V2_DATA_KEK), v2_key(V2_LEGACY_KEK)],
+        )
+        .unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+    }
+
+    #[test]
+    fn v2_vector_fails_without_keys_and_on_tampering() {
+        assert!(decrypt_storage_key_envelope(V2_CURRENT, &[]).is_err());
+        let mut raw = STANDARD.decode(V2_CURRENT).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        let tampered = STANDARD.encode(&raw);
+        assert!(decrypt_storage_key_envelope(&tampered, &[v2_key(V2_DATA_KEK)]).is_err());
+        assert!(decrypt_storage_key_envelope("AAAA", &[v2_key(V2_DATA_KEK)]).is_err());
+    }
+
+    #[test]
+    fn v2_nonce_marker_is_recognized() {
+        assert!(is_storage_key_envelope_nonce("Ag=="));
+        assert!(!is_storage_key_envelope_nonce("AQ=="));
+        assert!(!is_storage_key_envelope_nonce(""));
+        assert!(!is_storage_key_envelope_nonce("not base64"));
+    }
+
+    #[test]
+    fn v2_nonce_marker_uses_the_remembered_keys() {
+        remember_storage_envelope_keys(Some(V2_DATA_KEK), &[v2_key(V2_LEGACY_KEK)]);
+        for blob in [V2_CURRENT, V2_LEGACY_ONLY] {
+            let (plain, origin) =
+                decrypt_envelope_noting_origin(blob, Some("Ag=="), b"unused", None, &[], &[]).unwrap();
+            assert_eq!(plain, V2_PLAINTEXT);
+            assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+        }
     }
 }

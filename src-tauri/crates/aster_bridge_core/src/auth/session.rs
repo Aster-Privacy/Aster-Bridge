@@ -338,9 +338,20 @@ pub struct VaultKeyMaterial {
 pub fn decrypt_vault_key_material(
     encrypted_vault: &str,
     vault_nonce: &str,
+    vault_kdf_iterations: Option<u32>,
     passphrase: &[u8],
 ) -> Result<VaultKeyMaterial> {
-    let v = crate::crypto::vault::decrypt_vault(encrypted_vault, vault_nonce, passphrase)?;
+    let v = crate::crypto::vault::decrypt_vault_with_iterations(
+        encrypted_vault,
+        vault_nonce,
+        passphrase,
+        vault_kdf_iterations,
+    )?;
+    let ratchet_recovery = crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault(&v, passphrase);
+    crate::crypto::envelope::remember_storage_envelope_keys(
+        v.data_kek.as_deref(),
+        &ratchet_recovery.storage_keys,
+    );
     Ok(VaultKeyMaterial {
         identity_key: v.identity_key.clone(),
         data_kek: v.data_kek.clone().map(Zeroizing::new),
@@ -348,7 +359,7 @@ pub fn decrypt_vault_key_material(
         ratchet_keys: crate::crypto::ratchet::build_receiver_key_sets(&v),
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
         previous_keys: Zeroizing::new(collect_previous_identity_keys(&v)),
-        ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault(&v, passphrase),
+        ratchet_recovery,
     })
 }
 
@@ -438,6 +449,7 @@ pub async fn login_with_passphrase(
         match decrypt_vault_key_material(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
+            login_resp.vault_kdf_iterations,
             &passphrase,
         ) {
             Ok(m) => (
@@ -568,6 +580,7 @@ pub async fn refresh_access_token(
                 tracing::warn!("session refresh returned no access token; signing in with the device key");
             }
             Err(e) if is_transient_refresh_error(&e) => return Err(e),
+            Err(e @ BridgeError::ClientUpgradeRequired(_)) => return Err(e),
             Err(e) => {
                 tracing::warn!("session refresh failed ({}); signing in with the device key", e);
             }
@@ -609,6 +622,7 @@ async fn sign_in_and_reload_vault(
     let material = decrypt_vault_key_material(
         &login_resp.encrypted_vault,
         &login_resp.vault_nonce,
+        login_resp.vault_kdf_iterations,
         &passphrase,
     );
     let loaded_account_keys = match &material {
@@ -719,6 +733,7 @@ pub async fn first_time_setup(
                     match decrypt_vault_key_material(
                         &login_resp.encrypted_vault,
                         &login_resp.vault_nonce,
+                        login_resp.vault_kdf_iterations,
                         &passphrase,
                     ) {
                         Ok(m) => (

@@ -30,6 +30,7 @@ pub enum AccountState {
     Suspended,
     DeletionScheduled,
     FamilyPolicy,
+    UpdateRequired,
 }
 
 impl AccountState {
@@ -39,6 +40,7 @@ impl AccountState {
             AccountState::Suspended => "suspended",
             AccountState::DeletionScheduled => "deletion_scheduled",
             AccountState::FamilyPolicy => "family_policy",
+            AccountState::UpdateRequired => "update_required",
         }
     }
 
@@ -48,6 +50,7 @@ impl AccountState {
             AccountState::Suspended => 1,
             AccountState::DeletionScheduled => 2,
             AccountState::FamilyPolicy => 3,
+            AccountState::UpdateRequired => 4,
         }
     }
 
@@ -56,6 +59,7 @@ impl AccountState {
             1 => AccountState::Suspended,
             2 => AccountState::DeletionScheduled,
             3 => AccountState::FamilyPolicy,
+            4 => AccountState::UpdateRequired,
             _ => AccountState::Active,
         }
     }
@@ -70,6 +74,8 @@ pub fn classify(error: &str) -> Option<AccountState> {
         Some(AccountState::DeletionScheduled)
     } else if error.contains("FAMILY_2FA_REQUIRED") {
         Some(AccountState::FamilyPolicy)
+    } else if error.contains("CLIENT_UPGRADE_REQUIRED") || error.contains("client_upgrade_required") {
+        Some(AccountState::UpdateRequired)
     } else {
         None
     }
@@ -95,10 +101,17 @@ pub fn record(state: AccountState) -> bool {
     changed
 }
 
+fn state_after_success(current: AccountState) -> AccountState {
+    match current {
+        AccountState::UpdateRequired => AccountState::UpdateRequired,
+        _ => AccountState::Active,
+    }
+}
+
 pub fn observe<T>(result: &Result<T, String>) {
     match result {
         Ok(_) => {
-            record(AccountState::Active);
+            record(state_after_success(current()));
         }
         Err(e) => {
             if let Some(state) = classify(e) {
@@ -126,6 +139,14 @@ mod tests {
             classify(r#"403 Forbidden: {"error":"two-factor required","code":"FAMILY_2FA_REQUIRED"}"#),
             Some(AccountState::FamilyPolicy)
         );
+        assert_eq!(
+            classify(r#"426 Upgrade Required: {"error":"Update the app.","code":"CLIENT_UPGRADE_REQUIRED"}"#),
+            Some(AccountState::UpdateRequired)
+        );
+        assert_eq!(
+            classify("client_upgrade_required: Update the app."),
+            Some(AccountState::UpdateRequired)
+        );
         assert_eq!(classify("500 Internal Server Error: boom"), None);
         assert_eq!(classify("network error: timed out"), None);
     }
@@ -139,6 +160,20 @@ mod tests {
         assert_eq!(current(), AccountState::Suspended);
         observe(&Ok(()));
         assert_eq!(current(), AccountState::Active);
+    }
+
+    #[test]
+    fn success_does_not_clear_update_required() {
+        assert_eq!(
+            state_after_success(AccountState::UpdateRequired),
+            AccountState::UpdateRequired
+        );
+        assert_eq!(state_after_success(AccountState::Suspended), AccountState::Active);
+        assert_eq!(
+            AccountState::from_u8(AccountState::UpdateRequired.to_u8()),
+            AccountState::UpdateRequired
+        );
+        assert_eq!(AccountState::UpdateRequired.as_str(), "update_required");
     }
 
     #[test]

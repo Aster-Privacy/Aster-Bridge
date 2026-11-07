@@ -121,6 +121,7 @@ pub fn account_state_label(account_state: AccountState) -> &'static str {
         AccountState::Suspended => "Suspended",
         AccountState::DeletionScheduled => "Scheduled for deletion",
         AccountState::FamilyPolicy => "Needs two-factor authentication",
+        AccountState::UpdateRequired => "Update required",
     }
 }
 
@@ -137,6 +138,10 @@ pub fn account_state_error(account_state: AccountState) -> CliError {
         AccountState::FamilyPolicy => (
             "Your family plan requires two-factor authentication before Aster Bridge can connect.",
             format!("To continue, turn on two-factor authentication at {}/settings.", APP_URL),
+        ),
+        AccountState::UpdateRequired => (
+            "This version of Aster Bridge can't connect to your account.",
+            "To continue, install the latest version of Aster Bridge, then start it again. You stay signed in.".to_string(),
         ),
         AccountState::Active => {
             return CliError::coded(CODE_SIGN_IN, "Aster Mail refused the sign-in.");
@@ -537,6 +542,22 @@ mod tests {
         assert_eq!(err.exit_code, EXIT_ACCESS);
         let err = map_login_error(dir.path(), BridgeError::PlanUpgradeRequired("x".into()));
         assert_eq!(err.code, "bridge_access_required");
+    }
+
+    #[test]
+    fn client_upgrade_required_keeps_the_device_and_asks_for_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = map_login_error(
+            dir.path(),
+            BridgeError::ClientUpgradeRequired("Update the app.".into()),
+        );
+        assert_eq!(err.code, "update_required");
+        assert_eq!(err.exit_code, EXIT_ACCESS);
+        assert!(err.hint.is_some());
+        assert_eq!(
+            account_state_label(AccountState::UpdateRequired),
+            "Update required"
+        );
     }
 
     #[test]

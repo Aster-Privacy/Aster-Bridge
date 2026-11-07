@@ -18,7 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -29,6 +29,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::{BridgeError, Result};
 
 const PBKDF2_ITERATIONS: u32 = 310_000;
+const PBKDF2_ITERATIONS_STRONG: u32 = 600_000;
+const VAULT_AAD: &[u8] = b"aster-vault-v1";
 const SALT_LEN: usize = 16;
 
 #[derive(Deserialize, Zeroize, Clone)]
@@ -137,11 +139,34 @@ pub struct VaultContents {
     pub legacy_identity_keys: Option<Vec<String>>,
 }
 
+pub fn vault_kdf_iterations(stored: Option<u32>) -> Result<u32> {
+    match stored {
+        None => Ok(PBKDF2_ITERATIONS),
+        Some(PBKDF2_ITERATIONS) => Ok(PBKDF2_ITERATIONS),
+        Some(PBKDF2_ITERATIONS_STRONG) => Ok(PBKDF2_ITERATIONS_STRONG),
+        Some(other) => Err(BridgeError::Crypto(format!(
+            "unsupported vault kdf iterations: {}",
+            other
+        ))),
+    }
+}
+
 pub fn decrypt_vault(
     encrypted_vault_b64: &str,
     vault_nonce_b64: &str,
     passphrase: &[u8],
 ) -> Result<VaultContents> {
+    decrypt_vault_with_iterations(encrypted_vault_b64, vault_nonce_b64, passphrase, None)
+}
+
+pub fn decrypt_vault_with_iterations(
+    encrypted_vault_b64: &str,
+    vault_nonce_b64: &str,
+    passphrase: &[u8],
+    stored_iterations: Option<u32>,
+) -> Result<VaultContents> {
+    let iterations = vault_kdf_iterations(stored_iterations)?;
+
     let combined = STANDARD
         .decode(encrypted_vault_b64)
         .map_err(|e| BridgeError::Crypto(format!("vault data decode: {}", e)))?;
@@ -162,7 +187,7 @@ pub fn decrypt_vault(
     let ciphertext = &combined[SALT_LEN..];
 
     let mut key = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, PBKDF2_ITERATIONS, &mut key);
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut key);
 
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
@@ -171,6 +196,15 @@ pub fn decrypt_vault(
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
+        .or_else(|_| {
+            cipher.decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: VAULT_AAD,
+                },
+            )
+        })
         .map_err(|_| BridgeError::Crypto("vault decrypt failed".to_string()))?;
 
     let mut vault_json = String::from_utf8(plaintext)
@@ -279,5 +313,101 @@ mod tests {
     fn decrypt_vault_invalid_base64_errors_not_panic() {
         let nonce_b64 = STANDARD.encode([0u8; 12]);
         assert!(decrypt_vault("!!!not-base64", &nonce_b64, b"p").is_err());
+    }
+
+    const VECTOR_PASSWORD: &[u8] = b"correct horse battery staple";
+    const VECTOR_NONCE: &str = "MDEyMzQ1Njc4OTo7";
+    const VECTOR_DATA_KEK: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const VECTOR_600K_NO_AAD: &str = "EBESExQVFhcYGRobHB0eHzSa66nA+rHMINpdiOTpkjSCLhwwf3wsJL83mK7tmNaM7vJPzgxj+NUyvRlcWDdrwRNULF7InqurSUTICamu5KacrQS2IjGLyOnx9LZ0MC2EoKMAMr5335JJHdmKF1VwBXA=";
+    const VECTOR_600K_AAD: &str = "EBESExQVFhcYGRobHB0eHzSa66nA+rHMINpdiOTpkjSCLhwwf3wsJL83mK7tmNaM7vJPzgxj+NUyvRlcWDdrwRNULF7InqurSUTICamu5KacrQS2IjGLyOnx9LZ0MC2EoHqqTrmesmoHLQ6kNpv6xHU=";
+    const VECTOR_310K_NO_AAD: &str = "EBESExQVFhcYGRobHB0eH50xxkcJB5SCtgtwRihOGlJpA8baPelSa7kLsGCC/XD/WniEAFD+wtkjtM9nC5jHqjiir62dXVYDU2og79rnDzdr682La1IW1eHEi6OMTTtMkITkVo8ts1yICXjRFG6sx9o=";
+
+    fn assert_vector_contents(vault: &VaultContents) {
+        assert_eq!(vault.identity_key, "test");
+        assert_eq!(vault.data_kek.as_deref(), Some(VECTOR_DATA_KEK));
+    }
+
+    #[test]
+    fn vault_vector_600k_without_aad_decrypts() {
+        let vault = decrypt_vault_with_iterations(
+            VECTOR_600K_NO_AAD,
+            VECTOR_NONCE,
+            VECTOR_PASSWORD,
+            Some(600_000),
+        )
+        .unwrap();
+        assert_vector_contents(&vault);
+    }
+
+    #[test]
+    fn vault_vector_600k_with_aad_decrypts() {
+        let vault = decrypt_vault_with_iterations(
+            VECTOR_600K_AAD,
+            VECTOR_NONCE,
+            VECTOR_PASSWORD,
+            Some(600_000),
+        )
+        .unwrap();
+        assert_vector_contents(&vault);
+    }
+
+    #[test]
+    fn vault_vector_310k_decrypts_with_null_and_explicit_count() {
+        let from_null =
+            decrypt_vault_with_iterations(VECTOR_310K_NO_AAD, VECTOR_NONCE, VECTOR_PASSWORD, None)
+                .unwrap();
+        assert_vector_contents(&from_null);
+        let explicit = decrypt_vault_with_iterations(
+            VECTOR_310K_NO_AAD,
+            VECTOR_NONCE,
+            VECTOR_PASSWORD,
+            Some(310_000),
+        )
+        .unwrap();
+        assert_vector_contents(&explicit);
+        assert_vector_contents(&decrypt_vault(VECTOR_310K_NO_AAD, VECTOR_NONCE, VECTOR_PASSWORD).unwrap());
+    }
+
+    #[test]
+    fn vault_vector_600k_fails_at_default_count() {
+        assert!(decrypt_vault_with_iterations(VECTOR_600K_NO_AAD, VECTOR_NONCE, VECTOR_PASSWORD, None).is_err());
+    }
+
+    #[test]
+    fn vault_unknown_iteration_count_is_rejected() {
+        assert!(vault_kdf_iterations(Some(12_345)).is_err());
+        assert!(decrypt_vault_with_iterations(
+            VECTOR_310K_NO_AAD,
+            VECTOR_NONCE,
+            VECTOR_PASSWORD,
+            Some(12_345)
+        )
+        .is_err());
+        assert_eq!(vault_kdf_iterations(None).unwrap(), 310_000);
+        assert_eq!(vault_kdf_iterations(Some(600_000)).unwrap(), 600_000);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn seal_vault_with_iterations(
+        plaintext: &[u8],
+        passphrase: &[u8],
+        iterations: u32,
+    ) -> (String, String) {
+        let salt: [u8; SALT_LEN] = rand::random();
+        let nonce_bytes: [u8; 12] = rand::random();
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, &salt, iterations, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        key.zeroize();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .unwrap();
+        let mut combined = salt.to_vec();
+        combined.extend_from_slice(&ciphertext);
+        (STANDARD.encode(&combined), STANDARD.encode(nonce_bytes))
     }
 }

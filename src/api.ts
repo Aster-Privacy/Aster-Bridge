@@ -62,6 +62,7 @@ export interface BridgeState {
   import_progress: ImportProgress | null;
   port_conflict: PortConflict | null;
   insecure_sign_in: InsecureSignIn | null;
+  update_required: boolean;
 }
 
 async function tauri_invoke<T>(
@@ -90,6 +91,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     import_progress: ImportProgress | null;
     port_conflict: PortConflict | null;
     insecure_sign_in: InsecureSignIn | null;
+    update_required?: boolean;
   }>("get_bridge_status");
 
   let passwords: AppPassword[] = [];
@@ -115,6 +117,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     import_progress: status.import_progress ?? null,
     port_conflict: status.port_conflict ?? null,
     insecure_sign_in: status.insecure_sign_in ?? null,
+    update_required: status.update_required ?? false,
   };
 }
 

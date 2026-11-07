@@ -148,7 +148,12 @@ async fn refresh(
 
     let decrypt_passphrase = passphrase.clone();
     let material = tokio::task::spawn_blocking(move || {
-        decrypt_vault_key_material(&vault.encrypted_vault, &vault.vault_nonce, &decrypt_passphrase)
+        decrypt_vault_key_material(
+            &vault.encrypted_vault,
+            &vault.vault_nonce,
+            vault.vault_kdf_iterations,
+            &decrypt_passphrase,
+        )
     })
     .await
     .map_err(|e| BridgeError::Crypto(format!("vault decrypt task: {}", e)))??;
@@ -304,6 +309,10 @@ fn apply_storage_keys(
         }
     }
     session.ratchet_recovery.storage_keys = merged;
+    crate::crypto::envelope::remember_storage_envelope_keys(
+        None,
+        &session.ratchet_recovery.storage_keys,
+    );
 
     if changed {
         if let Some(t) = target {
@@ -328,22 +337,11 @@ pub(crate) mod tests {
     pub(crate) const PASSPHRASE: &[u8] = b"vault-pass";
 
     pub(crate) fn seal_vault(vault_json: &serde_json::Value) -> (String, String) {
-        use aes_gcm::aead::Aead;
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-        let salt: [u8; 16] = rand::random();
-        let nonce_bytes: [u8; 12] = rand::random();
-        let mut key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(PASSPHRASE, &salt, 310_000, &mut key);
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                vault_json.to_string().as_bytes(),
-            )
-            .unwrap();
-        let mut combined = salt.to_vec();
-        combined.extend_from_slice(&ciphertext);
-        (STANDARD.encode(&combined), STANDARD.encode(nonce_bytes))
+        crate::crypto::vault::test_support::seal_vault_with_iterations(
+            vault_json.to_string().as_bytes(),
+            PASSPHRASE,
+            310_000,
+        )
     }
 
     pub(crate) fn session_with(data_kek: Option<[u8; 32]>, identity_key: Option<String>) -> Session {

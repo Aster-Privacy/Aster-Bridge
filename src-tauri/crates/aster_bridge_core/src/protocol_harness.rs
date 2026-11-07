@@ -1123,10 +1123,11 @@ async fn decrypt_real_internal() {
     };
     let access_token = zeroize::Zeroizing::new(login_resp.access_token.clone().unwrap_or_default());
     let (identity_key, ratchet_identity_public, ratchet_keys, inbound_keys) =
-        match crate::crypto::vault::decrypt_vault(
+        match crate::crypto::vault::decrypt_vault_with_iterations(
             &login_resp.encrypted_vault,
             &login_resp.vault_nonce,
             &passphrase,
+            login_resp.vault_kdf_iterations,
         ) {
             Ok(v) => (
                 Some(v.identity_key.clone()),

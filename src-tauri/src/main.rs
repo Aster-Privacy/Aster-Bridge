@@ -137,6 +137,7 @@ struct BridgeStatusResponse {
     import_progress: Option<imap::append::ImportProgress>,
     port_conflict: Option<PortConflict>,
     insecure_sign_in: Option<sign_in_notice::InsecureSignIn>,
+    update_required: bool,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -251,6 +252,8 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         import_progress: imap::append::current_import_progress(),
         port_conflict: guard.port_conflict.clone(),
         insecure_sign_in: sign_in_notice::last_insecure(),
+        update_required: aster_bridge_core::account_state::current()
+            == aster_bridge_core::account_state::AccountState::UpdateRequired,
     })
 }
 
@@ -452,6 +455,7 @@ async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> R
     auth::device_identity::clear_identity(&data_dir);
     auth::device_identity::clear_passphrase(&data_dir);
     guard.identity.device_id = None;
+    crypto::envelope::forget_storage_envelope_keys();
 
     drop(guard);
     let _ = app_handle.emit("state_updated", ());
@@ -1581,6 +1585,10 @@ impl aster_bridge_core::events::BridgeEvents for TauriEvents {
     fn state_changed(&self) {
         let _ = self.0.emit("state_updated", ());
     }
+
+    fn account_state_changed(&self, _state: aster_bridge_core::account_state::AccountState) {
+        let _ = self.0.emit("state_updated", ());
+    }
 }
 
 fn main() {
@@ -1923,7 +1931,11 @@ fn main() {
                         Err(e) => {
                             let msg = e.to_string();
                             tracing::warn!("auto-login failed, setup required: {}", msg);
-                            if msg.contains("401") || msg.to_lowercase().contains("unauthorized") {
+                            if matches!(e, aster_bridge_core::error::BridgeError::ClientUpgradeRequired(_)) {
+                                aster_bridge_core::account_state::record(
+                                    aster_bridge_core::account_state::AccountState::UpdateRequired,
+                                );
+                            } else if msg.contains("401") || msg.to_lowercase().contains("unauthorized") {
                                 let data_dir = guard.config.data_dir.clone();
                                 let _ = auth::device_identity::clear_device_id(&data_dir);
                                 auth::device_identity::clear_passphrase(&data_dir);
@@ -1936,6 +1948,7 @@ fn main() {
                                 guard.has_bridge_access = false;
                                 guard.passwords = None;
                                 guard.stop_runtime(runtime::StopReason::UserRequested);
+                                crypto::envelope::forget_storage_envelope_keys();
                                 drop(guard);
                                 let _ = app_handle.emit("session_expired", ());
                             }

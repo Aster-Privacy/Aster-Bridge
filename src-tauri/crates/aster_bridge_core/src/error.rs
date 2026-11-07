@@ -55,6 +55,9 @@ pub enum BridgeError {
     #[error("plan_upgrade_required: {0}")]
     PlanUpgradeRequired(String),
 
+    #[error("client_upgrade_required: {0}")]
+    ClientUpgradeRequired(String),
+
     #[error("message too large: {0}")]
     MessageTooLarge(String),
 
@@ -85,6 +88,10 @@ mod tests {
         assert_eq!(
             BridgeError::PlanUpgradeRequired("pro".to_string()).to_string(),
             "plan_upgrade_required: pro"
+        );
+        assert_eq!(
+            BridgeError::ClientUpgradeRequired("update".to_string()).to_string(),
+            "client_upgrade_required: update"
         );
     }
 

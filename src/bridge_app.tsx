@@ -2816,6 +2816,7 @@ export function BridgeApp() {
   const [port_conflict, set_port_conflict] = useState<PortConflict | null>(null);
   const [insecure_sign_in, set_insecure_sign_in] = useState<InsecureSignIn | null>(null);
   const dismissed_insecure_seq = useRef(0);
+  const update_required_shown = useRef(false);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
@@ -2854,6 +2855,10 @@ export function BridgeApp() {
         api.get_connection_info(),
       ]);
       set_conn_info(info);
+      if (state.update_required && !update_required_shown.current) {
+        update_required_shown.current = true;
+        show_toast(i18next.t("toast_bridge_update_required"), "error", 10000);
+      }
       if (state.enrolled) {
         set_view("dashboard");
         set_email(state.email);
