@@ -135,6 +135,7 @@ pub(super) struct Keys {
     pub(super) identity_key: Option<String>,
     pub(super) previous_keys: Zeroizing<Vec<String>>,
     pub(super) inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
+    pub(super) external_key: Option<crate::crypto::external_pgp_key::ExternalPgpKey>,
 }
 
 impl Keys {
@@ -146,6 +147,7 @@ impl Keys {
             identity_key: s.identity_key.clone(),
             previous_keys: s.previous_keys.clone(),
             inbound_keys: s.inbound_keys.clone(),
+            external_key: s.external_pgp_key.clone(),
         }
     }
 }
@@ -389,6 +391,7 @@ async fn retry_undecrypted(db: &Database, client: &ApiClient, keys: &Keys, now: 
                     keys.identity_key.as_deref(),
                     &keys.previous_keys,
                     &keys.inbound_keys,
+                    keys.external_key.as_ref(),
                 );
                 if outcome.decrypt_failed {
                     let _ = db.history_retry_note(&id, &label, retry_delay_secs, now as i64);
@@ -681,6 +684,7 @@ fn index_page(
             keys.identity_key.as_deref(),
             &keys.previous_keys,
             &keys.inbound_keys,
+            keys.external_key.as_ref(),
         ) {
             Prepared::Done(outcome) => outcome,
             Prepared::Ready(prepared) => commit_history_item(db, &folder, item, prepared),
@@ -844,6 +848,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }))
     }
 
@@ -2291,7 +2296,7 @@ mod tests {
 
         run_sync_pass(&session, &client, &db, None, true).await.unwrap();
         while !db.list_attachment_backlog(1).unwrap().is_empty() {
-            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], &HashSet::new()).await;
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], None, &HashSet::new()).await;
         }
         let (recent_disk, recent_live) = database_bytes(&db, dir.path());
         let lists_before = backend.list_calls.load(Ordering::SeqCst);
@@ -2321,7 +2326,7 @@ mod tests {
         .unwrap();
         let backlog_started = std::time::Instant::now();
         while !db.list_attachment_backlog(1).unwrap().is_empty() {
-            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], &HashSet::new()).await;
+            backfill_pending_attachments(&db, &client, &keys.access_token, &keys.passphrase, IK, &[], &[], None, &HashSet::new()).await;
         }
         let backlog_in = backlog_started.elapsed();
         let backlog_files = backend.attachment_requests() - files_before - history_files;

@@ -34,6 +34,7 @@ use crate::crypto::ratchet::X3DH_VERSION_TRANSCRIPT_BOUND;
 pub const MAX_ENVELOPE_MARKER: i16 = INBOUND_PQ_HYBRID_MARKER as i16;
 pub const PLATFORM: &str = "bridge";
 pub const X3DH_MAX_VERSION: i16 = X3DH_VERSION_TRANSCRIPT_BOUND as i16;
+pub const PGP_EXTERNAL_VERSION: i16 = 1;
 pub const REPORT_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 
 const STATE_FILE: &str = "envelope_capability.json";
@@ -48,6 +49,8 @@ pub struct CapabilityState {
     pub last_reported_at: HashMap<String, u64>,
     #[serde(default)]
     pub last_reported_fingerprint: HashMap<String, String>,
+    #[serde(default)]
+    pub last_reported_pgp_external_version: HashMap<String, i16>,
 }
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
@@ -108,6 +111,10 @@ pub fn is_report_due_for(
     }
 }
 
+pub fn reported_capabilities_are_stale(state: &CapabilityState, user_id: &str) -> bool {
+    state.last_reported_pgp_external_version.get(user_id).copied() != Some(PGP_EXTERNAL_VERSION)
+}
+
 pub fn ensure_client_id(state: &mut CapabilityState) -> String {
     if state.client_id.trim().is_empty() {
         state.client_id = uuid::Uuid::new_v4().to_string();
@@ -138,7 +145,9 @@ pub async fn report_if_due(
     let now = unix_now();
     let fingerprint = identity_fingerprint(identity_public_b64);
 
-    if !is_report_due_for(&state, user_id, fingerprint.as_deref(), now) {
+    if !is_report_due_for(&state, user_id, fingerprint.as_deref(), now)
+        && !reported_capabilities_are_stale(&state, user_id)
+    {
         return;
     }
 
@@ -149,11 +158,15 @@ pub async fn report_if_due(
         platform: PLATFORM,
         identity_fingerprint: fingerprint.as_deref(),
         x3dh_max_version: X3DH_MAX_VERSION,
+        pgp_external_version: PGP_EXTERNAL_VERSION,
     };
 
     match client.report_envelope_capability(access_token, &body).await {
         Ok(response) if response.success => {
             state.last_reported_at.insert(user_id.to_string(), now);
+            state
+                .last_reported_pgp_external_version
+                .insert(user_id.to_string(), PGP_EXTERNAL_VERSION);
             match fingerprint.as_deref() {
                 Some(current) => {
                     state
@@ -206,10 +219,25 @@ mod tests {
             platform: PLATFORM,
             identity_fingerprint: None,
             x3dh_max_version: X3DH_MAX_VERSION,
+            pgp_external_version: PGP_EXTERNAL_VERSION,
         };
         let value = serde_json::to_value(&body).unwrap();
 
         assert_eq!(value["x3dh_max_version"], 2);
+        assert_eq!(value["pgp_external_version"], 1);
+    }
+
+    #[test]
+    fn a_report_without_the_external_key_version_is_stale() {
+        let mut state = CapabilityState::default();
+        state.last_reported_at.insert("user".to_string(), 1_000_000);
+        assert!(!is_report_due_for(&state, "user", None, 1_000_000 + 60));
+        assert!(reported_capabilities_are_stale(&state, "user"));
+
+        state
+            .last_reported_pgp_external_version
+            .insert("user".to_string(), PGP_EXTERNAL_VERSION);
+        assert!(!reported_capabilities_are_stale(&state, "user"));
     }
 
     #[test]

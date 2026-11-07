@@ -26,6 +26,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::crypto::external_pgp_key::ExternalPgpKey;
 use crate::crypto::inbound::{
     decrypt_inbound_envelope, InboundKeyCandidate, INBOUND_ECDH_MARKER, INBOUND_PQ_HYBRID_MARKER,
 };
@@ -65,13 +66,34 @@ pub fn decrypt_envelope_with_previous_keys(
     previous_keys: &[String],
     inbound_keys: &[InboundKeyCandidate],
 ) -> Result<String> {
-    decrypt_envelope_noting_origin(
+    decrypt_envelope_with_external_key(
         encrypted_data_b64,
         nonce_b64,
         passphrase,
         identity_key,
         previous_keys,
         inbound_keys,
+        None,
+    )
+}
+
+pub fn decrypt_envelope_with_external_key(
+    encrypted_data_b64: &str,
+    nonce_b64: Option<&str>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
+) -> Result<String> {
+    decrypt_envelope_noting_origin_with_external_key(
+        encrypted_data_b64,
+        nonce_b64,
+        passphrase,
+        identity_key,
+        previous_keys,
+        inbound_keys,
+        external_key,
     )
     .map(|(plaintext, _)| plaintext)
 }
@@ -97,6 +119,26 @@ pub fn decrypt_envelope_noting_origin(
     previous_keys: &[String],
     inbound_keys: &[InboundKeyCandidate],
 ) -> Result<(String, EnvelopeOrigin)> {
+    decrypt_envelope_noting_origin_with_external_key(
+        encrypted_data_b64,
+        nonce_b64,
+        passphrase,
+        identity_key,
+        previous_keys,
+        inbound_keys,
+        None,
+    )
+}
+
+pub fn decrypt_envelope_noting_origin_with_external_key(
+    encrypted_data_b64: &str,
+    nonce_b64: Option<&str>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    inbound_keys: &[InboundKeyCandidate],
+    external_key: Option<&ExternalPgpKey>,
+) -> Result<(String, EnvelopeOrigin)> {
     let nonce_bytes = match nonce_b64 {
         Some(n) if !n.is_empty() => STANDARD
             .decode(n)
@@ -105,7 +147,7 @@ pub fn decrypt_envelope_noting_origin(
     };
 
     if nonce_bytes.is_empty() {
-        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase);
+        return decrypt_pgp_envelope(encrypted_data_b64, identity_key, previous_keys, passphrase, external_key);
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
@@ -241,6 +283,7 @@ fn decrypt_pgp_envelope(
     identity_key: Option<&str>,
     previous_keys: &[String],
     passphrase: &[u8],
+    external_key: Option<&ExternalPgpKey>,
 ) -> Result<(String, EnvelopeOrigin)> {
     let data = STANDARD
         .decode(encrypted_data_b64)
@@ -248,7 +291,7 @@ fn decrypt_pgp_envelope(
 
     if let Ok(text) = String::from_utf8(data) {
         if text.starts_with("-----BEGIN PGP") {
-            let (decrypted, origin) = open_own_pgp(&text, identity_key, previous_keys, passphrase)?;
+            let (decrypted, origin) = open_own_pgp(&text, identity_key, previous_keys, passphrase, external_key)?;
             let plaintext = String::from_utf8(decrypted.to_vec())
                 .map_err(|e| BridgeError::Crypto(format!("PGP utf8: {}", e)))?;
             return Ok((plaintext, origin));
@@ -309,24 +352,43 @@ fn open_own_pgp(
     identity_key: Option<&str>,
     previous_keys: &[String],
     passphrase: &[u8],
+    external_key: Option<&ExternalPgpKey>,
 ) -> Result<(Zeroizing<Vec<u8>>, EnvelopeOrigin)> {
-    let own_keys = own_pgp_keys(identity_key, previous_keys)?;
-    let key_refs: Vec<&aster_crypto::KeyPair> = own_keys.iter().collect();
-    let own_public: Vec<aster_crypto::PublicKey> = own_keys.iter().map(|k| k.public_key()).collect();
-    let public_refs: Vec<&aster_crypto::PublicKey> = own_public.iter().collect();
-    let passphrase_text = Zeroizing::new(std::str::from_utf8(passphrase).unwrap_or("").to_string());
-    for candidate in [passphrase_text.as_str(), ""] {
-        if let Ok(plain) = aster_crypto::decrypt_and_verify_with_passphrase(
-            armored.as_bytes(),
-            &key_refs,
-            &public_refs,
-            candidate,
-        ) {
-            return Ok((Zeroizing::new(plain), EnvelopeOrigin::SelfAuthored));
+    if let Ok(own_keys) = own_pgp_keys(identity_key, previous_keys) {
+        let key_refs: Vec<&aster_crypto::KeyPair> = own_keys.iter().collect();
+        let own_public: Vec<aster_crypto::PublicKey> = own_keys.iter().map(|k| k.public_key()).collect();
+        let public_refs: Vec<&aster_crypto::PublicKey> = own_public.iter().collect();
+        let passphrase_text = Zeroizing::new(std::str::from_utf8(passphrase).unwrap_or("").to_string());
+        for candidate in [passphrase_text.as_str(), ""] {
+            if let Ok(plain) = aster_crypto::decrypt_and_verify_with_passphrase(
+                armored.as_bytes(),
+                &key_refs,
+                &public_refs,
+                candidate,
+            ) {
+                return Ok((Zeroizing::new(plain), EnvelopeOrigin::SelfAuthored));
+            }
         }
     }
-    decrypt_own_pgp(armored, identity_key, previous_keys, passphrase)
+    decrypt_own_or_external_pgp(armored, identity_key, previous_keys, passphrase, external_key)
         .map(|plain| (plain, EnvelopeOrigin::UnsignedPgp))
+}
+
+pub(crate) fn decrypt_own_or_external_pgp(
+    armored: &str,
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    passphrase: &[u8],
+    external_key: Option<&ExternalPgpKey>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let own = decrypt_own_pgp(armored, identity_key, previous_keys, passphrase);
+    if own.is_ok() {
+        return own;
+    }
+    match external_key.and_then(|key| key.decrypt_armored(armored)) {
+        Some(plain) => Ok(plain),
+        None => own,
+    }
 }
 
 pub(crate) fn decrypt_own_pgp(
@@ -875,5 +937,72 @@ mod tests {
             &[],
         )
         .is_err());
+    }
+
+    fn open_with_external(
+        envelope: &str,
+        nonce: Option<&str>,
+        identity_key: Option<&str>,
+        external: Option<&ExternalPgpKey>,
+    ) -> Result<(String, EnvelopeOrigin)> {
+        decrypt_envelope_noting_origin_with_external_key(
+            envelope,
+            nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            identity_key,
+            &[],
+            &[],
+            external,
+        )
+    }
+
+    #[test]
+    fn a_pgp_envelope_to_the_external_key_opens_after_own_keys_fail() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let owner_armored = owner.to_armored().unwrap();
+        for bytes in [
+            crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key(),
+            crate::crypto::external_pgp_key::test_keys::rsa_3072_secret_key(),
+        ] {
+            let external = crate::crypto::external_pgp_key::external_key_for_tests(&bytes);
+            let pair = aster_crypto::import_secret_key_bytes(&bytes).unwrap();
+            let envelope = pgp_envelope_for(&pair, r#"{"body":"outside"}"#);
+
+            assert!(open_with_external(&envelope, None, Some(&owner_armored), None).is_err());
+            let (plaintext, origin) =
+                open_with_external(&envelope, None, Some(&owner_armored), Some(&external)).unwrap();
+            assert_eq!(plaintext, r#"{"body":"outside"}"#);
+            assert_eq!(origin, EnvelopeOrigin::UnsignedPgp);
+            assert!(!origin.authenticated());
+
+            let (without_identity, _) = open_with_external(&envelope, Some(""), None, Some(&external)).unwrap();
+            assert_eq!(without_identity, r#"{"body":"outside"}"#);
+        }
+    }
+
+    #[test]
+    fn own_keys_still_win_when_an_external_key_is_loaded() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(VAULT_PASSPHRASE);
+        let owner_armored = owner.to_armored().unwrap();
+        let external = crate::crypto::external_pgp_key::external_key_for_tests(
+            &crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key(),
+        );
+        let sealed =
+            crate::crypto::sent_copy::seal_sent_envelope("{}", &owner_armored, VAULT_PASSPHRASE.as_bytes()).unwrap();
+
+        let (_, origin) = open_with_external(&sealed, None, Some(&owner_armored), Some(&external)).unwrap();
+
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+    }
+
+    #[test]
+    fn the_external_key_never_opens_an_identity_key_envelope() {
+        let external = crate::crypto::external_pgp_key::external_key_for_tests(
+            &crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key(),
+        );
+        let (data, nonce) = build_identity_envelope(b"{}", FIXTURE_IDENTITY_KEY, ENVELOPE_VERSION_DEFAULT.as_bytes());
+
+        assert!(open_with_external(&data, Some(&nonce), None, Some(&external)).is_err());
+        assert!(open_with_external(&data, Some(&nonce), Some(FIXTURE_IDENTITY_KEY), Some(&external)).is_ok());
     }
 }

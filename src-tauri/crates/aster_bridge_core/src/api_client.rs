@@ -223,6 +223,7 @@ pub struct ReportEnvelopeCapability<'a> {
     pub platform: &'a str,
     pub identity_fingerprint: Option<&'a str>,
     pub x3dh_max_version: i16,
+    pub pgp_external_version: i16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,6 +470,19 @@ pub struct PlanInfoResponse {
 #[derive(Deserialize)]
 pub struct AccountKeyTokenResponse {
     pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct ExternalPgpKeyRecord {
+    pub fingerprint: String,
+    #[serde(default)]
+    pub wrapped_private_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ExternalPgpKeyResponse {
+    #[serde(default)]
+    pub key: Option<ExternalPgpKeyRecord>,
 }
 
 #[derive(Deserialize)]
@@ -916,6 +930,28 @@ impl ApiClient {
         }
 
         resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn get_external_pgp_key(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<ExternalPgpKeyRecord>> {
+        let resp = self
+            .client
+            .get(format!("{}/crypto/v1/keys/pgp/external", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: ExternalPgpKeyResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.key)
     }
 
     pub async fn get_account_key_token_history(

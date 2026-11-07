@@ -1093,6 +1093,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
 
         let client = Arc::new(ApiClient::new_with_base_url(&api_base));
@@ -1799,6 +1800,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
         let app = build_app(
             session,
