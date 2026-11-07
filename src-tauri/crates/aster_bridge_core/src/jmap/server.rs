@@ -305,6 +305,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
 
         let client = Arc::new(ApiClient::new());
@@ -502,6 +503,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
         let client = Arc::new(ApiClient::new());
         let basic = base64::engine::general_purpose::STANDARD
@@ -1397,6 +1399,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }));
         let (tx, _rx) = broadcast::channel(8);
         let app = build_app(
@@ -1437,6 +1440,7 @@ mod e2e_tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         })),
         });
         let attempt = |password: &str| {

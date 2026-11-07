@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::api_client::AttachmentResponse;
 use crate::crypto::envelope::{decrypt_pbkdf2_envelope, encrypt_pbkdf2_envelope};
+use crate::crypto::external_pgp_key::ExternalPgpKey;
 use crate::error::{BridgeError, Result};
 
 const SESSION_KEY_LEN: usize = 32;
@@ -254,6 +255,7 @@ fn open_client_authored_meta(
     identity_key: Option<&str>,
     previous_keys: &[String],
     storage_keys: &[Zeroizing<[u8; 32]>],
+    external_key: Option<&ExternalPgpKey>,
 ) -> Option<RowMeta> {
     if let Ok(text) = std::str::from_utf8(encrypted_meta) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -264,11 +266,12 @@ fn open_client_authored_meta(
             }
         }
         if text.starts_with("-----BEGIN PGP MESSAGE-----") {
-            let decrypted = crate::crypto::envelope::decrypt_own_pgp(
+            let decrypted = crate::crypto::envelope::decrypt_own_or_external_pgp(
                 text,
                 identity_key,
                 previous_keys,
                 passphrase,
+                external_key,
             )
             .ok()?;
             let parsed: serde_json::Value = serde_json::from_slice(&decrypted).ok()?;
@@ -335,6 +338,17 @@ pub fn decrypt_attachment(
     identity_key: Option<&str>,
     previous_keys: &[String],
 ) -> Result<DecryptedAttachment> {
+    decrypt_attachment_with_external_key(row, entry, passphrase, identity_key, previous_keys, None)
+}
+
+pub fn decrypt_attachment_with_external_key(
+    row: &AttachmentResponse,
+    entry: Option<&AttachmentKeyEntry>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    external_key: Option<&ExternalPgpKey>,
+) -> Result<DecryptedAttachment> {
     let storage_keys = crate::crypto::envelope::remembered_storage_envelope_keys();
     decrypt_attachment_with_storage_keys(
         row,
@@ -343,6 +357,7 @@ pub fn decrypt_attachment(
         identity_key,
         previous_keys,
         &storage_keys,
+        external_key,
     )
 }
 
@@ -353,6 +368,7 @@ fn decrypt_attachment_with_storage_keys(
     identity_key: Option<&str>,
     previous_keys: &[String],
     storage_keys: &[Zeroizing<[u8; 32]>],
+    external_key: Option<&ExternalPgpKey>,
 ) -> Result<DecryptedAttachment> {
     let seq = row.seq_num as i64;
     let encrypted_meta = STANDARD
@@ -385,6 +401,7 @@ fn decrypt_attachment_with_storage_keys(
             identity_key,
             previous_keys,
             storage_keys,
+            external_key,
         );
     }
     let row_meta = row_meta.unwrap_or_default();
@@ -1027,6 +1044,40 @@ mod tests {
     }
 
     #[test]
+    fn pgp_meta_to_the_external_key_opens_only_with_that_key() {
+        let owner = crate::crypto::account_key::tests::protected_keypair("vault pass");
+        let owner_armored = owner.to_armored().unwrap();
+        let bytes = crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key();
+        let external = crate::crypto::external_pgp_key::external_key_for_tests(&bytes);
+        let pair = aster_crypto::import_secret_key_bytes(&bytes).unwrap();
+        let key = random_key();
+        let nonce = random_nonce();
+        let plain = b"outside attachment".to_vec();
+        let ct = seal(&key, &nonce, &plain, b"");
+        let meta = serde_json::json!({
+            "filename": "outside.txt",
+            "content_type": "text/plain",
+            "session_key": STANDARD.encode(key)
+        })
+        .to_string();
+        let armored = aster_crypto::encrypt_message(meta.as_bytes(), &[&pair.public_key()]).unwrap();
+        let r = row(0, &ct, &nonce, &armored, &[0u8; 12]);
+
+        assert!(decrypt_attachment(&r, None, b"vault pass", Some(&owner_armored), &[]).is_err());
+        let out = decrypt_attachment_with_external_key(
+            &r,
+            None,
+            b"vault pass",
+            Some(&owner_armored),
+            &[],
+            Some(&external),
+        )
+        .unwrap();
+        assert_eq!(out.filename, "outside.txt");
+        assert_eq!(out.data, plain);
+    }
+
+    #[test]
     fn plaintext_json_meta_carries_its_own_session_key() {
         let key = random_key();
         let nonce = random_nonce();
@@ -1094,7 +1145,7 @@ mod tests {
         passphrase: &[u8],
         keys: &[[u8; 32]],
     ) -> Result<DecryptedAttachment> {
-        decrypt_attachment_with_storage_keys(r, entry, passphrase, None, &[], &ring(keys))
+        decrypt_attachment_with_storage_keys(r, entry, passphrase, None, &[], &ring(keys), None)
     }
 
     #[test]

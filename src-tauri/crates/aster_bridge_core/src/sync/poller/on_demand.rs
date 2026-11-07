@@ -134,6 +134,7 @@ async fn fill(
         keys.identity_key.as_deref(),
         &keys.previous_keys,
         &keys.inbound_keys,
+        keys.external_key.as_ref(),
     )
     .await;
     let BacklogDownload {

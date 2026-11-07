@@ -1966,6 +1966,7 @@ mod tests {
             account_keys: Vec::new(),
             previous_keys: Default::default(),
             ratchet_recovery: Default::default(),
+            external_pgp_key: None,
         }))
     }
 
