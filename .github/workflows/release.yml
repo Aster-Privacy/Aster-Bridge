@@ -212,7 +212,7 @@ jobs:
           ls -l "$OUT"
 
       - name: Upload the unsigned bundles
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-${{ matrix.leg }}
           path: ${{ runner.temp }}/bundle/
@@ -258,7 +258,7 @@ jobs:
           ls -l "$OUT"
 
       - name: Upload this run's installers for provenance
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: provenance-${{ matrix.leg }}
           path: ${{ runner.temp }}/provenance/
@@ -368,7 +368,7 @@ jobs:
           cp "$ARCHIVE" "$RUNNER_TEMP/provenance/"
 
       - name: Upload the command-line archive for publishing
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-${{ matrix.target }}
           path: ${{ runner.temp }}/cli/
@@ -376,7 +376,7 @@ jobs:
           retention-days: 1
 
       - name: Upload this run's command-line archive for provenance
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: provenance-cli-${{ matrix.target }}
           path: ${{ runner.temp }}/provenance/
@@ -454,7 +454,7 @@ jobs:
           find "$SIGS" -type f -name '*.sig' | sort
 
       - name: Upload the updater signatures
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: updater-signatures
           path: ${{ runner.temp }}/signatures/
