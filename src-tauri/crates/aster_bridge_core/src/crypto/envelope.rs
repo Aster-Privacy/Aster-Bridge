@@ -102,7 +102,7 @@ pub fn storage_envelope_keys_generation() -> u64 {
     STORAGE_ENVELOPE_KEYS_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn remembered_storage_envelope_keys() -> Vec<Zeroizing<[u8; 32]>> {
+pub(crate) fn remembered_storage_envelope_keys() -> Vec<Zeroizing<[u8; 32]>> {
     STORAGE_ENVELOPE_KEYS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -219,12 +219,41 @@ fn open_sealed_meta(encrypted_meta: &[u8], meta_nonce: &[u8], key_b64: &str) -> 
     Some(meta)
 }
 
+fn open_vault_key_meta(
+    encrypted_meta: &[u8],
+    meta_nonce: &[u8],
+    storage_keys: &[Zeroizing<[u8; 32]>],
+) -> Option<RowMeta> {
+    if meta_nonce.len() != DATA_NONCE_LEN {
+        return None;
+    }
+    let nonce = Nonce::from_slice(meta_nonce);
+    for key in storage_keys {
+        let Ok(cipher) = Aes256Gcm::new_from_slice(key.as_slice()) else {
+            continue;
+        };
+        let Ok(plain) = cipher.decrypt(nonce, encrypted_meta) else {
+            continue;
+        };
+        let plain = Zeroizing::new(plain);
+        if let Some(meta) = serde_json::from_slice::<serde_json::Value>(&plain)
+            .ok()
+            .and_then(|parsed| row_meta_from_json(&parsed))
+        {
+            return Some(meta);
+        }
+    }
+    None
+}
+
 fn open_client_authored_meta(
     encrypted_meta_b64: &str,
     encrypted_meta: &[u8],
+    meta_nonce: &[u8],
     passphrase: &[u8],
     identity_key: Option<&str>,
     previous_keys: &[String],
+    storage_keys: &[Zeroizing<[u8; 32]>],
 ) -> Option<RowMeta> {
     if let Ok(text) = std::str::from_utf8(encrypted_meta) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -246,9 +275,27 @@ fn open_client_authored_meta(
             return row_meta_from_json(&parsed);
         }
     }
-    let plain = Zeroizing::new(decrypt_pbkdf2_envelope(encrypted_meta_b64, passphrase).ok()?);
-    let parsed: serde_json::Value = serde_json::from_str(&plain).ok()?;
-    row_meta_from_json(&parsed)
+    if let Ok(plain) =
+        crate::crypto::envelope::decrypt_storage_key_envelope(encrypted_meta_b64, storage_keys)
+    {
+        let plain = Zeroizing::new(plain);
+        if let Some(meta) = serde_json::from_str::<serde_json::Value>(&plain)
+            .ok()
+            .and_then(|parsed| row_meta_from_json(&parsed))
+        {
+            return Some(meta);
+        }
+    }
+    if let Ok(plain) = decrypt_pbkdf2_envelope(encrypted_meta_b64, passphrase) {
+        let plain = Zeroizing::new(plain);
+        if let Some(meta) = serde_json::from_str::<serde_json::Value>(&plain)
+            .ok()
+            .and_then(|parsed| row_meta_from_json(&parsed))
+        {
+            return Some(meta);
+        }
+    }
+    open_vault_key_meta(encrypted_meta, meta_nonce, storage_keys)
 }
 
 fn decrypt_data(
@@ -288,6 +335,25 @@ pub fn decrypt_attachment(
     identity_key: Option<&str>,
     previous_keys: &[String],
 ) -> Result<DecryptedAttachment> {
+    let storage_keys = crate::crypto::envelope::remembered_storage_envelope_keys();
+    decrypt_attachment_with_storage_keys(
+        row,
+        entry,
+        passphrase,
+        identity_key,
+        previous_keys,
+        &storage_keys,
+    )
+}
+
+fn decrypt_attachment_with_storage_keys(
+    row: &AttachmentResponse,
+    entry: Option<&AttachmentKeyEntry>,
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    storage_keys: &[Zeroizing<[u8; 32]>],
+) -> Result<DecryptedAttachment> {
     let seq = row.seq_num as i64;
     let encrypted_meta = STANDARD
         .decode(row.encrypted_meta.trim())
@@ -314,9 +380,11 @@ pub fn decrypt_attachment(
         row_meta = open_client_authored_meta(
             row.encrypted_meta.trim(),
             &encrypted_meta,
+            &meta_nonce,
             passphrase,
             identity_key,
             previous_keys,
+            storage_keys,
         );
     }
     let row_meta = row_meta.unwrap_or_default();
@@ -951,6 +1019,204 @@ mod tests {
         assert_eq!(out.filename, "x.csv");
         assert_eq!(out.content_type, "text/csv");
         assert_eq!(out.data, plain);
+    }
+
+    const VECTOR_DATA_KEK: [u8; 32] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ];
+    const VECTOR_LEGACY_KEK: [u8; 32] = [
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+        55, 56, 57, 58, 59, 60, 61, 62, 63,
+    ];
+    const VECTOR_CURRENT: &str = "oKGio6SlpqeoqaqrrK2ur8DBwsPExcbHyMnKyxmUrphDVc4W9hq0u8Q/kCWAkTj6oNg/L8FnTtfoYrei0cSkxxjeICkSF8UMMji/";
+    const V2_META_NONCE: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    fn ring(keys: &[[u8; 32]]) -> Vec<Zeroizing<[u8; 32]>> {
+        keys.iter().map(|k| Zeroizing::new(*k)).collect()
+    }
+
+    fn sealed_attachment(name: &str) -> ([u8; 12], Vec<u8>, Vec<u8>, String) {
+        let key = random_key();
+        let nonce = random_nonce();
+        let plain = format!("body of {}", name).into_bytes();
+        let ct = seal(&key, &nonce, &plain, b"");
+        let meta = serde_json::json!({
+            "filename": name,
+            "content_type": "image/png",
+            "session_key": STANDARD.encode(key),
+        })
+        .to_string();
+        (nonce, plain, ct, meta)
+    }
+
+    fn v2_row(
+        meta: &str,
+        writer: &[u8; 32],
+        meta_nonce: &[u8],
+        ct: &[u8],
+        nonce: &[u8; 12],
+    ) -> AttachmentResponse {
+        AttachmentResponse {
+            encrypted_meta: crate::crypto::envelope::encrypt_storage_key_envelope(meta, writer)
+                .unwrap(),
+            ..row(0, ct, nonce, b"", meta_nonce)
+        }
+    }
+
+    fn open_with(
+        r: &AttachmentResponse,
+        entry: Option<&AttachmentKeyEntry>,
+        passphrase: &[u8],
+        keys: &[[u8; 32]],
+    ) -> Result<DecryptedAttachment> {
+        decrypt_attachment_with_storage_keys(r, entry, passphrase, None, &[], &ring(keys))
+    }
+
+    #[test]
+    fn vector_keys_match_the_envelope_v2_vector() {
+        let plain = crate::crypto::envelope::decrypt_storage_key_envelope(
+            VECTOR_CURRENT,
+            &ring(&[VECTOR_DATA_KEK]),
+        )
+        .unwrap();
+        assert_eq!(plain, r#"{"subject":"Vector test","n":7}"#);
+        assert!(crate::crypto::envelope::decrypt_storage_key_envelope(
+            VECTOR_CURRENT,
+            &ring(&[VECTOR_LEGACY_KEK]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn vector_blob_as_meta_has_no_filename_and_keeps_the_default_name() {
+        let r = AttachmentResponse {
+            encrypted_meta: VECTOR_CURRENT.to_string(),
+            ..row(0, b"raw stored bytes", &[0u8; 12], b"", &V2_META_NONCE)
+        };
+        let out = open_with(&r, None, b"pass", &[VECTOR_DATA_KEK]).unwrap();
+        assert_eq!(out.filename, "attachment-1.bin");
+    }
+
+    #[test]
+    fn v2_meta_with_the_marker_nonce_opens_with_the_data_kek() {
+        let (nonce, plain, ct, meta) = sealed_attachment("photo.png");
+        let r = v2_row(&meta, &VECTOR_DATA_KEK, &V2_META_NONCE, &ct, &nonce);
+        let out = open_with(&r, None, b"pass", &[VECTOR_DATA_KEK]).unwrap();
+        assert_eq!(out.filename, "photo.png");
+        assert_eq!(out.content_type, "image/png");
+        assert_eq!(out.data, plain);
+    }
+
+    #[test]
+    fn v2_meta_written_under_a_legacy_kek_opens_from_the_ring() {
+        let (nonce, plain, ct, meta) = sealed_attachment("ring.png");
+        let r = v2_row(&meta, &VECTOR_LEGACY_KEK, &V2_META_NONCE, &ct, &nonce);
+        let out = open_with(&r, None, b"pass", &[VECTOR_DATA_KEK, VECTOR_LEGACY_KEK]).unwrap();
+        assert_eq!(out.filename, "ring.png");
+        assert_eq!(out.data, plain);
+        assert!(open_with(&r, None, b"pass", &[VECTOR_DATA_KEK]).is_err());
+    }
+
+    #[test]
+    fn v2_meta_with_a_zero_random_or_missing_nonce_opens() {
+        for meta_nonce in [vec![0u8; 12], random_nonce().to_vec(), Vec::new()] {
+            let (nonce, plain, ct, meta) = sealed_attachment("zero.png");
+            let r = v2_row(&meta, &VECTOR_DATA_KEK, &meta_nonce, &ct, &nonce);
+            let out = open_with(&r, None, b"pass", &[VECTOR_DATA_KEK]).unwrap();
+            assert_eq!(out.filename, "zero.png");
+            assert_eq!(out.data, plain);
+        }
+    }
+
+    #[test]
+    fn v2_meta_without_its_key_yields_no_session_key() {
+        let (nonce, _, ct, meta) = sealed_attachment("locked.png");
+        let r = v2_row(&meta, &VECTOR_DATA_KEK, &V2_META_NONCE, &ct, &nonce);
+        assert!(open_with(&r, None, b"pass", &[VECTOR_LEGACY_KEK]).is_err());
+        assert!(open_with(&r, None, b"pass", &[]).is_err());
+    }
+
+    #[test]
+    fn vault_key_meta_opens_with_the_data_kek_or_a_legacy_kek() {
+        for writer in [VECTOR_DATA_KEK, VECTOR_LEGACY_KEK] {
+            let (nonce, plain, ct, meta) = sealed_attachment("f6.png");
+            let meta_nonce = random_nonce();
+            let sealed_meta = seal(&writer, &meta_nonce, meta.as_bytes(), b"");
+            let r = row(0, &ct, &nonce, &sealed_meta, &meta_nonce);
+            let out = open_with(&r, None, b"pass", &[VECTOR_DATA_KEK, VECTOR_LEGACY_KEK]).unwrap();
+            assert_eq!(out.filename, "f6.png");
+            assert_eq!(out.content_type, "image/png");
+            assert_eq!(out.data, plain);
+        }
+    }
+
+    #[test]
+    fn vault_key_meta_needs_its_own_nonce_and_key() {
+        let (nonce, _, ct, meta) = sealed_attachment("f6.png");
+        let meta_nonce = random_nonce();
+        let sealed_meta = seal(&VECTOR_DATA_KEK, &meta_nonce, meta.as_bytes(), b"");
+        let r = row(0, &ct, &nonce, &sealed_meta, &random_nonce());
+        assert!(open_with(&r, None, b"pass", &[VECTOR_DATA_KEK]).is_err());
+        let r = row(0, &ct, &nonce, &sealed_meta, &meta_nonce);
+        assert!(open_with(&r, None, b"pass", &[VECTOR_LEGACY_KEK]).is_err());
+        assert!(open_with(&r, None, b"pass", &[]).is_err());
+    }
+
+    #[test]
+    fn existing_meta_formats_are_unchanged_with_storage_keys_present() {
+        let keys = [VECTOR_DATA_KEK, VECTOR_LEGACY_KEK];
+
+        let (nonce, plain, ct, meta) = sealed_attachment("pbkdf2.png");
+        let r = AttachmentResponse {
+            encrypted_meta: encrypt_pbkdf2_envelope(&meta, b"pass").unwrap(),
+            ..row(0, &ct, &nonce, b"", &random_nonce())
+        };
+        let with = open_with(&r, None, b"pass", &keys).unwrap();
+        let without = open_with(&r, None, b"pass", &[]).unwrap();
+        assert_eq!(with.filename, "pbkdf2.png");
+        assert_eq!(with.filename, without.filename);
+        assert_eq!(with.content_type, without.content_type);
+        assert_eq!(with.data, plain);
+        assert_eq!(with.data, without.data);
+        assert!(open_with(&r, None, b"wrong", &keys).is_err());
+        assert!(open_with(&r, None, b"wrong", &[]).is_err());
+
+        let (nonce, plain, ct, meta) = sealed_attachment("plain.png");
+        let r = row(0, &ct, &nonce, meta.as_bytes(), &[0u8; 12]);
+        let with = open_with(&r, None, b"pass", &keys).unwrap();
+        let without = open_with(&r, None, b"pass", &[]).unwrap();
+        assert_eq!(with.filename, "plain.png");
+        assert_eq!(with.filename, without.filename);
+        assert_eq!(with.data, plain);
+        assert_eq!(with.data, without.data);
+
+        let key = random_key();
+        let data_nonce = random_nonce();
+        let ct = seal(&key, &data_nonce, b"PNG bytes", &attachment_data_aad(3));
+        let meta = serde_json::json!({
+            "filename": "server.png",
+            "content_type": "image/png",
+        })
+        .to_string();
+        let meta_nonce = random_nonce();
+        let sealed_meta = seal(&key, &meta_nonce, meta.as_bytes(), b"");
+        let entry = AttachmentKeyEntry {
+            key: Some(STANDARD.encode(key)),
+            ..Default::default()
+        };
+        let r = row(3, &ct, &data_nonce, &sealed_meta, &meta_nonce);
+        let with = open_with(&r, Some(&entry), b"pass", &keys).unwrap();
+        let without = open_with(&r, Some(&entry), b"pass", &[]).unwrap();
+        assert_eq!(with.filename, "server.png");
+        assert_eq!(with.filename, without.filename);
+        assert_eq!(with.data, b"PNG bytes".to_vec());
+        assert_eq!(with.data, without.data);
+
+        let r = row(0, b"raw stored bytes", &[0u8; 12], b"", &[0u8; 12]);
+        let with = open_with(&r, None, b"pass", &keys).unwrap();
+        assert_eq!(with.filename, "attachment-1.bin");
+        assert_eq!(with.data, b"raw stored bytes".to_vec());
     }
 
     #[test]
