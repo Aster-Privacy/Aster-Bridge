@@ -1184,6 +1184,7 @@ pub async fn build_threaded_send_payload(
     let reply = crate::smtp::reply_thread::resolve_reply(db, &headers);
     let seal_to_identity =
         crate::crypto::sent_copy::format_writes_enabled(client, &access_token).await;
+    crate::crypto::envelope_v2::ensure_envelope_v2_admission(client, &access_token).await;
     let mut payload = build_send_payload_blocking(
         raw_message.to_vec(),
         from,

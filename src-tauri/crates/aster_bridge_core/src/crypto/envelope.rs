@@ -81,6 +81,7 @@ pub fn remember_storage_envelope_keys(
 }
 
 pub fn forget_storage_envelope_keys() {
+    crate::crypto::envelope_v2::forget_envelope_v2_state();
     let mut ring = STORAGE_ENVELOPE_KEYS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -140,6 +141,43 @@ pub fn decrypt_storage_key_envelope(
     }
 
     Err(BridgeError::Crypto("storage key envelope decrypt failed".to_string()))
+}
+
+pub fn storage_key_envelope_nonce_marker() -> String {
+    STANDARD.encode([STORAGE_KEY_ENVELOPE_MARKER])
+}
+
+pub fn encrypt_storage_key_envelope(plaintext: &str, key: &[u8; 32]) -> Result<String> {
+    use rand_core::{OsRng, RngCore};
+
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let mut iv = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut iv);
+    seal_storage_key_envelope(plaintext, key, &salt, &iv)
+}
+
+fn seal_storage_key_envelope(
+    plaintext: &str,
+    key: &[u8; 32],
+    salt: &[u8; SALT_LEN],
+    iv: &[u8; NONCE_LEN],
+) -> Result<String> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), key);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(STORAGE_KEY_ENVELOPE_INFO, okm.as_mut_slice())
+        .map_err(|_| BridgeError::Crypto("storage key derivation failed".to_string()))?;
+    let cipher = Aes256Gcm::new_from_slice(okm.as_slice())
+        .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(iv), plaintext.as_bytes())
+        .map_err(|_| BridgeError::Crypto("storage key envelope encrypt failed".to_string()))?;
+
+    let mut combined = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    combined.extend_from_slice(salt);
+    combined.extend_from_slice(iv);
+    combined.extend_from_slice(&ciphertext);
+    Ok(STANDARD.encode(&combined))
 }
 
 pub const ENVELOPE_VERSION_DEFAULT: &str = "astermail-envelope-v1";
@@ -1043,5 +1081,33 @@ mod tests {
             assert_eq!(plain, V2_PLAINTEXT);
             assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
         }
+    }
+
+    #[test]
+    fn v2_write_reproduces_the_vector_and_round_trips() {
+        let raw = STANDARD.decode(V2_CURRENT).unwrap();
+        let salt: [u8; SALT_LEN] = raw[..SALT_LEN].try_into().unwrap();
+        let iv: [u8; NONCE_LEN] = raw[SALT_LEN..SALT_LEN + NONCE_LEN].try_into().unwrap();
+        let key = v2_key(V2_DATA_KEK);
+        let sealed = seal_storage_key_envelope(V2_PLAINTEXT, &key, &salt, &iv).unwrap();
+        assert_eq!(sealed, V2_CURRENT);
+        assert_eq!(
+            decrypt_storage_key_envelope(&sealed, &[key.clone()]).unwrap(),
+            V2_PLAINTEXT
+        );
+    }
+
+    #[test]
+    fn v2_write_uses_fresh_salt_and_iv_and_opens_only_with_its_key() {
+        let key = v2_key(V2_DATA_KEK);
+        let first = encrypt_storage_key_envelope(V2_PLAINTEXT, &key).unwrap();
+        let second = encrypt_storage_key_envelope(V2_PLAINTEXT, &key).unwrap();
+        assert_ne!(first, second);
+        let raw = STANDARD.decode(&first).unwrap();
+        assert_eq!(raw.len(), SALT_LEN + NONCE_LEN + V2_PLAINTEXT.len() + 16);
+        assert_eq!(decrypt_storage_key_envelope(&first, &[key.clone()]).unwrap(), V2_PLAINTEXT);
+        assert!(decrypt_storage_key_envelope(&first, &[v2_key(V2_LEGACY_KEK)]).is_err());
+        assert_eq!(storage_key_envelope_nonce_marker(), "Ag==");
+        assert!(is_storage_key_envelope_nonce(&storage_key_envelope_nonce_marker()));
     }
 }

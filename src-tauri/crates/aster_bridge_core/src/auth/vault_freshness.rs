@@ -317,6 +317,9 @@ fn apply_storage_keys(
     if changed {
         if let Some(t) = target {
             session.data_kek = Some(Zeroizing::new(STANDARD.encode(*t)));
+            crate::crypto::envelope_v2::update_envelope_v2_write_key(
+                session.data_kek.as_deref().map(|k| k.as_str()),
+            );
             tracing::info!("contacts key updated from the server vault");
         }
     }

@@ -170,6 +170,7 @@ async fn attach_sent_copy(ctx: &Arc<JmapContext>, body: &mut Value) {
     };
     let seal_to_identity =
         crate::crypto::sent_copy::format_writes_enabled(&ctx.client, &access_token).await;
+    crate::crypto::envelope_v2::ensure_envelope_v2_admission(&ctx.client, &access_token).await;
     let mut payload = std::mem::take(body);
     let joined = tokio::task::spawn_blocking(move || {
         crate::smtp::reply_thread::attach_sent_copy(

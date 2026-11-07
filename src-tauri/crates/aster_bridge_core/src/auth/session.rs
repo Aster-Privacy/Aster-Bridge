@@ -400,6 +400,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     }
     session.identity_key = Some(material.identity_key);
     session.data_kek = material.data_kek;
+    crate::crypto::envelope_v2::begin_envelope_v2_unlock(session.data_kek.as_deref().map(|k| k.as_str()));
     session.ratchet_identity_public = material.ratchet_identity_public;
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
@@ -495,6 +496,7 @@ pub async fn login_with_passphrase(
         None => Vec::new(),
     };
 
+    crate::crypto::envelope_v2::begin_envelope_v2_unlock(data_kek.as_deref().map(|k| k.as_str()));
     Ok(Session {
         user_id: login_resp.user_id,
         username: login_resp.username,
@@ -779,6 +781,9 @@ pub async fn first_time_setup(
                     None => Vec::new(),
                 };
 
+                crate::crypto::envelope_v2::begin_envelope_v2_unlock(
+                    data_kek.as_deref().map(|k| k.as_str()),
+                );
                 return Ok(Session {
                     user_id: login_resp.user_id,
                     username: login_resp.username,

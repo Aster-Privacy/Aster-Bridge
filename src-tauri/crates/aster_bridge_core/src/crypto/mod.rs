@@ -25,6 +25,7 @@ pub mod contacts;
 pub mod draft;
 pub mod envelope;
 pub mod envelope_capability;
+pub mod envelope_v2;
 pub mod folder;
 pub mod inbound;
 pub mod internal_send;

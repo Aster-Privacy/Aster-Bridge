@@ -1010,6 +1010,55 @@ impl ApiClient {
         }
     }
 
+    pub async fn request_envelope_v2_admission(
+        &self,
+        access_token: &str,
+    ) -> crate::crypto::envelope_v2::Level2Admission {
+        use crate::crypto::envelope_v2::Level2Admission;
+        let resp = match self
+            .client
+            .post(format!(
+                "{}/core/v1/auth/me/storage-rekey/envelope-v2",
+                self.base_url
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => return Level2Admission::Unknown,
+        };
+        let status = resp.status();
+        let body = resp.bytes().await.unwrap_or_default();
+        let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        if status.is_success() {
+            let admitted = parsed
+                .as_ref()
+                .and_then(|v| v.get("level2_admitted"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            return if admitted {
+                Level2Admission::Admitted
+            } else {
+                Level2Admission::Unknown
+            };
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            crate::auth::session::request_token_refresh();
+        }
+        let refused = status == reqwest::StatusCode::CONFLICT
+            && parsed
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(|v| v.as_str())
+                == Some("VAULT_LEVEL2_NOT_ADMITTED");
+        if refused {
+            Level2Admission::Refused
+        } else {
+            Level2Admission::Unknown
+        }
+    }
+
     pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {
         let resp = self.client
             .get(format!("{}/settings/v1/preferences/default-sender", self.base_url))

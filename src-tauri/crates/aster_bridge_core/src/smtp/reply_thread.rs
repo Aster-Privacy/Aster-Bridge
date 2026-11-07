@@ -421,6 +421,30 @@ pub fn attach_sent_copy_with_message_id(
     seal_to_identity: bool,
     message_id: Option<&str>,
 ) {
+    let storage_key = crate::crypto::envelope_v2::envelope_v2_write_key();
+    attach_sent_copy_with_storage_key(
+        payload,
+        from_email,
+        plain_text,
+        identity_key,
+        passphrase,
+        seal_to_identity,
+        message_id,
+        storage_key.as_deref(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_sent_copy_with_storage_key(
+    payload: &mut Value,
+    from_email: &str,
+    plain_text: Option<&str>,
+    identity_key: Option<&str>,
+    passphrase: &[u8],
+    seal_to_identity: bool,
+    message_id: Option<&str>,
+    storage_key: Option<&[u8; 32]>,
+) {
     let Some(identity_key) = identity_key.filter(|k| !k.is_empty()) else {
         tracing::warn!("session has no identity key; sent copy skipped");
         return;
@@ -450,6 +474,18 @@ pub fn attach_sent_copy_with_message_id(
             return;
         }
         tracing::warn!("sent copy seal failed; using the legacy envelope");
+    }
+    if let Some(key) = storage_key {
+        match crate::crypto::envelope::encrypt_storage_key_envelope(&envelope, key) {
+            Ok(encrypted) => {
+                payload["encrypted_envelope"] = json!(encrypted);
+                payload["envelope_nonce"] =
+                    json!(crate::crypto::envelope::storage_key_envelope_nonce_marker());
+                payload["folder_token"] = json!(sent_folder_token(identity_key));
+                return;
+            }
+            Err(e) => tracing::warn!("sent copy storage key encryption failed: {}", e),
+        }
     }
     match crate::crypto::envelope::encrypt_pbkdf2_envelope(&envelope, passphrase) {
         Ok(encrypted) => {
@@ -879,5 +915,85 @@ mod tests {
         apply_reply_thread(&mut payload, &client, "t", &reply).await;
         assert_eq!(payload["thread_token"], "existing-token");
         assert_eq!(payload["in_reply_to"], "<root@x.test> <p@x.test>");
+    }
+
+    const STORAGE_KEY: [u8; 32] = [7u8; 32];
+
+    fn storage_key_payload(seal_to_identity: bool, identity_key: &str, key: Option<&[u8; 32]>) -> Value {
+        let mut payload = json!({"to": ["a@x.test"], "subject": "S", "body": "hello", "is_html": false});
+        attach_sent_copy_with_storage_key(
+            &mut payload,
+            "me@aster.test",
+            None,
+            Some(identity_key),
+            b"vault-pass",
+            seal_to_identity,
+            Some("<v2@client.example>"),
+            key,
+        );
+        payload
+    }
+
+    #[test]
+    fn admitted_sent_copy_is_written_with_the_storage_key() {
+        let payload = storage_key_payload(false, "ik", Some(&STORAGE_KEY));
+        assert_eq!(payload["envelope_nonce"], json!("Ag=="));
+        assert_eq!(payload["folder_token"], json!(sent_folder_token("ik")));
+        let blob = payload["encrypted_envelope"].as_str().unwrap();
+        assert!(STANDARD.decode(blob).unwrap().len() > 16 + 12 + 16);
+        assert!(crate::crypto::envelope::decrypt_storage_key_envelope(
+            blob,
+            &[zeroize::Zeroizing::new([8u8; 32])]
+        )
+        .is_err());
+        let opened = crate::crypto::envelope::decrypt_storage_key_envelope(
+            blob,
+            &[zeroize::Zeroizing::new(STORAGE_KEY)],
+        )
+        .unwrap();
+        let env: Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(env["body_text"], "hello");
+        assert_eq!(env["message_id"], "<v2@client.example>");
+        assert!(crate::crypto::envelope::decrypt_pbkdf2_envelope(blob, b"vault-pass").is_err());
+    }
+
+    #[test]
+    fn without_admission_the_sent_copy_keeps_the_password_envelope() {
+        let payload = storage_key_payload(false, "ik", None);
+        assert_eq!(
+            payload["envelope_nonce"],
+            json!(crate::crypto::envelope::pbkdf2_envelope_nonce_marker())
+        );
+        let blob = payload["encrypted_envelope"].as_str().unwrap();
+        assert!(crate::crypto::envelope::decrypt_storage_key_envelope(
+            blob,
+            &[zeroize::Zeroizing::new(STORAGE_KEY)]
+        )
+        .is_err());
+        let opened = crate::crypto::envelope::decrypt_envelope(
+            blob,
+            payload["envelope_nonce"].as_str(),
+            b"vault-pass",
+            Some("ik"),
+            &[],
+        )
+        .unwrap();
+        let env: Value = serde_json::from_str(&opened).unwrap();
+        assert_eq!(env["body_text"], "hello");
+    }
+
+    #[test]
+    fn the_identity_seal_still_wins_over_the_storage_key() {
+        let key = crate::crypto::account_key::tests::protected_keypair("vault-pass")
+            .to_armored()
+            .unwrap();
+        let payload = storage_key_payload(true, &key, Some(&STORAGE_KEY));
+        assert_eq!(payload["envelope_nonce"], json!(""));
+    }
+
+    #[test]
+    fn a_failed_seal_falls_back_to_the_storage_key_when_admitted() {
+        let payload = storage_key_payload(true, "ik", Some(&STORAGE_KEY));
+        assert_eq!(payload["envelope_nonce"], json!("Ag=="));
     }
 }
