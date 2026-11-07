@@ -42,6 +42,28 @@ use crate::auth::app_passwords::AppPasswords;
 use crate::auth::session::Session;
 use crate::db::Database;
 
+pub(crate) fn derive_sync_key(vault_passphrase: &[u8]) -> Result<[u8; 32], String> {
+    use sha2::Digest;
+    let mut salt_input = b"aster-hkdf-salt-v1:".to_vec();
+    salt_input.extend_from_slice(vault_passphrase);
+    let salt = sha2::Sha256::digest(&salt_input);
+    let master = crate::crypto::ratchet::hkdf_sha256(
+        vault_passphrase,
+        &salt,
+        b"aster-storage-encryption-key-v1",
+        32,
+    )?;
+    let sync = crate::crypto::ratchet::hkdf_sha256(
+        &master,
+        b"Aster Mail_Ratchet_State_Encryption",
+        b"ratchet_state_key",
+        32,
+    )?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&sync);
+    Ok(out)
+}
+
 const APP_PW: &str = "abcd-efgh-ijkl-mnop";
 
 async fn resolve_pq_secret(
@@ -1161,7 +1183,7 @@ async fn decrypt_real_internal() {
     println!("logged in as {}", session.email);
     println!("ratchet key sets available: {}", session.ratchet_keys.len());
 
-    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let sync_key = derive_sync_key(&session.vault_passphrase).ok();
     let token = session.access_token.clone();
 
     let (mut total_ratchet, mut decrypted, mut failed) = (0u32, 0u32, 0u32);
@@ -1245,7 +1267,7 @@ async fn decrypt_real_internal() {
 async fn report_internal_decrypt(client: &ApiClient, session: &crate::auth::session::Session) {
     use crate::api_client::MailListQuery;
 
-    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let sync_key = derive_sync_key(&session.vault_passphrase).ok();
     let token = session.access_token.clone();
     let (mut total_ratchet, mut decrypted, mut failed) = (0u32, 0u32, 0u32);
 
@@ -1393,7 +1415,7 @@ async fn pqxdh_self_roundtrip_real() {
     println!("logged in as {} (user {}, key sets {})", session.email, session.username, session.ratchet_keys.len());
 
     let token = session.access_token.clone();
-    let sync_key = match crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase) {
+    let sync_key = match derive_sync_key(&session.vault_passphrase) {
         Ok(k) => k,
         Err(e) => { println!("sync key derive failed: {}", e); return; }
     };
@@ -1881,7 +1903,7 @@ async fn poll_for_fresh_decrypt() {
     println!("watching inbox as {} - send yourself an internal email and leave it UNREAD", session.email);
 
     let token = session.access_token.clone();
-    let sync_key = crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase).ok();
+    let sync_key = derive_sync_key(&session.vault_passphrase).ok();
     let start = std::time::Instant::now();
     let mut round = 0u32;
 
@@ -1951,7 +1973,7 @@ async fn self_deliver_and_decrypt() {
     };
     let our_email = session.email.clone();
     let token = session.access_token.clone();
-    let sync_key = match crate::crypto::ratchet::derive_sync_key(&session.vault_passphrase) {
+    let sync_key = match derive_sync_key(&session.vault_passphrase) {
         Ok(k) => k, Err(e) => { println!("sync key: {}", e); return; }
     };
     let identity_key = match session.identity_key.as_deref() { Some(k) => k, None => { println!("no identity_key"); return; } };

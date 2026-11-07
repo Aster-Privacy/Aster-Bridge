@@ -30,7 +30,7 @@ use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 use crate::crypto::vault::VaultContents;
@@ -262,17 +262,6 @@ pub(crate) fn jwk_d_bytes(jwk_string: &str) -> Result<Vec<u8>, String> {
     URL_SAFE_NO_PAD
         .decode(d.trim().trim_end_matches('='))
         .map_err(|e| format!("jwk d decode: {}", e))
-}
-
-pub fn derive_sync_key(vault_passphrase: &[u8]) -> Result<[u8; 32], String> {
-    let mut salt_input = b"aster-hkdf-salt-v1:".to_vec();
-    salt_input.extend_from_slice(vault_passphrase);
-    let salt = Sha256::digest(&salt_input);
-    let master = hkdf_sha256(vault_passphrase, &salt, b"aster-storage-encryption-key-v1", 32)?;
-    let sync = hkdf_sha256(&master, b"Aster Mail_Ratchet_State_Encryption", b"ratchet_state_key", 32)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&sync);
-    Ok(out)
 }
 
 pub fn decrypt_pq_secret(
@@ -557,7 +546,9 @@ pub fn encrypt_bootstrap_versioned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol_harness::derive_sync_key;
     use ml_kem::kem::Encapsulate;
+    use sha2::Digest;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand_core::OsRng;
     use serde_json::json;

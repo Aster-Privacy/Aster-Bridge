@@ -30,7 +30,10 @@ const PASSWORD_KEY_CALLS: &[&str] = &[
     "storage_key_candidates(",
     "encrypt_pbkdf2_envelope(",
     "pbkdf2_hmac",
+    "derive_sync_key(",
 ];
+
+const TEST_ONLY_FILES: &[&str] = &["protocol_harness.rs"];
 
 const ALLOWED: &[(&str, &str, usize)] = &[
     ("auth/session.rs", "storage_key_candidates(", 1),
@@ -85,7 +88,7 @@ fn password_key_call_sites() -> BTreeMap<(String, String), usize> {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        if relative == SELF_PATH {
+        if relative == SELF_PATH || TEST_ONLY_FILES.contains(&relative.as_str()) {
             continue;
         }
         let source = std::fs::read_to_string(&file).expect("source file is readable");
@@ -137,4 +140,27 @@ fn the_call_site_scan_finds_the_known_sites() {
 fn production_part_stops_at_the_test_module() {
     let source = "fn a() { derive_storage_key(x) }\n#[cfg(test)]\nmod tests {\n derive_storage_key(y)\n}\n";
     assert_eq!(production_part(source).matches("derive_storage_key(").count(), 1);
+}
+
+#[test]
+fn test_only_files_are_compiled_only_for_tests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = std::fs::read_to_string(root.join("lib.rs"))
+        .expect("lib.rs is readable")
+        .replace("\r\n", "\n");
+    for file in TEST_ONLY_FILES {
+        let module = file.trim_end_matches(".rs");
+        assert!(
+            lib.contains(&format!("#[cfg(test)]\nmod {};", module)),
+            "{} must stay behind #[cfg(test)]",
+            file
+        );
+    }
+}
+
+#[test]
+fn the_password_sync_key_has_no_production_caller() {
+    assert!(!password_key_call_sites()
+        .keys()
+        .any(|(_, call)| call == "derive_sync_key("));
 }

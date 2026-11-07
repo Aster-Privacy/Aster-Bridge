@@ -526,6 +526,22 @@ pub fn seal_attachment_with_own_key(
     passphrase: &[u8],
     own_key: Option<&str>,
 ) -> Result<SealedAttachment> {
+    let v2_key = crate::crypto::envelope_v2::envelope_v2_write_key();
+    seal_attachment_with_keys(attachment, passphrase, own_key, v2_key.as_deref())
+}
+
+fn v2_meta_nonce() -> [u8; DATA_NONCE_LEN] {
+    let mut nonce = [0u8; DATA_NONCE_LEN];
+    nonce[0] = 2;
+    nonce
+}
+
+fn seal_attachment_with_keys(
+    attachment: &OutgoingAttachment,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+    v2_key: Option<&[u8; 32]>,
+) -> Result<SealedAttachment> {
     use rand_core::{OsRng, RngCore};
 
     let mut session_key = Zeroizing::new([0u8; SESSION_KEY_LEN]);
@@ -559,8 +575,16 @@ pub fn seal_attachment_with_own_key(
             if own_key.is_some() {
                 tracing::warn!("attachment meta seal to the identity key failed, using the passphrase envelope");
             }
-            OsRng.fill_bytes(&mut sender_meta_nonce);
-            encrypt_pbkdf2_envelope(&plain_meta, passphrase)?
+            match v2_key {
+                Some(key) => {
+                    sender_meta_nonce = v2_meta_nonce();
+                    crate::crypto::envelope::encrypt_storage_key_envelope(&plain_meta, key)?
+                }
+                None => {
+                    OsRng.fill_bytes(&mut sender_meta_nonce);
+                    encrypt_pbkdf2_envelope(&plain_meta, passphrase)?
+                }
+            }
         }
     };
     Ok(SealedAttachment {
@@ -1374,6 +1398,89 @@ mod tests {
         let opened =
             decrypt_attachment(&sender_row(&sealed), None, b"not the key pass", None, &[]).unwrap();
         assert_eq!(opened.data, b"wrong pass");
+    }
+
+    #[test]
+    fn admitted_session_writes_a_marker_nonce_v2_meta() {
+        let att = outgoing("v2.txt", "text/plain", Some("v2@aster"), b"v2 bytes");
+        for key in [None, Some(r#"{"kty":"EC"}"#)] {
+            let sealed =
+                seal_attachment_with_keys(&att, b"vault-pass", key, Some(&VECTOR_DATA_KEK)).unwrap();
+            assert_eq!(sealed.sender_meta_nonce, V2_META_NONCE);
+            let value = send_attachment_value(&sealed);
+            assert_eq!(value["sender_meta_nonce"], "AgAAAAAAAAAAAAAA");
+            assert!(decrypt_pbkdf2_envelope(&sealed.sender_meta, b"vault-pass").is_err());
+            let plain = crate::crypto::envelope::decrypt_storage_key_envelope(
+                &sealed.sender_meta,
+                &ring(&[VECTOR_DATA_KEK]),
+            )
+            .unwrap();
+            assert_eq!(plain.as_str(), sealed.plain_meta.as_str());
+            assert!(crate::crypto::envelope::decrypt_storage_key_envelope(
+                &sealed.sender_meta,
+                &ring(&[VECTOR_LEGACY_KEK]),
+            )
+            .is_err());
+
+            let r = sender_row(&sealed);
+            let opened = open_with(&r, None, b"vault-pass", &[VECTOR_DATA_KEK]).unwrap();
+            assert_eq!(opened.data, b"v2 bytes");
+            assert_eq!(opened.filename, "v2.txt");
+            assert_eq!(opened.content_id.as_deref(), Some("v2@aster"));
+            assert!(open_with(&r, None, b"vault-pass", &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn admitted_session_keeps_the_identity_key_seal_first() {
+        let key = own_key();
+        let att = outgoing("pgp.txt", "text/plain", None, b"pgp first");
+        let sealed = seal_attachment_with_keys(
+            &att,
+            OWN_PASS.as_bytes(),
+            Some(&key),
+            Some(&VECTOR_DATA_KEK),
+        )
+        .unwrap();
+        assert_eq!(sealed.sender_meta_nonce, [0u8; DATA_NONCE_LEN]);
+        let raw = STANDARD.decode(&sealed.sender_meta).unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains("BEGIN PGP"));
+    }
+
+    #[test]
+    fn unadmitted_session_keeps_the_passphrase_envelope() {
+        let att = outgoing("old.txt", "text/plain", None, b"old bytes");
+        for key in [None, Some(r#"{"kty":"EC"}"#)] {
+            let sealed = seal_attachment_with_keys(&att, b"vault-pass", key, None).unwrap();
+            assert_ne!(sealed.sender_meta_nonce, V2_META_NONCE);
+            assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
+            let plain = decrypt_pbkdf2_envelope(&sealed.sender_meta, b"vault-pass").unwrap();
+            assert_eq!(plain.as_str(), sealed.plain_meta.as_str());
+            let fresh = encrypt_pbkdf2_envelope(&sealed.plain_meta, b"vault-pass").unwrap();
+            assert_eq!(
+                STANDARD.decode(&sealed.sender_meta).unwrap().len(),
+                STANDARD.decode(&fresh).unwrap().len()
+            );
+            assert!(crate::crypto::envelope::decrypt_storage_key_envelope(
+                &sealed.sender_meta,
+                &ring(&[VECTOR_DATA_KEK]),
+            )
+            .is_err());
+            let opened = open_with(&sender_row(&sealed), None, b"vault-pass", &[]).unwrap();
+            assert_eq!(opened.data, b"old bytes");
+            assert_eq!(opened.filename, "old.txt");
+        }
+    }
+
+    #[test]
+    fn the_v2_write_key_is_released_only_after_admission() {
+        let mut state = crate::crypto::envelope_v2::EnvelopeV2State::new();
+        state.begin_unlock(Some(&STANDARD.encode(VECTOR_DATA_KEK)));
+        assert!(state.write_key().is_none());
+        let generation = state.start_attempt(std::time::Instant::now());
+        state.record(generation, crate::crypto::envelope_v2::Level2Admission::Admitted);
+        let key = state.write_key().unwrap();
+        assert_eq!(*key, VECTOR_DATA_KEK);
     }
 
     fn manifest_key_entry(entry: &serde_json::Value) -> AttachmentKeyEntry {
