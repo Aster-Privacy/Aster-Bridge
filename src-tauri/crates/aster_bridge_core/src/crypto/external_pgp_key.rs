@@ -40,7 +40,7 @@ const FINGERPRINT_HEX_LEN: usize = 40;
 #[derive(Clone)]
 pub struct ExternalPgpKey {
     fingerprint: String,
-    secret_key_bytes: Zeroizing<Vec<u8>>,
+    key: std::sync::Arc<aster_crypto::KeyPair>,
 }
 
 impl std::fmt::Debug for ExternalPgpKey {
@@ -57,11 +57,39 @@ impl ExternalPgpKey {
     }
 
     pub(crate) fn decrypt_armored(&self, armored: &str) -> Option<Zeroizing<Vec<u8>>> {
-        let key = aster_crypto::import_secret_key_bytes(&self.secret_key_bytes).ok()?;
-        aster_crypto::decrypt_message(armored.as_bytes(), &[&key])
+        aster_crypto::decrypt_message(armored.as_bytes(), &[self.key.as_ref()])
             .ok()
             .map(Zeroizing::new)
     }
+}
+
+const OWN_MAIL_FOLDERS: [&str; 4] = ["sent", "drafts", "draft", "scheduled"];
+const OWN_MAIL_ITEM_TYPES: [&str; 4] = ["sent", "draft", "drafts", "scheduled"];
+
+pub(crate) fn external_key_allowed(folder: &str, item_type: Option<&str>) -> bool {
+    let folder = folder.trim();
+    let own_folder = OWN_MAIL_FOLDERS.iter().any(|own| own.eq_ignore_ascii_case(folder));
+    let own_item = item_type
+        .map(str::trim)
+        .is_some_and(|kind| OWN_MAIL_ITEM_TYPES.iter().any(|own| own.eq_ignore_ascii_case(kind)));
+    !own_folder && !own_item
+}
+
+pub(crate) fn external_key_for<'a>(
+    external_key: Option<&'a ExternalPgpKey>,
+    folder: &str,
+    item_type: Option<&str>,
+) -> Option<&'a ExternalPgpKey> {
+    external_key.filter(|_| external_key_allowed(folder, item_type))
+}
+
+fn every_secret_is_unprotected(key: &aster_crypto::KeyPair) -> bool {
+    let secret = key.secret_key();
+    secret.primary_key.secret_params().string_to_key_id() == 0
+        && secret
+            .secret_subkeys
+            .iter()
+            .all(|subkey| subkey.key.secret_params().string_to_key_id() == 0)
 }
 
 fn normalized_fingerprint(fingerprint: &str) -> Result<String> {
@@ -130,9 +158,12 @@ pub fn unwrap_external_key(
     if key.fingerprint().to_ascii_lowercase() != fingerprint {
         return Err(BridgeError::Crypto("external key fingerprint does not match".to_string()));
     }
+    if !every_secret_is_unprotected(&key) {
+        return Err(BridgeError::Crypto("external key is passphrase protected".to_string()));
+    }
     Ok(ExternalPgpKey {
         fingerprint,
-        secret_key_bytes,
+        key: std::sync::Arc::new(key),
     })
 }
 
@@ -195,12 +226,10 @@ pub(crate) fn wrap_external_key_for_tests(
 
 #[cfg(test)]
 pub(crate) fn external_key_for_tests(secret_key_bytes: &[u8]) -> ExternalPgpKey {
-    let fingerprint = aster_crypto::import_secret_key_bytes(secret_key_bytes)
-        .unwrap()
-        .fingerprint();
+    let key = aster_crypto::import_secret_key_bytes(secret_key_bytes).unwrap();
     ExternalPgpKey {
-        fingerprint,
-        secret_key_bytes: Zeroizing::new(secret_key_bytes.to_vec()),
+        fingerprint: key.fingerprint().to_ascii_lowercase(),
+        key: std::sync::Arc::new(key),
     }
 }
 
@@ -211,27 +240,57 @@ pub(crate) mod test_keys {
     use pgp::ser::Serialize;
 
     fn generate(primary: KeyType, encryption: KeyType) -> Vec<u8> {
+        generate_protected(primary, encryption, None, None)
+    }
+
+    fn generate_protected(
+        primary: KeyType,
+        encryption: KeyType,
+        primary_passphrase: Option<&str>,
+        subkey_passphrase: Option<&str>,
+    ) -> Vec<u8> {
         let rng = rand::rngs::OsRng;
         let params = SecretKeyParamsBuilder::default()
             .key_type(primary)
             .can_certify(true)
             .can_sign(true)
             .primary_user_id("Outside <outside@example.com>".into())
+            .passphrase(primary_passphrase.map(str::to_string))
             .subkey(
                 SubkeyParamsBuilder::default()
                     .key_type(encryption)
                     .can_encrypt(true)
+                    .passphrase(subkey_passphrase.map(str::to_string))
                     .build()
                     .unwrap(),
             )
             .build()
             .unwrap();
+        let unlock = primary_passphrase.unwrap_or_default().to_string();
         let signed = params
             .generate(rng)
             .unwrap()
-            .sign(rng, String::new)
+            .sign(rng, move || unlock)
             .unwrap();
         signed.to_bytes().unwrap()
+    }
+
+    pub(crate) fn protected_primary_secret_key() -> Vec<u8> {
+        generate_protected(
+            KeyType::EdDSALegacy,
+            KeyType::ECDH(ECCCurve::Curve25519),
+            Some("outside"),
+            None,
+        )
+    }
+
+    pub(crate) fn protected_subkey_secret_key() -> Vec<u8> {
+        generate_protected(
+            KeyType::EdDSALegacy,
+            KeyType::ECDH(ECCCurve::Curve25519),
+            None,
+            Some("outside"),
+        )
     }
 
     pub(crate) fn curve25519_legacy_secret_key() -> Vec<u8> {
@@ -276,8 +335,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(key.fingerprint(), fingerprint.to_ascii_lowercase());
-        assert_eq!(key.secret_key_bytes.as_slice(), bytes.as_slice());
-        assert!(!format!("{:?}", key).contains("secret_key_bytes"));
+        assert_eq!(key.key.to_bytes().unwrap(), bytes);
+        assert!(!format!("{:?}", key).contains("key:"));
+    }
+
+    #[test]
+    fn the_external_key_is_limited_to_inbound_mail() {
+        for folder in ["inbox", "INBOX", "archive", "spam", "trash", "custom-token"] {
+            assert!(external_key_allowed(folder, Some("received")), "{folder}");
+            assert!(external_key_allowed(folder, None), "{folder}");
+        }
+        for folder in ["sent", "Sent", "drafts", "scheduled"] {
+            assert!(!external_key_allowed(folder, Some("received")), "{folder}");
+            assert!(!external_key_allowed(folder, None), "{folder}");
+        }
+        for item_type in ["sent", "draft", "drafts", "scheduled", "SENT"] {
+            assert!(!external_key_allowed("inbox", Some(item_type)), "{item_type}");
+            assert!(!external_key_allowed("custom-token", Some(item_type)), "{item_type}");
+        }
+
+        let key = external_key_for_tests(&test_keys::curve25519_legacy_secret_key());
+        assert!(external_key_for(Some(&key), "inbox", Some("received")).is_some());
+        assert!(external_key_for(Some(&key), "archive", Some("sent")).is_none());
+        assert!(external_key_for(Some(&key), "sent", None).is_none());
+        assert!(external_key_for(None, "inbox", Some("received")).is_none());
+    }
+
+    #[test]
+    fn a_passphrase_protected_key_is_rejected() {
+        for bytes in [test_keys::protected_primary_secret_key(), test_keys::protected_subkey_secret_key()] {
+            let fingerprint = aster_crypto::import_secret_key_bytes(&bytes).unwrap().fingerprint();
+            let wrapped = wrap(&bytes, &fingerprint);
+
+            let error = unwrap_external_key(&data_kek(), &user_id(), &fingerprint, &wrapped).unwrap_err();
+
+            assert!(error.to_string().contains("passphrase protected"));
+        }
+    }
+
+    #[test]
+    fn the_parsed_key_decrypts_repeatedly_and_clones_share_it() {
+        let (bytes, fingerprint) = fixture();
+        let pair = aster_crypto::import_secret_key_bytes(&bytes).unwrap();
+        let wrapped = wrap(&bytes, &fingerprint);
+        let key = unwrap_external_key(&data_kek(), &user_id(), &fingerprint, &wrapped).unwrap();
+        let copy = key.clone();
+        let armored = aster_crypto::encrypt_message(b"twice", &[&pair.public_key()]).unwrap();
+        let armored = std::str::from_utf8(&armored).unwrap();
+
+        assert_eq!(key.decrypt_armored(armored).unwrap().as_slice(), b"twice");
+        assert_eq!(copy.decrypt_armored(armored).unwrap().as_slice(), b"twice");
+        assert!(std::sync::Arc::ptr_eq(&key.key, &copy.key));
     }
 
     #[test]
@@ -376,12 +484,9 @@ mod tests {
         assert_eq!(wrap_external_key_for_tests(&data_kek, &user_id, fingerprint, &secret_key, nonce), wrapped);
 
         let key = unwrap_external_key(&data_kek, &user_id, fingerprint, wrapped).unwrap();
-        assert_eq!(key.secret_key_bytes.as_slice(), secret_key.as_slice());
+        assert_eq!(key.key.to_bytes().unwrap(), secret_key);
         assert_eq!(key.fingerprint(), fingerprint);
-        assert_eq!(
-            aster_crypto::import_secret_key_bytes(&key.secret_key_bytes).unwrap().fingerprint(),
-            fingerprint
-        );
+        assert_eq!(key.key.fingerprint().to_ascii_lowercase(), fingerprint);
 
         let plain = key.decrypt_armored(vector_field(&vector, "message_armored")).unwrap();
         assert_eq!(plain.as_slice(), vector_field(&vector, "message_plaintext").as_bytes());

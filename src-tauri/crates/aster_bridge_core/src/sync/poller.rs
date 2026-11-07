@@ -698,12 +698,16 @@ async fn refresh_attachment_keys(
     identity_key: Option<&str>,
     previous_keys: &[String],
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
+    folder: &str,
     external_key: Option<&ExternalPgpKey>,
-) -> std::result::Result<(Vec<EnvelopeAttachment>, bool), AttachmentFetchError> {
+) -> std::result::Result<(Vec<EnvelopeAttachment>, bool, bool), AttachmentFetchError> {
     let item = client
         .fetch_mail_item(access_token, aster_id)
         .await
         .map_err(classify_api_error)?;
+    let external_key_allowed =
+        crate::crypto::external_pgp_key::external_key_allowed(folder, Some(&item.item_type));
+    let external_key = external_key.filter(|_| external_key_allowed);
     let plaintext = decrypt_envelope_with_external_key(
         &item.encrypted_envelope,
         Some(&item.envelope_nonce),
@@ -717,7 +721,15 @@ async fn refresh_attachment_keys(
     let parsed: serde_json::Value = serde_json::from_str(&plaintext)
         .map_err(|e| AttachmentFetchError::Content(format!("envelope parse: {}", e)))?;
     let sealed_ratchet = crate::crypto::ratchet::find_ratchet_object(&parsed).is_some();
-    Ok((parse_envelope_attachments(&parsed), sealed_ratchet))
+    Ok((parse_envelope_attachments(&parsed), sealed_ratchet, external_key_allowed))
+}
+
+const ITEM_TYPE_META_KEY: &str = "item_type";
+
+fn cached_item_type(raw_headers: Option<&str>) -> Option<String> {
+    raw_headers
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|meta| meta.get(ITEM_TYPE_META_KEY).and_then(|v| v.as_str()).map(str::to_string))
 }
 
 fn cached_without_encryption(raw_headers: Option<&str>) -> bool {
@@ -749,6 +761,12 @@ async fn download_backlog_item(
 ) -> BacklogDownload {
     let mut entries = cached_attachment_entries(msg.raw_headers.as_deref());
     let mut meta_json = msg.raw_headers.clone();
+    let cached_type = cached_item_type(msg.raw_headers.as_deref());
+    let mut external_key = crate::crypto::external_pgp_key::external_key_for(
+        external_key,
+        &folder,
+        cached_type.as_deref(),
+    );
     if cached_without_encryption(msg.raw_headers.as_deref()) {
         return BacklogDownload {
             aster_id,
@@ -769,15 +787,19 @@ async fn download_backlog_item(
             identity_key,
             previous_keys,
             inbound_keys,
+            &folder,
             external_key,
         )
         .await
         {
-            Ok((fresh, sealed_ratchet)) if !fresh.is_empty() => {
+            Ok((fresh, sealed_ratchet, allowed)) if !fresh.is_empty() => {
                 meta_json = Some(merge_attachment_meta(msg.raw_headers.as_deref(), &fresh, sealed_ratchet));
                 entries = fresh;
+                external_key = external_key.filter(|_| allowed);
             }
-            Ok(_) => {}
+            Ok((_, _, allowed)) => {
+                external_key = external_key.filter(|_| allowed);
+            }
             Err(AttachmentFetchError::Transport(e)) => {
                 tracing::debug!("attachment key refresh for {} deferred: {}", aster_id, e);
                 return BacklogDownload {
@@ -1259,6 +1281,7 @@ struct PreparedMessage {
     unencrypted: bool,
     sender_unverified: bool,
     sealed_ratchet: bool,
+    external_key_allowed: bool,
 }
 
 enum Prepared {
@@ -1280,6 +1303,8 @@ fn prepare_mail_item(
     inbound_keys: &[crate::crypto::inbound::InboundKeyCandidate],
     external_key: Option<&ExternalPgpKey>,
 ) -> Prepared {
+    let external_key_allowed = crate::crypto::external_pgp_key::external_key_allowed(folder, Some(&item.item_type));
+    let external_key = external_key.filter(|_| external_key_allowed);
     if !is_valid_item_id(&item.id) {
         tracing::warn!("rejecting message with invalid id format");
         return Prepared::Done(CacheOutcome::default());
@@ -1465,6 +1490,7 @@ fn prepare_mail_item(
         unencrypted,
         sender_unverified,
         sealed_ratchet: is_ratchet_envelope,
+        external_key_allowed,
     })
 }
 
@@ -1541,6 +1567,7 @@ fn commit_prepared(
         .unwrap_or(0);
     let mut raw_headers_map = serde_json::Map::new();
     raw_headers_map.insert("is_html".to_string(), serde_json::json!(prepared.is_html));
+    raw_headers_map.insert(ITEM_TYPE_META_KEY.to_string(), serde_json::json!(item.item_type));
     raw_headers_map.insert(
         "message_id".to_string(),
         serde_json::json!(prepared.message_id),
@@ -3011,7 +3038,7 @@ async fn run_sync_pass(
                                         &passphrase,
                                         identity_key.as_deref(),
                                         &previous_keys,
-                                        external_key.as_ref(),
+                                        external_key.as_ref().filter(|_| prepared.external_key_allowed),
                                         None,
                                     )
                                     .await
@@ -4603,6 +4630,45 @@ mod tests {
         item.encrypted_envelope = STANDARD.encode(armored);
         item.envelope_nonce = String::new();
         item
+    }
+
+    #[test]
+    fn the_external_key_opens_only_inbound_mail() {
+        let (_dir, db) = temp_db();
+        let owner = aster_crypto::generate_keypair("Me", "me@astermail.org").unwrap();
+        let owner_armored = owner.to_armored().unwrap();
+        let outside_bytes = crate::crypto::external_pgp_key::test_keys::curve25519_legacy_secret_key();
+        let outside = aster_crypto::import_secret_key_bytes(&outside_bytes).unwrap();
+        let external = crate::crypto::external_pgp_key::external_key_for_tests(&outside_bytes);
+        let cases = [
+            ("ext-inbox", "inbox", "received", true),
+            ("ext-archive", "archive", "received", true),
+            ("ext-custom", "custom-token", "received", true),
+            ("ext-sent-folder", "sent", "received", false),
+            ("ext-drafts-folder", "drafts", "received", false),
+            ("ext-sent-item", "custom-token", "sent", false),
+            ("ext-draft-item", "inbox", "draft", false),
+        ];
+        for (id, folder, item_type, expected) in cases {
+            let json = serde_json::json!({"from": "carol@example.com", "subject": "s", "body_text": "b"});
+            let armored = aster_crypto::encrypt_message(json.to_string().as_bytes(), &[&outside.public_key()]).unwrap();
+            let mut item = pgp_item(id, armored);
+            item.item_type = item_type.to_string();
+            let outcome = cache_mail_item_with_external_key(
+                &db,
+                folder,
+                &item,
+                b"pass",
+                Some(&owner_armored),
+                &[],
+                &[],
+                Some(&external),
+            );
+            assert_eq!(outcome.was_new, expected, "{id}");
+            assert_eq!(outcome.decrypt_failed, !expected, "{id}");
+        }
+        let raw = db.get_cached_message("ext-inbox").unwrap().unwrap().raw_headers;
+        assert_eq!(cached_item_type(raw.as_deref()).as_deref(), Some("received"));
     }
 
     #[test]
