@@ -678,6 +678,7 @@ mod tests {
                 storage_keys: storage_keys.into_iter().map(zeroize::Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
             },
+            external_pgp_key: None,
         };
         ContactsStore::new(
             Arc::new(ApiClient::new_with_base_url("http://127.0.0.1:9")),

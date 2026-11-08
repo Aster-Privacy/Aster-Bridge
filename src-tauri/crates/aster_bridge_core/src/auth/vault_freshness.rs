@@ -368,6 +368,7 @@ pub(crate) mod tests {
                 storage_keys: data_kek.into_iter().map(Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
             },
+            external_pgp_key: None,
         }
     }
 
