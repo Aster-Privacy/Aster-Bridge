@@ -55,7 +55,21 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
         Command::Serve {
             json_events,
             service,
-        } => serve::run(&ctx, json_events, service).await,
+            listen,
+            allow_from,
+            hostnames,
+            tls_cert,
+            tls_key,
+        } => {
+            let network = serve::ServeNetwork {
+                listen,
+                allow_from,
+                hostnames,
+                tls_cert,
+                tls_key,
+            };
+            serve::run(&ctx, json_events, service, network).await
+        }
         Command::Status { refresh, live } => status::run(&ctx, refresh, live).await,
         Command::Stop => stop::run(&ctx).await,
         Command::AppPassword(command) => app_password::run(&ctx, command).await,

@@ -1110,7 +1110,7 @@ pub async fn serve(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
+        if !crate::network::current().peer_allowed(peer.ip()) {
             tracing::warn!("IMAP rejected non-loopback peer {}", peer);
             drop(stream);
             continue;
@@ -1163,7 +1163,7 @@ pub async fn run_implicit_tls(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
+        if !crate::network::current().peer_allowed(peer.ip()) {
             tracing::warn!("IMAPS rejected non-loopback peer {}", peer);
             drop(stream);
             continue;

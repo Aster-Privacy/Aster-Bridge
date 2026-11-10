@@ -44,12 +44,42 @@ const SERVER_AUTH_OID: &str = "1.3.6.1.5.5.7.3.1";
 pub fn ensure_cert(
     data_dir: &Path,
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    ensure_cert_with_policy(data_dir, REQUIRE_SERVER_AUTH_USAGE)
+    ensure_cert_with_policy(data_dir, REQUIRE_SERVER_AUTH_USAGE, &[])
+}
+
+pub fn ensure_cert_with_names(
+    data_dir: &Path,
+    extra_names: &[String],
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    ensure_cert_with_policy(data_dir, REQUIRE_SERVER_AUTH_USAGE, extra_names)
+}
+
+pub fn load_cert_files(
+    cert_path: &Path,
+    key_path: &Path,
+) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    load_existing(cert_path, key_path)
+}
+
+pub fn cert_covers_name(cert_der: &[u8], name: &str) -> bool {
+    let Ok(server_name) = rustls::pki_types::ServerName::try_from(name.to_string()) else {
+        return false;
+    };
+    let der = CertificateDer::from(cert_der.to_vec());
+    match webpki::EndEntityCert::try_from(&der) {
+        Ok(cert) => cert.verify_is_valid_for_subject_name(&server_name).is_ok(),
+        Err(_) => false,
+    }
+}
+
+pub fn cert_fingerprint_of(cert_der: &[u8]) -> String {
+    fingerprint_hex_colon(cert_der)
 }
 
 fn ensure_cert_with_policy(
     data_dir: &Path,
     require_server_auth_usage: bool,
+    extra_names: &[String],
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = cert_pem_path(data_dir);
     let key_path = key_pem_path(data_dir);
@@ -59,10 +89,15 @@ fn ensure_cert_with_policy(
             let expiring = expires_within_days(certs[0].as_ref(), RENEW_BEFORE_EXPIRY_DAYS);
             let unusable_for_server_auth =
                 require_server_auth_usage && !allows_server_auth(certs[0].as_ref());
-            if !expiring && !unusable_for_server_auth {
+            let missing_names = extra_names
+                .iter()
+                .any(|name| !cert_covers_name(certs[0].as_ref(), name));
+            if !expiring && !unusable_for_server_auth && !missing_names {
                 return Ok((certs, key));
             }
-            if expiring {
+            if missing_names && !expiring && !unusable_for_server_auth {
+                tracing::info!("TLS cert doesn't cover every configured host name; regenerating");
+            } else if expiring {
                 tracing::info!(
                     "TLS cert expires within {} days; regenerating",
                     RENEW_BEFORE_EXPIRY_DAYS
@@ -77,7 +112,7 @@ fn ensure_cert_with_policy(
         }
     }
 
-    generate_and_persist(&cert_path, &key_path)
+    generate_and_persist(&cert_path, &key_path, extra_names)
 }
 
 fn load_existing(
@@ -106,6 +141,7 @@ fn load_existing(
 fn generate_and_persist(
     cert_path: &Path,
     key_path: &Path,
+    extra_names: &[String],
 ) -> TlsResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     use rcgen::{
         CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
@@ -131,6 +167,15 @@ fn generate_and_persist(
         SanType::DnsName("localhost".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
         SanType::DnsName("bridge.local".to_string().try_into().map_err(|e: rcgen::Error| e.to_string())?),
     ];
+    for name in extra_names {
+        let san = match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => SanType::IpAddress(ip),
+            Err(_) => SanType::DnsName(name.clone().try_into().map_err(|e: rcgen::Error| e.to_string())?),
+        };
+        if !params.subject_alt_names.contains(&san) {
+            params.subject_alt_names.push(san);
+        }
+    }
 
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -416,6 +461,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extra_names_are_added_once_and_the_default_cert_is_kept_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, _) = ensure_cert(dir.path()).unwrap();
+        assert!(cert_covers_name(plain[0].as_ref(), "127.0.0.1"));
+        assert!(cert_covers_name(plain[0].as_ref(), "localhost"));
+        assert!(!cert_covers_name(plain[0].as_ref(), "nas.home.arpa"));
+
+        let (again, _) = ensure_cert_with_names(dir.path(), &[]).unwrap();
+        assert_eq!(plain[0].as_ref(), again[0].as_ref());
+
+        let names = vec!["nas.home.arpa".to_string(), "192.168.1.5".to_string()];
+        let (named, _) = ensure_cert_with_names(dir.path(), &names).unwrap();
+        assert_ne!(plain[0].as_ref(), named[0].as_ref());
+        assert!(cert_covers_name(named[0].as_ref(), "nas.home.arpa"));
+        assert!(cert_covers_name(named[0].as_ref(), "192.168.1.5"));
+        assert!(cert_covers_name(named[0].as_ref(), "127.0.0.1"));
+
+        let (kept, _) = ensure_cert_with_names(dir.path(), &names).unwrap();
+        assert_eq!(named[0].as_ref(), kept[0].as_ref());
+        let (kept_plain, _) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(named[0].as_ref(), kept_plain[0].as_ref());
+    }
+
+    #[test]
     fn ensure_cert_generates_and_reuses() {
         let dir = tempfile::tempdir().unwrap();
         let (certs1, _key1) = ensure_cert(dir.path()).unwrap();
@@ -606,12 +675,12 @@ mod tests {
     fn a_certificate_without_server_auth_is_replaced_when_required() {
         let dir = tempfile::tempdir().unwrap();
         let old = write_cert_without_server_auth(dir.path());
-        let (certs, key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        let (certs, key) = ensure_cert_with_policy(dir.path(), true, &[]).unwrap();
         assert_ne!(certs[0].as_ref(), &old[..]);
         assert!(allows_server_auth(certs[0].as_ref()));
         server_config(certs.clone(), key).expect("the regenerated pair must belong together");
 
-        let (again, _key) = ensure_cert_with_policy(dir.path(), true).unwrap();
+        let (again, _key) = ensure_cert_with_policy(dir.path(), true, &[]).unwrap();
         assert_eq!(again[0].as_ref(), certs[0].as_ref());
     }
 
@@ -619,7 +688,7 @@ mod tests {
     fn a_certificate_without_server_auth_is_kept_when_not_required() {
         let dir = tempfile::tempdir().unwrap();
         let old = write_cert_without_server_auth(dir.path());
-        let (certs, _key) = ensure_cert_with_policy(dir.path(), false).unwrap();
+        let (certs, _key) = ensure_cert_with_policy(dir.path(), false, &[]).unwrap();
         assert_eq!(certs[0].as_ref(), &old[..]);
     }
 

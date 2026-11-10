@@ -103,6 +103,16 @@ pub enum Command {
         json_events: bool,
         #[arg(long, help = "Behave as a background service")]
         service: bool,
+        #[arg(long, env = "ASTER_BRIDGE_LISTEN", value_name = "ADDRESS", help = "Address the mail servers listen on, such as 0.0.0.0 to accept connections from other devices (default: 127.0.0.1)")]
+        listen: Option<String>,
+        #[arg(long = "allow-from", env = "ASTER_BRIDGE_ALLOW_FROM", value_name = "RANGES", help = "Comma-separated addresses or CIDR ranges that can connect when listening beyond this device (default: private network ranges)")]
+        allow_from: Option<String>,
+        #[arg(long = "hostname", env = "ASTER_BRIDGE_HOSTNAMES", value_name = "NAMES", help = "Comma-separated host names that mail apps use to reach this bridge")]
+        hostnames: Option<String>,
+        #[arg(long = "tls-cert", env = "ASTER_BRIDGE_TLS_CERT_FILE", value_name = "PATH", requires = "tls_key", help = "PEM certificate chain to serve instead of the generated certificate")]
+        tls_cert: Option<PathBuf>,
+        #[arg(long = "tls-key", env = "ASTER_BRIDGE_TLS_KEY_FILE", value_name = "PATH", requires = "tls_cert", help = "PEM private key for the certificate given with --tls-cert")]
+        tls_key: Option<PathBuf>,
     },
     #[command(about = "Show account, plan, and server status")]
     Status {

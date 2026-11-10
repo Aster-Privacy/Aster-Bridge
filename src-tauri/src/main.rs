@@ -405,6 +405,7 @@ async fn start_runtime_inner(shared: &SharedBridgeState) -> Result<(), runtime::
         signing_key: guard.identity.ed25519_signing_key.clone(),
         profile: runtime::ClientProfile::Desktop,
         tuning: runtime::RuntimeTuning::for_config(&guard.config),
+        network: aster_bridge_core::network::NetworkPolicy::loopback(),
     };
     let running = runtime::BridgeRuntime::start(grant, deps, opts).await?;
     if running.bound_ports().apply_to_config(&mut guard.config) {

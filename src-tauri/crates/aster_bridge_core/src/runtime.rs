@@ -33,7 +33,7 @@ use crate::error::BridgeError;
 use crate::port_picker::{self, Occupant};
 use crate::sync::poller::{self, PollExit, PollTuning, SyncTrigger, SyncTriggerTx};
 
-pub const LOOPBACK_HOST: &str = "127.0.0.1";
+pub use crate::network::LOOPBACK_HOST;
 const PLAN_CHECK_ATTEMPTS: u8 = 3;
 const SESSION_EXPIRED_AFTER_FAILURES: u32 = 5;
 const DEVICE_REVOKED_AFTER_FAILURES: u32 = 3;
@@ -300,6 +300,7 @@ pub struct StartOptions {
     pub signing_key: ed25519_dalek::SigningKey,
     pub profile: ClientProfile,
     pub tuning: RuntimeTuning,
+    pub network: crate::network::NetworkPolicy,
 }
 
 struct Inner {
@@ -439,9 +440,17 @@ struct PortPlan {
     carddav_enabled: bool,
 }
 
-fn port_error(service: Service, port: u16, message: String) -> StartError {
+fn probe_host_for(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) if ip.is_unspecified() => LOOPBACK_HOST.to_string(),
+        Ok(std::net::IpAddr::V6(ip)) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+fn port_error(host: &str, service: Service, port: u16, message: String) -> StartError {
     let held_by_bridge = matches!(
-        port_picker::probe_occupant(LOOPBACK_HOST, port),
+        port_picker::probe_occupant(&probe_host_for(host), port),
         Occupant::AsterBridge
     );
     StartError::PortUnavailable {
@@ -452,12 +461,11 @@ fn port_error(service: Service, port: u16, message: String) -> StartError {
     }
 }
 
-fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> {
-    let host = LOOPBACK_HOST;
+fn plan_ports(host: &str, config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> {
     let imap = port_picker::pick_startup_port(host, config.imap_port)
-        .map_err(|e| port_error(Service::Imap, config.imap_port, e))?;
+        .map_err(|e| port_error(host, Service::Imap, config.imap_port, e))?;
     let smtp = port_picker::pick_startup_port(host, config.smtp_port)
-        .map_err(|e| port_error(Service::Smtp, config.smtp_port, e))?;
+        .map_err(|e| port_error(host, Service::Smtp, config.smtp_port, e))?;
     let configured = [
         config.imap_port,
         config.smtp_port,
@@ -481,7 +489,7 @@ fn plan_ports(config: &BridgeConfig, tls: bool) -> Result<PortPlan, StartError> 
         Ok(port)
     };
     let jmap = if config.jmap_enabled {
-        pick_free(config.jmap_port).map_err(|e| port_error(Service::Jmap, config.jmap_port, e))?
+        pick_free(config.jmap_port).map_err(|e| port_error(host, Service::Jmap, config.jmap_port, e))?
     } else {
         0
     };
@@ -590,12 +598,16 @@ impl BridgeRuntime {
             None
         };
         let has_tls = tls_cfg.is_some();
+        crate::network::install(opts.network.clone());
+        let bind_ip = opts.network.bind_ip();
+        let host = opts.network.bind_host();
         let config = opts.config.clone();
-        let plan = tokio::task::spawn_blocking(move || plan_ports(&config, has_tls))
+        let plan_host = host.clone();
+        let plan = tokio::task::spawn_blocking(move || plan_ports(&plan_host, &config, has_tls))
             .await
             .map_err(|e| StartError::Io(format!("port selection failed: {}", e)))??;
         let ports = plan.ports;
-        let host = LOOPBACK_HOST;
+        let listen_addr = |port: u16| std::net::SocketAddr::new(bind_ip, port).to_string();
         let jmap_https = opts.config.jmap_https_enabled && has_tls;
         let carddav_https = opts.config.carddav_https_enabled && has_tls;
 
@@ -612,7 +624,7 @@ impl BridgeRuntime {
         let (connections, conn_shutdown) = crate::shutdown::channel();
 
         {
-            let addr = format!("{}:{}", host, ports.imap);
+            let addr = listen_addr(ports.imap);
             let (s, d, c, p, b, t) = (
                 session.clone(),
                 db.clone(),
@@ -629,7 +641,7 @@ impl BridgeRuntime {
         }
 
         if let (Some(cfg), true) = (tls_cfg.clone(), ports.imaps != 0) {
-            let addr = format!("{}:{}", host, ports.imaps);
+            let addr = listen_addr(ports.imaps);
             let (s, d, c, p, b) = (
                 session.clone(),
                 db.clone(),
@@ -644,7 +656,7 @@ impl BridgeRuntime {
         }
 
         {
-            let addr = format!("{}:{}", host, ports.smtp);
+            let addr = listen_addr(ports.smtp);
             let (s, c, p, d, t) = (
                 session.clone(),
                 client.clone(),
@@ -660,7 +672,7 @@ impl BridgeRuntime {
         }
 
         if let (Some(cfg), true) = (tls_cfg.clone(), ports.smtps != 0) {
-            let addr = format!("{}:{}", host, ports.smtps);
+            let addr = listen_addr(ports.smtps);
             let (s, c, p, d) = (
                 session.clone(),
                 client.clone(),
@@ -674,7 +686,7 @@ impl BridgeRuntime {
         }
 
         if plan.jmap_enabled {
-            let addr = format!("{}:{}", host, ports.jmap);
+            let addr = listen_addr(ports.jmap);
             let (s, d, c, p, b) = (
                 session.clone(),
                 db.clone(),
@@ -688,7 +700,7 @@ impl BridgeRuntime {
         }
 
         if plan.carddav_enabled {
-            let addr = format!("{}:{}", host, ports.carddav);
+            let addr = listen_addr(ports.carddav);
             let (s, c, p) = (session.clone(), client.clone(), passwords.clone());
             let t = if carddav_https { tls_cfg.clone() } else { None };
             let fut = async move { crate::dav::server::run(&addr, s, c, p, t).await };
@@ -696,7 +708,7 @@ impl BridgeRuntime {
         }
 
         if ports.pop3 != 0 {
-            let addr = format!("{}:{}", host, ports.pop3);
+            let addr = listen_addr(ports.pop3);
             let (s, d, c, p, t) = (
                 session.clone(),
                 db.clone(),
@@ -709,7 +721,7 @@ impl BridgeRuntime {
         }
 
         if let (Some(cfg), true) = (tls_cfg.clone(), ports.pop3s != 0) {
-            let addr = format!("{}:{}", host, ports.pop3s);
+            let addr = listen_addr(ports.pop3s);
             let (s, d, c, p) = (
                 session.clone(),
                 db.clone(),
@@ -979,7 +991,7 @@ mod tests {
             return;
         }
 
-        let plan = plan_ports(&config, false).unwrap_or_else(|_| panic!("ports must plan"));
+        let plan = plan_ports(LOOPBACK_HOST, &config, false).unwrap_or_else(|_| panic!("ports must plan"));
         let ports = plan.ports;
         assert_ne!(ports.jmap, busy);
         assert_ne!(ports.jmap, ports.carddav);
