@@ -12,14 +12,11 @@ services:
       - aster-bridge-data:/data
       - aster-bridge-secrets:/run/secrets
     ports:
-      - "1143:1143"
-      - "1993:1993"
-      - "1025:1025"
-      - "1465:1465"
-      - "1110:1110"
-      - "1995:1995"
-      - "1080:1080"
-      - "1081:1081"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1993:1993"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1465:1465"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1995:1995"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1080:1080"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1081:1081"
 
 volumes:
   aster-bridge-data:

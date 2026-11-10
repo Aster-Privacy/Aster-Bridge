@@ -12,7 +12,7 @@ The desktop app and a plain `aster-bridge serve` accept connections only from th
 - The bridge accepts connections only from loopback and private addresses: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`, `fc00::/7`, and `fe80::/10`. To change the list, set `ASTER_BRIDGE_ALLOW_FROM`.
 - Your mail app still signs in with an app password, never with your Aster password.
 
-Never publish the bridge ports to the internet. Reach it from outside your home through a VPN instead. The address check doesn't replace a firewall: when Docker forwards a connection through its own proxy, such as for IPv6 on some hosts, the bridge sees Docker's private address instead of the real one.
+Never publish the bridge ports to the internet. Reach it from outside your home through a VPN instead. The address check doesn't replace a firewall: when Docker forwards a connection through its own proxy, such as for IPv6 on some hosts, the bridge sees Docker's private address instead of the real one. To avoid that, the Compose file publishes the ports on IPv4 only.
 
 ## Set up the container
 
@@ -46,16 +46,15 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 
 6. In your mail app, add an account that points at your server's address, with the ports from the following table and the app password.
 
-| Service | Port |
-|---|---|
-| IMAP with STARTTLS | 1143 |
-| IMAP over TLS | 1993 |
-| SMTP with STARTTLS | 1025 |
-| SMTP over TLS | 1465 |
-| POP3 with STARTTLS | 1110 |
-| POP3 over TLS | 1995 |
-| JMAP over HTTPS | 1080 |
-| CardDAV over HTTPS | 1081 |
+| Service | Port | Security setting in your mail app |
+|---|---|---|
+| IMAP | 1993 | SSL/TLS |
+| SMTP | 1465 | SSL/TLS |
+| POP3 | 1995 | SSL/TLS |
+| JMAP | 1080 | HTTPS |
+| CardDAV | 1081 | HTTPS |
+
+The Compose file publishes only these TLS ports. The STARTTLS ports (1143, 1025, and 1110) stay inside the container, because a device on your network could remove STARTTLS from the server's reply and read the password your mail app sends.
 
 To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. Docker runs the same command as the container health check, so `docker compose ps` shows the container as healthy once you're signed in and the servers are running.
 
@@ -67,7 +66,7 @@ The bridge creates a self-signed certificate the first time it starts and keeps 
 docker compose exec aster-bridge aster-bridge tls fingerprint
 ```
 
-If your mail app connects by a name, such as `bridge.home.arpa`, add the name to `ASTER_BRIDGE_HOSTNAMES` so the certificate covers it. Separate several names with commas. The bridge also uses the first name in the addresses it gives JMAP clients.
+If your mail app connects by a name, such as `bridge.home.arpa`, add the name to `ASTER_BRIDGE_HOSTNAMES` so the certificate covers it. Separate several names with commas. JMAP clients receive addresses that use the same name and port they connected with.
 
 To use your own certificate instead, mount the files into the container and set `ASTER_BRIDGE_TLS_CERT_FILE` and `ASTER_BRIDGE_TLS_KEY_FILE` to their paths. Both files must be PEM, and the key must be readable by user 10001.
 
@@ -78,7 +77,8 @@ Set these environment variables in `compose.yaml`, or in an `.env` file next to 
 | Variable | What it does |
 |---|---|
 | `ASTER_BRIDGE_HOSTNAMES` | Names your mail apps use to reach the bridge. The certificate covers them, and the bridge accepts HTTP requests addressed to them. |
-| `ASTER_BRIDGE_ALLOW_FROM` | Addresses and ranges that can connect, separated by commas, such as `192.168.1.0/24,10.8.0.0/24`. It replaces the default private ranges. Loopback is always allowed. |
+| `ASTER_BRIDGE_ALLOW_FROM` | Addresses and ranges that can connect, separated by commas, such as `192.168.1.0/24,10.8.0.0/24`. It replaces the default private ranges. Loopback is always allowed. The bridge refuses ranges broader than `/8` for IPv4 or `/7` for IPv6. |
+| `ASTER_BRIDGE_PUBLISH_IP` | The host address that Docker publishes the ports on. The default is `0.0.0.0`, every IPv4 address on the host. To accept connections on one network only, set the server's address on that network, such as `192.168.1.20`. |
 | `ASTER_BRIDGE_LISTEN` | The address the bridge listens on inside the container. The default is `0.0.0.0`. Set `::` to listen on IPv6 too. |
 | `ASTER_BRIDGE_TLS_CERT_FILE` and `ASTER_BRIDGE_TLS_KEY_FILE` | Paths to your own certificate and private key. Set both or neither. |
 
