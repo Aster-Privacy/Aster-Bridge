@@ -233,6 +233,7 @@ dependencies = [
  "hmac",
  "hyper",
  "hyper-util",
+ "ipnet",
  "keyring",
  "mail-parser",
  "miniz_oxide",

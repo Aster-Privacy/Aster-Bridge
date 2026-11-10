@@ -1110,20 +1110,20 @@ pub async fn serve(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
-            tracing::warn!("IMAP rejected non-loopback peer {}", peer);
+        if !crate::network::current().peer_allowed(peer.ip()) {
+            crate::network::note_rejected_peer("IMAP");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Imap) {
             Some(p) => p,
             None => {
-                tracing::warn!("IMAP connection limit reached, dropping {}", peer);
+                tracing::warn!("IMAP connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }
         };
-        tracing::debug!("IMAP connection from {}", peer);
+        tracing::debug!("IMAP connection accepted");
 
         let session = session.clone();
         let client = client.clone();
@@ -1163,15 +1163,15 @@ pub async fn run_implicit_tls(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
-            tracing::warn!("IMAPS rejected non-loopback peer {}", peer);
+        if !crate::network::current().peer_allowed(peer.ip()) {
+            crate::network::note_rejected_peer("IMAPS");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Imap) {
             Some(p) => p,
             None => {
-                tracing::warn!("IMAPS connection limit reached, dropping {}", peer);
+                tracing::warn!("IMAPS connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }

@@ -190,15 +190,15 @@ pub async fn serve_with_tls(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
-            tracing::warn!("POP3 rejected non-loopback peer {}", peer);
+        if !crate::network::current().peer_allowed(peer.ip()) {
+            crate::network::note_rejected_peer("POP3");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Pop3) {
             Some(p) => p,
             None => {
-                tracing::warn!("POP3 connection limit reached, dropping {}", peer);
+                tracing::warn!("POP3 connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }
@@ -235,15 +235,15 @@ pub async fn run_implicit_tls(
     let shutdown = crate::shutdown::current();
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
-        if !peer.ip().is_loopback() {
-            tracing::warn!("POP3S rejected non-loopback peer {}", peer);
+        if !crate::network::current().peer_allowed(peer.ip()) {
+            crate::network::note_rejected_peer("POP3S");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Pop3) {
             Some(p) => p,
             None => {
-                tracing::warn!("POP3S connection limit reached, dropping {}", peer);
+                tracing::warn!("POP3S connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }

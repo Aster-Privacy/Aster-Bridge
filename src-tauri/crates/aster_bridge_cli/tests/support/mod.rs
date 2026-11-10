@@ -77,7 +77,7 @@ impl Run {
 pub struct Env {
     pub mock: Mock,
     pub data: PathBuf,
-    key_file: PathBuf,
+    pub key_file: PathBuf,
     _root: TempDir,
 }
 

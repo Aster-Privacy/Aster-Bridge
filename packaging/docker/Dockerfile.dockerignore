@@ -1,0 +1,14 @@
+*
+!.github/source_pins.env
+!scripts/fetch_pinned_sources.sh
+!src-tauri
+!dist/amd64/aster-bridge
+!dist/arm64/aster-bridge
+src-tauri/target
+src-tauri/gen
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*.db
+**/*.sqlite

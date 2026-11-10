@@ -355,6 +355,39 @@ fn tls_fingerprint_is_stable() {
 }
 
 #[test]
+fn secret_key_create_writes_a_new_key_and_never_replaces_one() {
+    let env = Env::new();
+    let existing = std::fs::read(&env.key_file).unwrap();
+    let refused = env.json(&["secret-key", "create"]);
+    assert_ne!(refused.code, 0);
+    assert_eq!(refused.error_code(), "secret_key_file_invalid");
+    assert!(refused.json()["error"]["hint"].as_str().unwrap_or_default().contains("keep it"));
+    assert_eq!(std::fs::read(&env.key_file).unwrap(), existing);
+
+    let fresh = env.data.parent().unwrap().join("fresh-secret-key");
+    let output = env
+        .command(&["--json", "secret-key", "create"])
+        .env("ASTER_BRIDGE_SECRET_KEY_FILE", &fresh)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let key = std::fs::read_to_string(&fresh).unwrap();
+    let key = key.trim();
+    assert_eq!(key.len(), 64);
+    let printed = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(!printed.contains(key));
+    aster_bridge_core::secrets::load_key_file(&fresh).unwrap();
+
+    let unset = env
+        .command(&["--json", "secret-key", "create"])
+        .env_remove("ASTER_BRIDGE_SECRET_KEY_FILE")
+        .output()
+        .unwrap();
+    assert!(!unset.status.success());
+    assert!(String::from_utf8_lossy(&unset.stdout).contains("secret_key_file_missing"));
+}
+
+#[test]
 fn commands_explain_what_they_need() {
     let env = Env::new();
     env.json(&["outbox", "list"]).expect(3);

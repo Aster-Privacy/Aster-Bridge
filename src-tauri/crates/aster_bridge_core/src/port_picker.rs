@@ -20,12 +20,16 @@ pub enum Occupant {
     Unreachable,
 }
 
+fn socket_addr(host: &str, port: u16) -> Option<SocketAddr> {
+    let ip: std::net::IpAddr = host.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
 pub fn probe_occupant(host: &str, port: u16) -> Occupant {
     use std::io::Read;
 
-    let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
-        Ok(a) => a,
-        Err(_) => return Occupant::Unreachable,
+    let Some(addr) = socket_addr(host, port) else {
+        return Occupant::Unreachable;
     };
     if let Ok(listener) = std::net::TcpListener::bind(addr) {
         drop(listener);
@@ -104,9 +108,11 @@ pub fn pick_startup_port(host: &str, preferred: u16) -> Result<u16, String> {
 
 pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
     let host_ip: std::net::IpAddr = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .parse()
         .map_err(|_| format!("invalid bind host: {}", host))?;
-    if !host_ip.is_loopback() {
+    if !crate::network::current().bind_allowed(host_ip) {
         return Err(format!("refusing to bind mail listener to non-loopback host {}", host));
     }
     for offset in 0..=MAX_PROBE_STEPS {
@@ -114,11 +120,8 @@ pub fn pick_available_port(host: &str, preferred: u16) -> Result<u16, String> {
             Some(p) if p >= 1024 => p,
             _ => continue,
         };
-        let addr_str = format!("{}:{}", host, candidate);
-        let parsed: SocketAddr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
+        let parsed = SocketAddr::new(host_ip, candidate);
+        let addr_str = parsed.to_string();
         match std::net::TcpListener::bind(parsed) {
             Ok(listener) => {
                 drop(listener);
@@ -189,7 +192,7 @@ pub async fn bind_loopback_listener(addr: &str) -> std::io::Result<tokio::net::T
     let sock_addr: SocketAddr = addr
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    if !sock_addr.ip().is_loopback() {
+    if !crate::network::current().bind_allowed(sock_addr.ip()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -200,7 +203,11 @@ pub async fn bind_loopback_listener(addr: &str) -> std::io::Result<tokio::net::T
     }
     let mut attempt = 0u32;
     loop {
-        let socket = tokio::net::TcpSocket::new_v4()?;
+        let socket = if sock_addr.is_ipv6() {
+            tokio::net::TcpSocket::new_v6()?
+        } else {
+            tokio::net::TcpSocket::new_v4()?
+        };
         #[cfg(not(windows))]
         socket.set_reuseaddr(true).ok();
         match socket.bind(sock_addr) {
