@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use ipnet::IpNet;
@@ -204,7 +205,7 @@ impl NetworkPolicy {
         let Some(name) = normalize_hostname(host) else {
             return false;
         };
-        name == "localhost" || self.hostnames.iter().any(|h| *h == name)
+        name == "localhost" || self.hostnames.contains(&name)
     }
 
     pub fn origin_allowed(&self, origin: &str, scheme: &str, port: u16) -> bool {
@@ -263,9 +264,22 @@ pub fn parse_peer_ranges(raw: &str) -> Result<Vec<IpNet>, String> {
                 Err(_) => return Err(format!("{} isn't an IP address or a range like 192.168.1.0/24.", item)),
             },
         };
+        let too_broad = match net {
+            IpNet::V4(v4) => v4.prefix_len() < 8,
+            IpNet::V6(v6) => v6.prefix_len() < 7,
+        };
+        if too_broad {
+            return Err(format!(
+                "{} covers too much of the internet. Use a smaller range, such as 192.168.1.0/24.",
+                item
+            ));
+        }
         if !out.contains(&net) {
             out.push(net);
         }
+    }
+    if out.is_empty() {
+        return Err("Give at least one address or range, such as 192.168.1.0/24.".to_string());
     }
     Ok(out)
 }
@@ -290,9 +304,44 @@ pub fn current() -> Arc<NetworkPolicy> {
     }
 }
 
+const REJECTED_PEER_LOG_INTERVAL_SECS: u64 = 60;
+
+fn rejected_peer_log_due(last: &AtomicU64, now: u64) -> bool {
+    let previous = last.load(Ordering::Relaxed);
+    if previous != 0 && now.saturating_sub(previous) < REJECTED_PEER_LOG_INTERVAL_SECS {
+        return false;
+    }
+    last.compare_exchange(previous, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+pub fn note_rejected_peer(protocol: &str) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if rejected_peer_log_due(&LAST, now) {
+        tracing::warn!(
+            "{} refused a connection from an address outside the allowed ranges",
+            protocol
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_peer_log_is_throttled() {
+        let last = AtomicU64::new(0);
+        assert!(rejected_peer_log_due(&last, 1_000));
+        assert!(!rejected_peer_log_due(&last, 1_001));
+        assert!(!rejected_peer_log_due(&last, 1_059));
+        assert!(rejected_peer_log_due(&last, 1_060));
+        assert!(!rejected_peer_log_due(&last, 1_061));
+    }
 
     fn lan() -> NetworkPolicy {
         NetworkPolicy::network(
@@ -357,7 +406,13 @@ mod tests {
     fn peer_ranges_reject_garbage() {
         assert!(parse_peer_ranges("192.168.1.0/24,nope").is_err());
         assert!(parse_peer_ranges("10.0.0.0/33").is_err());
-        assert_eq!(parse_peer_ranges("  ").unwrap(), Vec::<IpNet>::new());
+        assert!(parse_peer_ranges("  ").is_err());
+        assert!(parse_peer_ranges(" , ").is_err());
+        assert!(parse_peer_ranges("0.0.0.0/0").is_err());
+        assert!(parse_peer_ranges("::/0").is_err());
+        assert!(parse_peer_ranges("10.0.0.0/7").is_err());
+        assert!(parse_peer_ranges("fc00::/7").is_ok());
+        assert!(parse_peer_ranges("10.0.0.0/8").is_ok());
         assert_eq!(parse_peer_ranges("10.0.0.9/8").unwrap(), vec!["10.0.0.0/8".parse::<IpNet>().unwrap()]);
     }
 
