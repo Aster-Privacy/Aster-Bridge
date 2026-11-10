@@ -5,6 +5,7 @@ services:
     image: ghcr.io/aster-privacy/aster-bridge:latest
     container_name: aster-bridge
     restart: unless-stopped
+    init: true
     environment:
       ASTER_BRIDGE_HOSTNAMES: ${ASTER_BRIDGE_HOSTNAMES:-}
       ASTER_BRIDGE_ALLOW_FROM: ${ASTER_BRIDGE_ALLOW_FROM:-}
