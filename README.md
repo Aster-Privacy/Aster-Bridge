@@ -10,7 +10,7 @@ You can sign up at [astermail.org](https://astermail.org). Aster Bridge requires
 
 ## How it works
 
-The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. All encryption and decryption happens locally, and no plaintext travels over the network.
+The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. If you run the bridge in Docker on a home server, it also serves other devices on your private network, and it requires TLS for every connection. All encryption and decryption happens locally, and no plaintext travels over the network.
 
 | Protocol | Default port |
 |---|---|
@@ -178,7 +178,7 @@ Add `--json` to any command for machine-readable output. Every command exits wit
 
 ## Run Aster Bridge in Docker
 
-To run Aster Bridge on a home server or NAS, use the `ghcr.io/aster-privacy/aster-bridge` image. The container serves every device on your private network, keeps TLS on, and accepts connections only from private addresses. For setup steps and a Compose file, see [packaging/docker](packaging/docker/README.md).
+To run Aster Bridge on a home server or NAS, use the `ghcr.io/aster-privacy/aster-bridge` image. The container serves every device on your private network, keeps TLS on, and accepts connections only from private addresses. The image runs on 64-bit Intel and ARM hardware. For setup steps and a Compose file, see the [Docker setup guide](packaging/docker/README.md).
 
 ## Build from source
 
