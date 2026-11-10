@@ -124,12 +124,11 @@ Use `aster-bridge service status` to check the service and `aster-bridge service
 
 ### Store keys without a system keychain
 
-The tool stores its keys in the system keychain: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux. Servers often don't run a Secret Service. To store keys in an encrypted file instead, create a key and point the tool at it:
+The tool stores its keys in the system keychain: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux. Servers often don't run a Secret Service. To store keys in an encrypted file instead, point the tool at a key file and create the key:
 
 ```
-openssl rand -hex 32 > ~/.config/aster-bridge.key
-chmod 600 ~/.config/aster-bridge.key
 export ASTER_BRIDGE_SECRET_KEY_FILE=~/.config/aster-bridge.key
+aster-bridge secret-key create
 aster-bridge --secret-backend file login
 ```
 

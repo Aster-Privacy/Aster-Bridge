@@ -21,10 +21,10 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 2. In that folder, create the key that encrypts the bridge's stored account data:
 
    ```
-   docker compose run --rm --entrypoint sh aster-bridge -c 'set -C && umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d " \n" > /run/secrets/aster_bridge_secret_key'
+   docker compose run --rm aster-bridge secret-key create
    ```
 
-   The key stays in the `aster-bridge-secrets` volume, apart from your data in the `aster-bridge-data` volume, and only the container's user can read it. The command refuses to replace a key that already exists. When you back up or move the bridge, keep both volumes, because the bridge can't read its data without the key.
+   The key stays in the `aster-bridge-secrets` volume, apart from your data in the `aster-bridge-data` volume, and only the container's user can read it. The command never shows the key, and it refuses to replace a key that already exists. When you back up or move the bridge, keep both volumes, because the bridge can't read its data without the key.
 
 3. To sign in, run:
 
