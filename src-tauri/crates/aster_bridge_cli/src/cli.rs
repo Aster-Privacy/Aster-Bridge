@@ -131,6 +131,8 @@ pub enum Command {
     Sync(SyncCommand),
     #[command(subcommand, about = "Show TLS certificate details")]
     Tls(TlsCommand),
+    #[command(subcommand, name = "secret-key", about = "Create the key file that protects stored secrets")]
+    SecretKey(SecretKeyCommand),
     #[command(subcommand, about = "Read and change settings")]
     Config(ConfigCommand),
     #[command(about = "Rebuild the local mail cache")]
@@ -197,6 +199,12 @@ pub enum SyncCommand {
 pub enum TlsCommand {
     #[command(about = "Print the certificate SHA-256 fingerprint")]
     Fingerprint,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretKeyCommand {
+    #[command(about = "Create a new key at ASTER_BRIDGE_SECRET_KEY_FILE without replacing an existing one")]
+    Create,
 }
 
 #[derive(Subcommand, Debug)]

@@ -149,6 +149,40 @@ pub fn probe_keyring(service: &str) -> Result<(), String> {
     }
 }
 
+pub fn create_key_file(path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    let mut text = Zeroizing::new(String::with_capacity(65));
+    for byte in key.iter() {
+        text.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        text.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    text.push('\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists, so it was left unchanged", path.display())
+        } else {
+            format!("cannot create secret key file {}: {}", path.display(), e)
+        }
+    })?;
+    let written = file.write_all(text.as_bytes()).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("cannot write secret key file {}: {}", path.display(), e));
+    }
+    restrict_permissions(path, false);
+    Ok(())
+}
+
 pub fn load_key_file(path: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
     #[cfg(unix)]
     {
@@ -308,6 +342,29 @@ pub fn restrict_permissions(path: &Path, is_dir: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn created_key_file_loads_and_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret-key");
+        create_key_file(&path).unwrap();
+        let first = load_key_file(&path).unwrap();
+        assert_ne!(*first, [0u8; 32]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim_end().len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let err = create_key_file(&path).unwrap_err();
+        assert!(err.contains("already exists"));
+        assert_eq!(*load_key_file(&path).unwrap(), *first);
+        let other = dir.path().join("other-key");
+        create_key_file(&other).unwrap();
+        assert_ne!(*load_key_file(&other).unwrap(), *first);
+    }
 
     #[test]
     fn file_store_round_trips_and_binds_name() {

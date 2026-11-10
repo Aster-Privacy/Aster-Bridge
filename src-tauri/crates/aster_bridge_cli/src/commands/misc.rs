@@ -163,6 +163,33 @@ pub fn tls_fingerprint(ctx: &Context) -> CliResult<i32> {
     Ok(EXIT_OK)
 }
 
+pub fn secret_key_create(out: &Output) -> CliResult<i32> {
+    let Some(path) = crate::secret_backend::key_file_path() else {
+        return Err(CliError::coded(
+            exit::CODE_SECRET_KEY_FILE_MISSING,
+            "No secret key file is set.",
+        )
+        .with_hint("Set ASTER_BRIDGE_SECRET_KEY_FILE to the path for the new key, then run the command again."));
+    };
+    aster_bridge_core::secrets::create_key_file(&path).map_err(|e| {
+        let error = CliError::coded(exit::CODE_SECRET_KEY_FILE_INVALID, format!("Couldn't create the secret key file: {}", e));
+        if path.exists() {
+            error.with_hint("The existing key protects your stored secrets, so keep it. To start over with a new key, sign out with aster-bridge logout, move the old file somewhere safe, and run this command again.")
+        } else {
+            error
+        }
+    })?;
+    let shown = path.display().to_string();
+    if out.json {
+        out.json(json!({ "created": true, "path": shown }));
+        return Ok(EXIT_OK);
+    }
+    out.fields(&[("Secret key file", shown)]);
+    out.blank();
+    out.line("Keep a backup of this file with your data. Aster Bridge can't read your stored secrets without it.");
+    Ok(EXIT_OK)
+}
+
 fn all_settings(config: &BridgeConfig) -> CliResult<Map<String, Value>> {
     match serde_json::to_value(config) {
         Ok(Value::Object(map)) => Ok(map),
