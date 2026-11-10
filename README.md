@@ -176,6 +176,10 @@ Add `--json` to any command for machine-readable output. Every command exits wit
 | 6 | The keychain or key file isn't available. |
 | 7 | Another Aster Bridge process is using the data folder. |
 
+## Run Aster Bridge in Docker
+
+To run Aster Bridge on a home server or NAS, use the `ghcr.io/aster-privacy/aster-bridge` image. The container serves every device on your private network, keeps TLS on, and accepts connections only from private addresses. For setup steps and a Compose file, see [packaging/docker](packaging/docker/README.md).
+
 ## Build from source
 
 Building the desktop app takes two steps, because the Rust binary embeds the web interface at compile time. Build the interface first, then the binary:
