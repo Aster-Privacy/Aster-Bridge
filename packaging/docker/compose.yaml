@@ -8,10 +8,9 @@ services:
     environment:
       ASTER_BRIDGE_HOSTNAMES: ${ASTER_BRIDGE_HOSTNAMES:-}
       ASTER_BRIDGE_ALLOW_FROM: ${ASTER_BRIDGE_ALLOW_FROM:-}
-    secrets:
-      - aster_bridge_secret_key
     volumes:
       - aster-bridge-data:/data
+      - aster-bridge-secrets:/run/secrets
     ports:
       - "1143:1143"
       - "1993:1993"
@@ -22,9 +21,6 @@ services:
       - "1080:1080"
       - "1081:1081"
 
-secrets:
-  aster_bridge_secret_key:
-    file: ./secret-key
-
 volumes:
   aster-bridge-data:
+  aster-bridge-secrets:

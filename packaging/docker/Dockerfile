@@ -37,7 +37,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 aster \
     && useradd --system --uid 10001 --gid aster --home-dir /data --shell /usr/sbin/nologin aster \
-    && install -d -m 0700 -o aster -g aster /data
+    && install -d -m 0700 -o aster -g aster /data /run/secrets
 COPY --from=binary --chmod=0755 /aster-bridge /usr/local/bin/aster-bridge
 ENV ASTER_BRIDGE_DATA_DIR=/data \
     ASTER_BRIDGE_SECRET_BACKEND=file \
@@ -46,7 +46,7 @@ ENV ASTER_BRIDGE_DATA_DIR=/data \
     ASTER_BRIDGE_COLOR=never \
     HOME=/data
 USER aster:aster
-VOLUME ["/data"]
+VOLUME ["/data", "/run/secrets"]
 EXPOSE 1143 1993 1025 1465 1110 1995 1080 1081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD ["aster-bridge", "status"]

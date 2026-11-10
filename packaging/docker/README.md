@@ -12,7 +12,7 @@ The desktop app and a plain `aster-bridge serve` accept connections only from th
 - The bridge accepts connections only from loopback and private addresses: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`, `fc00::/7`, and `fe80::/10`. To change the list, set `ASTER_BRIDGE_ALLOW_FROM`.
 - Your mail app still signs in with an app password, never with your Aster password.
 
-Never publish the bridge ports to the internet. Reach it from outside your home through a VPN instead.
+Never publish the bridge ports to the internet. Reach it from outside your home through a VPN instead. The address check doesn't replace a firewall: when Docker forwards a connection through its own proxy, such as for IPv6 on some hosts, the bridge sees Docker's private address instead of the real one.
 
 ## Set up the container
 
@@ -21,12 +21,10 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 2. In that folder, create the key that encrypts the bridge's stored account data:
 
    ```
-   openssl rand -hex 32 > secret-key
-   sudo chown 10001:10001 secret-key
-   sudo chmod 600 secret-key
+   docker compose run --rm --entrypoint sh aster-bridge -c 'set -C && umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d " \n" > /run/secrets/aster_bridge_secret_key'
    ```
 
-   The container runs as user 10001, and it refuses a key file that other users can read. Back up this file, because the bridge can't read its data without it.
+   The key stays in the `aster-bridge-secrets` volume, apart from your data in the `aster-bridge-data` volume, and only the container's user can read it. The command refuses to replace a key that already exists. When you back up or move the bridge, keep both volumes, because the bridge can't read its data without the key.
 
 3. To sign in, run:
 
@@ -102,7 +100,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Your account, cache, and settings stay in the `aster-bridge-data` volume.
+Your account, cache, and settings stay in the `aster-bridge-data` volume, and the key stays in the `aster-bridge-secrets` volume.
 
 ## Build the image yourself
 
