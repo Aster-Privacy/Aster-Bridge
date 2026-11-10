@@ -184,19 +184,19 @@ pub async fn serve(
     loop {
         let (stream, peer) = acceptor.accept(&listener).await;
         if !crate::network::current().peer_allowed(peer.ip()) {
-            tracing::warn!("SMTP rejected non-loopback peer {}", peer);
+            crate::network::note_rejected_peer("SMTP");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Smtp) {
             Some(p) => p,
             None => {
-                tracing::warn!("SMTP connection limit reached, dropping {}", peer);
+                tracing::warn!("SMTP connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }
         };
-        tracing::debug!("SMTP connection from {}", peer);
+        tracing::debug!("SMTP connection accepted");
 
         let session = session.clone();
         let client = client.clone();
@@ -231,14 +231,14 @@ pub async fn run_implicit_tls(
     loop {
         let (stream, peer) = conn_acceptor.accept(&listener).await;
         if !crate::network::current().peer_allowed(peer.ip()) {
-            tracing::warn!("SMTPS rejected non-loopback peer {}", peer);
+            crate::network::note_rejected_peer("SMTPS");
             drop(stream);
             continue;
         }
         let permit = match crate::conn_limit::try_acquire_connection(crate::conn_limit::Protocol::Smtp) {
             Some(p) => p,
             None => {
-                tracing::warn!("SMTPS connection limit reached, dropping {}", peer);
+                tracing::warn!("SMTPS connection limit reached, dropping a connection");
                 drop(stream);
                 continue;
             }
