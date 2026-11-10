@@ -369,9 +369,23 @@ pub fn sign_challenge(identity: &DeviceIdentity, nonce_b64: &str) -> Result<Stri
     sign_with_key(&identity.ed25519_signing_key, nonce_b64)
 }
 
+const DEVICE_CHALLENGE_LABEL: &[u8] = b"aster-device-challenge-v1";
+const DEVICE_CHALLENGE_NONCE_LEN: usize = 32;
+
+fn device_challenge_message(nonce: &[u8]) -> Result<Vec<u8>, String> {
+    if nonce.len() != DEVICE_CHALLENGE_NONCE_LEN {
+        return Err("invalid challenge length".to_string());
+    }
+    let mut message = Vec::with_capacity(DEVICE_CHALLENGE_LABEL.len() + nonce.len());
+    message.extend_from_slice(DEVICE_CHALLENGE_LABEL);
+    message.extend_from_slice(nonce);
+    Ok(message)
+}
+
 pub fn sign_with_key(key: &SigningKey, nonce_b64: &str) -> Result<String, String> {
     let nonce = b64url_decode(nonce_b64)?;
-    let sig = key.sign(&nonce);
+    let message = device_challenge_message(&nonce)?;
+    let sig = key.sign(&message);
     Ok(b64url(&sig.to_bytes()))
 }
 
@@ -792,7 +806,19 @@ mod tests {
         let sig_bytes = b64url_decode(&sig_b64).unwrap();
         let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
         let verifying: VerifyingKey = identity.ed25519_signing_key.verifying_key();
-        assert!(verifying.verify(&nonce_raw, &sig).is_ok());
+        let mut labeled = b"aster-device-challenge-v1".to_vec();
+        labeled.extend_from_slice(&nonce_raw);
+        assert!(verifying.verify_strict(&labeled, &sig).is_ok());
+        assert!(verifying.verify_strict(&nonce_raw, &sig).is_err());
+    }
+
+    #[test]
+    fn sign_challenge_rejects_wrong_nonce_length() {
+        let identity = test_identity();
+        for len in [0usize, 1, 16, 31, 33, 64, 4096] {
+            let nonce_b64 = b64url(&vec![3u8; len]);
+            assert!(sign_challenge(&identity, &nonce_b64).is_err());
+        }
     }
 
     #[test]
