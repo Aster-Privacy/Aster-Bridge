@@ -22,6 +22,7 @@ env:
 jobs:
   build:
     if: ${{ !inputs.cli_only }}
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -385,6 +386,7 @@ jobs:
 
   sign:
     needs: build
+    environment: release
     if: ${{ always() && !inputs.cli_only }}
     runs-on: ubuntu-22.04
     permissions: {}
@@ -418,7 +420,7 @@ jobs:
       - name: Sign every updater bundle with the current and the next updater key
         env:
           UPDATER_KEY_V1: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          UPDATER_KEY_V1_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          UPDATER_KEY_V1_PASSWORD: ''
           UPDATER_KEY_V2: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_V2 }}
           UPDATER_KEY_V2_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_V2 }}
         shell: bash
