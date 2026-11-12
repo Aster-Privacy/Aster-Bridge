@@ -36,6 +36,7 @@ pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;
 pub mod recipient_trust;
+pub mod sealed_details;
 pub mod sent_copy;
 #[cfg(test)]
 mod storage_key_call_sites;
