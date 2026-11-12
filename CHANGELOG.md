@@ -2,6 +2,14 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.17 - 2026-11-12
+
+### What's new
+- You can run Aster Bridge in Docker.
+- Aster Bridge opens mail sent to an OpenPGP key that you imported.
+- Aster Bridge shows the sender details of sealed messages in your mail app.
+- Mail that you send from an alias is signed with a key that belongs to that address.
+
 ## 1.0.16 - 2026-11-05
 
 ### Fixed
