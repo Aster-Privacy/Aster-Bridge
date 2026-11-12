@@ -1625,6 +1625,32 @@ impl Database {
         })
     }
 
+    pub fn update_cached_addressing(
+        &self,
+        aster_id: &str,
+        sender: Option<&str>,
+        recipients: Option<&str>,
+        date: &str,
+    ) -> Result<(), String> {
+        let single_line = |text: &str| {
+            let flat: String = text
+                .chars()
+                .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+                .collect();
+            strip_c0_controls(flat.trim())
+        };
+        let sender = sender.map(single_line).filter(|s| !s.is_empty());
+        let recipients = recipients.map(single_line).filter(|s| !s.is_empty());
+        let date = single_line(date);
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET sender=COALESCE(?2, sender), recipients=?3, date=?4 WHERE aster_id=?1",
+                rusqlite::params![aster_id, sender, recipients, date],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn list_ids_with_body(&self, body_text: &str, limit: usize) -> Result<Vec<String>, String> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn(|conn| {

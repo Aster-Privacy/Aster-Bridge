@@ -30,6 +30,9 @@ use crate::auth::session::Session;
 use zeroize::Zeroizing;
 
 use crate::crypto::ratchet::{encrypt_bootstrap_versioned, RatchetMessage};
+use crate::crypto::sealed_details::{
+    build_sealed_details, format_sent_at, sealed_sender_name, SealedMessageDetails,
+};
 use crate::crypto::recipient_trust::{
     evaluate_recipient, pin_id, verify_bundle, BundleVerdict, RatchetTarget, RecipientPin,
     SendRoute,
@@ -496,20 +499,77 @@ async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
     })
 }
 
-fn sealed_plaintext(payload: &Value) -> String {
+fn payload_addresses(payload: &Value, field: &str) -> Vec<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn payload_details(payload: &Value, account_name: Option<&str>, sent_at: &str) -> SealedMessageDetails {
+    let chosen = payload.get("sender_display_name").and_then(Value::as_str);
+    let sends_from_alias = payload
+        .get("sender_alias_hash")
+        .and_then(Value::as_str)
+        .is_some_and(|hash| !hash.is_empty());
+    build_sealed_details(
+        &sealed_sender_name(chosen, sends_from_alias, account_name),
+        &payload_addresses(payload, "to"),
+        &payload_addresses(payload, "cc"),
+        sent_at,
+    )
+}
+
+fn sealed_plaintext(payload: &Value, account_name: Option<&str>, sent_at: &str) -> String {
     let body = payload
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     let manifest = crate::crypto::attachment::send_attachment_manifest(payload);
-    if manifest.is_empty() {
-        return body.to_string();
-    }
     let subject = payload
         .get("subject")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    crate::crypto::ratchet_recovery::wrap_subject_bundle(subject, body, &manifest)
+    let details = payload_details(payload, account_name, sent_at);
+    crate::crypto::ratchet_recovery::wrap_subject_bundle_with_details(subject, body, &manifest, Some(&details))
+}
+
+fn sealed_send_plaintext(
+    payload: &mut Value,
+    self_placeholder: Option<&str>,
+    account_name: Option<&str>,
+    sent_at: &str,
+) -> String {
+    let only_self = self_placeholder.is_some_and(|own| {
+        matches!(
+            payload.get("to").and_then(Value::as_array).map(Vec::as_slice),
+            Some([only]) if only.as_str().is_some_and(|a| a.trim().eq_ignore_ascii_case(own.trim()))
+        )
+    });
+    if !only_self {
+        return sealed_plaintext(payload, account_name, sent_at);
+    }
+    let addressed = std::mem::replace(&mut payload["to"], json!([]));
+    let plaintext = sealed_plaintext(payload, account_name, sent_at);
+    payload["to"] = addressed;
+    plaintext
+}
+
+async fn account_display_name(session: &Arc<RwLock<Session>>) -> Option<String> {
+    session
+        .read()
+        .await
+        .send_identities
+        .iter()
+        .find(|identity| identity.kind == crate::auth::session::SendIdentityKind::Primary)
+        .and_then(|identity| identity.display_name.clone())
+        .filter(|name| !name.trim().is_empty())
 }
 
 fn has_post_quantum_protection(route: &SendRoute) -> bool {
@@ -680,8 +740,8 @@ async fn seal_internal_body_with(
 ) -> Result<()> {
     let self_placeholder = take_self_to_placeholder(payload);
     let mut lookup = lookup_hosted_recipients(payload, session, client, db, access_token).await?;
-    if let Some(own_address) = self_placeholder {
-        drop_sealed_self_placeholder(payload, &own_address, &lookup.hosted);
+    if let Some(own_address) = self_placeholder.as_deref() {
+        drop_sealed_self_placeholder(payload, own_address, &lookup.hosted);
     }
     let split = split_recipients_with(payload, &lookup.hosted);
     if split.internal.is_empty() {
@@ -697,7 +757,9 @@ async fn seal_internal_body_with(
     enforce_routed_like_external(&lookup.hosted, require_post_quantum)?;
     enforce_private_body(split.has_external, require_post_quantum)?;
 
-    let plaintext = sealed_plaintext(payload);
+    let account_name = account_display_name(session).await;
+    let sent_at = format_sent_at(chrono::Utc::now());
+    let plaintext = sealed_send_plaintext(payload, self_placeholder.as_deref(), account_name.as_deref(), &sent_at);
 
     let sender = sender_keys(session).await?;
     let mut routed: Vec<RoutedRecipient> = Vec::with_capacity(split.internal.len());
@@ -920,10 +982,67 @@ mod tests {
         })
     }
 
+    const TEST_SENT_AT: &str = "2026-11-12T10:15:00.000Z";
+
+    #[test]
+    fn the_sealed_plaintext_carries_the_message_details_without_hidden_recipients() {
+        let mut payload = payload_with(vec!["bo@astermail.org", "cy@astermail.org"]);
+        payload["cc"] = json!(["di@astermail.org"]);
+        payload["bcc"] = json!(["hidden@astermail.org"]);
+        payload["sender_display_name"] = json!("Ana Real");
+        assert_eq!(
+            sealed_plaintext(&payload, Some("Account Name"), TEST_SENT_AT),
+            "\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":\"Hi\",\"b\":\"<p>hello</p>\",\"details\":{\"v\":1,\"from_name\":\"Ana Real\",\"to\":[{\"name\":\"\",\"email\":\"bo@astermail.org\"},{\"name\":\"\",\"email\":\"cy@astermail.org\"}],\"cc\":[{\"name\":\"\",\"email\":\"di@astermail.org\"}],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}}"
+        );
+        assert!(!sealed_plaintext(&payload, None, TEST_SENT_AT).contains("hidden@astermail.org"));
+
+        let opened = crate::crypto::ratchet_recovery::extract_subject_bundle(&sealed_plaintext(&payload, None, TEST_SENT_AT));
+        let details = opened.details.expect("details");
+        assert_eq!(details.from_name, "Ana Real");
+        assert_eq!(details.to.len(), 2);
+        assert_eq!(details.cc.len(), 1);
+        assert_eq!(details.sent_at, TEST_SENT_AT);
+    }
+
+    #[test]
+    fn the_self_placeholder_never_appears_as_a_sealed_recipient() {
+        let mut payload = payload_with(vec!["me@mydomain.example"]);
+        payload["bcc"] = json!(["bob@custom.example", "stranger@example.com"]);
+        let sealed = sealed_send_plaintext(&mut payload, Some("me@mydomain.example"), None, TEST_SENT_AT);
+        let details = crate::crypto::ratchet_recovery::extract_subject_bundle(&sealed).details.expect("details");
+        assert!(details.to.is_empty());
+        assert!(!sealed.contains("stranger@example.com"));
+        assert_eq!(payload["to"], json!(["me@mydomain.example"]));
+
+        let mut addressed = payload_with(vec!["me@mydomain.example"]);
+        let kept = sealed_send_plaintext(&mut addressed, None, None, TEST_SENT_AT);
+        let details = crate::crypto::ratchet_recovery::extract_subject_bundle(&kept).details.expect("details");
+        assert_eq!(details.to[0].email, "me@mydomain.example");
+    }
+
+    #[test]
+    fn the_sealed_sender_name_follows_the_sending_identity() {
+        let name_of = |payload: &Value, account: Option<&str>| payload_details(payload, account, TEST_SENT_AT).from_name;
+        let mut payload = payload_with(vec!["bo@astermail.org"]);
+        payload["cc"] = Value::Null;
+        assert_eq!(name_of(&payload, Some("Account Name")), "Account Name");
+        assert_eq!(name_of(&payload, None), "");
+        assert!(payload_details(&payload, None, TEST_SENT_AT).cc.is_empty());
+        payload["sender_alias_hash"] = json!("aGFzaA==");
+        assert_eq!(name_of(&payload, Some("Account Name")), "");
+        payload["sender_display_name"] = json!("Sales");
+        assert_eq!(name_of(&payload, Some("Account Name")), "Sales");
+    }
+
     #[test]
     fn the_sealed_plaintext_lists_attachments_only_when_there_are_some() {
         let mut payload = payload_with(vec!["user@astermail.org"]);
-        assert_eq!(sealed_plaintext(&payload), "<p>hello</p>");
+        let without = sealed_plaintext(&payload, None, TEST_SENT_AT);
+        assert!(!without.contains("attachment_manifest"));
+        let plain = crate::crypto::ratchet_recovery::extract_subject_bundle(&without);
+        assert_eq!(plain.subject.as_deref(), Some("Hi"));
+        assert_eq!(plain.body, "<p>hello</p>");
+        assert_eq!(plain.attachment_manifest, None);
 
         let sealed = crate::crypto::attachment::seal_send_attachments(
             &[crate::crypto::attachment::OutgoingAttachment {
@@ -937,7 +1056,7 @@ mod tests {
         )
         .unwrap();
         payload["attachments"] = Value::Array(sealed);
-        let opened = crate::crypto::ratchet_recovery::extract_subject_bundle(&sealed_plaintext(&payload));
+        let opened = crate::crypto::ratchet_recovery::extract_subject_bundle(&sealed_plaintext(&payload, None, TEST_SENT_AT));
         assert_eq!(opened.subject.as_deref(), Some("Hi"));
         assert_eq!(opened.body, "<p>hello</p>");
         let manifest = opened.attachment_manifest.expect("manifest");
@@ -1580,7 +1699,7 @@ mod tests {
         let mut payload = payload_with_attachment(vec!["Visible@AsterMail.org", "out@example.com"]);
         payload["bcc"] = json!(["hidden@aster.cx"]);
         let outside_before = payload["attachments"][0]["recipient_encrypted_meta"].clone();
-        let manifest_before = sealed_plaintext(&payload);
+        let manifest_before = sealed_plaintext(&payload, None, TEST_SENT_AT);
 
         let visible = routed("Visible@AsterMail.org", None, &visible_account);
         let hidden = routed("hidden@aster.cx", None, &hidden_account);
@@ -1614,7 +1733,7 @@ mod tests {
             assert!(opened_meta(encoded, other, &me).is_none());
         }
 
-        assert_eq!(sealed_plaintext(&payload), manifest_before);
+        assert_eq!(sealed_plaintext(&payload, None, TEST_SENT_AT), manifest_before);
     }
 
     #[test]
@@ -1651,7 +1770,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let manifest_before = sealed_plaintext(&payload);
+        let manifest_before = sealed_plaintext(&payload, None, TEST_SENT_AT);
 
         let visible = routed("visible@astermail.org", None, &visible_account);
         let hidden = routed("Hidden@Aster.cx", None, &hidden_account);
