@@ -247,6 +247,24 @@ pub struct PrekeyBundle {
     pub pq_kem_public_key: Option<String>,
     #[serde(default)]
     pub x3dh_max_version: Option<i16>,
+    #[serde(default)]
+    pub address_scoped: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddressBundleUploadResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressBundleUpload {
+    Active,
+    Inactive,
+    Unsupported,
+    Rejected,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +288,7 @@ pub struct ReportEnvelopeCapability<'a> {
     pub identity_fingerprint: Option<&'a str>,
     pub x3dh_max_version: i16,
     pub pgp_external_version: i16,
+    pub address_identity_version: i16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1151,9 +1170,23 @@ impl ApiClient {
         username: &str,
         email: &str,
     ) -> Result<Option<PrekeyBundle>> {
+        self.find_prekey_bundle_in_scope(access_token, username, email, false).await
+    }
+
+    pub async fn find_prekey_bundle_in_scope(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+        address_scope: bool,
+    ) -> Result<Option<PrekeyBundle>> {
+        let mut query = vec![("email", email)];
+        if address_scope && !email.trim().is_empty() {
+            query.push(("scope", "address"));
+        }
         let resp = self.client
             .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
-            .query(&[("email", email)])
+            .query(&query)
             .bearer_auth(access_token)
             .send()
             .await?;
@@ -1206,6 +1239,37 @@ impl ApiClient {
             public_key: if key.is_empty() { None } else { Some(key) },
             internal: body.internal,
         }))
+    }
+
+    pub async fn put_address_bundle<T: Serialize + ?Sized>(
+        &self,
+        access_token: &str,
+        entry: &T,
+    ) -> Result<AddressBundleUpload> {
+        let resp = self.client
+            .put(format!("{}/crypto/v1/ratchet/address-bundle", self.base_url))
+            .bearer_auth(access_token)
+            .json(entry)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(AddressBundleUpload::Unsupported);
+        }
+        if status.is_client_error() {
+            return Ok(AddressBundleUpload::Rejected);
+        }
+        if !status.is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: AddressBundleUploadResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(if body.active {
+            AddressBundleUpload::Active
+        } else {
+            AddressBundleUpload::Inactive
+        })
     }
 
     pub async fn report_envelope_capability(

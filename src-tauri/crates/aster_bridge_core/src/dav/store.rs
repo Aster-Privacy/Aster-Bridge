@@ -677,6 +677,7 @@ mod tests {
             ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial {
                 storage_keys: storage_keys.into_iter().map(zeroize::Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
+                address_keys: Default::default(),
             },
             external_pgp_key: None,
         };

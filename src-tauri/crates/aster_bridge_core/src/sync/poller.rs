@@ -1925,6 +1925,15 @@ async fn fetch_pq_secrets(
     Vec::new()
 }
 
+fn open_with_sets(
+    account: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    derived: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    msg: &crate::crypto::ratchet::RatchetMessage,
+) -> Option<String> {
+    crate::crypto::ratchet::decrypt_with_key_sets(account, msg)
+        .or_else(|| crate::crypto::ratchet::decrypt_with_key_sets(derived, msg))
+}
+
 async fn try_bootstrap(
     ctx: &InternalDecryptContext<'_>,
     ratchet_obj: &serde_json::Value,
@@ -1934,20 +1943,36 @@ async fn try_bootstrap(
         return None;
     }
     let mut msg = crate::crypto::ratchet::parse_recipient_message(ratchet_obj, address)?;
-    let Some(key_id) = msg.pq_key_id else {
-        return crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
+    let mut derived = ctx.recovery.address_keys.receiver_key_sets(address);
+    let opened = match msg.pq_key_id {
+        None => open_with_sets(ctx.ratchet_keys, &derived, &msg),
+        Some(key_id) => {
+            let mut secrets = fetch_pq_secrets(ctx, key_id).await;
+            if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
+                for secret in ctx.recovery.address_keys.pq_secrets(address) {
+                    if !secrets.iter().any(|s| s.as_slice() == secret.as_slice()) {
+                        secrets.push(secret);
+                    }
+                }
+            }
+            let mut opened = None;
+            for secret in secrets {
+                msg.pq_secret = Some(secret.to_vec());
+                opened = open_with_sets(ctx.ratchet_keys, &derived, &msg);
+                if let Some(mut s) = msg.pq_secret.take() {
+                    s.zeroize();
+                }
+                if opened.is_some() {
+                    break;
+                }
+            }
+            opened
+        }
     };
-    for secret in fetch_pq_secrets(ctx, key_id).await {
-        msg.pq_secret = Some(secret.to_vec());
-        let opened = crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
-        if let Some(mut s) = msg.pq_secret.take() {
-            s.zeroize();
-        }
-        if opened.is_some() {
-            return opened;
-        }
+    for set in derived.iter_mut() {
+        set.zeroize();
     }
-    None
+    opened
 }
 
 async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
@@ -2034,7 +2059,20 @@ async fn try_decrypt_internal_mail(
                 &conversation,
                 sender_identity,
                 &ctx.recovery.lane_candidates,
-            );
+            )
+            .or_else(|| {
+                let mut derived = ctx.recovery.address_keys.lane_candidates(&attempt.address);
+                let result = crate::crypto::ratchet_recovery::decrypt_via_recovery_lane(
+                    attempt.data,
+                    &conversation,
+                    sender_identity,
+                    &derived,
+                );
+                for candidate in derived.iter_mut() {
+                    candidate.zeroize();
+                }
+                result
+            });
             if opened.is_some() {
                 sender_unverified = true;
                 break;
@@ -2216,6 +2254,7 @@ fn store_unsealed_message(
         meta_map.insert("sender_unverified".to_string(), serde_json::json!(true));
     } else {
         meta_map.remove("sender_unverified");
+        meta_map.remove("reply_to");
     }
     let details = bundle.details.as_ref().filter(|_| !bundle.sender_unverified);
     if let Some(details) = details {
@@ -2255,7 +2294,11 @@ fn store_unsealed_message(
     if !listed.is_empty() {
         reconcile_listed_attachments(db, aster_id, &listed);
     }
-    if let Some(subject) = bundle.subject.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(subject) = bundle
+        .subject
+        .as_deref()
+        .filter(|s| !bundle.sender_unverified || !s.trim().is_empty())
+    {
         if let Err(e) = db.update_cached_subject(aster_id, subject) {
             tracing::warn!("storing decrypted ratchet subject for {} failed: {}", aster_id, e);
         }
@@ -4573,6 +4616,61 @@ mod tests {
     }
 
     #[test]
+    fn sealed_fields_replace_every_server_supplied_field() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let keys = [inbound_candidate(&recipient)];
+        let mut served = ratchet_envelope("Server Name <bob@astermail.org>", "BDh==");
+        served["subject"] = serde_json::json!("Server subject");
+        served["to"] = serde_json::json!([{"name": "Wrong", "email": "wrong@astermail.org"}]);
+        served["cc"] = serde_json::json!([{"name": "Extra", "email": "extra@astermail.org"}]);
+        served["raw_headers"] = serde_json::json!([{"name": "Reply-To", "value": "Thief <thief@example.com>"}]);
+        served["attachment_keys"] = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "swap.exe"}]);
+        for id in ["sealed-fields", "unverified-fields"] {
+            let item = inbound_item(id, &served, &recipient);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
+            assert_eq!(cached_meta(&db, id)["reply_to"], "Thief <thief@example.com>");
+        }
+        let details = crate::crypto::sealed_details::build_sealed_details(
+            "Bob Real",
+            &["me@astermail.org".to_string()],
+            &[],
+            "2026-11-12T10:15:00.000Z",
+        );
+        let sealed = |sender_unverified| crate::crypto::ratchet_recovery::SubjectBundle {
+            subject: Some(String::new()),
+            body: "real body".to_string(),
+            sender_unverified,
+            attachment_manifest: None,
+            details: Some(details.clone()),
+        };
+        assert!(store_unsealed_message(&db, "sealed-fields", &sealed(false)));
+        let cached = db.get_cached_message("sealed-fields").unwrap().unwrap();
+        let meta = cached_meta(&db, "sealed-fields");
+        assert_eq!(cached.subject.as_deref(), Some(""));
+        assert_eq!(cached.sender.as_deref(), Some("Bob Real <bob@astermail.org>"));
+        assert_eq!(cached.recipients.as_deref(), Some("me@astermail.org"));
+        assert!(cached.date.as_deref().unwrap_or_default().starts_with("2026-11-12T10:15:00"));
+        assert!(meta.get("reply_to").is_none());
+        assert!(meta.get("cc").is_none());
+        assert!(crate::message_render::attachments_unverified(&meta));
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(!rendered.contains("thief@example.com"));
+        assert!(!rendered.contains("Server subject"));
+        assert!(!rendered.contains("Server Name"));
+        assert!(rendered.contains(crate::message_render::ATTACHMENTS_UNVERIFIED_NOTE));
+
+        assert!(store_unsealed_message(&db, "unverified-fields", &sealed(true)));
+        let cached = db.get_cached_message("unverified-fields").unwrap().unwrap();
+        let meta = cached_meta(&db, "unverified-fields");
+        assert!(crate::message_render::sender_unverified(&meta));
+        assert!(meta.get(crate::crypto::sealed_details::SEALED_DETAILS_META_KEY).is_none());
+        assert_eq!(cached.subject.as_deref(), Some("Server subject"));
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(rendered.contains(crate::message_render::SENDER_UNVERIFIED_NOTE));
+    }
+
+    #[test]
     fn a_sealed_ratchet_message_with_listed_attachments_is_flagged_at_cache_time() {
         let (_dir, db) = temp_db();
         let keys = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "invoice.pdf"}]);
@@ -4632,6 +4730,7 @@ mod tests {
         let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
             storage_keys: Vec::new(),
             lane_candidates: Vec::new(),
+            address_keys: Default::default(),
         };
         let escrow_keys = vec![key];
         let ctx = InternalDecryptContext {
