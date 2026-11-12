@@ -39,6 +39,7 @@ use crate::crypto::recipient_trust::{
     RatchetTarget, RecipientPin, SendRoute,
 };
 use crate::crypto::address_directory::{AddressEntryDirectory, AddressEntryState, ADDRESS_ENTRIES};
+use crate::crypto::address_identity::{address_entry_forms, is_primary_address, AddressKeyring, SignedAddressEntry};
 use crate::db::Database;
 use crate::error::{BridgeError, Result};
 
@@ -384,6 +385,7 @@ struct SenderKeys {
     account_id: String,
     account_key: Option<Zeroizing<String>>,
     passphrase: Zeroizing<Vec<u8>>,
+    signs_with_account_key: bool,
 }
 
 struct RoutedRecipient {
@@ -429,6 +431,51 @@ fn seal_ratchet_envelope(
     Ok(sender_identity_key.map(|key| build_envelope(&key, sealed)))
 }
 
+const NO_ACCOUNT_KEY_FOR_MESSAGES: &str =
+    "no account key in the vault; cannot encrypt for Aster recipients";
+const NO_ACCOUNT_KEY_FOR_ATTACHMENTS: &str =
+    "no account key in the vault; cannot encrypt attachments for Aster recipients";
+
+fn no_account_key(message: &str) -> BridgeError {
+    BridgeError::Crypto(message.to_string())
+}
+
+fn import_recipient_keys(recipient_keys: &[&str]) -> Result<Vec<aster_crypto::PublicKey>> {
+    recipient_keys
+        .iter()
+        .map(|armored| {
+            aster_crypto::import_public_key(armored).map_err(|_| {
+                BridgeError::RecipientKey(
+                    "A recipient's published encryption key could not be read, so the message was not sent."
+                        .to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn seal_without_account_signature(plaintext: &str, recipient_keys: &[&str]) -> Result<String> {
+    let keys = import_recipient_keys(recipient_keys)?;
+    let references: Vec<&aster_crypto::PublicKey> = keys.iter().collect();
+    let armored = aster_crypto::encrypt_message(plaintext.as_bytes(), &references)
+        .map_err(|_| BridgeError::Crypto("the message could not be encrypted".to_string()))?;
+    String::from_utf8(armored)
+        .map_err(|_| BridgeError::Crypto("the message could not be encrypted".to_string()))
+}
+
+fn seal_for_account_keys(
+    sender: &SenderKeys,
+    plaintext: &str,
+    recipient_keys: &[&str],
+    missing_key: &str,
+) -> Result<String> {
+    if !sender.signs_with_account_key {
+        return seal_without_account_signature(plaintext, recipient_keys);
+    }
+    let account_key = sender.account_key.as_ref().ok_or_else(|| no_account_key(missing_key))?;
+    seal_with_account_keys(plaintext, recipient_keys, account_key, &sender.passphrase)
+}
+
 fn seal_with_account_keys(
     plaintext: &str,
     recipient_keys: &[&str],
@@ -442,15 +489,7 @@ fn seal_with_account_keys(
             .to_string(),
     );
     let signer = aster_crypto::import_secret_key(sender_account_key).map_err(|_| unusable())?;
-    let mut keys = Vec::with_capacity(recipient_keys.len() + 1);
-    for armored in recipient_keys {
-        keys.push(aster_crypto::import_public_key(armored).map_err(|_| {
-            BridgeError::RecipientKey(
-                "A recipient's published encryption key could not be read, so the message was not sent."
-                    .to_string(),
-            )
-        })?);
-    }
+    let mut keys = import_recipient_keys(recipient_keys)?;
     keys.push(signer.public_key());
     let references: Vec<&aster_crypto::PublicKey> = keys.iter().collect();
     let armored = aster_crypto::encrypt_and_sign_with_passphrase(
@@ -468,11 +507,9 @@ fn seal_routed(sender: &SenderKeys, recipients: &[RoutedRecipient], plaintext: &
     if let Some(envelope) = seal_ratchet_envelope(&sender.identity_secret_d, recipients, plaintext)? {
         return Ok(envelope);
     }
-    let account_key = sender.account_key.as_ref().ok_or_else(|| {
-        BridgeError::Crypto(
-            "no account key in the vault; cannot encrypt for Aster recipients".to_string(),
-        )
-    })?;
+    if sender.signs_with_account_key && sender.account_key.is_none() {
+        return Err(no_account_key(NO_ACCOUNT_KEY_FOR_MESSAGES));
+    }
     let mut recipient_keys = Vec::with_capacity(recipients.len());
     for recipient in recipients {
         recipient_keys.push(recipient.account_key.as_deref().ok_or_else(|| {
@@ -482,7 +519,7 @@ fn seal_routed(sender: &SenderKeys, recipients: &[RoutedRecipient], plaintext: &
             ))
         })?);
     }
-    seal_with_account_keys(plaintext, &recipient_keys, account_key, &sender.passphrase)
+    seal_for_account_keys(sender, plaintext, &recipient_keys, NO_ACCOUNT_KEY_FOR_MESSAGES)
 }
 
 async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
@@ -498,15 +535,8 @@ async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
         account_id: guard.user_id.to_string(),
         account_key: guard.identity_key.clone().map(Zeroizing::new),
         passphrase: Zeroizing::new(guard.vault_passphrase.clone()),
+        signs_with_account_key: true,
     })
-}
-
-fn address_ignoring_dots(address: &str) -> String {
-    let lowered = address.trim().to_lowercase();
-    match lowered.rfind('@') {
-        Some(at) => format!("{}{}", lowered[..at].replace('.', ""), &lowered[at..]),
-        None => lowered.replace('.', ""),
-    }
 }
 
 fn sender_identity_failed() -> BridgeError {
@@ -531,11 +561,15 @@ async fn address_sender_secret(
     else {
         return Ok(None);
     };
-    let (primary, keyring) = {
+    let (primary, username, keyring) = {
         let guard = session.read().await;
-        (guard.email.clone(), guard.ratchet_recovery.address_keys.clone())
+        (
+            guard.email.clone(),
+            guard.username.clone(),
+            guard.ratchet_recovery.address_keys.clone(),
+        )
     };
-    if !primary.trim().is_empty() && address_ignoring_dots(&primary) == address_ignoring_dots(sender_email) {
+    if is_primary_address(&primary, sender_email) {
         return Ok(None);
     }
     if keyring.current_identity_public().is_none() {
@@ -546,12 +580,60 @@ async fn address_sender_secret(
         .await
     {
         AddressEntryState::Inactive => Ok(None),
-        AddressEntryState::Failed => Err(sender_identity_failed()),
         AddressEntryState::Active => keyring
             .sender_identity(sender_email)
             .map(|derived| Some(derived.scalar))
             .ok_or_else(sender_identity_failed),
+        AddressEntryState::Unconfirmed => {
+            let Some(published) = published_sender_entry(client, access_token, &username, sender_email).await? else {
+                return Ok(None);
+            };
+            let local = address_entry_forms(sender_email)
+                .first()
+                .and_then(|form| keyring.sign_entry(form));
+            match (local, keyring.sender_identity(sender_email)) {
+                (Some(local), Some(derived)) if is_same_entry(&published, &local) => Ok(Some(derived.scalar)),
+                _ => Err(sender_identity_failed()),
+            }
+        }
     }
+}
+
+async fn published_sender_entry(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    sender_email: &str,
+) -> Result<Option<PrekeyBundle>> {
+    let lookup_username = key_lookup_username(sender_email, username).ok_or_else(sender_identity_failed)?;
+    Ok(client
+        .find_prekey_bundle_in_scope(access_token, &lookup_username, sender_email, true)
+        .await?
+        .filter(is_address_scoped))
+}
+
+fn present(key: Option<&str>) -> Option<&str> {
+    key.filter(|key| !key.is_empty())
+}
+
+fn is_same_entry(published: &PrekeyBundle, local: &SignedAddressEntry) -> bool {
+    published.kem_identity_key == local.kem_identity_key
+        && published.signed_prekey == local.signed_prekey
+        && present(published.pq_kem_public_key.as_deref()) == present(local.pq_kem_public_key.as_deref())
+}
+
+fn local_address_bundle(keyring: &AddressKeyring, address: &str) -> Option<PrekeyBundle> {
+    let form = address_entry_forms(address).into_iter().next()?;
+    let entry = keyring.sign_entry(&form)?;
+    Some(PrekeyBundle {
+        kem_identity_key: entry.kem_identity_key,
+        signed_prekey: entry.signed_prekey,
+        signed_prekey_signature: Some(entry.signed_prekey_signature),
+        pq_prekey: None,
+        pq_kem_public_key: entry.pq_kem_public_key,
+        x3dh_max_version: Some(2),
+        address_scoped: Some(true),
+    })
 }
 
 fn payload_addresses(payload: &Value, field: &str) -> Vec<String> {
@@ -698,6 +780,41 @@ fn is_own_address(session: &Session, address: &str) -> bool {
             .any(|identity| identity.address.trim().eq_ignore_ascii_case(address))
 }
 
+fn same_entry_address(left: &str, right: &str) -> bool {
+    let left = address_entry_forms(left);
+    !left.is_empty() && left.first() == address_entry_forms(right).first()
+}
+
+fn local_self_recipient(
+    session: &Session,
+    directory: &AddressEntryDirectory,
+    address: &str,
+    derived_sender: Option<&str>,
+) -> Option<RoutedRecipient> {
+    if !is_own_address(session, address) || is_primary_address(&session.email, address) {
+        return None;
+    }
+    let keyring = &session.ratchet_recovery.address_keys;
+    let active = derived_sender.is_some_and(|sender| same_entry_address(sender, address))
+        || directory.known_state(keyring, address) == Some(AddressEntryState::Active);
+    if !active {
+        return None;
+    }
+    let bundle = local_address_bundle(keyring, address)?;
+    let route = evaluate_address_entry(address, &bundle, DirectoryTrust::Entry, None, None)
+        .outcome
+        .ok()?;
+    let account_key = aster_crypto::import_secret_key(session.identity_key.as_deref()?)
+        .ok()?
+        .public_key_armored()
+        .ok()?;
+    Some(RoutedRecipient {
+        address: address.to_string(),
+        route,
+        account_key: Some(account_key),
+    })
+}
+
 async fn lookup_hosted_recipients(
     payload: &Value,
     session: &Arc<RwLock<Session>>,
@@ -789,7 +906,7 @@ async fn resolve_recipient_route(
         Some(bundle) if is_address_scoped(&bundle) => {
             let trust = classify_scoped_entry(address, &bundle, existing);
             if trust != DirectoryTrust::Account {
-                return Ok(evaluate_address_entry(address, &bundle, trust, existing));
+                return Ok(evaluate_address_entry(address, &bundle, trust, existing, owner_public_key));
             }
             let account_bundle = client
                 .find_prekey_bundle_in_scope(access_token, username, address, false)
@@ -870,11 +987,23 @@ async fn seal_internal_body_with(
     let mut sender = sender_keys(session).await?;
     if let Some(secret) = address_sender_secret(payload, session, client, access_token, directory).await? {
         sender.identity_secret_d = secret.to_vec();
+        sender.signs_with_account_key = false;
     }
+    let derived_sender = (!sender.signs_with_account_key)
+        .then(|| payload.get("sender_email").and_then(Value::as_str))
+        .flatten();
     let mut routed: Vec<RoutedRecipient> = Vec::with_capacity(split.internal.len());
     let mut pending_pins = Vec::new();
 
     for address in &split.internal {
+        let own_copy = {
+            let guard = session.read().await;
+            local_self_recipient(&guard, directory, address, derived_sender)
+        };
+        if let Some(own_copy) = own_copy {
+            routed.push(own_copy);
+            continue;
+        }
         let is_hosted = lookup.hosted.contains(address);
         let (username, bundle, owner_public_key) = match lookup.take(address) {
             Some(known) => (known.username, known.bundle, known.owner_public_key),
@@ -996,12 +1125,9 @@ fn seal_attachment_metas(
     if private.is_empty() && shared.is_none() {
         return Ok(());
     }
-    let account_key = sender.account_key.as_ref().ok_or_else(|| {
-        BridgeError::Crypto(
-            "no account key in the vault; cannot encrypt attachments for Aster recipients"
-                .to_string(),
-        )
-    })?;
+    if sender.signs_with_account_key && sender.account_key.is_none() {
+        return Err(no_account_key(NO_ACCOUNT_KEY_FOR_ATTACHMENTS));
+    }
     let unreadable = || {
         BridgeError::Crypto("an attachment could not be prepared for Aster recipients".to_string())
     };
@@ -1017,11 +1143,11 @@ fn seal_attachment_metas(
         if !private.is_empty() {
             let mut metas = serde_json::Map::new();
             for recipient in private {
-                let sealed = seal_with_account_keys(
+                let sealed = seal_for_account_keys(
+                    sender,
                     meta,
                     &[recipient_account_key(recipient)?],
-                    account_key,
-                    &sender.passphrase,
+                    NO_ACCOUNT_KEY_FOR_ATTACHMENTS,
                 )?;
                 metas.insert(
                     recipient.address.trim().to_lowercase(),
@@ -1035,7 +1161,7 @@ fn seal_attachment_metas(
                 .iter()
                 .map(|recipient| recipient_account_key(recipient))
                 .collect::<Result<Vec<&str>>>()?;
-            let sealed = seal_with_account_keys(meta, &keys, account_key, &sender.passphrase)?;
+            let sealed = seal_for_account_keys(sender, meta, &keys, NO_ACCOUNT_KEY_FOR_ATTACHMENTS)?;
             attachment["recipient_encrypted_meta"] = json!(STANDARD.encode(sealed.as_bytes()));
         }
     }
@@ -1391,6 +1517,7 @@ mod tests {
             account_id: "account".to_string(),
             account_key: Some(Zeroizing::new(account.keypair.to_armored().unwrap())),
             passphrase: Zeroizing::new(Vec::new()),
+            signs_with_account_key: true,
         }
     }
 
@@ -1994,6 +2121,98 @@ mod tests {
         ));
     }
 
+    fn opened_by(armored: &str, reader: &crate::crypto::recipient_trust::tests::Owner) -> bool {
+        aster_crypto::decrypt_message(armored.as_bytes(), &[&reader.keypair]).is_ok()
+    }
+
+    fn signed_by(
+        armored: &str,
+        reader: &crate::crypto::recipient_trust::tests::Owner,
+        signer: &crate::crypto::recipient_trust::tests::Owner,
+    ) -> bool {
+        aster_crypto::decrypt_and_verify_with_passphrase(
+            armored.as_bytes(),
+            &[&reader.keypair],
+            &[&signer.keypair.public_key()],
+            "",
+        )
+        .is_ok()
+    }
+
+    fn alias_sender(account: &crate::crypto::recipient_trust::tests::Owner) -> SenderKeys {
+        SenderKeys {
+            signs_with_account_key: false,
+            ..sender(account)
+        }
+    }
+
+    #[test]
+    fn the_account_key_fallback_signs_for_the_primary_address_and_not_for_an_alias() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let account = owner("user");
+        let me = owner("sender");
+        let recipients = [routed("user@astermail.org", None, &account)];
+
+        let primary = seal_routed(&sender(&me), &recipients, "hello").unwrap();
+        assert!(signed_by(&primary, &account, &me));
+        assert!(opened_by(&primary, &me));
+
+        let alias = seal_routed(&alias_sender(&me), &recipients, "hello").unwrap();
+        assert_eq!(
+            aster_crypto::decrypt_message(alias.as_bytes(), &[&account.keypair]).unwrap(),
+            b"hello"
+        );
+        assert!(!signed_by(&alias, &account, &me));
+        assert!(!opened_by(&alias, &me));
+
+        let mut keyless_alias = alias_sender(&me);
+        keyless_alias.account_key = None;
+        assert!(seal_routed(&keyless_alias, &recipients, "hello").is_ok());
+    }
+
+    #[test]
+    fn attachment_metas_are_signed_for_the_primary_address_and_not_for_an_alias() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let visible_account = owner("visible");
+        let hidden_account = owner("hidden");
+        let me = owner("sender");
+        let visible = routed("visible@astermail.org", None, &visible_account);
+        let hidden = routed("hidden@aster.cx", None, &hidden_account);
+
+        for (keys, signs) in [(sender(&me), true), (alias_sender(&me), false)] {
+            let mut payload = payload_with_attachment(vec!["visible@astermail.org"]);
+            payload["bcc"] = json!(["hidden@aster.cx"]);
+            seal_attachment_metas(&mut payload, &keys, &[&hidden], Some(&[&visible])).expect("sealed");
+            let attachment = &payload["attachments"][0];
+            let private = String::from_utf8(
+                STANDARD
+                    .decode(attachment["recipient_metas"]["hidden@aster.cx"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let shared = String::from_utf8(
+                STANDARD
+                    .decode(attachment["recipient_encrypted_meta"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(opened_by(&private, &hidden_account));
+            assert!(opened_by(&shared, &visible_account));
+            assert!(!opened_by(&shared, &hidden_account));
+            assert_eq!(signed_by(&private, &hidden_account, &me), signs);
+            assert_eq!(signed_by(&shared, &visible_account, &me), signs);
+            assert_eq!(opened_by(&private, &me), signs);
+            assert_eq!(opened_by(&shared, &me), signs);
+        }
+
+        let mut keyless_alias = alias_sender(&me);
+        keyless_alias.account_key = None;
+        let mut payload = payload_with_attachment(vec!["visible@astermail.org"]);
+        assert!(seal_attachment_metas(&mut payload, &keyless_alias, &[&visible], None).is_ok());
+    }
+
     fn lookup(public_key: Option<&str>, internal: bool) -> RecipientKeyLookup {
         RecipientKeyLookup {
             public_key: public_key.map(str::to_string),
@@ -2582,10 +2801,53 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            send_from(Some("s.ender+news@astermail.org"), AddressEntryDirectory::new()).await.unwrap(),
+            vec![account_identity.clone()]
+        );
+
         directory.entry_status.store(500, Ordering::SeqCst);
+        let uploads = directory.entries.lock().unwrap().len();
+        assert_eq!(
+            send_from(Some(alias), AddressEntryDirectory::new()).await.unwrap(),
+            vec![account_identity.clone()],
+            "an upload error with no active entry keeps the account identity"
+        );
+        assert_eq!(directory.entries.lock().unwrap().len(), uploads + 1);
+
+        let entry_json = |entry: &crate::crypto::address_identity::SignedAddressEntry| {
+            json!({
+                "kem_identity_key": entry.kem_identity_key,
+                "signed_prekey": entry.signed_prekey,
+                "signed_prekey_signature": entry.signed_prekey_signature,
+                "pq_kem_public_key": entry.pq_kem_public_key,
+                "x3dh_max_version": 2,
+                "address_scoped": true,
+            })
+        };
+        let entry = keyring.sign_entry(alias).unwrap();
+        directory.set_scoped(alias, Some(entry_json(&entry)));
+        assert_eq!(
+            send_from(Some(alias), AddressEntryDirectory::new()).await.unwrap(),
+            vec![alias_identity.clone()],
+            "an upload error with our own active entry keeps the address identity"
+        );
+
+        let mut other = entry.clone();
+        other.signed_prekey = STANDARD.encode([0x11u8; 65]);
+        directory.set_scoped(alias, Some(entry_json(&other)));
         assert!(matches!(
             send_from(Some(alias), AddressEntryDirectory::new()).await,
             Err(BridgeError::Crypto(_))
+        ));
+        directory.set_scoped(alias, None);
+
+        let offline = ApiClient::new_with_base_url("http://127.0.0.1:9");
+        let mut payload = payload_with(vec!["amy@astermail.org"]);
+        payload["sender_email"] = json!(alias);
+        assert!(matches!(
+            seal_internal_body_with(&mut payload, &session, &offline, &db, "token", true, &AddressEntryDirectory::new()).await,
+            Err(BridgeError::Network(_))
         ));
 
         session.write().await.ratchet_recovery.address_keys = Default::default();
@@ -2642,6 +2904,63 @@ mod tests {
         assert!(stored.address_rooted);
 
         directory.set_scoped(address, None);
-        assert!(seal().await.is_err(), "an unscoped answer for a rooted address is refused");
+        let refused = seal().await.unwrap_err();
+        assert!(
+            matches!(&refused, BridgeError::RecipientKey(message) if message.contains("recipient-key accept")),
+            "an unscoped answer for a rooted address asks to accept the changed key: {refused:?}"
+        );
+        let shown = crate::crypto::recipient_trust::key_fingerprint(Some(&amy.public_key)).unwrap();
+        crate::crypto::recipient_trust::accept_recipient_key(&db, &account_id, address, Some(&amy.public_key), &shown).unwrap();
+        let accepted = seal().await.unwrap();
+        assert_eq!(accepted["is_e2e_encrypted"], json!(true));
+        let stored = crate::crypto::recipient_trust::read_recipient_pin(&db, &account_id, address)
+            .unwrap()
+            .pin
+            .unwrap();
+        assert!(!stored.address_rooted && !stored.flagged);
+    }
+
+    #[tokio::test]
+    async fn a_copy_to_our_own_alias_is_sealed_without_fetching_its_entry() {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        use crate::crypto::address_identity::tests::fixed_keyring;
+        use crate::crypto::recipient_trust::tests::owner;
+        use std::sync::atomic::Ordering;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let offline = ApiClient::new_with_base_url("http://127.0.0.1:9");
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let alias = "sender.alias@astermail.org";
+        {
+            let mut guard = session.write().await;
+            guard.ratchet_recovery.address_keys = fixed_keyring();
+            guard.send_identities = vec![SendIdentity {
+                address: alias.to_string(),
+                auth_hash_b64: None,
+                display_name: None,
+                kind: SendIdentityKind::Alias,
+                enabled: true,
+                sender_id: "alias-1".to_string(),
+            }];
+        }
+        let entries = AddressEntryDirectory::new();
+        directory.entry_status.store(200, Ordering::SeqCst);
+
+        let mut payload = payload_with(vec![alias]);
+        payload["sender_email"] = json!(alias);
+        seal_internal_body_with(&mut payload, &session, &client, &db, "token", true, &entries)
+            .await
+            .unwrap();
+        assert_eq!(payload["is_e2e_encrypted"], json!(true));
+
+        let mut payload = payload_with(vec![alias]);
+        payload["sender_email"] = json!("sender@astermail.org");
+        seal_internal_body_with(&mut payload, &session, &offline, &db, "token", true, &entries)
+            .await
+            .unwrap();
+        assert_eq!(payload["is_e2e_encrypted"], json!(true));
     }
 }

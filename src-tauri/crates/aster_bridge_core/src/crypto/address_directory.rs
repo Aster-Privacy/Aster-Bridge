@@ -26,13 +26,12 @@ use crate::crypto::address_identity::{address_entry_forms, AddressKeyring};
 
 const ACTIVE_REFRESH: Duration = Duration::from_secs(6 * 60 * 60);
 const INACTIVE_RETRY: Duration = Duration::from_secs(10 * 60);
-const FAILED_RETRY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressEntryState {
     Active,
     Inactive,
-    Failed,
+    Unconfirmed,
 }
 
 struct PublishedState {
@@ -84,6 +83,12 @@ impl AddressEntryDirectory {
         })
     }
 
+    pub fn known_state(&self, keyring: &AddressKeyring, address: &str) -> Option<AddressEntryState> {
+        let exact = address_entry_forms(address).into_iter().next()?;
+        keyring.current_identity_public()?;
+        self.cached(&exact, &keyring.fingerprint(), Instant::now())
+    }
+
     fn is_unsupported(&self, now: Instant) -> bool {
         self.with_state(|state| state.unsupported_until.is_some_and(|until| now < until))
     }
@@ -113,10 +118,10 @@ impl AddressEntryDirectory {
     ) -> AddressEntryState {
         let forms = address_entry_forms(address);
         let Some(exact) = forms.first().cloned() else {
-            return AddressEntryState::Failed;
+            return AddressEntryState::Unconfirmed;
         };
         if keyring.current_identity_public().is_none() {
-            return AddressEntryState::Failed;
+            return AddressEntryState::Unconfirmed;
         }
         let fingerprint = keyring.fingerprint();
         let now = Instant::now();
@@ -126,7 +131,9 @@ impl AddressEntryDirectory {
         if self.is_unsupported(now) {
             return AddressEntryState::Inactive;
         }
-        let (outcome, retry) = self.upload(client, access_token, keyring, &exact).await;
+        let Some((outcome, retry)) = self.upload(client, access_token, keyring, &exact).await else {
+            return AddressEntryState::Unconfirmed;
+        };
         for form in forms.iter().skip(1) {
             if self.is_unsupported(Instant::now()) {
                 break;
@@ -143,20 +150,18 @@ impl AddressEntryDirectory {
         access_token: &str,
         keyring: &AddressKeyring,
         form: &str,
-    ) -> (AddressEntryState, Duration) {
-        let Some(entry) = keyring.sign_entry(form) else {
-            return (AddressEntryState::Failed, FAILED_RETRY);
-        };
+    ) -> Option<(AddressEntryState, Duration)> {
+        let entry = keyring.sign_entry(form)?;
         match client.put_address_bundle(access_token, &entry).await {
-            Ok(AddressBundleUpload::Active) => (AddressEntryState::Active, ACTIVE_REFRESH),
+            Ok(AddressBundleUpload::Active) => Some((AddressEntryState::Active, ACTIVE_REFRESH)),
             Ok(AddressBundleUpload::Inactive) | Ok(AddressBundleUpload::Rejected) => {
-                (AddressEntryState::Inactive, INACTIVE_RETRY)
+                Some((AddressEntryState::Inactive, INACTIVE_RETRY))
             }
             Ok(AddressBundleUpload::Unsupported) => {
                 self.mark_unsupported();
-                (AddressEntryState::Inactive, INACTIVE_RETRY)
+                Some((AddressEntryState::Inactive, INACTIVE_RETRY))
             }
-            Err(_) => (AddressEntryState::Failed, FAILED_RETRY),
+            Err(_) => None,
         }
     }
 }
@@ -265,7 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_entry_is_inactive_and_a_server_error_fails() {
+    async fn a_rejected_entry_is_inactive_and_a_server_error_is_retried_on_the_next_send() {
         let (client, _server) = start_server(400, true).await;
         let directory = AddressEntryDirectory::new();
         assert_eq!(
@@ -278,26 +283,40 @@ mod tests {
         let keyring = fixed_keyring();
         assert_eq!(
             directory.entry_state(&client, "token", &keyring, "alias@example.org").await,
-            AddressEntryState::Failed
+            AddressEntryState::Unconfirmed
         );
+        assert_eq!(directory.known_state(&keyring, "alias@example.org"), None);
+        assert_eq!(
+            directory.entry_state(&client, "token", &keyring, "alias@example.org").await,
+            AddressEntryState::Unconfirmed
+        );
+        assert_eq!(uploaded(&server).len(), 2);
         server.status.store(200, Ordering::SeqCst);
         assert_eq!(
             directory.entry_state(&client, "token", &keyring, "alias@example.org").await,
-            AddressEntryState::Failed
+            AddressEntryState::Active
+        );
+        assert_eq!(directory.known_state(&keyring, "alias@example.org"), Some(AddressEntryState::Active));
+
+        let offline = ApiClient::new_with_base_url("http://127.0.0.1:9");
+        let directory = AddressEntryDirectory::new();
+        assert_eq!(
+            directory.entry_state(&offline, "token", &keyring, "alias@example.org").await,
+            AddressEntryState::Unconfirmed
         );
     }
 
     #[tokio::test]
-    async fn a_keyring_without_keys_or_a_bad_address_fails() {
+    async fn a_keyring_without_keys_or_a_bad_address_is_unconfirmed() {
         let (client, server) = start_server(200, true).await;
         let directory = AddressEntryDirectory::new();
         assert_eq!(
             directory.entry_state(&client, "token", &AddressKeyring::default(), "alias@example.org").await,
-            AddressEntryState::Failed
+            AddressEntryState::Unconfirmed
         );
         assert_eq!(
             directory.entry_state(&client, "token", &fixed_keyring(), "+tag@example.org").await,
-            AddressEntryState::Failed
+            AddressEntryState::Unconfirmed
         );
         assert!(uploaded(&server).is_empty());
     }

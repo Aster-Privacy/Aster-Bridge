@@ -245,16 +245,14 @@ fn dotted_spellings(canonical: &str, limit: usize) -> Vec<String> {
     }
     let gaps = letters.len() - 1;
     let mut spellings = Vec::new();
-    fn place(
-        letters: &[char],
-        domain: &str,
+    struct DotLayout<'a> {
+        letters: &'a [char],
+        domain: &'a str,
         gaps: usize,
-        remaining: usize,
-        start: usize,
-        dots: &mut Vec<usize>,
-        spellings: &mut Vec<String>,
         limit: usize,
-    ) {
+    }
+    fn place(layout: &DotLayout, remaining: usize, start: usize, dots: &mut Vec<usize>, spellings: &mut Vec<String>) {
+        let DotLayout { letters, domain, gaps, limit } = *layout;
         if spellings.len() >= limit {
             return;
         }
@@ -272,7 +270,7 @@ fn dotted_spellings(canonical: &str, limit: usize) -> Vec<String> {
         let mut gap = start;
         while gap + remaining <= gaps {
             dots.push(gap);
-            place(letters, domain, gaps, remaining - 1, gap + 1, dots, spellings, limit);
+            place(layout, remaining - 1, gap + 1, dots, spellings);
             dots.pop();
             if spellings.len() >= limit {
                 return;
@@ -280,9 +278,10 @@ fn dotted_spellings(canonical: &str, limit: usize) -> Vec<String> {
             gap += 1;
         }
     }
+    let layout = DotLayout { letters: &letters, domain, gaps, limit };
     let mut count = 1;
     while count <= gaps && spellings.len() < limit {
-        place(&letters, domain, gaps, count, 0, &mut Vec::new(), &mut spellings, limit);
+        place(&layout, count, 0, &mut Vec::new(), &mut spellings);
         count += 1;
     }
     spellings
@@ -417,6 +416,18 @@ fn accepted_pin(existing: RecipientPin, fingerprint: &str) -> RecipientPin {
     } else {
         (existing.binding_epoch, existing.binding_fingerprint.clone())
     };
+    if existing.address_rooted {
+        return RecipientPin {
+            owner_fingerprint: fingerprint.to_string(),
+            identity_fingerprint: String::new(),
+            pq_fingerprint: String::new(),
+            binding_epoch,
+            binding_fingerprint,
+            flagged: false,
+            address_rooted: false,
+            ..existing
+        };
+    }
     RecipientPin {
         owner_fingerprint: fingerprint.to_string(),
         binding_epoch,
@@ -489,13 +500,6 @@ fn binding_is_stale(base: &RecipientPin, signed: Option<&SignedBinding>) -> bool
                     && signed.fingerprint != base.binding_fingerprint)
         }
     }
-}
-
-fn address_key_replaced(address: &str) -> BridgeError {
-    BridgeError::RecipientKey(format!(
-        "The encryption keys for {} are no longer the keys that this address published before, so the message was not sent. Accepting the key does not fix this. Ask the recipient to sign in to an up-to-date Aster app so the keys for this address are published again.",
-        address
-    ))
 }
 
 fn no_published_key(address: &str) -> BridgeError {
@@ -605,15 +609,9 @@ pub fn evaluate_recipient(
             .as_deref()
             .is_some_and(|current| base.owner_fingerprint.eq_ignore_ascii_case(current));
     let verdict = bundle.map(|bundle| verify_bundle(bundle, owner_public_key));
+    let leaves_address_keys = base.address_rooted && bundle.is_some();
 
-    if base.address_rooted && !base.flagged {
-        return Evaluation {
-            pin: None,
-            outcome: Err(address_key_replaced(address)),
-        };
-    }
-
-    if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged {
+    if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged || leaves_address_keys {
         return Evaluation {
             pin: changed_pin(
                 existing,
@@ -810,33 +808,20 @@ pub fn evaluate_address_entry(
     bundle: &PrekeyBundle,
     trust: DirectoryTrust,
     existing: Option<&RecipientPin>,
+    owner_public_key: Option<&str>,
 ) -> Evaluation {
     let base = existing.cloned().unwrap_or_default();
-    match trust {
-        DirectoryTrust::Invalid => {
-            return Evaluation {
-                pin: changed_pin(
-                    existing,
-                    RecipientPin {
-                        flagged: true,
-                        ..base
-                    },
-                ),
-                outcome: Err(tampered(address)),
-            }
-        }
-        DirectoryTrust::Replaced | DirectoryTrust::Downgraded | DirectoryTrust::Account => {
-            return Evaluation {
-                pin: None,
-                outcome: Err(address_key_replaced(address)),
-            }
-        }
-        DirectoryTrust::Entry | DirectoryTrust::Endorsed => {}
-    }
-    if base.flagged {
+    let refused = !matches!(trust, DirectoryTrust::Entry | DirectoryTrust::Endorsed);
+    if refused || base.flagged {
         return Evaluation {
-            pin: None,
-            outcome: Err(untrusted(address, None)),
+            pin: changed_pin(
+                existing,
+                RecipientPin {
+                    flagged: true,
+                    ..base
+                },
+            ),
+            outcome: Err(untrusted(address, key_fingerprint(owner_public_key).as_deref())),
         };
     }
     let pq_key = advertised_pq_identity_key(bundle);
@@ -1932,7 +1917,7 @@ X1OEWHpsCOAO
         let bundle = scoped_entry(ALIAS);
         assert!(is_address_scoped(&bundle));
         assert_eq!(classify_scoped_entry(ALIAS, &bundle, None), DirectoryTrust::Entry);
-        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, None);
+        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, None, None);
         let pin = evaluation.pin.unwrap();
         assert!(pin.address_rooted);
         assert_eq!(pin.identity_fingerprint, key_fingerprint_hex(&bundle.kem_identity_key).unwrap());
@@ -1955,7 +1940,7 @@ X1OEWHpsCOAO
         let endorser = verification.endorsers.first().expect("the fixed vault endorses its entries");
         let pinned = pinned_to(endorser, true);
         assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pinned)), DirectoryTrust::Endorsed);
-        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Endorsed, Some(&pinned)).outcome.is_ok());
+        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Endorsed, Some(&pinned), None).outcome.is_ok());
     }
 
     #[test]
@@ -1964,7 +1949,7 @@ X1OEWHpsCOAO
         let other = STANDARD.encode([0x04u8; 65]);
         let rooted = pinned_to(&other, true);
         assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&rooted)), DirectoryTrust::Replaced);
-        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Replaced, Some(&rooted)).outcome.is_err());
+        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Replaced, Some(&rooted), None).outcome.is_err());
 
         let loose = pinned_to(&other, false);
         assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&loose)), DirectoryTrust::Account);
@@ -1973,9 +1958,131 @@ X1OEWHpsCOAO
         forged.signed_prekey = STANDARD.encode([0x11u8; 65]);
         let pinned = pinned_to(&bundle.kem_identity_key, true);
         assert_eq!(classify_scoped_entry(ALIAS, &forged, Some(&pinned)), DirectoryTrust::Invalid);
-        assert!(evaluate_address_entry(ALIAS, &forged, DirectoryTrust::Invalid, Some(&pinned)).outcome.is_err());
+        assert!(evaluate_address_entry(ALIAS, &forged, DirectoryTrust::Invalid, Some(&pinned), None).outcome.is_err());
         assert_eq!(classify_scoped_entry(ALIAS, &forged, None), DirectoryTrust::Account);
         assert_eq!(classify_scoped_entry("other@example.org", &bundle, None), DirectoryTrust::Account);
+    }
+
+    fn offers_to_accept(outcome: &Result<SendRoute, BridgeError>) -> bool {
+        matches!(outcome, Err(BridgeError::RecipientKey(message)) if message.contains("recipient-key accept"))
+    }
+
+    #[test]
+    fn a_refused_address_entry_can_be_accepted_like_any_changed_key() {
+        let (_dir, db) = pin_db();
+        let account = owner("alias");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let bundle = scoped_entry(ALIAS);
+        let mut forged = scoped_entry(ALIAS);
+        forged.signed_prekey = STANDARD.encode([0x11u8; 65]);
+        let other = STANDARD.encode([0x04u8; 65]);
+        let cases = [
+            (DirectoryTrust::Replaced, &bundle, pinned_to(&other, true)),
+            (DirectoryTrust::Downgraded, &bundle, pinned_to(&other, true)),
+            (DirectoryTrust::Invalid, &forged, pinned_to(&bundle.kem_identity_key, true)),
+        ];
+        for (trust, served, rooted) in cases {
+            let rooted = RecipientPin {
+                owner_fingerprint: shown.clone(),
+                pq_seen: true,
+                pq_fingerprint: "pq".to_string(),
+                ..rooted
+            };
+            let id = read_recipient_pin(&db, "a", ALIAS).unwrap().id;
+            db.recipient_pin_put(&id, &rooted).unwrap();
+
+            let refused = evaluate_address_entry(ALIAS, served, trust, Some(&rooted), Some(&account.public_key));
+            assert!(offers_to_accept(&refused.outcome), "{trust:?}");
+            let flagged = refused.pin.expect("the refusal is recorded");
+            assert!(flagged.flagged && flagged.address_rooted);
+            db.recipient_pin_put(&id, &flagged).unwrap();
+
+            assert_eq!(
+                accept_recipient_key(&db, "a", ALIAS, Some(&account.public_key), &shown).unwrap(),
+                KeyAcceptance::Accepted { fingerprint: shown.clone() }
+            );
+            let accepted = read_recipient_pin(&db, "a", ALIAS).unwrap().pin.unwrap();
+            assert!(!accepted.flagged && !accepted.address_rooted);
+            assert!(accepted.identity_fingerprint.is_empty());
+            assert!(accepted.pq_seen);
+            assert_eq!(classify_scoped_entry(ALIAS, served, Some(&accepted)), DirectoryTrust::Account);
+            let next = evaluate_recipient(
+                ALIAS,
+                Some(&signed_v2_bundle(&account)),
+                Some(&account.public_key),
+                Some(&accepted),
+            );
+            assert!(matches!(next.outcome, Ok(SendRoute::Ratchet(_))), "{trust:?}");
+        }
+    }
+
+    #[test]
+    fn a_flagged_entry_pin_offers_the_accept_path() {
+        let account = owner("alias");
+        let bundle = scoped_entry(ALIAS);
+        let flagged = RecipientPin {
+            flagged: true,
+            ..pinned_to(&bundle.kem_identity_key, true)
+        };
+        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, Some(&flagged), Some(&account.public_key));
+        assert!(offers_to_accept(&evaluation.outcome));
+        assert!(evaluation.pin.is_none());
+    }
+
+    #[test]
+    fn a_rooted_pin_answered_by_the_account_bundle_offers_the_accept_path() {
+        let account = owner("alias");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let rooted = RecipientPin {
+            owner_fingerprint: shown.clone(),
+            ..pinned_to(&STANDARD.encode([0x04u8; 65]), true)
+        };
+        let account_bundle = signed_v2_bundle(&account);
+        let refused = evaluate_recipient(ALIAS, Some(&account_bundle), Some(&account.public_key), Some(&rooted));
+        assert!(offers_to_accept(&refused.outcome));
+        let flagged = refused.pin.unwrap();
+        assert!(flagged.flagged);
+
+        let accepted = accepted_pin(flagged, &shown);
+        assert!(!accepted.address_rooted && !accepted.flagged);
+        let next = evaluate_recipient(ALIAS, Some(&account_bundle), Some(&account.public_key), Some(&accepted));
+        assert!(matches!(next.outcome, Ok(SendRoute::Ratchet(_))));
+
+        let no_bundle = evaluate_recipient(ALIAS, None, Some(&account.public_key), Some(&rooted));
+        assert!(matches!(no_bundle.outcome, Ok(SendRoute::AccountKey)));
+    }
+
+    #[test]
+    fn accepting_a_key_for_a_pin_without_an_address_entry_is_unchanged() {
+        let loose = RecipientPin {
+            identity_fingerprint: "id".to_string(),
+            owner_fingerprint: "old".to_string(),
+            pq_seen: true,
+            pq_fingerprint: "pq".to_string(),
+            binding_epoch: 3,
+            binding_fingerprint: "binding".to_string(),
+            transcript_bound: true,
+            hosted: true,
+            flagged: true,
+            address_rooted: false,
+        };
+        assert_eq!(
+            accepted_pin(loose.clone(), "old"),
+            RecipientPin {
+                flagged: false,
+                ..loose.clone()
+            }
+        );
+        assert_eq!(
+            accepted_pin(loose.clone(), "new"),
+            RecipientPin {
+                owner_fingerprint: "new".to_string(),
+                binding_epoch: 0,
+                binding_fingerprint: String::new(),
+                flagged: false,
+                ..loose
+            }
+        );
     }
 
     #[test]

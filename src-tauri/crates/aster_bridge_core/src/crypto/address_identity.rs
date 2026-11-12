@@ -75,6 +75,11 @@ pub fn canonical_address_form(address: &str) -> String {
     format!("{}@{}", local, &normalized[at + 1..])
 }
 
+pub fn is_primary_address(primary: &str, address: &str) -> bool {
+    let primary = canonical_address_form(primary);
+    primary.is_empty() || primary == canonical_address_form(address)
+}
+
 pub fn address_entry_forms(address: &str) -> Vec<String> {
     let normalized = normalize_identity_address(address);
     let canonical = canonical_address_form(&normalized);
@@ -497,7 +502,7 @@ fn verify_entry_for_form(form: &str, entry: &EntryKeys, signature_b64: &str) -> 
     let identity = decode_b64(&entry.kem_identity_key)?;
     if identity.len() != POINT_LEN
         || signature.len() < SIGNATURE_LEN
-        || (signature.len() - SIGNATURE_LEN) % ENDORSEMENT_LEN != 0
+        || !(signature.len() - SIGNATURE_LEN).is_multiple_of(ENDORSEMENT_LEN)
     {
         return Ok(None);
     }
@@ -633,6 +638,12 @@ pub(crate) mod tests {
         let forms: Vec<String> = serde_json::from_value(v["forms"].clone()).unwrap();
         assert_eq!(address_entry_forms(v["address"].as_str().unwrap()), forms);
         assert_eq!(canonical_address_form("J.o+x@Example.org"), "jo@example.org");
+        assert!(is_primary_address("jo@example.org", "J.o+news@Example.org"));
+        assert!(is_primary_address("j.o@example.org", "jo@example.org"));
+        assert!(is_primary_address("", "alias@example.org"));
+        assert!(is_primary_address("  ", "alias@example.org"));
+        assert!(!is_primary_address("jo@example.org", "alias@example.org"));
+        assert!(!is_primary_address("jo@example.org", "jo@example.net"));
         assert!(address_entry_forms("@example.org").is_empty());
         assert!(address_entry_forms("jo@").is_empty());
         assert!(address_entry_forms("+tag@example.org").is_empty());
