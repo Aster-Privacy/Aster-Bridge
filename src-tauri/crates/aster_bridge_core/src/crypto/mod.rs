@@ -19,6 +19,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 pub mod account_key;
+pub mod address_directory;
+pub mod address_identity;
 pub mod alias;
 pub mod attachment;
 pub mod contacts;

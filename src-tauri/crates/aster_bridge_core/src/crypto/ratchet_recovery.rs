@@ -26,6 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::crypto::address_identity::AddressKeyring;
 use crate::crypto::inbound::decode_pq_decap_key;
 use crate::crypto::ratchet::{
     b64_decode, ecdh_p256, hkdf_sha256, jwk_d_bytes, ml_kem768_decapsulate, serialize_header_ad,
@@ -85,6 +86,7 @@ pub struct LaneCandidate {
 pub struct RecoveryMaterial {
     pub storage_keys: Vec<Zeroizing<[u8; 32]>>,
     pub lane_candidates: Vec<LaneCandidate>,
+    pub address_keys: AddressKeyring,
 }
 
 impl Drop for RecoveryMaterial {
@@ -104,6 +106,7 @@ impl RecoveryMaterial {
         Self {
             storage_keys: derive_storage_base_keys(vault, passphrase, iterations),
             lane_candidates: build_lane_candidates(vault),
+            address_keys: AddressKeyring::from_vault(vault),
         }
     }
 

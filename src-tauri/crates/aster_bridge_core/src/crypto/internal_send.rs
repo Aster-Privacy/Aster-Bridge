@@ -34,9 +34,11 @@ use crate::crypto::sealed_details::{
     build_sealed_details, format_sent_at, sealed_sender_name, SealedMessageDetails,
 };
 use crate::crypto::recipient_trust::{
-    evaluate_recipient, pin_id, verify_bundle, BundleVerdict, RatchetTarget, RecipientPin,
-    SendRoute,
+    classify_scoped_entry, evaluate_address_entry, evaluate_recipient, is_address_scoped,
+    read_recipient_pin, verify_bundle, BundleVerdict, DirectoryTrust, Evaluation, PinRead,
+    RatchetTarget, RecipientPin, SendRoute,
 };
+use crate::crypto::address_directory::{AddressEntryDirectory, AddressEntryState, ADDRESS_ENTRIES};
 use crate::db::Database;
 use crate::error::{BridgeError, Result};
 
@@ -124,8 +126,8 @@ pub fn claims_aster_identity(db: &Database, address: &str) -> bool {
         return true;
     }
     matches!(
-        db.recipient_pin_get(&pin_id(&scope.account_id, address)),
-        Ok(Some(pin)) if pin.hosted
+        read_recipient_pin(db, &scope.account_id, address),
+        Ok(PinRead { pin: Some(pin), .. }) if pin.hosted
     )
 }
 
@@ -499,6 +501,59 @@ async fn sender_keys(session: &Arc<RwLock<Session>>) -> Result<SenderKeys> {
     })
 }
 
+fn address_ignoring_dots(address: &str) -> String {
+    let lowered = address.trim().to_lowercase();
+    match lowered.rfind('@') {
+        Some(at) => format!("{}{}", lowered[..at].replace('.', ""), &lowered[at..]),
+        None => lowered.replace('.', ""),
+    }
+}
+
+fn sender_identity_failed() -> BridgeError {
+    BridgeError::Crypto(
+        "the encryption keys for the sending address could not be prepared, so the message was not sent"
+            .to_string(),
+    )
+}
+
+async fn address_sender_secret(
+    payload: &Value,
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    access_token: &str,
+    directory: &AddressEntryDirectory,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let Some(sender_email) = payload
+        .get("sender_email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+    else {
+        return Ok(None);
+    };
+    let (primary, keyring) = {
+        let guard = session.read().await;
+        (guard.email.clone(), guard.ratchet_recovery.address_keys.clone())
+    };
+    if !primary.trim().is_empty() && address_ignoring_dots(&primary) == address_ignoring_dots(sender_email) {
+        return Ok(None);
+    }
+    if keyring.current_identity_public().is_none() {
+        return Ok(None);
+    }
+    match directory
+        .entry_state(client, access_token, &keyring, sender_email)
+        .await
+    {
+        AddressEntryState::Inactive => Ok(None),
+        AddressEntryState::Failed => Err(sender_identity_failed()),
+        AddressEntryState::Active => keyring
+            .sender_identity(sender_email)
+            .map(|derived| Some(derived.scalar))
+            .ok_or_else(sender_identity_failed),
+    }
+}
+
 fn payload_addresses(payload: &Value, field: &str) -> Vec<String> {
     payload
         .get(field)
@@ -607,6 +662,7 @@ fn enforce_routed_like_external(hosted: &HostedRecipients, required: bool) -> Re
 
 struct KnownKeys {
     address: String,
+    username: String,
     bundle: Option<PrekeyBundle>,
     owner_public_key: Option<String>,
 }
@@ -624,6 +680,13 @@ impl HostedLookup {
             .position(|known| known.address.eq_ignore_ascii_case(address))?;
         Some(self.known.swap_remove(index))
     }
+}
+
+fn unreadable_pin_error(address: &str) -> BridgeError {
+    BridgeError::RecipientKey(format!(
+        "The saved key record for {} could not be read, so the message was not sent.",
+        address
+    ))
 }
 
 fn is_own_address(session: &Session, address: &str) -> bool {
@@ -658,12 +721,9 @@ async fn lookup_hosted_recipients(
         let Some(username) = hosted_lookup_username(&address) else {
             continue;
         };
-        let pin = db.recipient_pin_get(&pin_id(&account_id, &address)).map_err(|_| {
-            BridgeError::RecipientKey(format!(
-                "The saved key record for {} could not be read, so the message was not sent.",
-                address
-            ))
-        })?;
+        let pin = read_recipient_pin(db, &account_id, &address)
+            .map_err(|_| unreadable_pin_error(&address))?
+            .pin;
         let fetched = fetch_hosted_keys(client, access_token, &username, &address).await;
         let (key_lookup, bundle) = match fetched {
             Ok(fetched) => fetched,
@@ -671,13 +731,15 @@ async fn lookup_hosted_recipients(
             Err(_) => continue,
         };
         let owner_public_key = key_lookup.as_ref().and_then(|lookup| lookup.public_key.clone());
-        let bundle_verified = matches!(
-            (bundle.as_ref(), owner_public_key.as_deref()),
-            (Some(bundle), Some(owner)) if matches!(
-                verify_bundle(bundle, Some(owner)),
-                BundleVerdict::Verified { .. }
-            )
-        );
+        let bundle_verified = match bundle.as_ref() {
+            Some(bundle) if is_address_scoped(bundle) => {
+                classify_scoped_entry(&address, bundle, None) == DirectoryTrust::Entry
+            }
+            Some(bundle) => owner_public_key.as_deref().is_some_and(|owner| {
+                matches!(verify_bundle(bundle, Some(owner)), BundleVerdict::Verified { .. })
+            }),
+            None => false,
+        };
         match classify_hosted(key_lookup.as_ref(), bundle_verified, pin.as_ref()) {
             HostedClass::Hosted => lookup.hosted.hosted.push(address.clone()),
             HostedClass::AsterRouted => lookup.hosted.routed_like_external.push(address.clone()),
@@ -685,6 +747,7 @@ async fn lookup_hosted_recipients(
         }
         lookup.known.push(KnownKeys {
             address,
+            username,
             bundle,
             owner_public_key,
         });
@@ -701,13 +764,46 @@ async fn fetch_hosted_keys(
     let key_lookup = client
         .lookup_recipient_key(access_token, username, address)
         .await?;
-    if key_lookup.as_ref().and_then(|lookup| lookup.public_key.as_ref()).is_none() {
+    let bundle = client
+        .find_prekey_bundle_in_scope(access_token, username, address, true)
+        .await?;
+    let has_owner_key = key_lookup
+        .as_ref()
+        .is_some_and(|lookup| lookup.public_key.is_some());
+    if !has_owner_key && !bundle.as_ref().is_some_and(is_address_scoped) {
         return Ok((key_lookup, None));
     }
-    let bundle = client
-        .find_prekey_bundle(access_token, username, address)
-        .await?;
     Ok((key_lookup, bundle))
+}
+
+async fn resolve_recipient_route(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+    first: Option<PrekeyBundle>,
+    owner_public_key: Option<&str>,
+    existing: Option<&RecipientPin>,
+) -> Result<Evaluation> {
+    match first {
+        Some(bundle) if is_address_scoped(&bundle) => {
+            let trust = classify_scoped_entry(address, &bundle, existing);
+            if trust != DirectoryTrust::Account {
+                return Ok(evaluate_address_entry(address, &bundle, trust, existing));
+            }
+            let account_bundle = client
+                .find_prekey_bundle_in_scope(access_token, username, address, false)
+                .await?
+                .filter(|bundle| !is_address_scoped(bundle));
+            Ok(evaluate_recipient(
+                address,
+                account_bundle.as_ref(),
+                owner_public_key,
+                existing,
+            ))
+        }
+        other => Ok(evaluate_recipient(address, other.as_ref(), owner_public_key, existing)),
+    }
 }
 
 fn enforce_private_body(has_external: bool, required: bool) -> Result<()> {
@@ -727,7 +823,16 @@ pub async fn seal_internal_body(
     access_token: &str,
 ) -> Result<()> {
     let require_post_quantum = crate::config::require_post_quantum();
-    seal_internal_body_with(payload, session, client, db, access_token, require_post_quantum).await
+    seal_internal_body_with(
+        payload,
+        session,
+        client,
+        db,
+        access_token,
+        require_post_quantum,
+        &ADDRESS_ENTRIES,
+    )
+    .await
 }
 
 async fn seal_internal_body_with(
@@ -737,6 +842,7 @@ async fn seal_internal_body_with(
     db: &Database,
     access_token: &str,
     require_post_quantum: bool,
+    directory: &AddressEntryDirectory,
 ) -> Result<()> {
     let self_placeholder = take_self_to_placeholder(payload);
     let mut lookup = lookup_hosted_recipients(payload, session, client, db, access_token).await?;
@@ -761,40 +867,45 @@ async fn seal_internal_body_with(
     let sent_at = format_sent_at(chrono::Utc::now());
     let plaintext = sealed_send_plaintext(payload, self_placeholder.as_deref(), account_name.as_deref(), &sent_at);
 
-    let sender = sender_keys(session).await?;
+    let mut sender = sender_keys(session).await?;
+    if let Some(secret) = address_sender_secret(payload, session, client, access_token, directory).await? {
+        sender.identity_secret_d = secret.to_vec();
+    }
     let mut routed: Vec<RoutedRecipient> = Vec::with_capacity(split.internal.len());
     let mut pending_pins = Vec::new();
 
     for address in &split.internal {
         let is_hosted = lookup.hosted.contains(address);
-        let (bundle, owner_public_key) = match lookup.take(address) {
-            Some(known) => (known.bundle, known.owner_public_key),
+        let (username, bundle, owner_public_key) = match lookup.take(address) {
+            Some(known) => (known.username, known.bundle, known.owner_public_key),
             None => {
                 let username = key_lookup_username(address, &sender.username).ok_or_else(|| {
                     BridgeError::Crypto("recipient address has no username to look up".to_string())
                 })?;
                 let bundle = client
-                    .find_prekey_bundle(access_token, &username, address)
+                    .find_prekey_bundle_in_scope(access_token, &username, address, true)
                     .await?;
                 let owner_public_key = client
                     .get_recipient_public_key(access_token, &username, address)
                     .await?;
-                (bundle, owner_public_key)
+                (username, bundle, owner_public_key)
             }
         };
-        let pin_key = pin_id(&sender.account_id, address);
-        let existing = db.recipient_pin_get(&pin_key).map_err(|_| {
-            BridgeError::RecipientKey(format!(
-                "The saved key record for {} could not be read, so the message was not sent.",
-                address
-            ))
-        })?;
-        let evaluation = evaluate_recipient(
+        let pin_read = read_recipient_pin(db, &sender.account_id, address)
+            .map_err(|_| unreadable_pin_error(address))?;
+        let pin_key = pin_read.id;
+        let from_legacy = pin_read.from_legacy;
+        let existing = pin_read.pin;
+        let evaluation = resolve_recipient_route(
+            client,
+            access_token,
+            &username,
             address,
-            bundle.as_ref(),
+            bundle,
             owner_public_key.as_deref(),
             existing.as_ref(),
-        );
+        )
+        .await?;
         let route = match evaluation.outcome {
             Ok(route) => route,
             Err(error) => {
@@ -805,8 +916,14 @@ async fn seal_internal_body_with(
             }
         };
         let hosted_now = is_hosted && !lookup.hosted.routed_like_external(address);
-        if let Some(pin) = pin_to_save(evaluation.pin, existing.as_ref(), hosted_now) {
-            pending_pins.push((pin_key, pin));
+        match pin_to_save(evaluation.pin, existing.as_ref(), hosted_now) {
+            Some(pin) => pending_pins.push((pin_key, pin)),
+            None if from_legacy => {
+                if let Some(pin) = existing.clone() {
+                    pending_pins.push((pin_key, pin));
+                }
+            }
+            None => {}
         }
         routed.push(RoutedRecipient {
             address: address.clone(),
@@ -962,6 +1079,7 @@ fn seal_shared_and_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::recipient_trust::pin_id;
     use crate::crypto::ratchet::{
         decrypt_bootstrap, encrypt_bootstrap, parse_recipient_message, RatchetReceiverKeys,
     };
@@ -1245,6 +1363,7 @@ mod tests {
             pq_prekey: None,
             pq_kem_public_key: Some(STANDARD.encode(encap.as_bytes())),
             x3dh_max_version: None,
+            address_scoped: None,
         };
         Recipient {
             identity,
@@ -1986,6 +2105,9 @@ mod tests {
     struct FakeDirectory {
         keys: std::sync::Mutex<std::collections::HashMap<String, Value>>,
         bundles: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+        scoped: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+        entry_status: std::sync::atomic::AtomicU16,
+        entries: std::sync::Mutex<Vec<Value>>,
     }
 
     impl FakeDirectory {
@@ -1994,6 +2116,14 @@ mod tests {
             match value {
                 Some(value) => keys.insert(address.to_string(), value),
                 None => keys.remove(address),
+            };
+        }
+
+        fn set_scoped(&self, address: &str, value: Option<Value>) {
+            let mut scoped = self.scoped.lock().unwrap();
+            match value {
+                Some(value) => scoped.insert(address.to_string(), value),
+                None => scoped.remove(address),
             };
         }
 
@@ -2015,8 +2145,11 @@ mod tests {
         let directory = Arc::new(FakeDirectory {
             keys: std::sync::Mutex::new(HashMap::new()),
             bundles: std::sync::Mutex::new(HashMap::new()),
+            scoped: std::sync::Mutex::new(HashMap::new()),
+            entry_status: std::sync::atomic::AtomicU16::new(404),
+            entries: std::sync::Mutex::new(Vec::new()),
         });
-        let (keys, bundles) = (directory.clone(), directory.clone());
+        let (keys, bundles, entries) = (directory.clone(), directory.clone(), directory.clone());
         let found = |value: Option<Value>| match value {
             Some(value) => axum::Json(value).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
@@ -2039,8 +2172,26 @@ mod tests {
                     let bundles = bundles.clone();
                     async move {
                         let email = query.get("email").cloned().unwrap_or_default();
-                        let value = bundles.bundles.lock().unwrap().get(&email).cloned();
+                        let scoped = query.get("scope").map(String::as_str) == Some("address");
+                        let value = scoped
+                            .then(|| bundles.scoped.lock().unwrap().get(&email).cloned())
+                            .flatten()
+                            .or_else(|| bundles.bundles.lock().unwrap().get(&email).cloned());
                         found(value)
+                    }
+                }),
+            )
+            .route(
+                "/crypto/v1/ratchet/address-bundle",
+                axum::routing::put(move |axum::Json(body): axum::Json<Value>| {
+                    let entries = entries.clone();
+                    async move {
+                        entries.entries.lock().unwrap().push(body);
+                        match entries.entry_status.load(std::sync::atomic::Ordering::SeqCst) {
+                            200 => axum::Json(json!({"success": true, "active": true})).into_response(),
+                            201 => axum::Json(json!({"success": true, "active": false})).into_response(),
+                            status => StatusCode::from_u16(status).unwrap().into_response(),
+                        }
                     }
                 }),
             );
@@ -2133,7 +2284,7 @@ mod tests {
         let seal = |mut payload: Value, required: bool| {
             let (session, client, db) = (&session, &client, &db);
             async move {
-                seal_internal_body_with(&mut payload, session, client, db, "token", required)
+                seal_internal_body_with(&mut payload, session, client, db, "token", required, &AddressEntryDirectory::new())
                     .await
                     .map(|_| payload)
             }
@@ -2284,7 +2435,7 @@ mod tests {
             let mut payload = payload_with(to);
             let (session, client, db) = (&session, &client, &db);
             async move {
-                seal_internal_body_with(&mut payload, session, client, db, "token", false)
+                seal_internal_body_with(&mut payload, session, client, db, "token", false, &AddressEntryDirectory::new())
                     .await
                     .map(|_| payload)
             }
@@ -2312,7 +2463,7 @@ mod tests {
         assert_eq!(routed["hosted_recipients"], json!(["carol@alias.example"]));
         let mut strict = payload_with(vec!["carol@alias.example"]);
         assert!(matches!(
-            seal_internal_body_with(&mut strict, &session, &client, &db, "token", true).await,
+            seal_internal_body_with(&mut strict, &session, &client, &db, "token", true, &AddressEntryDirectory::new()).await,
             Err(BridgeError::RecipientKey(_))
         ));
 
@@ -2334,5 +2485,163 @@ mod tests {
             seal(vec!["carol@alias.example"]).await.is_err(),
             "a pinned recipient that drops its post-quantum bundle is refused"
         );
+    }
+
+    fn sender_identity_keys(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    if key == "sender_identity_key" {
+                        if let Some(text) = inner.as_str() {
+                            found.push(text.to_string());
+                        }
+                    }
+                    sender_identity_keys(inner, found);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| sender_identity_keys(item, found)),
+            Value::String(text) => {
+                if let Ok(inner) = serde_json::from_str::<Value>(text.trim()) {
+                    if inner.is_object() || inner.is_array() {
+                        sender_identity_keys(&inner, found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn an_alias_with_an_active_entry_sends_with_its_own_identity() {
+        use crate::crypto::address_identity::tests::fixed_keyring;
+        use crate::crypto::recipient_trust::tests::owner;
+        use std::sync::atomic::Ordering;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let keyring = fixed_keyring();
+        session.write().await.ratchet_recovery.address_keys = keyring.clone();
+        let account_identity = {
+            let guard = session.read().await;
+            let secret = SecretKey::from_slice(&guard.ratchet_keys[0].identity_secret_d).unwrap();
+            STANDARD.encode(secret.public_key().to_encoded_point(false).as_bytes())
+        };
+
+        let amy = owner("amy");
+        let mut amy_keys = recipient();
+        sign_v2(&mut amy_keys.bundle, &amy);
+        directory.set_key("amy@astermail.org", Some(json!({"public_key": amy.public_key, "internal": true})));
+        directory.set_bundle("amy@astermail.org", Some(bundle_json(&amy_keys.bundle)));
+
+        let send_from = |from: Option<&'static str>, entries: AddressEntryDirectory| {
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                let mut payload = payload_with(vec!["amy@astermail.org"]);
+                if let Some(from) = from {
+                    payload["sender_email"] = json!(from);
+                }
+                seal_internal_body_with(&mut payload, session, client, db, "token", true, &entries)
+                    .await
+                    .map(|_| {
+                        let mut found = Vec::new();
+                        sender_identity_keys(&payload, &mut found);
+                        found.sort();
+                        found.dedup();
+                        found
+                    })
+            }
+        };
+
+        let alias = "alias@example.org";
+        let alias_identity = keyring.sender_identity(alias).unwrap().public_b64;
+        assert_ne!(alias_identity, account_identity);
+
+        directory.entry_status.store(200, Ordering::SeqCst);
+        assert_eq!(send_from(Some(alias), AddressEntryDirectory::new()).await.unwrap(), vec![alias_identity.clone()]);
+        assert!(!directory.entries.lock().unwrap().is_empty());
+
+        assert_eq!(send_from(None, AddressEntryDirectory::new()).await.unwrap(), vec![account_identity.clone()]);
+        assert_eq!(
+            send_from(Some("sender@astermail.org"), AddressEntryDirectory::new()).await.unwrap(),
+            vec![account_identity.clone()]
+        );
+        assert_eq!(
+            send_from(Some("s.ender@astermail.org"), AddressEntryDirectory::new()).await.unwrap(),
+            vec![account_identity.clone()]
+        );
+
+        for status in [201, 404, 405, 400] {
+            directory.entry_status.store(status, Ordering::SeqCst);
+            assert_eq!(
+                send_from(Some(alias), AddressEntryDirectory::new()).await.unwrap(),
+                vec![account_identity.clone()],
+                "status {status}"
+            );
+        }
+
+        directory.entry_status.store(500, Ordering::SeqCst);
+        assert!(matches!(
+            send_from(Some(alias), AddressEntryDirectory::new()).await,
+            Err(BridgeError::Crypto(_))
+        ));
+
+        session.write().await.ratchet_recovery.address_keys = Default::default();
+        assert_eq!(send_from(Some(alias), AddressEntryDirectory::new()).await.unwrap(), vec![account_identity]);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_entry_is_used_for_an_alias_recipient_and_a_downgrade_is_refused() {
+        use crate::crypto::address_identity::tests::fixed_keyring;
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+
+        let address = "amy.alias@astermail.org";
+        let amy = owner("amy");
+        let mut amy_keys = recipient();
+        sign_v2(&mut amy_keys.bundle, &amy);
+        directory.set_key(address, Some(json!({"public_key": amy.public_key, "internal": true})));
+        directory.set_bundle(address, Some(bundle_json(&amy_keys.bundle)));
+        let entry = fixed_keyring().sign_entry(address).unwrap();
+        directory.set_scoped(
+            address,
+            Some(json!({
+                "kem_identity_key": entry.kem_identity_key,
+                "signed_prekey": entry.signed_prekey,
+                "signed_prekey_signature": entry.signed_prekey_signature,
+                "pq_kem_public_key": entry.pq_kem_public_key,
+                "x3dh_max_version": 2,
+                "address_scoped": true,
+            })),
+        );
+
+        let seal = || {
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                let mut payload = payload_with(vec![address]);
+                seal_internal_body_with(&mut payload, session, client, db, "token", true, &AddressEntryDirectory::new())
+                    .await
+                    .map(|_| payload)
+            }
+        };
+
+        let sealed = seal().await.unwrap();
+        assert_eq!(sealed["is_e2e_encrypted"], json!(true));
+        let account_id = session.read().await.user_id.to_string();
+        let stored = crate::crypto::recipient_trust::read_recipient_pin(&db, &account_id, address)
+            .unwrap()
+            .pin
+            .expect("the entry is pinned");
+        assert!(stored.address_rooted);
+
+        directory.set_scoped(address, None);
+        assert!(seal().await.is_err(), "an unscoped answer for a rooted address is refused");
     }
 }

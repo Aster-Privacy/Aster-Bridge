@@ -35,6 +35,7 @@ pub const MAX_ENVELOPE_MARKER: i16 = INBOUND_PQ_HYBRID_MARKER as i16;
 pub const PLATFORM: &str = "bridge";
 pub const X3DH_MAX_VERSION: i16 = X3DH_VERSION_TRANSCRIPT_BOUND as i16;
 pub const PGP_EXTERNAL_VERSION: i16 = 1;
+pub const ADDRESS_IDENTITY_VERSION: i16 = 1;
 pub const REPORT_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 
 const STATE_FILE: &str = "envelope_capability.json";
@@ -51,6 +52,8 @@ pub struct CapabilityState {
     pub last_reported_fingerprint: HashMap<String, String>,
     #[serde(default)]
     pub last_reported_pgp_external_version: HashMap<String, i16>,
+    #[serde(default)]
+    pub last_reported_address_identity_version: HashMap<String, i16>,
 }
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
@@ -113,6 +116,8 @@ pub fn is_report_due_for(
 
 pub fn reported_capabilities_are_stale(state: &CapabilityState, user_id: &str) -> bool {
     state.last_reported_pgp_external_version.get(user_id).copied() != Some(PGP_EXTERNAL_VERSION)
+        || state.last_reported_address_identity_version.get(user_id).copied()
+            != Some(ADDRESS_IDENTITY_VERSION)
 }
 
 pub fn ensure_client_id(state: &mut CapabilityState) -> String {
@@ -159,6 +164,7 @@ pub async fn report_if_due(
         identity_fingerprint: fingerprint.as_deref(),
         x3dh_max_version: X3DH_MAX_VERSION,
         pgp_external_version: PGP_EXTERNAL_VERSION,
+        address_identity_version: ADDRESS_IDENTITY_VERSION,
     };
 
     match client.report_envelope_capability(access_token, &body).await {
@@ -167,6 +173,9 @@ pub async fn report_if_due(
             state
                 .last_reported_pgp_external_version
                 .insert(user_id.to_string(), PGP_EXTERNAL_VERSION);
+            state
+                .last_reported_address_identity_version
+                .insert(user_id.to_string(), ADDRESS_IDENTITY_VERSION);
             match fingerprint.as_deref() {
                 Some(current) => {
                     state
@@ -220,11 +229,13 @@ mod tests {
             identity_fingerprint: None,
             x3dh_max_version: X3DH_MAX_VERSION,
             pgp_external_version: PGP_EXTERNAL_VERSION,
+            address_identity_version: ADDRESS_IDENTITY_VERSION,
         };
         let value = serde_json::to_value(&body).unwrap();
 
         assert_eq!(value["x3dh_max_version"], 2);
         assert_eq!(value["pgp_external_version"], 1);
+        assert_eq!(value["address_identity_version"], 1);
     }
 
     #[test]
@@ -237,6 +248,10 @@ mod tests {
         state
             .last_reported_pgp_external_version
             .insert("user".to_string(), PGP_EXTERNAL_VERSION);
+        assert!(reported_capabilities_are_stale(&state, "user"));
+        state
+            .last_reported_address_identity_version
+            .insert("user".to_string(), ADDRESS_IDENTITY_VERSION);
         assert!(!reported_capabilities_are_stale(&state, "user"));
     }
 
