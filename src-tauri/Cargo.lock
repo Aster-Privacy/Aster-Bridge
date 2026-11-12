@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "aster-bridge-desktop"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "aster-bridge-core",
  "mail-parser",
