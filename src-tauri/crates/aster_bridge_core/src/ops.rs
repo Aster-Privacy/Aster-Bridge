@@ -66,6 +66,7 @@ pub async fn request_device_code(
             x25519_pk,
             machine_name: machine_name(profile),
             device_type: DEVICE_TYPE.to_string(),
+            envelope_versions: device_identity::ENVELOPE_VERSIONS.to_vec(),
         })
         .await?;
     Ok(DeviceCode {
@@ -99,11 +100,17 @@ pub async fn poll_device_sign_in(
                 .ok_or_else(|| BridgeError::Auth("no sealed envelope in confirmation".to_string()))?;
             let passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
                 .map_err(BridgeError::Crypto)?;
-            device_identity::set_device_id(data_dir, device_id).map_err(BridgeError::Auth)?;
-            device_identity::store_passphrase(data_dir, &passphrase).map_err(BridgeError::Auth)?;
-            identity.device_id = Some(device_id);
             let session =
                 session::login_with_passphrase(identity, device_id, passphrase, client).await?;
+            if session.identity_key.is_none() {
+                return Err(BridgeError::Auth(
+                    "the sign-in did not unlock this account".to_string(),
+                ));
+            }
+            device_identity::set_device_id(data_dir, device_id).map_err(BridgeError::Auth)?;
+            device_identity::store_passphrase(data_dir, &session.vault_passphrase)
+                .map_err(BridgeError::Auth)?;
+            identity.device_id = Some(device_id);
             Ok(SignInPoll::Confirmed(Box::new(session)))
         }
         "expired" => Ok(SignInPoll::Expired),

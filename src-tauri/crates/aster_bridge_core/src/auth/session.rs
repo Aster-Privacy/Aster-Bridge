@@ -379,6 +379,14 @@ fn collect_previous_identity_keys(vault: &crate::crypto::vault::VaultContents) -
     keys
 }
 
+fn bound_inbound_keys(
+    mut keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
+    user_id: &Uuid,
+) -> Vec<crate::crypto::inbound::InboundKeyCandidate> {
+    crate::crypto::inbound::bind_inbound_owner(&mut keys, user_id);
+    keys
+}
+
 pub fn inbound_keys_equal(
     a: &[crate::crypto::inbound::InboundKeyCandidate],
     b: &[crate::crypto::inbound::InboundKeyCandidate],
@@ -440,6 +448,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     session.ratchet_identity_public = material.ratchet_identity_public;
     session.ratchet_keys = material.ratchet_keys;
     session.inbound_keys = material.inbound_keys;
+    crate::crypto::inbound::bind_inbound_owner(&mut session.inbound_keys, &session.user_id);
     session.previous_keys = material.previous_keys;
     session.ratchet_recovery = material.ratchet_recovery;
 }
@@ -494,7 +503,7 @@ pub async fn login_with_passphrase(
                 m.data_kek,
                 m.ratchet_identity_public,
                 m.ratchet_keys,
-                m.inbound_keys,
+                bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
                 m.previous_keys,
                 m.ratchet_recovery,
             ),
@@ -718,6 +727,7 @@ pub async fn first_time_setup(
             x25519_pk,
             machine_name,
             device_type: "bridge".to_string(),
+            envelope_versions: device_identity::ENVELOPE_VERSIONS.to_vec(),
         })
         .await?;
 
@@ -754,16 +764,8 @@ pub async fn first_time_setup(
                     .sealed_envelope
                     .ok_or_else(|| BridgeError::Auth("no sealed envelope".to_string()))?;
 
-                let passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
+                let mut passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
                     .map_err(BridgeError::Crypto)?;
-
-                device_identity::set_device_id(&config.data_dir, device_id)
-                    .map_err(BridgeError::Auth)?;
-
-                device_identity::store_passphrase(&config.data_dir, &passphrase)
-                    .map_err(BridgeError::Auth)?;
-
-                tracing::info!("Device enrolled successfully!");
 
                 let challenge = client.device_challenge(device_id).await?;
                 let signature = device_identity::sign_challenge(identity, &challenge.nonce)
@@ -792,18 +794,26 @@ pub async fn first_time_setup(
                             m.data_kek,
                             m.ratchet_identity_public,
                             m.ratchet_keys,
-                            m.inbound_keys,
+                            bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
                             m.previous_keys,
                             m.ratchet_recovery,
                         ),
                         Err(e) => {
-                            tracing::error!(
-                                "vault decrypt failed during setup: {}; encrypted mail cannot be decrypted until you sign in again",
-                                e
-                            );
-                            (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()), Default::default())
+                            passphrase.zeroize();
+                            tracing::error!("vault decrypt failed during setup: {}", e);
+                            return Err(BridgeError::Auth(
+                                "the sign-in did not unlock this account".to_string(),
+                            ));
                         }
                     };
+
+                device_identity::set_device_id(&config.data_dir, device_id)
+                    .map_err(BridgeError::Auth)?;
+
+                device_identity::store_passphrase(&config.data_dir, &passphrase)
+                    .map_err(BridgeError::Auth)?;
+
+                tracing::info!("Device enrolled successfully");
 
                 let send_identities = build_send_identities(
                     client,
@@ -993,22 +1003,7 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use base64::Engine as _;
 
-    fn encrypt_vault_for_test(plaintext: &[u8], passphrase: &[u8]) -> (String, String) {
-        use aes_gcm::aead::Aead;
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-        use sha2::Sha256;
-        let salt = [13u8; 16];
-        let nonce_bytes = [21u8; 12];
-        let mut key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, &salt, 310_000, &mut key);
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-            .unwrap();
-        let mut combined = salt.to_vec();
-        combined.extend_from_slice(&ciphertext);
-        (STANDARD.encode(&combined), STANDARD.encode(nonce_bytes))
-    }
+    use crate::crypto::vault::encrypt_vault_for_test;
 
     async fn spawn_device_login_server(encrypted_vault: String, vault_nonce: String) -> String {
         use axum::{routing::post, Json, Router};
@@ -1142,6 +1137,7 @@ mod tests {
         initial.inbound_keys = vec![crate::crypto::inbound::InboundKeyCandidate {
             ecdh_secret_d: vec![9u8; 32],
             pq_decap_key: None,
+            owner: None,
         }];
         let session = std::sync::Arc::new(tokio::sync::RwLock::new(initial));
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
@@ -1268,10 +1264,12 @@ mod tests {
         let a = vec![crate::crypto::inbound::InboundKeyCandidate {
             ecdh_secret_d: vec![1u8; 32],
             pq_decap_key: None,
+            owner: None,
         }];
         let b = vec![crate::crypto::inbound::InboundKeyCandidate {
             ecdh_secret_d: vec![2u8; 32],
             pq_decap_key: None,
+            owner: None,
         }];
         assert!(inbound_keys_equal(&a, &a.clone()));
         assert!(!inbound_keys_equal(&a, &b));

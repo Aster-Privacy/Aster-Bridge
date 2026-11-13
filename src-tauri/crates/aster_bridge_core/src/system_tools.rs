@@ -47,9 +47,174 @@ pub fn icacls_command() -> std::process::Command {
     std::process::Command::new(icacls_path())
 }
 
+pub fn whoami_command() -> std::process::Command {
+    std::process::Command::new(system32_tool("whoami.exe"))
+}
+
+pub fn parse_account_sid(output: &str) -> Option<String> {
+    let sid = output.trim().rsplit(',').next()?.trim().trim_matches('"');
+    let well_formed = sid.starts_with("S-1-")
+        && sid.len() <= 184
+        && sid[2..]
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+
+    well_formed.then(|| sid.to_string())
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn current_account_sid() -> Option<&'static str> {
+    use std::os::windows::process::CommandExt;
+    static SID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+    SID.get_or_init(|| {
+        let out = whoami_command()
+            .args(["/user", "/fo", "csv", "/nh"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+
+        if !out.status.success() {
+            return None;
+        }
+        parse_account_sid(&String::from_utf8_lossy(&out.stdout))
+    })
+    .as_deref()
+}
+
+#[cfg(windows)]
+fn grant_only(path: &Path, trustee: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let out = icacls_command()
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{}:(F)", trustee))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("icacls could not run: {}", e))?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+    .trim()
+    .to_string())
+}
+
+#[cfg(windows)]
+fn restrict_to_current_account(path: &Path) -> Result<(), String> {
+    let mut failure = "the current account could not be resolved".to_string();
+
+    if let Some(sid) = current_account_sid() {
+        match grant_only(path, &format!("*{}", sid)) {
+            Ok(()) => return Ok(()),
+            Err(e) => failure = e,
+        }
+    }
+
+    let user = whoami::fallible::username()
+        .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
+
+    if !user.is_empty() {
+        match grant_only(path, &user) {
+            Ok(()) => return Ok(()),
+            Err(e) => failure = e,
+        }
+    }
+
+    Err(format!(
+        "could not restrict {} to the current account: {}",
+        path.display(),
+        failure
+    ))
+}
+
+pub fn restrict_to_current_user(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("could not restrict {}: {}", path.display(), e))?;
+    }
+    #[cfg(windows)]
+    restrict_to_current_account(path)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_account_sid_from_the_last_field() {
+        assert_eq!(
+            parse_account_sid("\"desk\\sam\",\"S-1-5-21-1-2-3-1001\"\r\n").as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        assert_eq!(
+            parse_account_sid("\"a,b\",\"S-1-5-18\"").as_deref(),
+            Some("S-1-5-18")
+        );
+    }
+
+    #[test]
+    fn refuses_output_that_is_not_a_sid() {
+        for bad in [
+            "",
+            "\"sam\"",
+            "\"sam\",\"S-1-\"",
+            "\"sam\",\"S-1-5-x\"",
+            "\"sam\",\"Everyone:(F)\"",
+            "\"sam\",\"S-1-5-21 /grant x\"",
+        ] {
+            assert!(parse_account_sid(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fails_when_the_file_cannot_be_restricted() {
+        let missing = std::env::temp_dir()
+            .join(format!("aster_absent_{}", std::process::id()))
+            .join("none.bin");
+
+        assert!(restrict_to_current_user(&missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaves_the_file_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_to_current_user(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricts_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        std::fs::write(&path, b"x").unwrap();
+
+        restrict_to_current_user(&path).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
 
     #[test]
     fn uses_system_root_when_absolute() {

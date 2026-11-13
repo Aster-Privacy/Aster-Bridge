@@ -63,6 +63,32 @@ pub fn parse_format_writes(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+pub fn parse_bound_attachment_writes(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.as_object()?.get("bound_attachment_writes")?.as_bool())
+        .unwrap_or(false)
+}
+
+fn bound_attachment_cache() -> &'static Mutex<FormatWritesCache> {
+    static CACHE: OnceLock<Mutex<FormatWritesCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(FormatWritesCache::default()))
+}
+
+pub fn record_bound_attachment_writes(body: &[u8]) {
+    if let Ok(mut cache) = bound_attachment_cache().lock() {
+        cache.store(parse_bound_attachment_writes(body), Instant::now());
+    }
+}
+
+pub fn bound_attachment_writes() -> bool {
+    bound_attachment_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(Instant::now()))
+        .unwrap_or(false)
+}
+
 #[derive(Default)]
 pub struct FormatWritesCache {
     cached: Option<(bool, Instant)>,
@@ -199,6 +225,17 @@ mod tests {
         assert!(!parse_format_writes(b"[true]"));
         assert!(!parse_format_writes(b"not json"));
         assert!(!parse_format_writes(b""));
+    }
+
+    #[test]
+    fn bound_attachment_writes_parses_only_a_boolean() {
+        assert!(parse_bound_attachment_writes(br#"{"bound_attachment_writes":true}"#));
+        assert!(!parse_bound_attachment_writes(br#"{"bound_attachment_writes":false}"#));
+        assert!(!parse_bound_attachment_writes(br#"{"bound_attachment_writes":"true"}"#));
+        assert!(!parse_bound_attachment_writes(br#"{"bound_attachment_writes":1}"#));
+        assert!(!parse_bound_attachment_writes(br#"{"format_writes":true}"#));
+        assert!(!parse_bound_attachment_writes(b"{}"));
+        assert!(!parse_bound_attachment_writes(b"not json"));
     }
 
     #[test]

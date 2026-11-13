@@ -43,7 +43,18 @@ const X3DH_INFO_PQ_IDENTITY: &[u8] = b"Aster Mail_PQXDH_identity_v1";
 const X3DH_INFO_CLASSICAL_V2: &[u8] = b"Aster Mail_X3DH_v2";
 const X3DH_INFO_PQ_V2: &[u8] = b"Aster Mail_PQXDH_v2";
 const X3DH_INFO_PQ_IDENTITY_V2: &[u8] = b"Aster Mail_PQXDH_identity_v2";
+const X3DH_INFO_CLASSICAL_V3: &[u8] = b"Aster Mail_X3DH_v3";
+const X3DH_INFO_PQ_V3: &[u8] = b"Aster Mail_PQXDH_v3";
+const X3DH_INFO_PQ_IDENTITY_V3: &[u8] = b"Aster Mail_PQXDH_identity_v3";
+pub const X3DH_VERSION_LEGACY: u8 = 1;
 pub const X3DH_VERSION_TRANSCRIPT_BOUND: u8 = 2;
+pub const X3DH_VERSION_KEY_BOUND: u8 = 3;
+const X3DH_INFO_CLASSICAL_V4: &[u8] = b"Aster Mail_X3DH_v4";
+const X3DH_INFO_PQ_V4: &[u8] = b"Aster Mail_PQXDH_v4";
+const X3DH_INFO_PQ_IDENTITY_V4: &[u8] = b"Aster Mail_PQXDH_identity_v4";
+pub const X3DH_VERSION_ONE_TIME_BOUND: u8 = 4;
+pub const ONE_TIME_PREKEY_ID_MAX: u32 = 0x7fff_ffff;
+const P256_PUBLIC_LEN: usize = 65;
 const KDF_INFO_ROOT: &[u8] = b"Aster Mail_Root_KDF";
 const KDF_INFO_CHAIN: &[u8] = b"Aster Mail_Chain_KDF";
 const RATCHET_HEADER_AD_PREFIX: &[u8] = b"astermail-ratchet-header-v2";
@@ -71,6 +82,26 @@ pub struct RatchetMessage {
     pub pq_key_id: Option<i32>,
     pub pq_secret: Option<Vec<u8>>,
     pub x3dh_version: Option<u8>,
+    pub opk_id: Option<u32>,
+    pub spk_id: Option<String>,
+    pub opk_secret: Option<Vec<u8>>,
+}
+
+pub fn is_valid_one_time_prekey_id(key_id: u32) -> bool {
+    (1..=ONE_TIME_PREKEY_ID_MAX).contains(&key_id)
+}
+
+pub fn is_p256_public(public: &[u8]) -> bool {
+    public.len() == P256_PUBLIC_LEN && public[0] == 0x04 && PublicKey::from_sec1_bytes(public).is_ok()
+}
+
+pub fn signed_prekey_id(signed_prekey_public: &[u8]) -> String {
+    use sha2::Digest;
+    Sha256::digest(signed_prekey_public)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
 }
 
 pub(crate) fn ecdh_p256(secret_d: &[u8], public_sec1: &[u8]) -> Result<[u8; 32], String> {
@@ -125,36 +156,96 @@ struct PqContribution<'a> {
 }
 
 struct Transcript<'a> {
+    version: u8,
     initiator_identity: &'a [u8],
     responder_identity: &'a [u8],
+    responder_signed_prekey: &'a [u8],
+    initiator_ephemeral: &'a [u8],
+    one_time: Option<OneTimeBinding<'a>>,
+}
+
+struct OneTimeBinding<'a> {
+    key_id: u32,
+    public: &'a [u8],
+}
+
+fn x3dh_info(version: u8, pq_from_identity: Option<bool>) -> &'static [u8] {
+    match (pq_from_identity, version) {
+        (Some(true), X3DH_VERSION_ONE_TIME_BOUND) => X3DH_INFO_PQ_IDENTITY_V4,
+        (Some(true), X3DH_VERSION_KEY_BOUND) => X3DH_INFO_PQ_IDENTITY_V3,
+        (Some(true), X3DH_VERSION_TRANSCRIPT_BOUND) => X3DH_INFO_PQ_IDENTITY_V2,
+        (Some(true), _) => X3DH_INFO_PQ_IDENTITY,
+        (Some(false), X3DH_VERSION_ONE_TIME_BOUND) => X3DH_INFO_PQ_V4,
+        (Some(false), X3DH_VERSION_KEY_BOUND) => X3DH_INFO_PQ_V3,
+        (Some(false), X3DH_VERSION_TRANSCRIPT_BOUND) => X3DH_INFO_PQ_V2,
+        (Some(false), _) => X3DH_INFO_PQ,
+        (None, X3DH_VERSION_ONE_TIME_BOUND) => X3DH_INFO_CLASSICAL_V4,
+        (None, X3DH_VERSION_KEY_BOUND) => X3DH_INFO_CLASSICAL_V3,
+        (None, X3DH_VERSION_TRANSCRIPT_BOUND) => X3DH_INFO_CLASSICAL_V2,
+        (None, _) => X3DH_INFO_CLASSICAL,
+    }
+}
+
+fn check_one_time_inputs(dh: &[&[u8]], version: u8, transcript: Option<&Transcript<'_>>) -> Result<(), String> {
+    let one_time = transcript.and_then(|transcript| transcript.one_time.as_ref());
+    if version > X3DH_VERSION_ONE_TIME_BOUND {
+        return Err(format!("unsupported x3dh version {}", version));
+    }
+    if version < X3DH_VERSION_ONE_TIME_BOUND {
+        if dh.len() != 3 || one_time.is_some() {
+            return Err("one-time prekey is only bound by the one-time handshake".to_string());
+        }
+        return Ok(());
+    }
+    let transcript = transcript.ok_or_else(|| "one-time handshake needs its transcript".to_string())?;
+    let one_time = one_time.ok_or_else(|| "one-time handshake needs a one-time prekey".to_string())?;
+    if dh.len() != 4 || dh.iter().any(|part| part.len() != 32) {
+        return Err("one-time handshake needs four key agreements".to_string());
+    }
+    if !is_valid_one_time_prekey_id(one_time.key_id) {
+        return Err("one-time prekey id is out of range".to_string());
+    }
+    let publics = [
+        transcript.initiator_identity,
+        transcript.responder_identity,
+        transcript.responder_signed_prekey,
+        transcript.initiator_ephemeral,
+        one_time.public,
+    ];
+    if publics.iter().any(|public| public.len() != P256_PUBLIC_LEN) {
+        return Err("one-time handshake needs every public key".to_string());
+    }
+    Ok(())
 }
 
 fn x3dh_shared_secret(
-    dh: [&[u8]; 3],
+    dh: &[&[u8]],
     pq: Option<PqContribution<'_>>,
     transcript: Option<Transcript<'_>>,
 ) -> Result<Vec<u8>, String> {
-    let bound = transcript.is_some();
-    let mut ikm = Vec::with_capacity(128);
+    let version = transcript
+        .as_ref()
+        .map_or(X3DH_VERSION_LEGACY, |transcript| transcript.version);
+    check_one_time_inputs(dh, version, transcript.as_ref())?;
+    let mut ikm = Vec::with_capacity(512);
     for part in dh {
         ikm.extend_from_slice(part);
     }
-    let info = match &pq {
-        Some(pq) => {
-            ikm.extend_from_slice(pq.shared_secret);
-            match (pq.from_identity, bound) {
-                (true, true) => X3DH_INFO_PQ_IDENTITY_V2,
-                (true, false) => X3DH_INFO_PQ_IDENTITY,
-                (false, true) => X3DH_INFO_PQ_V2,
-                (false, false) => X3DH_INFO_PQ,
-            }
-        }
-        None if bound => X3DH_INFO_CLASSICAL_V2,
-        None => X3DH_INFO_CLASSICAL,
-    };
+    if let Some(pq) = &pq {
+        ikm.extend_from_slice(pq.shared_secret);
+    }
+    let info = x3dh_info(version, pq.as_ref().map(|pq| pq.from_identity));
     if let Some(transcript) = transcript {
         ikm.extend_from_slice(transcript.initiator_identity);
         ikm.extend_from_slice(transcript.responder_identity);
+        if transcript.version >= X3DH_VERSION_KEY_BOUND {
+            ikm.extend_from_slice(transcript.responder_signed_prekey);
+            ikm.extend_from_slice(transcript.initiator_ephemeral);
+        }
+        if let Some(one_time) = &transcript.one_time {
+            ikm.extend_from_slice(one_time.public);
+            ikm.extend_from_slice(&one_time.key_id.to_be_bytes());
+        }
         if let Some(pq) = &pq {
             ikm.extend_from_slice(pq.ciphertext);
         }
@@ -168,10 +259,30 @@ pub(crate) fn derive_x3dh_shared_secret(
     keys: &RatchetReceiverKeys,
     msg: &RatchetMessage,
 ) -> Result<Vec<u8>, String> {
-    let transcript_bound = match msg.x3dh_version {
-        None | Some(1) => false,
-        Some(X3DH_VERSION_TRANSCRIPT_BOUND) => true,
+    let version = match msg.x3dh_version {
+        None | Some(X3DH_VERSION_LEGACY) => X3DH_VERSION_LEGACY,
+        Some(
+            version @ (X3DH_VERSION_TRANSCRIPT_BOUND | X3DH_VERSION_KEY_BOUND | X3DH_VERSION_ONE_TIME_BOUND),
+        ) => version,
         Some(other) => return Err(format!("unsupported x3dh version {}", other)),
+    };
+
+    let mut one_time: Option<(u32, Vec<u8>, [u8; 32])> = if version == X3DH_VERSION_ONE_TIME_BOUND {
+        let key_id = msg
+            .opk_id
+            .filter(|key_id| is_valid_one_time_prekey_id(*key_id))
+            .ok_or_else(|| "one-time prekey id missing".to_string())?;
+        let secret = msg
+            .opk_secret
+            .as_deref()
+            .ok_or_else(|| "one-time prekey secret missing".to_string())?;
+        Some((
+            key_id,
+            identity_public_sec1(secret)?,
+            ecdh_p256(secret, &msg.ephemeral_public)?,
+        ))
+    } else {
+        None
     };
 
     let dh1 = ecdh_p256(&keys.signed_prekey_secret_d, &msg.sender_identity_public)?;
@@ -191,14 +302,30 @@ pub(crate) fn derive_x3dh_shared_secret(
         _ => None,
     };
     let responder_identity = identity_public_sec1(&keys.identity_secret_d)?;
-    let transcript = transcript_bound.then_some(Transcript {
+    let responder_signed_prekey = identity_public_sec1(&keys.signed_prekey_secret_d)?;
+    let transcript = (version >= X3DH_VERSION_TRANSCRIPT_BOUND).then_some(Transcript {
+        version,
         initiator_identity: &msg.sender_identity_public,
         responder_identity: &responder_identity,
+        responder_signed_prekey: &responder_signed_prekey,
+        initiator_ephemeral: &msg.ephemeral_public,
+        one_time: one_time.as_ref().map(|(key_id, public, _)| OneTimeBinding {
+            key_id: *key_id,
+            public: public.as_slice(),
+        }),
     });
 
-    let shared_secret = x3dh_shared_secret([&dh1, &dh2, &dh3], pq, transcript);
+    let mut dh: Vec<&[u8]> = vec![dh1.as_slice(), dh2.as_slice(), dh3.as_slice()];
+    if let Some((_, _, dh4)) = one_time.as_ref() {
+        dh.push(dh4.as_slice());
+    }
+    let shared_secret = x3dh_shared_secret(&dh, pq, transcript);
+    drop(dh);
     if let Some(secret) = pq_ss.as_mut() {
         secret.zeroize();
+    }
+    if let Some((_, _, dh4)) = one_time.as_mut() {
+        dh4.zeroize();
     }
     shared_secret
 }
@@ -232,10 +359,10 @@ pub fn decrypt_bootstrap(keys: &RatchetReceiverKeys, msg: &RatchetMessage) -> Re
         msg.message_number,
     );
 
-    let prefer_ad = msg.header_version.map(|v| v >= 2).unwrap_or(false);
-    let order: [bool; 2] = if prefer_ad { [true, false] } else { [false, true] };
+    let header_bound = msg.header_version.map(|v| v >= 2).unwrap_or(false);
+    let order: &[bool] = if header_bound { &[true, false] } else { &[false] };
 
-    for with_ad in order {
+    for &with_ad in order {
         let result = if with_ad {
             cipher.decrypt(nonce, Payload { msg: &msg.ciphertext, aad: &ad })
         } else {
@@ -395,6 +522,17 @@ pub fn parse_recipient_message(ratchet: &Value, our_email: &str) -> Option<Ratch
         .get("x3dh_v")
         .and_then(|v| v.as_u64())
         .map(|v| u8::try_from(v).unwrap_or(u8::MAX));
+    let one_time_bound = x3dh_version == Some(X3DH_VERSION_ONE_TIME_BOUND);
+    let opk_id = rec
+        .get("opk_id")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|key_id| one_time_bound && is_valid_one_time_prekey_id(*key_id));
+    let spk_id = rec
+        .get("spk_id")
+        .and_then(|v| v.as_str())
+        .filter(|_| one_time_bound)
+        .map(str::to_string);
 
     Some(RatchetMessage {
         sender_identity_public,
@@ -409,11 +547,34 @@ pub fn parse_recipient_message(ratchet: &Value, our_email: &str) -> Option<Ratch
         pq_key_id,
         pq_secret: None,
         x3dh_version,
+        opk_id,
+        spk_id,
+        opk_secret: None,
     })
 }
 
+fn matches_signed_prekey_hint(keys: &RatchetReceiverKeys, hint: Option<&str>) -> bool {
+    let Some(hint) = hint else {
+        return false;
+    };
+    identity_public_sec1(&keys.signed_prekey_secret_d)
+        .map(|public| signed_prekey_id(&public).eq_ignore_ascii_case(hint))
+        .unwrap_or(false)
+}
+
+pub(crate) fn key_sets_in_hint_order<'a>(
+    key_sets: &'a [RatchetReceiverKeys],
+    hint: Option<&str>,
+) -> Vec<&'a RatchetReceiverKeys> {
+    let (mut hinted, rest): (Vec<_>, Vec<_>) = key_sets
+        .iter()
+        .partition(|keys| matches_signed_prekey_hint(keys, hint));
+    hinted.extend(rest);
+    hinted
+}
+
 pub fn decrypt_with_key_sets(key_sets: &[RatchetReceiverKeys], msg: &RatchetMessage) -> Option<String> {
-    for keys in key_sets {
+    for keys in key_sets_in_hint_order(key_sets, msg.spk_id.as_deref()) {
         if let Ok(plaintext) = decrypt_bootstrap(keys, msg) {
             return Some(plaintext);
         }
@@ -436,7 +597,7 @@ pub fn encrypt_bootstrap(
         recipient_signed_prekey_public,
         recipient_pq_public,
         pq_key_id,
-        false,
+        X3DH_VERSION_LEGACY,
         plaintext,
     )
 }
@@ -447,7 +608,66 @@ pub fn encrypt_bootstrap_versioned(
     recipient_signed_prekey_public: &[u8],
     recipient_pq_public: Option<&[u8]>,
     pq_key_id: Option<i32>,
-    transcript_bound: bool,
+    x3dh_version: u8,
+    plaintext: &str,
+) -> Result<RatchetMessage, String> {
+    let version = match x3dh_version {
+        X3DH_VERSION_TRANSCRIPT_BOUND | X3DH_VERSION_KEY_BOUND => x3dh_version,
+        _ => X3DH_VERSION_LEGACY,
+    };
+    seal_bootstrap(
+        sender_identity_secret_d,
+        recipient_identity_public,
+        recipient_signed_prekey_public,
+        recipient_pq_public,
+        pq_key_id,
+        version,
+        None,
+        plaintext,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_bootstrap_one_time_bound(
+    sender_identity_secret_d: &[u8],
+    recipient_identity_public: &[u8],
+    recipient_signed_prekey_public: &[u8],
+    recipient_pq_public: Option<&[u8]>,
+    pq_key_id: Option<i32>,
+    one_time_key_id: u32,
+    one_time_public: &[u8],
+    plaintext: &str,
+) -> Result<RatchetMessage, String> {
+    if !is_valid_one_time_prekey_id(one_time_key_id) {
+        return Err("one-time prekey id is out of range".to_string());
+    }
+    if !is_p256_public(one_time_public) {
+        return Err("one-time prekey is not a P-256 public key".to_string());
+    }
+    if !is_p256_public(recipient_identity_public) || !is_p256_public(recipient_signed_prekey_public) {
+        return Err("one-time handshake needs every public key".to_string());
+    }
+    seal_bootstrap(
+        sender_identity_secret_d,
+        recipient_identity_public,
+        recipient_signed_prekey_public,
+        recipient_pq_public,
+        pq_key_id,
+        X3DH_VERSION_ONE_TIME_BOUND,
+        Some((one_time_key_id, one_time_public)),
+        plaintext,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_bootstrap(
+    sender_identity_secret_d: &[u8],
+    recipient_identity_public: &[u8],
+    recipient_signed_prekey_public: &[u8],
+    recipient_pq_public: Option<&[u8]>,
+    pq_key_id: Option<i32>,
+    version: u8,
+    one_time: Option<(u32, &[u8])>,
     plaintext: &str,
 ) -> Result<RatchetMessage, String> {
     use ml_kem::kem::Encapsulate;
@@ -474,6 +694,10 @@ pub fn encrypt_bootstrap_versioned(
     let dh1 = ecdh_p256(sender_identity_secret_d, recipient_signed_prekey_public)?;
     let dh2 = ecdh_p256(ephemeral_d.as_slice(), recipient_identity_public)?;
     let dh3 = ecdh_p256(ephemeral_d.as_slice(), recipient_signed_prekey_public)?;
+    let mut dh4 = match one_time {
+        Some((_, one_time_public)) => Some(ecdh_p256(ephemeral_d.as_slice(), one_time_public)?),
+        None => None,
+    };
 
     let (pq_ciphertext, out_key_id, mut pq_ss): (Option<Vec<u8>>, Option<i32>, Option<Vec<u8>>) =
         match (recipient_pq_public, pq_key_id) {
@@ -496,13 +720,25 @@ pub fn encrypt_bootstrap_versioned(
         }),
         _ => None,
     };
-    let transcript = transcript_bound.then_some(Transcript {
+    let transcript = (version >= X3DH_VERSION_TRANSCRIPT_BOUND).then_some(Transcript {
+        version,
         initiator_identity: &sender_identity_public,
         responder_identity: recipient_identity_public,
+        responder_signed_prekey: recipient_signed_prekey_public,
+        initiator_ephemeral: &ephemeral_public,
+        one_time: one_time.map(|(key_id, public)| OneTimeBinding { key_id, public }),
     });
 
-    let shared_secret = x3dh_shared_secret([&dh1, &dh2, &dh3], pq, transcript);
+    let mut dh: Vec<&[u8]> = vec![dh1.as_slice(), dh2.as_slice(), dh3.as_slice()];
+    if let Some(dh4) = dh4.as_ref() {
+        dh.push(dh4.as_slice());
+    }
+    let shared_secret = x3dh_shared_secret(&dh, pq, transcript);
+    drop(dh);
     if let Some(secret) = pq_ss.as_mut() {
+        secret.zeroize();
+    }
+    if let Some(secret) = dh4.as_mut() {
         secret.zeroize();
     }
     let shared_secret = shared_secret?;
@@ -539,7 +775,10 @@ pub fn encrypt_bootstrap_versioned(
         pq_ciphertext,
         pq_key_id: out_key_id,
         pq_secret: None,
-        x3dh_version: transcript_bound.then_some(X3DH_VERSION_TRANSCRIPT_BOUND),
+        x3dh_version: (version >= X3DH_VERSION_TRANSCRIPT_BOUND).then_some(version),
+        opk_id: one_time.map(|(key_id, _)| key_id),
+        spk_id: one_time.map(|_| signed_prekey_id(recipient_signed_prekey_public)),
+        opk_secret: None,
     })
 }
 
@@ -576,6 +815,16 @@ mod tests {
     }
 
     fn build_message(plaintext: &str, use_pq: bool, header_version: Option<u8>) -> Built {
+        let header_bound = header_version.map(|v| v >= 2).unwrap_or(false);
+        build_sealed_message(plaintext, use_pq, header_version, header_bound)
+    }
+
+    fn build_sealed_message(
+        plaintext: &str,
+        use_pq: bool,
+        header_version: Option<u8>,
+        header_bound: bool,
+    ) -> Built {
         let recv_identity = SecretKey::random(&mut OsRng);
         let recv_spk = SecretKey::random(&mut OsRng);
         let recv_spk_pub = pub_sec1(&recv_spk);
@@ -614,7 +863,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(message_key).unwrap();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ad = serialize_header_ad(header_version.unwrap_or(1), &sender_ratchet_pub, 0, 0);
-        let ciphertext = if header_version.map(|v| v >= 2).unwrap_or(false) {
+        let ciphertext = if header_bound {
             cipher.encrypt(nonce, Payload { msg: plaintext.as_bytes(), aad: &ad }).unwrap()
         } else {
             cipher.encrypt(nonce, plaintext.as_bytes()).unwrap()
@@ -639,6 +888,9 @@ mod tests {
                 pq_key_id: if pq_secret.is_some() { Some(436178) } else { None },
                 pq_secret,
                 x3dh_version: None,
+                opk_id: None,
+                spk_id: None,
+                opk_secret: None,
             },
         }
     }
@@ -655,6 +907,16 @@ mod tests {
     }
 
     fn vector_secret(version: Option<u8>, pq: bool, identity_lane: bool) -> Result<String, String> {
+        vector_secret_with_one_time(version, pq, identity_lane, None, None)
+    }
+
+    fn vector_secret_with_one_time(
+        version: Option<u8>,
+        pq: bool,
+        identity_lane: bool,
+        opk_id: Option<u32>,
+        opk_secret: Option<Vec<u8>>,
+    ) -> Result<String, String> {
         use ml_kem::EncapsulateDeterministic;
 
         let seed: Vec<u8> = (0..64u32).map(|i| ((i * 13 + 5) & 0xff) as u8).collect();
@@ -692,9 +954,338 @@ mod tests {
             pq_key_id: pq.then(|| if identity_lane { PQ_IDENTITY_KEY_ID } else { 7 }),
             pq_secret: pq.then(|| dk.as_bytes().to_vec()),
             x3dh_version: version,
+            opk_id,
+            spk_id: None,
+            opk_secret,
         };
 
         derive_x3dh_shared_secret(&keys, &msg).map(|secret| to_hex(&secret))
+    }
+
+    const VECTOR_RECEIVER_ONE_TIME_PREKEY_D: &str = "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dw";
+    const VECTOR_RECEIVER_ONE_TIME_PREKEY: &str =
+        "BCR1say+jFjG6SpReRvhFC2KRyeTOj5xHZXoOuldEQr6ZQuEikGWXN5/AKJYN+xh/HjLnqrQG4QpVkzPocFYbJg=";
+    const VECTOR_RECEIVER_SIGNED_PREKEY: &str =
+        "BD2011HtZ43TRKxUnMnCmWP/0TK0zPJZz5CCvFz5jI0YIgTYHpcXHehrOpf9cUy8sk9Pl6Xi4+JuPtkA+ZiK1Cc=";
+    const VECTOR_ONE_TIME_PREKEY_ID: u32 = 16_909_060;
+    const VECTOR_SIGNED_PREKEY_ID: &str = "c5ea95322278e438";
+
+    fn vector_one_time_secret() -> Vec<u8> {
+        URL_SAFE_NO_PAD.decode(VECTOR_RECEIVER_ONE_TIME_PREKEY_D).unwrap()
+    }
+
+    fn one_time_vector_secret(pq: bool, identity_lane: bool) -> Result<String, String> {
+        vector_secret_with_one_time(
+            Some(X3DH_VERSION_ONE_TIME_BOUND),
+            pq,
+            identity_lane,
+            Some(VECTOR_ONE_TIME_PREKEY_ID),
+            Some(vector_one_time_secret()),
+        )
+    }
+
+    #[test]
+    fn one_time_bound_secrets_match_the_cross_client_vectors() {
+        assert_eq!(
+            one_time_vector_secret(false, false).unwrap(),
+            "cd86fc61ca372fd0fe6cef01c44b004d66956e98779c2c115605d5098a42b148"
+        );
+        assert_eq!(
+            one_time_vector_secret(true, false).unwrap(),
+            "80a66a85ce5a08d96469b61f1a35e8512b431519342d5bd597ff86a5bf7ec50a"
+        );
+        assert_eq!(
+            one_time_vector_secret(true, true).unwrap(),
+            "49e59d658796cf02446ae941a33c01f0f8bb954ce1f968a45738598c36132818"
+        );
+    }
+
+    #[test]
+    fn the_vector_one_time_prekey_matches_its_public_key_and_agreement() {
+        let secret = vector_one_time_secret();
+        assert_eq!(
+            identity_public_sec1(&secret).unwrap(),
+            STANDARD.decode(VECTOR_RECEIVER_ONE_TIME_PREKEY).unwrap()
+        );
+        let dh4 = ecdh_p256(&secret, &STANDARD.decode(VECTOR_SENDER_EPHEMERAL).unwrap()).unwrap();
+        assert_eq!(
+            to_hex(&dh4),
+            "fac4776f042455e16e259fc01c18495dadf16b63652473797bbd9fbd3232eaa0"
+        );
+        assert_eq!(VECTOR_ONE_TIME_PREKEY_ID.to_be_bytes(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn earlier_handshakes_ignore_one_time_prekey_material() {
+        let cases = [
+            (Some(1), false, false, "8d18029bb35dde7d83b8f9228152e49d34e096819b1fb7c810ef70ac5bc600b6"),
+            (Some(2), false, false, "6bb032c615db5f87012e62cf8da751b52343c2b4c2d5ed8f140a2c1bb6014f48"),
+            (Some(3), false, false, "09459744acadbaf0e93995b1e78476b89ae2abc12225f3b8471680411f39f075"),
+            (Some(1), true, false, "efa41c478ff0477bfea970527a6a9cee3d8a348e3e4704e255593aa18e3b25f6"),
+            (Some(2), true, false, "023e364282464ccbe2c013d61f7453907d94e2a464f0ee5025cb485eb9cc324c"),
+            (Some(3), true, false, "295cb2db9bb952b6beff8dff48ab2bfda87b16c09eb05397a36326361bcc60f4"),
+            (Some(2), true, true, "1ffb50c01be8f1aa988305dc1152a159a7ab59ad9f845e2f3f7544bf272af88a"),
+            (Some(3), true, true, "c96ffc27882c8cdd893f3f3a5cea5c5961c94702b6fd34498f254a71e5266fdd"),
+        ];
+        for (version, pq, identity_lane, expected) in cases {
+            let secret = vector_secret_with_one_time(
+                version,
+                pq,
+                identity_lane,
+                Some(VECTOR_ONE_TIME_PREKEY_ID),
+                Some(vector_one_time_secret()),
+            )
+            .unwrap();
+            assert_eq!(secret, expected, "version {:?}", version);
+        }
+    }
+
+    #[test]
+    fn a_one_time_bound_handshake_refuses_missing_inputs() {
+        let secret = vector_one_time_secret;
+        let derive = |opk_id: Option<u32>, opk_secret: Option<Vec<u8>>| {
+            vector_secret_with_one_time(Some(X3DH_VERSION_ONE_TIME_BOUND), false, false, opk_id, opk_secret)
+        };
+
+        assert!(derive(None, None).is_err());
+        assert!(derive(Some(VECTOR_ONE_TIME_PREKEY_ID), None).is_err());
+        assert!(derive(None, Some(secret())).is_err());
+        assert!(derive(Some(0), Some(secret())).is_err());
+        assert!(derive(Some(ONE_TIME_PREKEY_ID_MAX + 1), Some(secret())).is_err());
+        assert!(derive(Some(u32::MAX), Some(secret())).is_err());
+        assert!(derive(Some(VECTOR_ONE_TIME_PREKEY_ID), Some(vec![0u8; 32])).is_err());
+        assert!(derive(Some(VECTOR_ONE_TIME_PREKEY_ID), Some(vec![7u8; 16])).is_err());
+        assert!(derive(Some(1), Some(secret())).is_ok());
+        assert!(derive(Some(ONE_TIME_PREKEY_ID_MAX), Some(secret())).is_ok());
+        assert!(vector_secret_with_one_time(Some(5), false, false, Some(1), Some(secret())).is_err());
+    }
+
+    fn bound_secret(
+        version: u8,
+        parts: usize,
+        publics: [&[u8]; 4],
+        one_time: Option<(u32, &[u8])>,
+    ) -> Result<Vec<u8>, String> {
+        let agreements = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let dh: Vec<&[u8]> = agreements.iter().take(parts).map(|part| part.as_slice()).collect();
+        x3dh_shared_secret(
+            &dh,
+            None,
+            Some(Transcript {
+                version,
+                initiator_identity: publics[0],
+                responder_identity: publics[1],
+                responder_signed_prekey: publics[2],
+                initiator_ephemeral: publics[3],
+                one_time: one_time.map(|(key_id, public)| OneTimeBinding { key_id, public }),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_one_time_bound_transcript_is_never_shortened() {
+        let full_bytes = [4u8; 65];
+        let full: &[u8] = &full_bytes;
+        let short: &[u8] = &full_bytes[..64];
+        let empty: &[u8] = &[];
+        let bound = X3DH_VERSION_ONE_TIME_BOUND;
+        let all = [full, full, full, full];
+
+        assert!(bound_secret(bound, 4, all, Some((9u32, full))).is_ok());
+        assert!(bound_secret(bound, 3, all, Some((9u32, full))).is_err());
+        assert!(bound_secret(bound, 4, all, None).is_err());
+        for missing in 0..4 {
+            let mut publics = all;
+            publics[missing] = empty;
+            assert!(bound_secret(bound, 4, publics, Some((9u32, full))).is_err());
+            publics[missing] = short;
+            assert!(bound_secret(bound, 4, publics, Some((9u32, full))).is_err());
+        }
+        assert!(bound_secret(bound, 4, all, Some((9u32, short))).is_err());
+        assert!(bound_secret(bound, 4, all, Some((9u32, empty))).is_err());
+        assert!(bound_secret(bound, 4, all, Some((0u32, full))).is_err());
+        assert!(bound_secret(bound, 4, all, Some((ONE_TIME_PREKEY_ID_MAX + 1, full))).is_err());
+
+        assert!(bound_secret(X3DH_VERSION_KEY_BOUND, 3, all, None).is_ok());
+        assert!(bound_secret(X3DH_VERSION_KEY_BOUND, 4, all, None).is_err());
+        assert!(bound_secret(X3DH_VERSION_KEY_BOUND, 3, all, Some((9u32, full))).is_err());
+        assert!(bound_secret(5, 4, all, Some((9u32, full))).is_err());
+    }
+
+    #[test]
+    fn the_signed_prekey_id_matches_the_vector() {
+        let public = STANDARD.decode(VECTOR_RECEIVER_SIGNED_PREKEY).unwrap();
+        assert_eq!(signed_prekey_id(&public), VECTOR_SIGNED_PREKEY_ID);
+        assert_eq!(
+            identity_public_sec1(&URL_SAFE_NO_PAD.decode(VECTOR_RECEIVER_SIGNED_PREKEY_D).unwrap()).unwrap(),
+            public
+        );
+    }
+
+    #[test]
+    fn the_signed_prekey_hint_orders_candidates_without_excluding_any() {
+        let first = peer().keys;
+        let second = peer().keys;
+        let key_sets = vec![first.clone(), second.clone()];
+        let hint = signed_prekey_id(&second.signed_prekey_public);
+        let order = |hint: Option<&str>| -> Vec<Vec<u8>> {
+            key_sets_in_hint_order(&key_sets, hint)
+                .into_iter()
+                .map(|keys| keys.signed_prekey_public.clone())
+                .collect()
+        };
+
+        assert_eq!(order(None), vec![first.signed_prekey_public.clone(), second.signed_prekey_public.clone()]);
+        assert_eq!(
+            order(Some(hint.as_str())),
+            vec![second.signed_prekey_public.clone(), first.signed_prekey_public.clone()]
+        );
+        assert_eq!(
+            order(Some(hint.to_uppercase().as_str())),
+            vec![second.signed_prekey_public.clone(), first.signed_prekey_public.clone()]
+        );
+        assert_eq!(
+            order(Some("0000000000000000")),
+            vec![first.signed_prekey_public.clone(), second.signed_prekey_public.clone()]
+        );
+    }
+
+    #[test]
+    fn a_one_time_bound_bootstrap_round_trips_on_every_lane() {
+        let sender = SecretKey::random(&mut OsRng);
+        for pq_key_id in [None, Some(7), Some(PQ_IDENTITY_KEY_ID)] {
+            let recipient = peer();
+            let one_time = SecretKey::random(&mut OsRng);
+            let mut message = encrypt_bootstrap_one_time_bound(
+                sender.to_bytes().as_slice(),
+                &recipient.identity_public,
+                &recipient.keys.signed_prekey_public,
+                pq_key_id.map(|_| recipient.pq_public.as_slice()),
+                pq_key_id,
+                41,
+                &pub_sec1(&one_time),
+                "one-time",
+            )
+            .unwrap();
+            assert_eq!(message.x3dh_version, Some(X3DH_VERSION_ONE_TIME_BOUND));
+            assert_eq!(message.opk_id, Some(41));
+            assert_eq!(
+                message.spk_id.as_deref(),
+                Some(signed_prekey_id(&recipient.keys.signed_prekey_public).as_str())
+            );
+            assert!(message.opk_secret.is_none());
+            if pq_key_id.is_some() {
+                message.pq_secret = Some(recipient.pq_secret.clone());
+            }
+
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+
+            message.opk_secret = Some(SecretKey::random(&mut OsRng).to_bytes().to_vec());
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+
+            message.opk_secret = Some(one_time.to_bytes().to_vec());
+            assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "one-time");
+
+            message.spk_id = Some("ffffffffffffffff".to_string());
+            let other = peer().keys;
+            assert_eq!(
+                decrypt_with_key_sets(&[other, recipient.keys.clone()], &message).as_deref(),
+                Some("one-time")
+            );
+
+            message.opk_id = Some(42);
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+            message.opk_id = Some(41);
+
+            message.x3dh_version = Some(X3DH_VERSION_KEY_BOUND);
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+        }
+    }
+
+    #[test]
+    fn the_one_time_bound_sender_refuses_an_unusable_one_time_prekey() {
+        let sender = SecretKey::random(&mut OsRng);
+        let recipient = peer();
+        let one_time = pub_sec1(&SecretKey::random(&mut OsRng));
+        let seal = |key_id: u32, public: &[u8]| {
+            encrypt_bootstrap_one_time_bound(
+                sender.to_bytes().as_slice(),
+                &recipient.identity_public,
+                &recipient.keys.signed_prekey_public,
+                None,
+                None,
+                key_id,
+                public,
+                "refused",
+            )
+        };
+        let mut compressed_tag = one_time.clone();
+        compressed_tag[0] = 0x02;
+        let mut off_curve = one_time.clone();
+        off_curve[64] ^= 0x01;
+
+        assert!(seal(1, &one_time).is_ok());
+        assert!(seal(0, &one_time).is_err());
+        assert!(seal(ONE_TIME_PREKEY_ID_MAX + 1, &one_time).is_err());
+        assert!(seal(1, &one_time[..64]).is_err());
+        assert!(seal(1, &[]).is_err());
+        assert!(seal(1, &compressed_tag).is_err());
+        assert!(seal(1, &off_curve).is_err());
+    }
+
+    #[test]
+    fn the_versioned_sender_never_writes_the_one_time_bound_version() {
+        let sender = SecretKey::random(&mut OsRng);
+        let recipient = peer();
+        for version in [1, 2, 3, X3DH_VERSION_ONE_TIME_BOUND, 5] {
+            let message = encrypt_bootstrap_versioned(
+                sender.to_bytes().as_slice(),
+                &recipient.identity_public,
+                &recipient.keys.signed_prekey_public,
+                None,
+                None,
+                version,
+                "earlier",
+            )
+            .unwrap();
+            assert_ne!(message.x3dh_version, Some(X3DH_VERSION_ONE_TIME_BOUND));
+            assert!(message.opk_id.is_none());
+            assert!(message.spk_id.is_none());
+            assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "earlier");
+        }
+    }
+
+    #[test]
+    fn one_time_fields_are_parsed_only_for_the_one_time_bound_version() {
+        let (case, _, _) = pq_identity_vector_parts();
+        let mut ratchet = find_ratchet_object(&case["envelope"]).unwrap();
+        let our_email = case["our_email"].as_str().unwrap();
+        let mut set = |version: Value, opk_id: Value, spk_id: Value| {
+            for entry in ratchet["recipients"].as_object_mut().unwrap().values_mut() {
+                entry["x3dh_v"] = version.clone();
+                entry["opk_id"] = opk_id.clone();
+                entry["spk_id"] = spk_id.clone();
+            }
+            parse_recipient_message(&ratchet, our_email).unwrap()
+        };
+
+        let bound = set(json!(4), json!(16909060), json!("c5ea95322278e438"));
+        assert_eq!(bound.x3dh_version, Some(4));
+        assert_eq!(bound.opk_id, Some(16_909_060));
+        assert_eq!(bound.spk_id.as_deref(), Some("c5ea95322278e438"));
+        assert!(bound.opk_secret.is_none());
+
+        for version in [1, 2, 3] {
+            let earlier = set(json!(version), json!(16909060), json!("c5ea95322278e438"));
+            assert_eq!(earlier.opk_id, None);
+            assert_eq!(earlier.spk_id, None);
+        }
+
+        for bad_id in [json!(0), json!(2147483648u64), json!(-1), json!("7"), json!(1.5), Value::Null] {
+            assert_eq!(set(json!(4), bad_id, Value::Null).opk_id, None);
+        }
+        assert_eq!(set(json!(4), json!(2147483647), json!(7)).opk_id, Some(ONE_TIME_PREKEY_ID_MAX));
+        assert_eq!(set(json!(4), json!(1), json!(7)).spk_id, None);
     }
 
     #[test]
@@ -719,6 +1310,18 @@ mod tests {
         assert_eq!(
             vector_secret(Some(2), true, true).unwrap(),
             "1ffb50c01be8f1aa988305dc1152a159a7ab59ad9f845e2f3f7544bf272af88a"
+        );
+        assert_eq!(
+            vector_secret(Some(3), false, false).unwrap(),
+            "09459744acadbaf0e93995b1e78476b89ae2abc12225f3b8471680411f39f075"
+        );
+        assert_eq!(
+            vector_secret(Some(3), true, false).unwrap(),
+            "295cb2db9bb952b6beff8dff48ab2bfda87b16c09eb05397a36326361bcc60f4"
+        );
+        assert_eq!(
+            vector_secret(Some(3), true, true).unwrap(),
+            "c96ffc27882c8cdd893f3f3a5cea5c5961c94702b6fd34498f254a71e5266fdd"
         );
     }
 
@@ -749,7 +1352,14 @@ mod tests {
     #[test]
     fn a_bound_bootstrap_round_trips_on_every_lane() {
         let sender = SecretKey::random(&mut OsRng);
-        for pq_key_id in [None, Some(7), Some(PQ_IDENTITY_KEY_ID)] {
+        let lanes = [None, Some(7), Some(PQ_IDENTITY_KEY_ID)];
+        let versions = [
+            (X3DH_VERSION_TRANSCRIPT_BOUND, X3DH_VERSION_KEY_BOUND),
+            (X3DH_VERSION_KEY_BOUND, X3DH_VERSION_TRANSCRIPT_BOUND),
+        ];
+        for (pq_key_id, (version, other_version)) in
+            lanes.into_iter().flat_map(|lane| versions.map(|pair| (lane, pair)))
+        {
             let recipient = peer();
             let mut message = encrypt_bootstrap_versioned(
                 sender.to_bytes().as_slice(),
@@ -757,20 +1367,67 @@ mod tests {
                 &recipient.keys.signed_prekey_public,
                 pq_key_id.map(|_| recipient.pq_public.as_slice()),
                 pq_key_id,
-                true,
+                version,
                 "bound",
             )
             .unwrap();
-            assert_eq!(message.x3dh_version, Some(X3DH_VERSION_TRANSCRIPT_BOUND));
+            assert_eq!(message.x3dh_version, Some(version));
             if pq_key_id.is_some() {
                 message.pq_secret = Some(recipient.pq_secret.clone());
             }
 
             assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "bound");
 
+            message.x3dh_version = Some(other_version);
+            assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
+
             message.x3dh_version = None;
             assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
         }
+    }
+
+    #[test]
+    fn a_key_bound_bootstrap_does_not_open_under_another_signed_prekey() {
+        let sender = SecretKey::random(&mut OsRng);
+        let recipient = peer();
+        let message = encrypt_bootstrap_versioned(
+            sender.to_bytes().as_slice(),
+            &recipient.identity_public,
+            &recipient.keys.signed_prekey_public,
+            None,
+            None,
+            X3DH_VERSION_KEY_BOUND,
+            "bound",
+        )
+        .unwrap();
+        let other_prekey = SecretKey::random(&mut OsRng);
+        let other_keys = RatchetReceiverKeys {
+            identity_secret_d: recipient.keys.identity_secret_d.clone(),
+            signed_prekey_secret_d: other_prekey.to_bytes().to_vec(),
+            signed_prekey_public: other_prekey.public_key().to_encoded_point(false).as_bytes().to_vec(),
+        };
+
+        assert!(decrypt_bootstrap(&other_keys, &message).is_err());
+        assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "bound");
+    }
+
+    #[test]
+    fn an_unknown_sender_version_falls_back_to_the_first_handshake() {
+        let sender = SecretKey::random(&mut OsRng);
+        let recipient = peer();
+        let message = encrypt_bootstrap_versioned(
+            sender.to_bytes().as_slice(),
+            &recipient.identity_public,
+            &recipient.keys.signed_prekey_public,
+            None,
+            None,
+            9,
+            "legacy",
+        )
+        .unwrap();
+
+        assert_eq!(message.x3dh_version, None);
+        assert_eq!(decrypt_bootstrap(&recipient.keys, &message).unwrap(), "legacy");
     }
 
     #[test]
@@ -797,7 +1454,9 @@ mod tests {
 
     #[test]
     fn unknown_x3dh_version_is_rejected() {
-        assert!(vector_secret(Some(3), false, false).is_err());
+        assert!(vector_secret(Some(4), false, false).is_err());
+        assert!(vector_secret(Some(0), false, false).is_err());
+        assert!(vector_secret(Some(u8::MAX), false, false).is_err());
     }
 
     #[test]
@@ -827,6 +1486,21 @@ mod tests {
     fn round_trip_pqxdh_no_header_version_no_aad() {
         let pt = "internal message with no header version field";
         let b = build_message(pt, true, None);
+        assert_eq!(decrypt_bootstrap(&b.keys, &b.msg).unwrap(), pt);
+    }
+
+    #[test]
+    fn unversioned_header_never_opens_as_header_bound() {
+        for header_version in [None, Some(1)] {
+            let b = build_sealed_message("sealed with a header binding", true, header_version, true);
+            assert!(decrypt_bootstrap(&b.keys, &b.msg).is_err());
+        }
+    }
+
+    #[test]
+    fn versioned_header_still_opens_mail_sealed_without_its_binding() {
+        let pt = "sent by an older desktop build";
+        let b = build_sealed_message(pt, true, Some(2), false);
         assert_eq!(decrypt_bootstrap(&b.keys, &b.msg).unwrap(), pt);
     }
 

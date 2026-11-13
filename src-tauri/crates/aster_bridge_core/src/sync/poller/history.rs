@@ -2253,7 +2253,7 @@ mod tests {
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
                 let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-                let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                let size = crate::db::page_size_bytes(conn)?;
                 Ok(((pages - free) * size) as u64)
             })
             .unwrap();

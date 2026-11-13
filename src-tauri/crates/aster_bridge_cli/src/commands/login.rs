@@ -219,7 +219,10 @@ async fn wait_for_confirmation(
                     Err(BridgeError::Api(message)) if message.starts_with("404") || message.starts_with("410") => {
                         break Err(expired(dir));
                     }
-                    Err(e) => break Err(CliError::coded(CODE_SIGN_IN, format!("Couldn't finish signing in: {}", e))),
+                    Err(e) => {
+                        state::clear_pending(dir);
+                        break Err(CliError::coded(CODE_SIGN_IN, format!("Couldn't finish signing in: {}", e)));
+                    }
                 }
             }
         }

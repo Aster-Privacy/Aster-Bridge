@@ -32,7 +32,7 @@ aster-crypto = { path = "../../../../Aster-Mail/aster-crypto", default-features 
 
 tokio = { workspace = true }
 reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.42", features = ["bundled-sqlcipher-vendored-openssl"] }
 mail-parser = { workspace = true }
 quick-xml = "0.41"
 
@@ -58,7 +58,7 @@ percent-encoding = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 p256 = { version = "0.13", features = ["ecdh"] }
-ml-kem = { version = "0.2", features = ["deterministic"] }
+ml-kem = { version = "0.2", features = ["deterministic", "zeroize"] }
 miniz_oxide = "0.8"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"

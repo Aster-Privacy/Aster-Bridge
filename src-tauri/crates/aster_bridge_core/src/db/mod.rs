@@ -26,6 +26,8 @@ use std::sync::Mutex;
 use zeroize::Zeroize;
 
 mod history;
+#[cfg(test)]
+pub(crate) use history::page_size_bytes;
 
 const KEYRING_DB_USER: &str = "db-encryption-key-v1";
 
@@ -659,31 +661,8 @@ fn restrict_db_file_permissions(db_path: &Path) {
         if !p.exists() {
             continue;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            let user = whoami::fallible::username()
-                .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
-            if !user.is_empty() {
-                let _ = crate::system_tools::icacls_command()
-                    .args([
-                        p.to_string_lossy().as_ref(),
-                        "/inheritance:r",
-                        "/grant:r",
-                        &format!("{}:(F)", user),
-                    ])
-                    .creation_flags(0x0800_0000)
-                    .output();
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = &p;
+        if let Err(e) = crate::system_tools::restrict_to_current_user(&p) {
+            tracing::warn!("{}", e);
         }
     }
 }
@@ -725,6 +704,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "jmap_change_log",
     "jmap_blob",
     "envelope_nonces",
+    "envelope_nonce_superseded",
     "recipient_key_pin",
     "outbox",
     "pending_flag_push",
@@ -955,6 +935,11 @@ impl Database {
                 aster_id TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
                 first_seen INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS envelope_nonce_superseded (
+                aster_id TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                PRIMARY KEY (aster_id, nonce)
              );",
         ).map_err(|e| e.to_string())?;
 
@@ -2694,6 +2679,18 @@ impl Database {
                 .ok();
             if let Some(prev) = existing {
                 if prev != envelope_nonce {
+                    let superseded: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM envelope_nonce_superseded WHERE aster_id = ?1 AND nonce = ?2",
+                        rusqlite::params![aster_id, envelope_nonce],
+                        |r| r.get(0),
+                    )?;
+                    if superseded > 0 {
+                        return Ok(false);
+                    }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO envelope_nonce_superseded (aster_id, nonce) VALUES (?1, ?2)",
+                        rusqlite::params![aster_id, prev],
+                    )?;
                     conn.execute(
                         "UPDATE envelope_nonces SET nonce = ?2, first_seen = ?3 WHERE aster_id = ?1",
                         rusqlite::params![aster_id, envelope_nonce, now],
@@ -3037,6 +3034,7 @@ impl Database {
                  DELETE FROM jmap_blob;
                  DELETE FROM uid_map;
                  DELETE FROM envelope_nonces;
+                 DELETE FROM envelope_nonce_superseded;
                  DELETE FROM sync_state;",
             )?;
             conn.execute_batch(history::HISTORY_CLEAR_SQL)?;
@@ -3062,6 +3060,7 @@ impl Database {
                  DELETE FROM jmap_change_log;
                  DELETE FROM jmap_blob;
                  DELETE FROM envelope_nonces;
+                 DELETE FROM envelope_nonce_superseded;
                  DELETE FROM outbox;
                  DELETE FROM pending_flag_push;",
             )?;
@@ -3178,12 +3177,18 @@ fn prune_envelope_nonces(conn: &Connection, kept: i64, slack: i64) -> rusqlite::
     if span < kept + slack {
         return Ok(0);
     }
-    conn.execute(
+    let pruned = conn.execute(
         "DELETE FROM envelope_nonces WHERE rowid <= (
             SELECT rowid FROM envelope_nonces ORDER BY rowid DESC LIMIT 1 OFFSET ?1
          )",
         [kept],
-    )
+    )?;
+    conn.execute(
+        "DELETE FROM envelope_nonce_superseded
+         WHERE aster_id NOT IN (SELECT aster_id FROM envelope_nonces)",
+        [],
+    )?;
+    Ok(pruned)
 }
 
 fn sql_text_literal(s: &str) -> String {
@@ -5172,6 +5177,20 @@ mod db_tests {
         assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "same nonce is allowed");
         assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "re-encryption rotates the nonce and must not lock the item out");
         assert!(db.replay_check_and_record("a1", "nonce2").unwrap(), "the rotated nonce becomes the recorded one");
+    }
+
+    #[test]
+    fn replay_check_refuses_an_envelope_that_was_already_superseded() {
+        let (_d, db) = open_db();
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap());
+        assert!(db.replay_check_and_record("a1", "nonce2").unwrap());
+        assert!(db.replay_check_and_record("a1", "nonce3").unwrap());
+        assert!(!db.replay_check_and_record("a1", "nonce1").unwrap(), "an older envelope must not come back");
+        assert!(!db.replay_check_and_record("a1", "nonce2").unwrap(), "every superseded envelope stays refused");
+        assert!(db.replay_check_and_record("a1", "nonce3").unwrap(), "the current envelope is still accepted");
+        assert!(db.replay_check_and_record("a2", "nonce1").unwrap(), "another message is judged by its own history");
+        db.repair_cache().unwrap();
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "a rebuilt cache starts a new history");
     }
 
     #[test]

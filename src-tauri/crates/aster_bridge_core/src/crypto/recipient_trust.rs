@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 
 use crate::api_client::{ApiClient, PrekeyBundle};
 use crate::crypto::internal_send::key_lookup_username;
-use crate::crypto::ratchet::{PQ_IDENTITY_KEY_ID, X3DH_VERSION_TRANSCRIPT_BOUND};
+use crate::crypto::ratchet::{
+    is_p256_public, is_valid_one_time_prekey_id, PQ_IDENTITY_KEY_ID, X3DH_VERSION_KEY_BOUND,
+    X3DH_VERSION_LEGACY, X3DH_VERSION_ONE_TIME_BOUND, X3DH_VERSION_TRANSCRIPT_BOUND,
+};
 use crate::db::Database;
 use crate::error::BridgeError;
 
@@ -76,11 +79,33 @@ pub struct PqTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneTimePrekeyTarget {
+    pub key_id: u32,
+    pub public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatchetTarget {
     pub identity_public: Vec<u8>,
     pub signed_prekey: Vec<u8>,
     pub pq_target: Option<PqTarget>,
     pub transcript_bound: bool,
+    pub key_bound: bool,
+    pub one_time_prekey: Option<OneTimePrekeyTarget>,
+}
+
+impl RatchetTarget {
+    pub fn x3dh_version(&self) -> u8 {
+        if self.key_bound && self.one_time_prekey.is_some() {
+            X3DH_VERSION_ONE_TIME_BOUND
+        } else if self.key_bound {
+            X3DH_VERSION_KEY_BOUND
+        } else if self.transcript_bound {
+            X3DH_VERSION_TRANSCRIPT_BOUND
+        } else {
+            X3DH_VERSION_LEGACY
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +443,24 @@ fn select_pq_target(
     Ok(None)
 }
 
+fn select_one_time_prekey(bundle: &PrekeyBundle) -> Option<OneTimePrekeyTarget> {
+    if bundle.x3dh_max_version.unwrap_or(1) < i16::from(X3DH_VERSION_ONE_TIME_BOUND) {
+        return None;
+    }
+    let advertised = bundle.ec_one_time_prekey.as_ref()?;
+    let key_id = advertised
+        .get("key_id")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|key_id| is_valid_one_time_prekey_id(*key_id))?;
+    let public_key = advertised
+        .get("public_key")
+        .and_then(|value| value.as_str())
+        .and_then(|value| STANDARD.decode(value.trim()).ok())
+        .filter(|public_key| is_p256_public(public_key))?;
+    Some(OneTimePrekeyTarget { key_id, public_key })
+}
+
 fn ratchet_target(
     address: &str,
     bundle: &PrekeyBundle,
@@ -429,6 +472,8 @@ fn ratchet_target(
         pq_target: select_pq_target(bundle, covers_pq_identity, address)?,
         transcript_bound: bundle.x3dh_max_version.unwrap_or(1)
             >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND),
+        key_bound: bundle.x3dh_max_version.unwrap_or(1) >= i16::from(X3DH_VERSION_KEY_BOUND),
+        one_time_prekey: select_one_time_prekey(bundle),
     })
 }
 
@@ -511,6 +556,9 @@ pub fn evaluate_recipient(
                 }
             }
         };
+        if let Some(signed) = &signed {
+            target.key_bound = signed.x3dh_version >= i16::from(X3DH_VERSION_KEY_BOUND);
+        }
         target.transcript_bound = match &signed {
             Some(signed) => signed.x3dh_version >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND),
             None => target.transcript_bound || base.transcript_bound,
@@ -763,6 +811,7 @@ X1OEWHpsCOAO
             pq_prekey: None,
             pq_kem_public_key: pq_identity.map(|key| STANDARD.encode(key)),
             x3dh_max_version: None,
+            ec_one_time_prekey: None,
         }
     }
 
@@ -1512,6 +1561,163 @@ X1OEWHpsCOAO
             ))
             .transcript_bound
         );
+    }
+
+    #[test]
+    fn a_bundle_advertising_the_key_bound_handshake_selects_it() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        let version = |bundle: &PrekeyBundle, pin: Option<&RecipientPin>| {
+            ratchet(evaluate_recipient(BOB, Some(bundle), Some(&alice.public_key), pin)).x3dh_version()
+        };
+
+        assert_eq!(version(&bundle, None), 1);
+
+        bundle.x3dh_max_version = Some(3);
+        assert_eq!(version(&bundle, None), 3);
+        let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
+        let pin = evaluation.pin.clone().unwrap();
+        assert!(pin.transcript_bound);
+
+        bundle.x3dh_max_version = Some(2);
+        assert_eq!(version(&bundle, Some(&pin)), 2);
+
+        bundle.x3dh_max_version = Some(1);
+        assert_eq!(version(&bundle, Some(&pin)), 2);
+
+        bundle.x3dh_max_version = None;
+        assert_eq!(version(&bundle, Some(&pin)), 2);
+
+        bundle.x3dh_max_version = Some(99);
+        assert_eq!(version(&bundle, Some(&pin)), 3);
+    }
+
+    fn p256_public() -> Vec<u8> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        p256::SecretKey::random(&mut rand_core::OsRng)
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn advertised_one_time_prekey(key_id: u64, public_key: &[u8]) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "key_id": key_id,
+            "public_key": STANDARD.encode(public_key),
+        }))
+    }
+
+    fn chosen_target(bundle: &PrekeyBundle, owner: &Owner) -> RatchetTarget {
+        ratchet(evaluate_recipient(BOB, Some(bundle), Some(&owner.public_key), None))
+    }
+
+    #[test]
+    fn the_one_time_bound_handshake_needs_a_usable_one_time_prekey() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        let public = p256_public();
+
+        bundle.x3dh_max_version = Some(4);
+        assert_eq!(chosen_target(&bundle, &alice).x3dh_version(), 3);
+        assert_eq!(chosen_target(&bundle, &alice).one_time_prekey, None);
+
+        bundle.ec_one_time_prekey = advertised_one_time_prekey(41, &public);
+        let chosen = chosen_target(&bundle, &alice);
+        assert_eq!(chosen.x3dh_version(), 4);
+        assert_eq!(
+            chosen.one_time_prekey,
+            Some(OneTimePrekeyTarget {
+                key_id: 41,
+                public_key: public.clone()
+            })
+        );
+
+        bundle.x3dh_max_version = Some(99);
+        assert_eq!(chosen_target(&bundle, &alice).x3dh_version(), 4);
+
+        for advertised in [Some(3i16), Some(2), Some(1), None] {
+            bundle.x3dh_max_version = advertised;
+            let chosen = chosen_target(&bundle, &alice);
+            assert_eq!(chosen.one_time_prekey, None);
+            assert_eq!(i16::from(chosen.x3dh_version()), advertised.unwrap_or(1));
+        }
+    }
+
+    #[test]
+    fn a_malformed_one_time_prekey_keeps_the_key_bound_handshake() {
+        let alice = owner("alice");
+        let mut bundle = signed_v2_bundle(&alice);
+        bundle.x3dh_max_version = Some(4);
+        let public = p256_public();
+        let mut compressed_tag = public.clone();
+        compressed_tag[0] = 0x02;
+        let mut off_curve = public.clone();
+        off_curve[64] ^= 0x01;
+        let malformed = vec![
+            advertised_one_time_prekey(0, &public),
+            advertised_one_time_prekey(2_147_483_648, &public),
+            advertised_one_time_prekey(u64::MAX, &public),
+            advertised_one_time_prekey(41, &public[..64]),
+            advertised_one_time_prekey(41, &[]),
+            advertised_one_time_prekey(41, &compressed_tag),
+            advertised_one_time_prekey(41, &off_curve),
+            advertised_one_time_prekey(41, &[0x04u8; 65]),
+            Some(serde_json::json!({ "key_id": "41", "public_key": STANDARD.encode(&public) })),
+            Some(serde_json::json!({ "key_id": 41, "public_key": 7 })),
+            Some(serde_json::json!({ "key_id": 41, "public_key": "not base64" })),
+            Some(serde_json::json!({ "public_key": STANDARD.encode(&public) })),
+            Some(serde_json::json!({ "key_id": 41 })),
+            Some(serde_json::json!("41")),
+            Some(serde_json::Value::Null),
+        ];
+
+        for advertised in malformed {
+            bundle.ec_one_time_prekey = advertised.clone();
+            let chosen = chosen_target(&bundle, &alice);
+            assert_eq!(chosen.one_time_prekey, None, "{:?}", advertised);
+            assert_eq!(chosen.x3dh_version(), 3, "{:?}", advertised);
+        }
+
+        bundle.ec_one_time_prekey = advertised_one_time_prekey(2_147_483_647, &public);
+        assert_eq!(chosen_target(&bundle, &alice).x3dh_version(), 4);
+    }
+
+    #[test]
+    fn a_signed_statement_below_the_key_bound_handshake_blocks_the_one_time_bound_one() {
+        let alice = owner("alice");
+        let public = p256_public();
+        for (signed_version, expected) in [(1i16, 1u8), (2, 2), (3, 4), (4, 4)] {
+            let mut bundle = signed_v3_bundle(&alice, signed_version, 5);
+            bundle.x3dh_max_version = Some(4);
+            bundle.ec_one_time_prekey = advertised_one_time_prekey(41, &public);
+            assert_eq!(
+                chosen_target(&bundle, &alice).x3dh_version(),
+                expected,
+                "signed {}",
+                signed_version
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_the_one_time_prekey_field_still_parses() {
+        let bundle: PrekeyBundle = serde_json::from_value(serde_json::json!({
+            "kem_identity_key": "a",
+            "signed_prekey": "b",
+            "x3dh_max_version": 3
+        }))
+        .unwrap();
+        assert!(bundle.ec_one_time_prekey.is_none());
+
+        let bundle: PrekeyBundle = serde_json::from_value(serde_json::json!({
+            "kem_identity_key": "a",
+            "signed_prekey": "b",
+            "x3dh_max_version": 4,
+            "ec_one_time_prekey": [1, 2, 3]
+        }))
+        .unwrap();
+        assert!(select_one_time_prekey(&bundle).is_none());
     }
 
     #[test]

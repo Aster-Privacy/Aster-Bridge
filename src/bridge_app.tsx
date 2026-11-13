@@ -182,6 +182,32 @@ type ToastType = "success" | "error" | "info" | "warning";
 const LINK_DEVICE_URL = "https://app.astermail.org/link-device";
 
 
+const SANDBOX_OFF_BY_SETTING = new Set(["forced_off", "disabled_by_environment"]);
+
+function SandboxBanner() {
+  const { t } = useTranslation();
+  const [status, set_status] = useState<api.WebkitSandboxStatus | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    api.webkit_sandbox_status().then((next) => { if (active) set_status(next); }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  if (!status || status.enabled) return null;
+
+  return (
+    <div role="status" className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium text-txt-primary">
+      <svg className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "var(--color-warning)" }} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+        <path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      {t(SANDBOX_OFF_BY_SETTING.has(status.reason) ? "sandbox_off_by_setting_banner" : "sandbox_off_banner")}
+    </div>
+  );
+}
+
+const HIDDEN_LABEL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+
 // Write to the clipboard via the native pasteboard (Tauri plugin), falling back
 // to the web clipboard API. The plugin path does not depend on webview
 // transient user-activation, so it works even after an intervening await (the
@@ -2759,6 +2785,7 @@ function DashboardView({
         outbox_count={outbox_count}
       />
       <div className="flex-1 p-2 min-h-0 min-w-0 flex flex-col overflow-hidden">
+        <SandboxBanner />
         {!is_online && (
           <div className="aster_island aster_island_tone_warning flex items-center gap-2 px-3 py-1.5 mb-1.5 text-[12px] font-medium text-txt-primary">
             <svg className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "var(--color-warning)" }} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -3116,7 +3143,7 @@ export function BridgeApp() {
         const raw_label = url.searchParams.get("label") || i18next.t("provision_default_label");
         // Deep links arrive from arbitrary local apps; the label is untrusted.
         // Strip control chars and cap length before it is shown in the confirm modal.
-        const label = [...raw_label].filter((ch) => ch.charCodeAt(0) >= 0x20 && ch.charCodeAt(0) !== 0x7f).join("").slice(0, 64).trim() || i18next.t("provision_default_label");
+        const label = [...raw_label].filter((ch) => !HIDDEN_LABEL_CHARACTER.test(ch)).join("").trim().slice(0, 64).trim() || i18next.t("provision_default_label");
         set_provision_label(label);
       } catch {
         /* ignore malformed deep link */
@@ -3137,11 +3164,16 @@ export function BridgeApp() {
     const label = provision_label;
     set_provision_label(null);
     try {
-      const bundle = await api.provision_bundle(label);
-      const payload = JSON.stringify(bundle, null, 2);
-      await navigator.clipboard.writeText(payload).catch(() => {});
+      const { password_id, ...settings } = await api.provision_bundle(label);
+      const payload = JSON.stringify(settings, null, 2);
+      try {
+        await copy_text(payload);
+      } catch (copy_error) {
+        await api.delete_app_password(password_id).catch(() => {});
+        throw copy_error;
+      }
       clear_clipboard_if_unchanged(payload);
-      show_toast(i18next.t("toast_provisioned", { label: bundle.label }), "success");
+      show_toast(i18next.t("toast_provisioned", { label: settings.label }), "success");
     } catch {
       show_toast(i18next.t("toast_provision_failed"), "error");
     }

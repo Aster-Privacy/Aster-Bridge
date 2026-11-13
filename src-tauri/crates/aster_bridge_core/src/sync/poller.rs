@@ -1924,12 +1924,45 @@ async fn try_bootstrap(
         return None;
     }
     let mut msg = crate::crypto::ratchet::parse_recipient_message(ratchet_obj, address)?;
+    if msg.x3dh_version != Some(crate::crypto::ratchet::X3DH_VERSION_ONE_TIME_BOUND) {
+        return open_bootstrap(ctx, &mut msg).await;
+    }
+    let one_time_key_id = msg.opk_id?;
+    let one_time_secret = crate::crypto::one_time_prekeys::load_one_time_secret(
+        ctx.client,
+        ctx.access_token,
+        ctx.our_email,
+        ctx.sync_keys,
+        one_time_key_id,
+    )
+    .await?;
+    msg.opk_secret = Some(one_time_secret.to_vec());
+    let opened = open_bootstrap(ctx, &mut msg).await;
+    if let Some(mut s) = msg.opk_secret.take() {
+        s.zeroize();
+    }
+    if opened.is_some() {
+        crate::crypto::one_time_prekeys::consume_one_time_secret(
+            ctx.client,
+            ctx.access_token,
+            ctx.our_email,
+            one_time_key_id,
+        )
+        .await;
+    }
+    opened
+}
+
+async fn open_bootstrap(
+    ctx: &InternalDecryptContext<'_>,
+    msg: &mut crate::crypto::ratchet::RatchetMessage,
+) -> Option<String> {
     let Some(key_id) = msg.pq_key_id else {
-        return crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
+        return crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, msg);
     };
     for secret in fetch_pq_secrets(ctx, key_id).await {
         msg.pq_secret = Some(secret.to_vec());
-        let opened = crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, &msg);
+        let opened = crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, msg);
         if let Some(mut s) = msg.pq_secret.take() {
             s.zeroize();
         }
@@ -1981,6 +2014,31 @@ fn replay_marker(item: &MailItem) -> String {
     format!("sealed:{}", marker)
 }
 
+async fn sender_identity_is_published(
+    ctx: &InternalDecryptContext<'_>,
+    sender_email: &str,
+    sender_identity: &str,
+) -> bool {
+    let address = sender_email.trim().to_lowercase();
+    let Some(username) = crate::crypto::internal_send::key_lookup_username(&address, "") else {
+        return false;
+    };
+    if sender_identity.is_empty() {
+        return false;
+    }
+    match ctx
+        .client
+        .published_ratchet_identity_keys(ctx.access_token, &username, &address)
+        .await
+    {
+        Ok(published) => published.iter().any(|key| key == sender_identity),
+        Err(e) => {
+            tracing::debug!("sender identity lookup failed: {}", e);
+            false
+        }
+    }
+}
+
 async fn try_decrypt_internal_mail(
     item: &MailItem,
     ctx: &InternalDecryptContext<'_>,
@@ -2012,6 +2070,7 @@ async fn try_decrypt_internal_mail(
         if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
             opened = try_bootstrap(ctx, &ratchet_obj, &attempt.address).await;
             if opened.is_some() {
+                sender_unverified = !sender_identity_is_published(ctx, &sender_email, sender_identity).await;
                 break;
             }
             failed_steps.push("bootstrap");
@@ -3417,12 +3476,13 @@ async fn report_envelope_capability(session: &Arc<RwLock<Session>>, client: &Arc
     let Ok(data_dir) = crate::config::data_dir() else {
         return;
     };
-    let (access_token, user_id, identity_public) = {
+    let (access_token, user_id, identity_public, one_time_keys_readable) = {
         let guard = session.read().await;
         (
             guard.access_token.to_string(),
             guard.user_id.to_string(),
             guard.ratchet_identity_public.clone(),
+            !guard.ratchet_keys.is_empty() && !guard.ratchet_recovery.sync_keys().is_empty(),
         )
     };
     crate::crypto::envelope_capability::report_if_due(
@@ -3430,6 +3490,7 @@ async fn report_envelope_capability(session: &Arc<RwLock<Session>>, client: &Arc
         &access_token,
         &user_id,
         identity_public.as_deref(),
+        one_time_keys_readable,
         &data_dir,
     )
     .await;
@@ -4245,6 +4306,7 @@ mod tests {
         crate::crypto::inbound::InboundKeyCandidate {
             ecdh_secret_d: sk.to_bytes().to_vec(),
             pq_decap_key: None,
+            owner: None,
         }
     }
 
@@ -4620,6 +4682,115 @@ mod tests {
 
         let moved = inbound_item("bob-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
         assert!(try_decrypt_internal_mail(&moved, &ctx).await.is_none());
+    }
+
+    async fn sender_directory(current: Option<String>, history: Vec<String>, failing: bool) -> ApiClient {
+        use axum::extract::{Path, Query};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Json, Router};
+        use std::collections::HashMap;
+
+        let reply = move |username: String, query: HashMap<String, String>, body: Option<serde_json::Value>| {
+            let addressed = username == "bob" && query.get("email").map(String::as_str) == Some("bob@astermail.org");
+            match (failing, addressed, body) {
+                (true, _, _) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                (false, true, Some(body)) => Json(body).into_response(),
+                _ => StatusCode::NOT_FOUND.into_response(),
+            }
+        };
+        let current_body = current.map(|key| serde_json::json!({"user_id": "u", "kem_identity_key": key, "signed_prekey": "spk"}));
+        let history_body = serde_json::json!({
+            "user_id": "u",
+            "entries": history.iter().map(|key| serde_json::json!({"kem_identity_key": key})).collect::<Vec<_>>(),
+            "history_complete": true,
+        });
+        let app = Router::new()
+            .route(
+                "/crypto/v1/ratchet/identity/:username",
+                get(move |Path(username): Path<String>, Query(query): Query<HashMap<String, String>>| {
+                    let body = current_body.clone();
+                    async move { reply(username, query, body) }
+                }),
+            )
+            .route(
+                "/crypto/v1/ratchet/prekey-bundle/:username/history",
+                get(move |Path(username): Path<String>, Query(query): Query<HashMap<String, String>>| {
+                    let body = Some(history_body.clone());
+                    async move { reply(username, query, body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port))
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_is_trusted_only_when_the_directory_publishes_the_sender_identity() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let public = |key: &p256::SecretKey| key.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let identity = p256::SecretKey::random(&mut rand_core::OsRng);
+        let prekey = p256::SecretKey::random(&mut rand_core::OsRng);
+        let ratchet_keys = vec![crate::crypto::ratchet::RatchetReceiverKeys {
+            identity_secret_d: identity.to_bytes().to_vec(),
+            signed_prekey_secret_d: prekey.to_bytes().to_vec(),
+            signed_prekey_public: public(&prekey),
+        }];
+        let sender = p256::SecretKey::random(&mut rand_core::OsRng);
+        let sender_b64 = STANDARD.encode(public(&sender));
+        let other_b64 = STANDARD.encode(public(&p256::SecretKey::random(&mut rand_core::OsRng)));
+        let message = crate::crypto::ratchet::encrypt_bootstrap(
+            sender.to_bytes().as_slice(),
+            &public(&identity),
+            &public(&prekey),
+            None,
+            None,
+            "hello bob",
+        )
+        .unwrap();
+        let sealed = crate::crypto::internal_send::build_envelope(
+            &sender_b64,
+            vec![("me@astermail.org".to_string(), crate::crypto::internal_send::recipient_entry(&message))],
+        );
+        let envelope = serde_json::json!({"from": "Bob <Bob@AsterMail.org>", "subject": "s", "body_text": sealed});
+        let inbound = p256::SecretKey::random(&mut rand_core::OsRng);
+        let inbound_keys = [inbound_candidate(&inbound)];
+        let item = inbound_item("bootstrap-item", &envelope, &inbound);
+        let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
+            storage_keys: Vec::new(),
+            lane_candidates: Vec::new(),
+        };
+
+        let cases = [
+            ("nothing published", None, vec![], false, true),
+            ("another identity published", Some(other_b64.clone()), vec![other_b64.clone()], false, true),
+            ("directory unreachable", Some(sender_b64.clone()), vec![sender_b64.clone()], true, true),
+            ("current identity", Some(sender_b64.clone()), vec![], false, false),
+            ("earlier identity", Some(other_b64.clone()), vec![other_b64.clone(), sender_b64.clone()], false, false),
+        ];
+        for (label, current, history, failing, expect_unverified) in cases {
+            let client = sender_directory(current, history, failing).await;
+            let ctx = InternalDecryptContext {
+                our_email: "me@astermail.org",
+                passphrase: b"pass",
+                identity_key: IK,
+                previous_keys: &[],
+                ratchet_keys: &ratchet_keys,
+                inbound_keys: &inbound_keys,
+                recovery: &recovery,
+                sync_keys: &[],
+                escrow_keys: &[],
+                client: &client,
+                access_token: "tok",
+            };
+            let bundle = try_decrypt_internal_mail(&item, &ctx).await.unwrap();
+            assert_eq!(bundle.body, "hello bob", "{label}");
+            assert_eq!(bundle.sender_unverified, expect_unverified, "{label}");
+        }
     }
 
     #[test]

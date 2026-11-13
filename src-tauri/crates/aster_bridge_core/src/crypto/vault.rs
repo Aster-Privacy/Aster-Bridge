@@ -151,6 +151,28 @@ pub fn vault_kdf_iterations(stored: Option<u32>) -> Result<u32> {
     }
 }
 
+fn vault_cipher(passphrase: &[u8], salt: &[u8], iterations: u32) -> Result<Aes256Gcm> {
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut key);
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)));
+    key.zeroize();
+    cipher
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn encrypt_vault_for_test(plaintext: &[u8], passphrase: &[u8]) -> (String, String) {
+    let salt = [13u8; SALT_LEN];
+    let nonce_bytes = [21u8; 12];
+    let cipher = vault_cipher(passphrase, &salt, PBKDF2_ITERATIONS).expect("vault cipher");
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .expect("vault encrypt");
+    let mut combined = salt.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    (STANDARD.encode(&combined), STANDARD.encode(nonce_bytes))
+}
+
 pub fn decrypt_vault(
     encrypted_vault_b64: &str,
     vault_nonce_b64: &str,
@@ -186,12 +208,7 @@ pub fn decrypt_vault_with_iterations(
     let salt = &combined[..SALT_LEN];
     let ciphertext = &combined[SALT_LEN..];
 
-    let mut key = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut key);
-
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
-    key.zeroize();
+    let cipher = vault_cipher(passphrase, salt, iterations)?;
 
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher

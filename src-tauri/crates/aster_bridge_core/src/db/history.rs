@@ -20,6 +20,24 @@
 //
 use super::Database;
 
+pub(crate) fn page_size_bytes(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    use rusqlite::types::ValueRef;
+    conn.query_row("PRAGMA page_size", [], |row| match row.get_ref(0)? {
+        ValueRef::Integer(size) => Ok(size),
+        ValueRef::Text(text) => std::str::from_utf8(text)
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+            .ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(0, "page_size".to_string(), rusqlite::types::Type::Text)
+            }),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            0,
+            "page_size".to_string(),
+            other.data_type(),
+        )),
+    })
+}
+
 pub(super) const HISTORY_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS listing_member (
     listing TEXT NOT NULL,
     aster_id TEXT NOT NULL,
@@ -189,7 +207,7 @@ impl Database {
     pub fn reclaim_free_space(&self, min_bytes: i64, pages_per_step: i64) -> Result<i64, String> {
         let (free_pages, page_size, auto_vacuum) = self.with_conn(|conn| {
             let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-            let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let size = page_size_bytes(conn)?;
             let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
             Ok((free, size, mode))
         })?;

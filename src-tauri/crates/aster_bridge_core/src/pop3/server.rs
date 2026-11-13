@@ -445,7 +445,9 @@ where
                         pre_auth.mark_signed_in();
                         writer.write_all(b"+OK maildrop ready\r\n").await?;
                     } else {
-                        failed_auth += 1;
+                        failed_auth = failed_auth.saturating_add(1);
+                        let backoff_ms = 200u64.saturating_mul(1u64 << failed_auth.min(5));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         if failed_auth >= MAX_FAILED_AUTH {
                             writer.write_all(b"-ERR too many failed attempts\r\n").await?;
                             break;
@@ -716,6 +718,30 @@ mod tests {
             "{:?}",
             out
         );
+        assert!(!out.contains("maildrop ready"), "{:?}", out);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_wrong_passwords_are_slowed_down_then_cut_off() {
+        let attempt = "USER tester@aster.test\r\nPASS wrong-password\r\n";
+        let script = attempt.repeat(MAX_FAILED_AUTH as usize + 2);
+        let started = tokio::time::Instant::now();
+        let out = pop3_transcript(&script, false).await;
+        let waited = started.elapsed();
+        let expected_ms: u64 = (1..=MAX_FAILED_AUTH).map(|n| 200u64 << n.min(5)).sum();
+        assert!(
+            waited >= std::time::Duration::from_millis(expected_ms),
+            "wrong passwords were answered after {:?}, expected at least {} ms",
+            waited,
+            expected_ms
+        );
+        assert_eq!(
+            out.matches("-ERR Sign-in failed.").count(),
+            MAX_FAILED_AUTH as usize - 1,
+            "{:?}",
+            out
+        );
+        assert!(out.ends_with("-ERR too many failed attempts\r\n"), "{:?}", out);
         assert!(!out.contains("maildrop ready"), "{:?}", out);
     }
 

@@ -94,13 +94,8 @@ fn manifest_entry(seq: usize, sealed: &serde_json::Value) -> Option<serde_json::
     if data_nonce.len() != DATA_NONCE_LEN {
         return None;
     }
-    let key_bytes = decode_session_key(key).ok()?;
-    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_slice()).ok()?;
-    let plain = Zeroizing::new(
-        cipher
-            .decrypt(Nonce::from_slice(&data_nonce), encrypted_data.as_ref())
-            .ok()?,
-    );
+    let slot = i64::try_from(seq).ok()?;
+    let plain = Zeroizing::new(decrypt_data(slot, &encrypted_data, &data_nonce, key).ok()?);
     let mut entry = serde_json::Map::new();
     entry.insert("seq".to_string(), serde_json::json!(seq));
     entry.insert("key".to_string(), serde_json::json!(key));
@@ -547,6 +542,17 @@ pub fn seal_attachment_with_own_key(
     seal_attachment_with_keys(attachment, passphrase, own_key, v2_key.as_deref())
 }
 
+pub fn seal_attachment_for_slot(
+    attachment: &OutgoingAttachment,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+    slot: usize,
+) -> Result<SealedAttachment> {
+    let v2_key = crate::crypto::envelope_v2::envelope_v2_write_key();
+    let bound_slot = crate::crypto::sent_copy::bound_attachment_writes().then_some(slot);
+    seal_attachment_in_form(attachment, passphrase, own_key, v2_key.as_deref(), bound_slot)
+}
+
 fn v2_meta_nonce() -> [u8; DATA_NONCE_LEN] {
     let mut nonce = [0u8; DATA_NONCE_LEN];
     nonce[0] = 2;
@@ -559,6 +565,16 @@ fn seal_attachment_with_keys(
     own_key: Option<&str>,
     v2_key: Option<&[u8; 32]>,
 ) -> Result<SealedAttachment> {
+    seal_attachment_in_form(attachment, passphrase, own_key, v2_key, None)
+}
+
+fn seal_attachment_in_form(
+    attachment: &OutgoingAttachment,
+    passphrase: &[u8],
+    own_key: Option<&str>,
+    v2_key: Option<&[u8; 32]>,
+    bound_slot: Option<usize>,
+) -> Result<SealedAttachment> {
     use rand_core::{OsRng, RngCore};
 
     let mut session_key = Zeroizing::new([0u8; SESSION_KEY_LEN]);
@@ -567,8 +583,22 @@ fn seal_attachment_with_keys(
         .map_err(|e| BridgeError::Crypto(format!("attachment cipher init: {}", e)))?;
     let mut data_nonce = [0u8; DATA_NONCE_LEN];
     OsRng.fill_bytes(&mut data_nonce);
+    let aad = match bound_slot {
+        Some(slot) => {
+            let seq = i64::try_from(slot)
+                .map_err(|_| BridgeError::Crypto("attachment slot out of range".to_string()))?;
+            attachment_data_aad(seq)
+        }
+        None => Vec::new(),
+    };
     let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&data_nonce), attachment.data.as_ref())
+        .encrypt(
+            Nonce::from_slice(&data_nonce),
+            Payload {
+                msg: attachment.data.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| {
             BridgeError::Crypto(format!("attachment encrypt failed for {}", attachment.name))
         })?;
@@ -637,8 +667,9 @@ pub fn seal_send_attachments_with_own_key(
 ) -> Result<Vec<serde_json::Value>> {
     attachments
         .iter()
-        .map(|a| {
-            seal_attachment_with_own_key(a, passphrase, own_key).map(|s| send_attachment_value(&s))
+        .enumerate()
+        .map(|(slot, a)| {
+            seal_attachment_for_slot(a, passphrase, own_key, slot).map(|s| send_attachment_value(&s))
         })
         .collect()
 }
@@ -647,6 +678,54 @@ pub fn seal_send_attachments_with_own_key(
 mod tests {
     use super::*;
     use rand_core::{OsRng, RngCore};
+
+    fn sealed_session_key(sealed: &SealedAttachment) -> String {
+        let meta: serde_json::Value = serde_json::from_str(&sealed.plain_meta).unwrap();
+        meta["session_key"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn an_attachment_is_written_unbound_unless_a_slot_is_given() {
+        let att = outgoing("a.txt", "text/plain", None, b"file body");
+        let sealed = seal_attachment_in_form(&att, b"vault-pass", None, None, None).unwrap();
+        let key = decode_session_key(&sealed_session_key(&sealed)).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+        let plain = cipher
+            .decrypt(Nonce::from_slice(&sealed.data_nonce), sealed.encrypted_data.as_ref())
+            .unwrap();
+        assert_eq!(plain, b"file body");
+    }
+
+    #[test]
+    fn a_bound_attachment_opens_only_at_its_own_slot() {
+        let att = outgoing("a.txt", "text/plain", None, b"file body");
+        let sealed = seal_attachment_in_form(&att, b"vault-pass", None, None, Some(2)).unwrap();
+        let key_b64 = sealed_session_key(&sealed);
+        let key = decode_session_key(&key_b64).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+        assert!(cipher
+            .decrypt(Nonce::from_slice(&sealed.data_nonce), sealed.encrypted_data.as_ref())
+            .is_err());
+        assert_eq!(
+            decrypt_data(2, &sealed.encrypted_data, &sealed.data_nonce, &key_b64).unwrap(),
+            b"file body"
+        );
+        assert!(decrypt_data(1, &sealed.encrypted_data, &sealed.data_nonce, &key_b64).is_err());
+    }
+
+    #[test]
+    fn the_send_manifest_lists_bound_attachments() {
+        let first = outgoing("a.txt", "text/plain", None, b"first");
+        let second = outgoing("b.txt", "text/plain", None, b"second body");
+        let list = vec![
+            send_attachment_value(&seal_attachment_in_form(&first, b"p", None, None, Some(0)).unwrap()),
+            send_attachment_value(&seal_attachment_in_form(&second, b"p", None, None, Some(1)).unwrap()),
+        ];
+        let manifest = send_attachment_manifest(&serde_json::json!({ "attachments": list }));
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[1]["size"], 11);
+        assert_eq!(manifest[1]["sha256"], sha256_hex(b"second body"));
+    }
 
     fn outgoing(name: &str, mime: &str, content_id: Option<&str>, data: &[u8]) -> OutgoingAttachment {
         OutgoingAttachment {
@@ -918,6 +997,22 @@ mod tests {
     }
 
     #[test]
+    fn bound_interop_vector_opens_only_at_its_slot() {
+        let key: Vec<u8> = (0u8..32).collect();
+        let nonce: Vec<u8> = (100u8..112).collect();
+        let sealed = STANDARD
+            .decode("KnSrCB3JN+pKAzyAtwAEiWK0Y2n/A4EnWy1F74Tph6cRl+lEq4yU")
+            .unwrap();
+        let key_b64 = STANDARD.encode(&key);
+        let out = decrypt_data(3, &sealed, &nonce, &key_b64).unwrap();
+        assert_eq!(out, b"bound attachment vector");
+        assert!(decrypt_data(4, &sealed, &nonce, &key_b64).is_err());
+        let mut tampered = sealed.clone();
+        tampered[0] ^= 1;
+        assert!(decrypt_data(3, &tampered, &nonce, &key_b64).is_err());
+    }
+
+    #[test]
     fn server_sealed_meta_opens_with_the_envelope_key() {
         let key = random_key();
         let nonce = random_nonce();
@@ -997,6 +1092,21 @@ mod tests {
         };
         let r = row(0, b"raw stored bytes plus a tag", &[0u8; 12], b"", &[0u8; 12]);
         assert!(decrypt_attachment(&r, Some(&entry), b"pass", None, &[]).is_err());
+    }
+
+    #[test]
+    fn stored_plaintext_is_refused_when_only_the_row_meta_carries_a_key() {
+        let meta = serde_json::json!({
+            "filename": "report.pdf",
+            "content_type": "application/pdf",
+            "session_key": STANDARD.encode(random_key()),
+        })
+        .to_string();
+        let r = AttachmentResponse {
+            encrypted_meta: encrypt_pbkdf2_envelope(&meta, b"pass").unwrap(),
+            ..row(0, b"%PDF-1.7 swapped", &[0u8; 12], b"", &random_nonce())
+        };
+        assert!(decrypt_attachment(&r, None, b"pass", None, &[]).is_err());
     }
 
     #[test]
