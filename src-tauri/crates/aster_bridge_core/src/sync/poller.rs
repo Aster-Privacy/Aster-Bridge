@@ -2845,6 +2845,9 @@ fn target_folder(system_label: &str, item: &MailItem, known: &HashSet<String>) -
             return label;
         }
     }
+    if system_label == "archive" && item.item_type == "sent" {
+        return "sent".to_string();
+    }
     system_label.to_string()
 }
 
@@ -4148,6 +4151,34 @@ mod tests {
     fn extract_recipients_none_for_empty_or_missing() {
         assert_eq!(extract_recipients(&serde_json::json!({"to": []}), "to"), None);
         assert_eq!(extract_recipients(&serde_json::json!({}), "to"), None);
+    }
+
+    #[test]
+    fn archived_sent_mail_stays_in_sent() {
+        let mut item = item_with_envelope("sent-archived", &serde_json::json!({}));
+        item.item_type = "sent".to_string();
+        let known = HashSet::new();
+        assert_eq!(target_folder("archive", &item, &known), "sent");
+        assert_eq!(target_folder("sent", &item, &known), "sent");
+    }
+
+    #[test]
+    fn archived_received_mail_goes_to_archive() {
+        let item = item_with_envelope("received-archived", &serde_json::json!({}));
+        assert_eq!(target_folder("archive", &item, &HashSet::new()), "archive");
+    }
+
+    #[test]
+    fn archived_sent_mail_in_a_custom_folder_stays_there() {
+        let mut item = item_with_envelope("sent-filed", &serde_json::json!({}));
+        item.item_type = "sent".to_string();
+        item.labels = Some(vec![crate::api_client::MailItemLabel {
+            token: "projects".to_string(),
+        }]);
+        let known: HashSet<String> = ["projects".to_string()].into_iter().collect();
+        let expected = crate::folders::folder_label("projects");
+        assert_eq!(target_folder("archive", &item, &known), expected);
+        assert_eq!(target_folder("sent", &item, &known), expected);
     }
 
     #[test]
