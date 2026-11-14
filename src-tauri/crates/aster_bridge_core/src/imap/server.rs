@@ -127,6 +127,7 @@ fn gmail_labels_for_message(msg: &CachedMessage) -> Vec<String> {
 }
 
 const MAX_LINE_LENGTH: usize = 8192;
+const IDLE_LINE_LIMIT: u64 = 256;
 const MAX_FAILED_AUTH: u32 = 5;
 const MAX_SEARCH_LITERALS: usize = 16;
 const SEARCH_LITERAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2046,9 +2047,10 @@ where
                 let mut disconnected = false;
 
                 loop {
+                    let mut limited = tokio::io::AsyncReadExt::take(&mut reader, IDLE_LINE_LIMIT);
                     tokio::select! {
                         biased;
-                        read_res = reader.read_until(b'\n', &mut buf) => {
+                        read_res = limited.read_until(b'\n', &mut buf) => {
                             match read_res {
                                 Ok(0) => {
                                     disconnected = true;

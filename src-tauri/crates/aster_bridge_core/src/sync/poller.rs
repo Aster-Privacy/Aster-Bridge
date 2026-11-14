@@ -504,6 +504,21 @@ fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachmen
     serde_json::Value::Object(map).to_string()
 }
 
+fn mark_attachments_unverified(raw_headers: Option<&str>) -> String {
+    let mut map = raw_headers
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    map.insert(
+        crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG.to_string(),
+        serde_json::json!(true),
+    );
+    serde_json::Value::Object(map).to_string()
+}
+
 const ADDRESS_META_VERSION_KEY: &str = "addresses_v";
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -807,7 +822,10 @@ async fn download_backlog_item(
                 entries = fresh;
                 external_key = external_key.filter(|_| allowed);
             }
-            Ok((_, _, allowed)) => {
+            Ok((_, sealed_ratchet, allowed)) => {
+                if sealed_ratchet && entries.is_empty() {
+                    meta_json = Some(mark_attachments_unverified(msg.raw_headers.as_deref()));
+                }
                 external_key = external_key.filter(|_| allowed);
             }
             Err(AttachmentFetchError::Transport(e)) => {
@@ -1615,7 +1633,9 @@ fn commit_prepared(
         );
     }
     let mut raw_headers_meta = serde_json::Value::Object(raw_headers_map);
-    if prepared.sealed_ratchet && crate::message_render::has_listed_attachments(&raw_headers_meta) {
+    if prepared.sealed_ratchet
+        && (crate::message_render::has_listed_attachments(&raw_headers_meta) || prepared.expected_attachments > 0)
+    {
         raw_headers_meta[crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG] = serde_json::json!(true);
     }
     let raw_headers_meta = raw_headers_meta.to_string();
@@ -2326,7 +2346,10 @@ fn store_unsealed_message(
     }
     let flag = crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG;
     let mut meta = serde_json::Value::Object(meta_map);
-    if listed.is_empty() && crate::message_render::has_listed_attachments(&meta) {
+    let unlisted_parts = listed.is_empty()
+        && (crate::message_render::has_listed_attachments(&meta)
+            || db.get_message_attachments(aster_id).is_ok_and(|stored| !stored.is_empty()));
+    if unlisted_parts {
         meta[flag] = serde_json::json!(true);
     } else if let Some(map) = meta.as_object_mut() {
         map.remove(flag);
@@ -7634,6 +7657,23 @@ mod sealed_retry_tests {
 
         assert!(store_unsealed_message(&db, "no-attachments", &unlisted));
         assert!(meta_of("no-attachments").get("attachments_unverified").is_none());
+
+        db.replace_message_attachments(
+            "no-attachments",
+            &[CachedAttachment {
+                seq: 0,
+                name: "extra.pdf".to_string(),
+                is_inline: false,
+                content_type: "application/pdf".to_string(),
+                content_id: None,
+                size: 5,
+                data: b"extra".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert!(store_unsealed_message(&db, "no-attachments", &unlisted));
+        assert_eq!(meta_of("no-attachments")["attachments_unverified"], true);
+        assert!(mark_attachments_unverified(Some("{\"is_html\":true}")).contains("\"attachments_unverified\":true"));
     }
 
     #[test]
