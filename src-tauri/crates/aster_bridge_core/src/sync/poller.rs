@@ -4562,12 +4562,17 @@ mod tests {
     }
 
     fn identity_sealed_item(id: &str, json: &serde_json::Value, identity_key: &str) -> MailItem {
-        let (data, nonce) = crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
-            &json.to_string(),
-            identity_key,
-            crate::crypto::envelope::ENVELOPE_VERSION_IMPORT,
-        )
-        .unwrap();
+        let (data, nonce) = loop {
+            let sealed = crate::crypto::envelope::encrypt_identity_key_envelope_with_version(
+                &json.to_string(),
+                identity_key,
+                crate::crypto::envelope::ENVELOPE_VERSION_IMPORT,
+            )
+            .unwrap();
+            if !crate::crypto::inbound::is_inbound_payload(&sealed.0, &sealed.1) {
+                break sealed;
+            }
+        };
         let mut item = item_with_envelope(id, json);
         item.encrypted_envelope = data;
         item.envelope_nonce = nonce;
