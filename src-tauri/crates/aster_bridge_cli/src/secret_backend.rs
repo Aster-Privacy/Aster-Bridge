@@ -123,6 +123,8 @@ fn build_file(data_dir: &Path) -> CliResult<SecretBackend> {
         let error = CliError::secret_store(format!("Couldn't use the secret key file: {}", e));
         if e.contains("by other users") {
             error.with_hint(key_file_access_hint(&path))
+        } else if e.contains("os error 13") {
+            error.with_hint(crate::context::access_hint(&path))
         } else if path.exists() {
             error.with_hint(key_file_hint())
         } else {
