@@ -2,7 +2,7 @@
 
 ARG BRIDGE_BINARY=source
 
-FROM rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS build
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 ENV CARGO_BUILD_JOBS=8 \
     CARGO_TERM_COLOR=never
 WORKDIR /src/Aster-Bridge
