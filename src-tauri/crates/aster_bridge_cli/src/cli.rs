@@ -121,6 +121,8 @@ pub enum Command {
         #[arg(long, conflicts_with = "refresh", help = "Keep the status on screen and update it")]
         live: bool,
     },
+    #[command(about = "Exit 0 when the mail servers are running and 1 otherwise, for container health checks")]
+    Healthcheck,
     #[command(about = "Stop the mail servers running on this computer")]
     Stop,
     #[command(subcommand, about = "Manage passwords for email apps")]

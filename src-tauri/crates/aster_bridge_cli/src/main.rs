@@ -20,6 +20,7 @@
 //
 mod cli;
 mod commands;
+mod container;
 mod context;
 mod control;
 mod events;
@@ -55,6 +56,7 @@ fn run() -> i32 {
             return code;
         }
     };
+    let health = matches!(cli.command, cli::Command::Healthcheck);
     let out = output::Output::new(&cli.global);
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -68,11 +70,16 @@ fn run() -> i32 {
     };
     let result = runtime.block_on(commands::dispatch(cli, out));
     runtime.shutdown_timeout(Duration::from_secs(1));
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(error) => {
             out.error(&error);
             error.exit_code
         }
+    };
+    if health && code != exit::EXIT_OK {
+        commands::status::UNHEALTHY
+    } else {
+        code
     }
 }

@@ -87,6 +87,9 @@ tracing = { workspace = true }
 thiserror = "2"
 anyhow = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -27,6 +27,10 @@ use crate::exit::CliError;
 use crate::theme::{self, ColorDepth, Palette, Role};
 
 pub fn write_stdout(text: &str) {
+    write_stdout_raw(&crate::container::localize(text));
+}
+
+pub fn write_stdout_raw(text: &str) {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     if handle.write_all(text.as_bytes()).is_err() || handle.flush().is_err() {
@@ -186,7 +190,7 @@ impl Output {
     }
 
     pub fn json(&self, value: Value) {
-        out_line!("{}", envelope(value));
+        write_stdout_raw(&format!("{}\n", envelope(value)));
         let _ = std::io::stdout().flush();
     }
 
@@ -418,7 +422,7 @@ impl Output {
         } else {
             format!("\x1b[1;{}mwarning:\x1b[0m", sequence)
         };
-        eprintln!("{} {}", label, text.as_ref());
+        eprintln!("{} {}", label, crate::container::localize(text.as_ref()));
     }
 
     pub fn error(&self, err: &CliError) {
@@ -434,12 +438,12 @@ impl Output {
         } else {
             format!("\x1b[1;{}merror:\x1b[0m", sequence)
         };
-        eprintln!("{} {}", label, err.message);
+        eprintln!("{} {}", label, crate::container::localize(&err.message));
         for (name, value) in error_details(err) {
             eprintln!(
                 "  {}  {}",
                 self.err_dim(&pad(name, DETAIL_LABEL_WIDTH)),
-                indent_continuation(&value)
+                indent_continuation(&crate::container::localize(&value))
             );
         }
     }

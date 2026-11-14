@@ -62,7 +62,9 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 
 The Compose file publishes only these TLS ports. The STARTTLS ports (1143, 1025, and 1110) stay inside the container, because a device on your network could remove STARTTLS from the server's reply and read the password your mail app sends.
 
-To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. Docker runs the same command as the container health check, so `docker compose ps` shows the container as healthy once you're signed in and the servers are running.
+To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. The container health check runs `aster-bridge healthcheck`, which exits with 0 when you're signed in and the servers are running and with 1 otherwise, so `docker compose ps` shows the container as healthy only then. The `status` command keeps its own exit codes for scripts.
+
+When a message inside the container suggests a command, it shows the `docker compose` form you run on your server, such as `docker compose exec aster-bridge aster-bridge login`. If your service has a different name in your Compose file, use that name instead.
 
 ## Store the data in a folder on your server
 
@@ -83,6 +85,21 @@ sudo chmod 700 data secrets
 ```
 
 To run the bridge as a different user instead, such as the owner of an existing folder, add `user: "1000:1000"` to the service with that user's ID and group ID. If the bridge can't write to a folder, it tells you which user needs access.
+
+## Keep the key in a Docker secret
+
+Instead of the `aster-bridge-secrets` volume, you can give the bridge its key as a Docker secret. The file `compose.secret.yaml` shows this setup. Create the key file next to it and limit who can read it:
+
+```
+openssl rand -hex 32 > aster_bridge_secret_key
+sudo chown 10001:10001 aster_bridge_secret_key
+sudo chmod 400 aster_bridge_secret_key
+docker compose -f compose.secret.yaml up -d
+```
+
+The bridge accepts a key file under `/run/secrets` when nobody but its owner can change it and the owner is root or the user that runs the bridge. That covers a file owned by user 10001 with mode `400`, and the read-only secrets that Docker Swarm mounts, which root owns with mode `444`. Anywhere else, the key file must be readable only by its owner. The bridge refuses a key file that other users can change, wherever it is.
+
+If you move the bridge to this setup from the volume, copy the existing key out of the volume instead of creating a new one, because a new key can't read the data that the old key protects.
 
 ## Certificates
 
