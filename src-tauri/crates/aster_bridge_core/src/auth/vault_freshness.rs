@@ -225,7 +225,7 @@ pub fn open_newest_wrap(
         let expected_id = wrap.key_id.trim().to_ascii_lowercase();
         for key_pair in &key_pairs {
             for candidate in [passphrase_text.as_str(), ""] {
-                if let Some(key) = open_wrap(&bytes, key_pair, candidate) {
+                if let Some(key) = open_wrap(&bytes, key_pair, candidate, &key_pairs) {
                     if storage_key_id(&key) == expected_id {
                         return Some(key);
                     }
@@ -240,11 +240,15 @@ fn open_wrap(
     bytes: &[u8],
     key_pair: &aster_crypto::KeyPair,
     passphrase: &str,
+    signers: &[aster_crypto::KeyPair],
 ) -> Option<Zeroizing<[u8; 32]>> {
     let msg = Message::from_bytes(bytes).ok()?;
     let (decrypted, _) = msg
         .decrypt(|| passphrase.to_string(), &[key_pair.secret_key()])
         .ok()?;
+    if !signed_by_own_key(&decrypted, signers) {
+        return None;
+    }
     let data = match decrypted.get_literal() {
         Some(literal) => Zeroizing::new(literal.data().to_vec()),
         None => match &decrypted {
@@ -256,6 +260,13 @@ fn open_wrap(
     Some(Zeroizing::new(array))
 }
 
+fn signed_by_own_key(msg: &Message, signers: &[aster_crypto::KeyPair]) -> bool {
+    signers.iter().any(|signer| {
+        let secret = signer.secret_key();
+        msg.verify(secret).is_ok() || secret.secret_subkeys.iter().any(|sub| msg.verify(sub).is_ok())
+    })
+}
+
 fn apply_storage_keys(
     session: &mut Session,
     vault_kek: Option<Zeroizing<[u8; 32]>>,
@@ -265,19 +276,15 @@ fn apply_storage_keys(
     let current = session.data_kek.as_deref().and_then(|k| raw_key(k));
     let known = session.ratchet_recovery.storage_keys.clone();
 
-    let target = match (wrap_kek, vault_kek.clone()) {
-        (Some(wrapped), _) => Some(wrapped),
-        (None, Some(from_vault)) => {
-            let is_former_key = current.as_ref().is_some_and(|c| **c != *from_vault)
-                && known.iter().any(|k| **k == *from_vault);
-            if is_former_key {
-                tracing::warn!("server vault holds an earlier contacts key, keeping the newer one");
-                None
-            } else {
-                Some(from_vault)
-            }
+    let is_former_key = |key: &Zeroizing<[u8; 32]>| {
+        current.as_ref().is_some_and(|c| **c != **key) && known.iter().any(|k| **k == **key)
+    };
+    let target = match wrap_kek.filter(|wrapped| !is_former_key(wrapped)).or(vault_kek.clone()) {
+        Some(key) if is_former_key(&key) => {
+            tracing::warn!("server holds an earlier contacts key, keeping the newer one");
+            None
         }
-        (None, None) => None,
+        other => other,
     };
 
     let changed = match (&target, &current) {
@@ -383,8 +390,31 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn wrap_for(key_pair: &aster_crypto::KeyPair, data_kek: &[u8; 32]) -> String {
-        let armored = aster_crypto::encrypt_message(data_kek, &[&key_pair.public_key()]).unwrap();
-        let (msg, _) = Message::from_armor_single(&armored[..]).unwrap();
+        signed_wrap(key_pair, key_pair, data_kek)
+    }
+
+    fn signed_wrap(
+        recipient: &aster_crypto::KeyPair,
+        signer: &aster_crypto::KeyPair,
+        data_kek: &[u8; 32],
+    ) -> String {
+        let armored = aster_crypto::encrypt_and_sign_with_passphrase(
+            data_kek,
+            &[&recipient.public_key()],
+            signer,
+            "",
+        )
+        .unwrap();
+        binary_wrap(&armored)
+    }
+
+    fn unsigned_wrap(recipient: &aster_crypto::KeyPair, data_kek: &[u8; 32]) -> String {
+        let armored = aster_crypto::encrypt_message(data_kek, &[&recipient.public_key()]).unwrap();
+        binary_wrap(&armored)
+    }
+
+    fn binary_wrap(armored: &[u8]) -> String {
+        let (msg, _) = Message::from_armor_single(armored).unwrap();
         STANDARD.encode(msg.to_bytes().unwrap())
     }
 
@@ -595,6 +625,71 @@ pub(crate) mod tests {
             nonce: Some(String::new()),
         }];
         assert_eq!(*open_newest_wrap(&good, &keys, PASSPHRASE).unwrap(), b);
+    }
+
+    #[tokio::test]
+    async fn a_side_copy_the_server_encrypts_to_the_public_key_is_never_adopted() {
+        let identity = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
+        let armored = identity.to_armored().unwrap();
+        let a = [3u8; 32];
+        let minted = [9u8; 32];
+        let wraps = serde_json::json!({
+            "wraps": [{
+                "key_id": storage_key_id(&minted),
+                "wrap": unsigned_wrap(&identity, &minted),
+                "nonce": null,
+                "identity_fingerprint": "ZnA=",
+                "created_at": "2026-11-06T12:00:00Z"
+            }]
+        });
+        let server = FakeServer::new(seal_vault(&vault_json(&armored, a, &[])), Some(wraps));
+        let client = ApiClient::new_with_base_url(&spawn(server.router()).await);
+        let session = RwLock::new(session_with(Some(a), Some(armored)));
+        let freshness = VaultFreshness::new();
+
+        assert_eq!(freshness.ensure_fresh(&client, &session).await, FreshnessOutcome::Unchanged);
+        let s = session.read().await;
+        assert_eq!(data_kek_of(&s), a);
+        assert!(!holds(&s, minted));
+    }
+
+    #[test]
+    fn a_side_copy_signed_by_another_key_is_refused() {
+        let identity = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
+        let stranger = aster_crypto::generate_keypair("other", "other@aster.test").unwrap();
+        let b = [4u8; 32];
+        let keys = vec![identity.to_armored().unwrap()];
+        let forged = vec![StorageKeyWrap {
+            key_id: storage_key_id(&b),
+            wrap: signed_wrap(&identity, &stranger, &b),
+            nonce: None,
+        }];
+        assert!(open_newest_wrap(&forged, &keys, PASSPHRASE).is_none());
+    }
+
+    #[test]
+    fn a_side_copy_signed_by_a_previous_identity_key_opens() {
+        let previous = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
+        let current = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
+        let b = [4u8; 32];
+        let keys = vec![current.to_armored().unwrap(), previous.to_armored().unwrap()];
+        let wraps = vec![StorageKeyWrap {
+            key_id: storage_key_id(&b),
+            wrap: wrap_for(&previous, &b),
+            nonce: None,
+        }];
+        assert_eq!(*open_newest_wrap(&wraps, &keys, PASSPHRASE).unwrap(), b);
+    }
+
+    #[test]
+    fn a_side_copy_of_a_former_key_never_rolls_back_the_session() {
+        let a = [3u8; 32];
+        let b = [4u8; 32];
+        let mut session = session_with(Some(b), None);
+        session.ratchet_recovery.storage_keys.push(Zeroizing::new(a));
+        assert!(!apply_storage_keys(&mut session, Some(Zeroizing::new(b)), Some(Zeroizing::new(a)), &[]));
+        assert_eq!(data_kek_of(&session), b);
+        assert!(holds(&session, a));
     }
 
     #[tokio::test]

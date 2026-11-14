@@ -1156,7 +1156,11 @@ async fn decrypt_real_internal() {
                 Some(v.identity_key.clone()),
                 v.ratchet_identity_public.clone(),
                 crate::crypto::ratchet::build_receiver_key_sets(&v),
-                crate::crypto::inbound::build_inbound_key_candidates(&v),
+                {
+                    let mut keys = crate::crypto::inbound::build_inbound_key_candidates(&v);
+                    crate::crypto::inbound::bind_inbound_owner(&mut keys, &login_resp.user_id);
+                    keys
+                },
             ),
             Err(e) => {
                 println!("vault decrypt FAILED: {}", e);

@@ -25,12 +25,14 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use ml_kem::array::Array;
-use ml_kem::kem::Decapsulate;
+use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
+use rand::Rng;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::path::Path;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -76,42 +78,13 @@ fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn set_file_permissions_restrictive(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms).map_err(|e| e.to_string())?;
+    crate::system_tools::restrict_to_current_user(path)
+}
+
+fn restrict_legacy_file(path: &Path) {
+    if let Err(e) = set_file_permissions_restrictive(path) {
+        tracing::warn!("{}", e);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let user = whoami::fallible::username()
-            .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
-        if !user.is_empty() {
-            match crate::system_tools::icacls_command()
-                .args([
-                    path.to_string_lossy().as_ref(),
-                    "/inheritance:r",
-                    "/grant:r",
-                    &format!("{}:(F)", user),
-                ])
-                .creation_flags(0x0800_0000)
-                .output()
-            {
-                Ok(out) if !out.status.success() => {
-                    tracing::warn!(
-                        "icacls failed to restrict {}: {}",
-                        path.display(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                Err(e) => tracing::warn!("icacls invocation failed for {}: {}", path.display(), e),
-                _ => {}
-            }
-        }
-    }
-    let _ = path;
-    Ok(())
 }
 
 const MAGIC_ID: &[u8; 8] = b"ASTERID\x01";
@@ -176,13 +149,19 @@ fn wrap_key_delete() -> Result<(), String> {
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let tmp = path.with_extension("tmp");
-    {
+    let written = (|| -> Result<(), String> {
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        set_file_permissions_restrictive(&tmp)?;
         f.write_all(data).map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())
+    })();
+    let replaced =
+        written.and_then(|()| std::fs::rename(&tmp, path).map_err(|e| e.to_string()));
+
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    replaced
 }
 
 fn seal_verified(
@@ -218,9 +197,7 @@ fn replace_with_verified(path: &Path, blob: &[u8]) -> Result<(), String> {
         if std::fs::read(&tmp).map_err(|e| e.to_string())? != blob {
             return Err("sealed copy did not read back from disk".to_string());
         }
-        if let Err(e) = set_file_permissions_restrictive(&tmp) {
-            tracing::warn!("could not restrict {}: {}", tmp.display(), e);
-        }
+        set_file_permissions_restrictive(&tmp)?;
         Ok(())
     })();
     if let Err(e) = written {
@@ -276,6 +253,7 @@ fn load_stored(data_dir: &Path) -> Result<Option<StoredIdentity>, String> {
     };
     if let Err(e) = reseal_legacy_file(&path, MAGIC_ID, &bytes) {
         tracing::warn!("identity legacy-to-v2 migration deferred: {}", e);
+        restrict_legacy_file(&path);
     }
     bytes.zeroize();
     Ok(Some(stored))
@@ -286,17 +264,66 @@ fn save_stored(data_dir: &Path, stored: &StoredIdentity) -> Result<(), String> {
     let json = serde_json::to_vec(stored).map_err(|e| e.to_string())?;
     let wrap_key = wrap_key_load_or_create()?;
     let blob = aead_seal(&wrap_key, MAGIC_ID, &json)?;
-    atomic_write(&path, &blob)?;
-    set_file_permissions_restrictive(&path)?;
-    Ok(())
+    atomic_write(&path, &blob)
+}
+
+const MLKEM_SK_LEN: usize = 2400;
+const MLKEM_SK_PKE_LEN: usize = 1152;
+const MLKEM_PK_SEED_LEN: usize = 32;
+const MLKEM_MODULUS: u16 = 3329;
+
+fn mlkem_encaps_key_from_bytes(bytes: &[u8]) -> Result<MlKemEncapKey, String> {
+    if bytes.len() != MLKEM_PK_LEN {
+        return Err("mlkem public size".to_string());
+    }
+    let canonical = bytes[..MLKEM_PK_LEN - MLKEM_PK_SEED_LEN]
+        .chunks_exact(3)
+        .all(|chunk| {
+            let low = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0f) << 8);
+            let high = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
+            low < MLKEM_MODULUS && high < MLKEM_MODULUS
+        });
+    if !canonical {
+        return Err("mlkem public key is not canonical".to_string());
+    }
+    let encoded = ml_kem::Encoded::<MlKemEncapKey>::try_from(bytes)
+        .map_err(|_| "mlkem public size".to_string())?;
+    Ok(MlKemEncapKey::from_bytes(&encoded))
+}
+
+fn mlkem_decaps_key_from_bytes(sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<MlKemDecapKey, String> {
+    if sk_bytes.len() != MLKEM_SK_LEN {
+        return Err("mlkem secret size".to_string());
+    }
+    let encaps_key = mlkem_encaps_key_from_bytes(pk_bytes)?;
+    let embedded = &sk_bytes[MLKEM_SK_PKE_LEN..MLKEM_SK_PKE_LEN + MLKEM_PK_LEN];
+    if !bool::from(embedded.ct_eq(pk_bytes)) {
+        return Err("mlkem key pair mismatch".to_string());
+    }
+    let mut encoded = ml_kem::Encoded::<MlKemDecapKey>::try_from(sk_bytes)
+        .map_err(|_| "mlkem secret size".to_string())?;
+    let decaps_key = MlKemDecapKey::from_bytes(&encoded);
+    encoded.zeroize();
+
+    let (ct, mut sent) = encaps_key
+        .encapsulate(&mut OsRng)
+        .map_err(|_| "mlkem self check".to_string())?;
+    let mut received = decaps_key
+        .decapsulate(&ct)
+        .map_err(|_| "mlkem self check".to_string())?;
+    let consistent = bool::from(sent.as_slice().ct_eq(received.as_slice()));
+    sent.zeroize();
+    received.zeroize();
+    if !consistent {
+        return Err("mlkem key pair mismatch".to_string());
+    }
+    Ok(decaps_key)
 }
 
 fn identity_from_stored(stored: StoredIdentity) -> Result<DeviceIdentity, String> {
     let ed25519_signing_key = SigningKey::from_bytes(&stored.ed25519_sk_bytes);
-    let mlkem_decaps_key = MlKemDecapKey::from_bytes(
-        &ml_kem::Encoded::<MlKemDecapKey>::try_from(stored.mlkem_sk_bytes.as_slice())
-            .map_err(|e| e.to_string())?,
-    );
+    let mlkem_decaps_key =
+        mlkem_decaps_key_from_bytes(&stored.mlkem_sk_bytes, &stored.mlkem_pk_bytes)?;
     let x25519_static_secret = StaticSecret::from(stored.x25519_sk_bytes);
     let x25519_public_bytes = *XPublicKey::from(&x25519_static_secret).as_bytes();
     let mlkem_encaps_key_bytes = stored.mlkem_pk_bytes.clone();
@@ -320,7 +347,9 @@ pub fn get_or_create_identity(data_dir: &Path) -> Result<DeviceIdentity, String>
     let mut ed25519_sk_bytes = ed25519_signing_key.to_bytes();
 
     let (dk, ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
-    let mut mlkem_sk_bytes = dk.as_bytes().to_vec();
+    let mut mlkem_sk_encoded = dk.as_bytes();
+    let mlkem_sk_bytes = mlkem_sk_encoded.to_vec();
+    mlkem_sk_encoded.zeroize();
     let mlkem_pk_bytes = ek.as_bytes().to_vec();
 
     let x25519_static_secret = StaticSecret::random_from_rng(OsRng);
@@ -330,14 +359,13 @@ pub fn get_or_create_identity(data_dir: &Path) -> Result<DeviceIdentity, String>
     let stored = StoredIdentity {
         device_id: None,
         ed25519_sk_bytes,
-        mlkem_sk_bytes: mlkem_sk_bytes.clone(),
+        mlkem_sk_bytes,
         mlkem_pk_bytes: mlkem_pk_bytes.clone(),
         x25519_sk_bytes,
     };
     let save_result = save_stored(data_dir, &stored);
 
     ed25519_sk_bytes.zeroize();
-    mlkem_sk_bytes.zeroize();
     x25519_sk_bytes.zeroize();
     save_result?;
 
@@ -428,100 +456,200 @@ pub fn get_pubkeys(identity: &DeviceIdentity) -> (String, String, String) {
     (ed25519_pk, mlkem_pk, x25519_pk)
 }
 
+pub const ENVELOPE_VERSIONS: [u8; 2] = [1, 2];
+
+const ENROLL_INFO_V1: &[u8] = b"astermail-device-enroll-v1";
+const ENROLL_INFO_V2: &[u8] = b"astermail-device-enroll-v2";
+const ENVELOPE_V2_MAGIC: &[u8; 4] = b"AEV2";
+const ED25519_PK_LEN: usize = 32;
+const MLKEM_PK_LEN: usize = 1184;
+const MLKEM_CT_LEN: usize = 1088;
+const X25519_PK_LEN: usize = 32;
+const ENVELOPE_NONCE_LEN: usize = 24;
+const ENVELOPE_HEADER_LEN: usize = X25519_PK_LEN + MLKEM_CT_LEN + ENVELOPE_NONCE_LEN;
+const ENVELOPE_TAG_LEN: usize = 16;
+
+pub struct EnvelopeRecipient<'a> {
+    pub ed25519_pk: &'a [u8],
+    pub mlkem_pk: &'a [u8],
+    pub x25519_pk: &'a [u8],
+}
+
+fn envelope_v2_transcript(
+    recipient: &EnvelopeRecipient<'_>,
+    eph_pk: &[u8],
+    mlkem_ct: &[u8],
+) -> Result<[u8; 32], String> {
+    use sha2::Digest;
+
+    if recipient.ed25519_pk.len() != ED25519_PK_LEN
+        || recipient.mlkem_pk.len() != MLKEM_PK_LEN
+        || recipient.x25519_pk.len() != X25519_PK_LEN
+    {
+        return Err("envelope recipient key size".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(ENROLL_INFO_V2);
+    hasher.update(ENVELOPE_V2_MAGIC);
+    hasher.update(recipient.ed25519_pk);
+    hasher.update(recipient.mlkem_pk);
+    hasher.update(recipient.x25519_pk);
+    hasher.update(eph_pk);
+    hasher.update(mlkem_ct);
+    Ok(hasher.finalize().into())
+}
+
+fn envelope_key(
+    ss_pq: &[u8],
+    ss_cl: &[u8],
+    nonce: &[u8],
+    transcript: Option<&[u8; 32]>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    let mut ikm = zeroize::Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(ss_pq);
+    ikm[32..].copy_from_slice(ss_cl);
+    let mut info = Vec::with_capacity(ENROLL_INFO_V2.len() + 32);
+    match transcript {
+        Some(hash) => {
+            info.extend_from_slice(ENROLL_INFO_V2);
+            info.extend_from_slice(hash);
+        }
+        None => info.extend_from_slice(ENROLL_INFO_V1),
+    }
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(nonce), ikm.as_slice())
+        .expand(&info, key.as_mut_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
+pub fn open_device_envelope(
+    data: &[u8],
+    recipient: &EnvelopeRecipient<'_>,
+    mlkem_decaps_key: &MlKemDecapKey,
+    x25519_secret: &StaticSecret,
+) -> Result<Vec<u8>, String> {
+    let (body, versioned) = match data.strip_prefix(ENVELOPE_V2_MAGIC.as_slice()) {
+        Some(rest) => (rest, true),
+        None => (data, false),
+    };
+    if body.len() < ENVELOPE_HEADER_LEN + ENVELOPE_TAG_LEN {
+        return Err("envelope too short".to_string());
+    }
+    let eph_pk = &body[..X25519_PK_LEN];
+    let mlkem_ct = &body[X25519_PK_LEN..X25519_PK_LEN + MLKEM_CT_LEN];
+    let nonce = &body[X25519_PK_LEN + MLKEM_CT_LEN..ENVELOPE_HEADER_LEN];
+    let ciphertext = &body[ENVELOPE_HEADER_LEN..];
+
+    let transcript = if versioned {
+        Some(envelope_v2_transcript(recipient, eph_pk, mlkem_ct)?)
+    } else {
+        None
+    };
+
+    let ct: Ciphertext<MlKem768> =
+        Array::try_from(mlkem_ct).map_err(|e: _| format!("ct size: {:?}", e))?;
+    let mut ss_pq = mlkem_decaps_key
+        .decapsulate(&ct)
+        .map_err(|e| format!("mlkem decaps: {:?}", e))?;
+    let eph_bytes: [u8; 32] = eph_pk.try_into().map_err(|_| "slice")?;
+    let ss_cl = x25519_secret.diffie_hellman(&XPublicKey::from(eph_bytes));
+    let key = envelope_key(ss_pq.as_slice(), ss_cl.as_bytes(), nonce, transcript.as_ref());
+    ss_pq.zeroize();
+    drop(ss_cl);
+    let key = key?;
+
+    let cipher = XChaCha20Poly1305::new(key.as_slice().into());
+    let xnonce = XNonce::from_slice(nonce);
+    let opened = match transcript {
+        Some(hash) => {
+            let mut aad = Vec::with_capacity(ENVELOPE_V2_MAGIC.len() + hash.len());
+            aad.extend_from_slice(ENVELOPE_V2_MAGIC);
+            aad.extend_from_slice(&hash);
+            cipher.decrypt(xnonce, Payload { msg: ciphertext, aad: &aad })
+        }
+        None => cipher.decrypt(xnonce, ciphertext),
+    };
+    opened.map_err(|e| format!("decrypt: {:?}", e))
+}
+
 pub fn unseal_vault_envelope(
     identity: &DeviceIdentity,
     envelope_b64: &str,
 ) -> Result<Vec<u8>, String> {
     let data = b64url_decode(envelope_b64)?;
-    if data.len() < 32 + 1088 + 24 + 16 {
-        return Err("envelope too short".to_string());
-    }
-
-    let x25519_eph_pk_bytes: [u8; 32] = data[0..32].try_into().map_err(|_| "slice")?;
-    let mlkem_ct_bytes = &data[32..32 + 1088];
-    let nonce_bytes: [u8; 24] = data[32 + 1088..32 + 1088 + 24]
-        .try_into()
-        .map_err(|_| "slice")?;
-    let ciphertext = &data[32 + 1088 + 24..];
-
-    let ct: Ciphertext<MlKem768> =
-        Array::try_from(mlkem_ct_bytes).map_err(|e: _| format!("ct size: {:?}", e))?;
-    let mut ss_pq = identity
-        .mlkem_decaps_key
-        .decapsulate(&ct)
-        .map_err(|e| format!("mlkem decaps: {:?}", e))?;
-
-    let eph_pub = XPublicKey::from(x25519_eph_pk_bytes);
-    let ss_cl = identity.x25519_static_secret.diffie_hellman(&eph_pub);
-
-    let mut ikm = [0u8; 64];
-    ikm[..32].copy_from_slice(ss_pq.as_slice());
-    ikm[32..].copy_from_slice(ss_cl.as_bytes());
-
-    let hk = Hkdf::<Sha256>::new(Some(&nonce_bytes), &ikm);
-    let mut shared_key = [0u8; 32];
-    hk.expand(b"astermail-device-enroll-v1", &mut shared_key)
-        .map_err(|e| e.to_string())?;
-
-    ikm.zeroize();
-    ss_pq.zeroize();
-    drop(ss_cl);
-
-    let cipher = XChaCha20Poly1305::new((&shared_key).into());
-    let xnonce = XNonce::from_slice(&nonce_bytes);
-    let plaintext = cipher
-        .decrypt(xnonce, ciphertext)
-        .map_err(|e| format!("decrypt: {:?}", e))?;
-
-    shared_key.zeroize();
-
-    Ok(plaintext)
+    let ed25519_pk = identity.ed25519_signing_key.verifying_key().to_bytes();
+    let recipient = EnvelopeRecipient {
+        ed25519_pk: &ed25519_pk,
+        mlkem_pk: &identity.mlkem_encaps_key_bytes,
+        x25519_pk: &identity.x25519_public_bytes,
+    };
+    open_device_envelope(
+        &data,
+        &recipient,
+        &identity.mlkem_decaps_key,
+        &identity.x25519_static_secret,
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn seal_vault_envelope(
+    ed25519_pk_b64: &str,
     mlkem_pk_b64: &str,
     x25519_pk_b64: &str,
     plaintext: &[u8],
+    version: u8,
 ) -> Result<String, String> {
-    use ml_kem::kem::Encapsulate;
-
+    if !ENVELOPE_VERSIONS.contains(&version) {
+        return Err("unsupported envelope version".to_string());
+    }
+    let ed25519_pk = b64url_decode(ed25519_pk_b64)?;
     let mlkem_pk = b64url_decode(mlkem_pk_b64)?;
-    let encoded = ml_kem::Encoded::<MlKemEncapKey>::try_from(mlkem_pk.as_slice())
-        .map_err(|e| format!("mlkem public size: {:?}", e))?;
-    let ek = MlKemEncapKey::from_bytes(&encoded);
+    let x25519_pk = b64url_decode(x25519_pk_b64)?;
+    let recipient = EnvelopeRecipient {
+        ed25519_pk: &ed25519_pk,
+        mlkem_pk: &mlkem_pk,
+        x25519_pk: &x25519_pk,
+    };
+    let ek = mlkem_encaps_key_from_bytes(&mlkem_pk)?;
     let (ct, mut ss_pq) = ek
         .encapsulate(&mut OsRng)
         .map_err(|e| format!("encapsulate: {:?}", e))?;
 
-    let x25519_pk: [u8; 32] = b64url_decode(x25519_pk_b64)?
+    let x25519_bytes: [u8; 32] = x25519_pk
         .as_slice()
         .try_into()
         .map_err(|_| "x25519 public size".to_string())?;
     let eph_secret = StaticSecret::random_from_rng(OsRng);
     let eph_public = XPublicKey::from(&eph_secret);
-    let ss_cl = eph_secret.diffie_hellman(&XPublicKey::from(x25519_pk));
+    let ss_cl = eph_secret.diffie_hellman(&XPublicKey::from(x25519_bytes));
 
-    let mut nonce_bytes = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; ENVELOPE_NONCE_LEN] = OsRng.gen();
 
-    let mut ikm = [0u8; 64];
-    ikm[..32].copy_from_slice(ss_pq.as_slice());
-    ikm[32..].copy_from_slice(ss_cl.as_bytes());
-    let hk = Hkdf::<Sha256>::new(Some(&nonce_bytes), &ikm);
-    let mut shared_key = [0u8; 32];
-    hk.expand(b"astermail-device-enroll-v1", &mut shared_key)
-        .map_err(|e| e.to_string())?;
-    ikm.zeroize();
+    let transcript = if version == 2 {
+        Some(envelope_v2_transcript(&recipient, eph_public.as_bytes(), ct.as_slice())?)
+    } else {
+        None
+    };
+    let key = envelope_key(ss_pq.as_slice(), ss_cl.as_bytes(), &nonce_bytes, transcript.as_ref());
     ss_pq.zeroize();
+    let key = key?;
 
-    let cipher = XChaCha20Poly1305::new((&shared_key).into());
-    let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce_bytes), plaintext)
-        .map_err(|e| format!("encrypt: {:?}", e))?;
-    shared_key.zeroize();
+    let cipher = XChaCha20Poly1305::new(key.as_slice().into());
+    let xnonce = XNonce::from_slice(&nonce_bytes);
+    let mut envelope = Vec::with_capacity(ENVELOPE_V2_MAGIC.len() + ENVELOPE_HEADER_LEN + plaintext.len() + ENVELOPE_TAG_LEN);
+    let ciphertext = match transcript {
+        Some(hash) => {
+            envelope.extend_from_slice(ENVELOPE_V2_MAGIC);
+            let mut aad = Vec::with_capacity(ENVELOPE_V2_MAGIC.len() + hash.len());
+            aad.extend_from_slice(ENVELOPE_V2_MAGIC);
+            aad.extend_from_slice(&hash);
+            cipher.encrypt(xnonce, Payload { msg: plaintext, aad: &aad })
+        }
+        None => cipher.encrypt(xnonce, plaintext),
+    }
+    .map_err(|e| format!("encrypt: {:?}", e))?;
 
-    let mut envelope = Vec::with_capacity(32 + ct.len() + 24 + ciphertext.len());
     envelope.extend_from_slice(eph_public.as_bytes());
     envelope.extend_from_slice(ct.as_slice());
     envelope.extend_from_slice(&nonce_bytes);
@@ -576,9 +704,7 @@ pub fn store_passphrase(data_dir: &Path, passphrase: &[u8]) -> Result<(), String
     let path = passphrase_file_path(data_dir);
     let wrap_key = wrap_key_load_or_create()?;
     let blob = aead_seal(&wrap_key, MAGIC_PP, passphrase)?;
-    atomic_write(&path, &blob)?;
-    set_file_permissions_restrictive(&path)?;
-    Ok(())
+    atomic_write(&path, &blob)
 }
 
 pub fn load_passphrase(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -610,6 +736,7 @@ pub fn load_passphrase(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
                 "could not re-seal legacy passphrase file; it remains in plaintext on disk: {}",
                 e
             );
+            restrict_legacy_file(&path);
         }
     }
 
@@ -786,14 +913,253 @@ mod tests {
         }
     }
 
+    fn seal_for(identity: &DeviceIdentity, plaintext: &[u8], version: u8) -> String {
+        let (ed25519_pk, mlkem_pk, x25519_pk) = get_pubkeys(identity);
+        seal_vault_envelope(&ed25519_pk, &mlkem_pk, &x25519_pk, plaintext, version).unwrap()
+    }
+
+    fn reencode(envelope: &str, edit: impl FnOnce(&mut Vec<u8>)) -> String {
+        let mut bytes = b64url_decode(envelope).unwrap();
+        edit(&mut bytes);
+        b64url(&bytes)
+    }
+
+    fn vector() -> std::collections::HashMap<String, String> {
+        include_str!("../../tests/fixtures/device_envelope_vector.txt")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+            .collect()
+    }
+
+    fn vector_bytes(vector: &std::collections::HashMap<String, String>, key: &str) -> Vec<u8> {
+        b64url_decode(&vector[key]).unwrap()
+    }
+
+    fn vector_keys(
+        vector: &std::collections::HashMap<String, String>,
+    ) -> (MlKemDecapKey, StaticSecret) {
+        let decaps = mlkem_decaps_key_from_bytes(
+            &vector_bytes(vector, "mlkem_decaps"),
+            &vector_bytes(vector, "mlkem_pk"),
+        )
+        .unwrap();
+        let scalar: [u8; 32] = vector_bytes(vector, "x25519_scalar").try_into().unwrap();
+        (decaps, StaticSecret::from(scalar))
+    }
+
+    fn open_vector(
+        vector: &std::collections::HashMap<String, String>,
+        envelope: &[u8],
+        ed25519_pk: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let (decaps, scalar) = vector_keys(vector);
+        let mlkem_pk = vector_bytes(vector, "mlkem_pk");
+        let x25519_pk = vector_bytes(vector, "x25519_pk");
+        let recipient = EnvelopeRecipient {
+            ed25519_pk,
+            mlkem_pk: &mlkem_pk,
+            x25519_pk: &x25519_pk,
+        };
+        open_device_envelope(envelope, &recipient, &decaps, &scalar)
+    }
+
     #[test]
     fn sealed_envelope_opens_with_the_device_keys() {
         let identity = test_identity();
+        for version in ENVELOPE_VERSIONS {
+            let envelope = seal_for(&identity, b"vault-passphrase", version);
+            assert_eq!(unseal_vault_envelope(&identity, &envelope).unwrap(), b"vault-passphrase");
+            let other = test_identity();
+            assert!(unseal_vault_envelope(&other, &envelope).is_err());
+        }
+    }
+
+    #[test]
+    fn a_v2_envelope_carries_the_version_magic() {
+        let identity = test_identity();
+        let envelope = b64url_decode(&seal_for(&identity, b"vault-passphrase", 2)).unwrap();
+        assert_eq!(&envelope[..4], b"AEV2");
+        assert_eq!(envelope.len(), 4 + ENVELOPE_HEADER_LEN + b"vault-passphrase".len() + ENVELOPE_TAG_LEN);
+    }
+
+    #[test]
+    fn a_v2_envelope_sealed_to_other_signing_key_is_refused() {
+        let identity = test_identity();
         let (_, mlkem_pk, x25519_pk) = get_pubkeys(&identity);
-        let envelope = seal_vault_envelope(&mlkem_pk, &x25519_pk, b"vault-passphrase").unwrap();
-        assert_eq!(unseal_vault_envelope(&identity, &envelope).unwrap(), b"vault-passphrase");
-        let other = test_identity();
-        assert!(unseal_vault_envelope(&other, &envelope).is_err());
+        let stranger = b64url(SigningKey::generate(&mut OsRng).verifying_key().as_bytes());
+        let envelope =
+            seal_vault_envelope(&stranger, &mlkem_pk, &x25519_pk, b"vault-passphrase", 2).unwrap();
+        assert!(unseal_vault_envelope(&identity, &envelope).is_err());
+    }
+
+    #[test]
+    fn a_v2_envelope_with_a_swapped_ephemeral_key_is_refused() {
+        let identity = test_identity();
+        let envelope = seal_for(&identity, b"vault-passphrase", 2);
+        let other = seal_for(&identity, b"vault-passphrase", 2);
+        let other_bytes = b64url_decode(&other).unwrap();
+        let spliced = reencode(&envelope, |bytes| {
+            bytes[4..4 + X25519_PK_LEN].copy_from_slice(&other_bytes[4..4 + X25519_PK_LEN]);
+        });
+        assert!(unseal_vault_envelope(&identity, &spliced).is_err());
+    }
+
+    #[test]
+    fn a_v2_envelope_with_any_flipped_byte_is_refused() {
+        let identity = test_identity();
+        let envelope = seal_for(&identity, b"vault-passphrase", 2);
+        let length = b64url_decode(&envelope).unwrap().len();
+        for index in [0, 3, 4, 4 + X25519_PK_LEN, 4 + X25519_PK_LEN + MLKEM_CT_LEN, length - 1] {
+            let tampered = reencode(&envelope, |bytes| bytes[index] ^= 0x01);
+            assert!(unseal_vault_envelope(&identity, &tampered).is_err(), "byte {index}");
+        }
+    }
+
+    #[test]
+    fn a_v2_envelope_stripped_of_its_magic_does_not_open_as_v1() {
+        let identity = test_identity();
+        let envelope = seal_for(&identity, b"vault-passphrase", 2);
+        let stripped = reencode(&envelope, |bytes| {
+            bytes.drain(..4);
+        });
+        assert!(unseal_vault_envelope(&identity, &stripped).is_err());
+    }
+
+    #[test]
+    fn a_v1_envelope_given_the_v2_magic_is_refused() {
+        let identity = test_identity();
+        let envelope = seal_for(&identity, b"vault-passphrase", 1);
+        let relabeled = reencode(&envelope, |bytes| {
+            bytes.splice(0..0, b"AEV2".iter().copied());
+        });
+        assert!(unseal_vault_envelope(&identity, &relabeled).is_err());
+    }
+
+    #[test]
+    fn a_short_v2_envelope_is_refused() {
+        let identity = test_identity();
+        let mut short = b"AEV2".to_vec();
+        short.extend_from_slice(&[0u8; ENVELOPE_HEADER_LEN + ENVELOPE_TAG_LEN - 1]);
+        assert!(unseal_vault_envelope(&identity, &b64url(&short)).is_err());
+    }
+
+    #[test]
+    fn an_unknown_envelope_version_is_not_sealed() {
+        let identity = test_identity();
+        let (ed25519_pk, mlkem_pk, x25519_pk) = get_pubkeys(&identity);
+        assert!(seal_vault_envelope(&ed25519_pk, &mlkem_pk, &x25519_pk, b"x", 3).is_err());
+    }
+
+    #[test]
+    fn the_shared_vector_keys_pass_validation() {
+        let vector = vector();
+        assert!(mlkem_decaps_key_from_bytes(
+            &vector_bytes(&vector, "mlkem_decaps"),
+            &vector_bytes(&vector, "mlkem_pk"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_decaps_key_must_match_its_public_key() {
+        let (dk, ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let (_, other_ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let sk = dk.as_bytes().to_vec();
+        assert!(mlkem_decaps_key_from_bytes(&sk, ek.as_bytes().as_slice()).is_ok());
+        assert!(mlkem_decaps_key_from_bytes(&sk, other_ek.as_bytes().as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_damaged_decaps_key_is_refused() {
+        let (dk, ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let sk = dk.as_bytes().to_vec();
+        let pk = ek.as_bytes().to_vec();
+        let hash_offset = MLKEM_SK_PKE_LEN + MLKEM_PK_LEN;
+        for offset in [0, MLKEM_SK_PKE_LEN, hash_offset] {
+            let mut damaged = sk.clone();
+            damaged[offset] ^= 0xff;
+            assert!(
+                mlkem_decaps_key_from_bytes(&damaged, &pk).is_err(),
+                "offset {offset}"
+            );
+        }
+        assert!(mlkem_decaps_key_from_bytes(&sk[..MLKEM_SK_LEN - 1], &pk).is_err());
+        assert!(mlkem_decaps_key_from_bytes(&[], &pk).is_err());
+        assert!(mlkem_decaps_key_from_bytes(&sk, &pk[..MLKEM_PK_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn a_public_key_with_an_out_of_range_coefficient_is_refused() {
+        let identity = test_identity();
+        let (ed25519_pk, _, x25519_pk) = get_pubkeys(&identity);
+        let mut pk = identity.mlkem_encaps_key_bytes.clone();
+        assert!(mlkem_encaps_key_from_bytes(&pk).is_ok());
+        pk[0] = 0xff;
+        pk[1] |= 0x0f;
+        assert!(mlkem_encaps_key_from_bytes(&pk).is_err());
+        assert!(seal_vault_envelope(&ed25519_pk, &b64url(&pk), &x25519_pk, b"x", 2).is_err());
+    }
+
+    #[test]
+    fn a_stored_identity_with_mismatched_keys_does_not_load() {
+        let (dk, _): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let (_, other_ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
+        let stored = StoredIdentity {
+            device_id: None,
+            ed25519_sk_bytes: [1u8; 32],
+            mlkem_sk_bytes: dk.as_bytes().to_vec(),
+            mlkem_pk_bytes: other_ek.as_bytes().to_vec(),
+            x25519_sk_bytes: [2u8; 32],
+        };
+        assert!(identity_from_stored(stored).is_err());
+    }
+
+    #[test]
+    fn the_shared_vectors_do_not_open_once_altered() {
+        let vector = vector();
+        let ed25519_pk = vector_bytes(&vector, "ed25519_pk");
+        for (name, prefix) in [("envelope", 0), ("envelope_v2", ENVELOPE_V2_MAGIC.len())] {
+            let envelope = vector_bytes(&vector, name);
+            let offsets = [
+                prefix,
+                prefix + X25519_PK_LEN,
+                prefix + X25519_PK_LEN + MLKEM_CT_LEN - 1,
+                prefix + X25519_PK_LEN + MLKEM_CT_LEN,
+                prefix + ENVELOPE_HEADER_LEN,
+                envelope.len() - 1,
+            ];
+            for offset in offsets {
+                let mut altered = envelope.clone();
+                altered[offset] ^= 0x01;
+                assert!(
+                    open_vector(&vector, &altered, &ed25519_pk).is_err(),
+                    "{name} offset {offset}"
+                );
+            }
+            assert!(open_vector(&vector, &envelope[..envelope.len() - 1], &ed25519_pk).is_err());
+            assert!(open_vector(&vector, &envelope[..prefix + ENVELOPE_HEADER_LEN], &ed25519_pk).is_err());
+        }
+    }
+
+    #[test]
+    fn the_shared_v1_vector_opens() {
+        let vector = vector();
+        let opened = open_vector(&vector, &vector_bytes(&vector, "envelope"), &[0u8; 32]).unwrap();
+        assert_eq!(opened, vector["plaintext"].as_bytes());
+    }
+
+    #[test]
+    fn the_shared_v2_vector_opens_only_for_its_recipient() {
+        let vector = vector();
+        let envelope = vector_bytes(&vector, "envelope_v2");
+        let ed25519_pk = vector_bytes(&vector, "ed25519_pk");
+        let opened = open_vector(&vector, &envelope, &ed25519_pk).unwrap();
+        assert_eq!(opened, vector["plaintext"].as_bytes());
+        let mut other_pk = ed25519_pk.clone();
+        other_pk[0] ^= 0x01;
+        assert!(open_vector(&vector, &envelope, &other_pk).is_err());
     }
 
     #[test]

@@ -28,7 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::external_pgp_key::ExternalPgpKey;
 use crate::crypto::inbound::{
-    decrypt_inbound_envelope, InboundKeyCandidate, INBOUND_ECDH_MARKER, INBOUND_PQ_HYBRID_MARKER,
+    decrypt_inbound_envelope, is_inbound_marker, InboundKeyCandidate,
 };
 use crate::error::{BridgeError, Result};
 
@@ -306,10 +306,7 @@ pub fn decrypt_envelope_noting_origin_with_external_key(
 
     if nonce_bytes.len() == NONCE_LEN && !inbound_keys.is_empty() {
         if let Ok(data) = STANDARD.decode(encrypted_data_b64) {
-            if matches!(
-                data.first(),
-                Some(&INBOUND_ECDH_MARKER) | Some(&INBOUND_PQ_HYBRID_MARKER)
-            ) {
+            if data.first().copied().is_some_and(is_inbound_marker) {
                 if let Ok(result) = decrypt_inbound_envelope(&data, &nonce_bytes, inbound_keys) {
                     return Ok((result, EnvelopeOrigin::Inbound));
                 }
@@ -764,6 +761,7 @@ mod tests {
         vec![InboundKeyCandidate {
             ecdh_secret_d: sk.to_bytes().to_vec(),
             pq_decap_key: None,
+            owner: None,
         }]
     }
 

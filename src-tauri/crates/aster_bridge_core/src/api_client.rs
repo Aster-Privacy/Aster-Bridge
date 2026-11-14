@@ -61,6 +61,17 @@ async fn err_body(resp: reqwest::Response) -> String {
     format!("{}: {}", status, truncated)
 }
 
+#[derive(Debug, Deserialize)]
+struct PublishedRatchetIdentity {
+    kem_identity_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishedRatchetIdentityHistory {
+    #[serde(default)]
+    entries: Vec<PublishedRatchetIdentity>,
+}
+
 fn urlencoding_path(segment: &str) -> String {
     percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
@@ -248,6 +259,8 @@ pub struct PrekeyBundle {
     #[serde(default)]
     pub x3dh_max_version: Option<i16>,
     #[serde(default)]
+    pub ec_one_time_prekey: Option<serde_json::Value>,
+    #[serde(default)]
     pub address_scoped: Option<bool>,
 }
 
@@ -265,6 +278,12 @@ pub enum AddressBundleUpload {
     Inactive,
     Unsupported,
     Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EcPrekeySecretResponse {
+    pub encrypted_secret: String,
+    pub secret_nonce: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +307,7 @@ pub struct ReportEnvelopeCapability<'a> {
     pub identity_fingerprint: Option<&'a str>,
     pub x3dh_max_version: i16,
     pub pgp_external_version: i16,
+    pub bound_envelope_version: i16,
     pub address_identity_version: i16,
 }
 
@@ -456,6 +476,7 @@ pub struct DeviceCodeRequest {
     pub x25519_pk: String,
     pub machine_name: String,
     pub device_type: String,
+    pub envelope_versions: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1060,7 +1081,10 @@ impl ApiClient {
         };
 
         match resp.bytes().await {
-            Ok(body) => crate::crypto::sent_copy::parse_format_writes(&body),
+            Ok(body) => {
+                crate::crypto::sent_copy::record_bound_attachment_writes(&body);
+                crate::crypto::sent_copy::parse_format_writes(&body)
+            }
             Err(_) => false,
         }
     }
@@ -1151,7 +1175,11 @@ impl ApiClient {
         email: &str,
     ) -> Result<PrekeyBundle> {
         let resp = self.client
-            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .get(format!(
+                "{}/crypto/v1/ratchet/prekey-bundle/{}",
+                self.base_url,
+                urlencoding_path(username)
+            ))
             .query(&[("email", email)])
             .bearer_auth(access_token)
             .send()
@@ -1185,8 +1213,63 @@ impl ApiClient {
             query.push(("scope", "address"));
         }
         let resp = self.client
-            .get(format!("{}/crypto/v1/ratchet/prekey-bundle/{}", self.base_url, username))
+            .get(format!(
+                "{}/crypto/v1/ratchet/prekey-bundle/{}",
+                self.base_url,
+                urlencoding_path(username)
+            ))
             .query(&query)
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn published_ratchet_identity_keys(
+        &self,
+        access_token: &str,
+        username: &str,
+        email: &str,
+    ) -> Result<Vec<String>> {
+        let segment = urlencoding_path(username);
+        let current: Option<PublishedRatchetIdentity> = self
+            .find_directory_json(
+                access_token,
+                format!("{}/crypto/v1/ratchet/identity/{}", self.base_url, segment),
+                email,
+            )
+            .await?;
+        let history: Option<PublishedRatchetIdentityHistory> = self
+            .find_directory_json(
+                access_token,
+                format!("{}/crypto/v1/ratchet/prekey-bundle/{}/history", self.base_url, segment),
+                email,
+            )
+            .await?;
+        Ok(current
+            .into_iter()
+            .chain(history.into_iter().flat_map(|history| history.entries))
+            .map(|entry| entry.kem_identity_key)
+            .collect())
+    }
+
+    async fn find_directory_json<T: serde::de::DeserializeOwned>(
+        &self,
+        access_token: &str,
+        url: String,
+        email: &str,
+    ) -> Result<Option<T>> {
+        let resp = self.client
+            .get(url)
+            .query(&[("email", email)])
             .bearer_auth(access_token)
             .send()
             .await?;
@@ -1220,7 +1303,11 @@ impl ApiClient {
         email: &str,
     ) -> Result<Option<RecipientKeyLookup>> {
         let resp = self.client
-            .get(format!("{}/crypto/v1/keys/public/{}", self.base_url, username))
+            .get(format!(
+                "{}/crypto/v1/keys/public/{}",
+                self.base_url,
+                urlencoding_path(username)
+            ))
             .query(&[("email", email)])
             .bearer_auth(access_token)
             .send()
@@ -1549,6 +1636,40 @@ impl ApiClient {
         }
 
         resp.json().await.map_err(BridgeError::from)
+    }
+
+    pub async fn get_ec_prekey_secret(
+        &self,
+        access_token: &str,
+        key_id: u32,
+    ) -> Result<Option<EcPrekeySecretResponse>> {
+        let resp = self.client
+            .get(format!("{}/crypto/v1/keys/ec-prekeys/secret/{}", self.base_url, key_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map(Some).map_err(BridgeError::from)
+    }
+
+    pub async fn delete_ec_prekey(&self, access_token: &str, key_id: u32) -> Result<()> {
+        let resp = self.client
+            .delete(format!("{}/crypto/v1/keys/ec-prekeys/{}", self.base_url, key_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+        Ok(())
     }
 
     pub async fn get_escrow_plaintext(
@@ -2316,6 +2437,37 @@ mod tests {
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z"
         })
+    }
+
+    #[tokio::test]
+    async fn username_path_segments_are_percent_encoded() {
+        let seen: Arc<TokioMutex<Vec<String>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let record = |seen: Arc<TokioMutex<Vec<String>>>| {
+            move |AxumPath(username): AxumPath<String>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().await.push(username);
+                    StatusCode::NOT_FOUND
+                }
+            }
+        };
+        let app = Router::new()
+            .route(
+                "/crypto/v1/ratchet/prekey-bundle/:username",
+                get(record(seen.clone())),
+            )
+            .route("/crypto/v1/keys/public/:username", get(record(seen.clone())));
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let hostile = "../../admin/v1/users?role=admin#x y%2e";
+
+        let _ = client.get_prekey_bundle("tok", hostile, "a@example.com").await;
+        let _ = client.find_prekey_bundle("tok", hostile, "a@example.com").await;
+        let _ = client.lookup_recipient_key("tok", hostile, "a@example.com").await;
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|username| username == hostile));
     }
 
     #[test]

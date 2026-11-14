@@ -78,6 +78,30 @@ fn expired_code_stores_nothing() {
 }
 
 #[test]
+fn login_seals_with_the_newest_envelope_version() {
+    let env = Env::new();
+    env.json(&["login"]).expect(0);
+    let requests = env.mock.code_requests();
+    assert_eq!(requests[0].body["envelope_versions"], serde_json::json!([1, 2]));
+}
+
+#[test]
+fn a_passphrase_that_does_not_open_the_vault_stores_nothing() {
+    let env = Env::new();
+    env.mock.set_code_status(CodeStatus::ConfirmForeignPassphrase);
+    let run = env.json(&["login"]);
+    assert_ne!(run.code, 0, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert_eq!(run.error_code(), "sign_in_failed");
+    let status = env.json(&["status"]);
+    status.expect(3);
+    assert_eq!(status.json()["signed_in"], false);
+
+    env.mock.set_code_status(CodeStatus::Confirm);
+    env.json(&["login"]).expect(0);
+    assert_eq!(env.mock.code_requests().len(), 2);
+}
+
+#[test]
 fn withdrawn_code_counts_as_expired() {
     let env = Env::new();
     env.mock.set_code_status(CodeStatus::Gone);

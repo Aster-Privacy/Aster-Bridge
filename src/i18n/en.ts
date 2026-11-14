@@ -375,6 +375,8 @@ const en = {
   import_finished_summary_other: "Import finished. {{count}} messages imported.",
   import_dismiss: "Dismiss",
   offline_banner: "No internet connection",
+  sandbox_off_banner: "This window is running without its sandbox. To turn the sandbox on, install bubblewrap, and then restart Aster Bridge.",
+  sandbox_off_by_setting_banner: "This window is running without its sandbox because an environment variable turned it off.",
 
   provision_title: "Allow access?",
   provision_allow: "Allow",

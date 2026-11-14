@@ -18,7 +18,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -33,6 +33,9 @@ use crate::error::{BridgeError, Result};
 
 pub const INBOUND_ECDH_MARKER: u8 = 0x03;
 pub const INBOUND_PQ_HYBRID_MARKER: u8 = 0x04;
+pub const INBOUND_ECDH_BOUND_MARKER: u8 = 0x05;
+pub const INBOUND_PQ_HYBRID_BOUND_MARKER: u8 = 0x06;
+pub const BOUND_ENVELOPE_VERSION: i16 = 1;
 
 const EPHEMERAL_POINT_LEN: usize = 65;
 const ML_KEM_768_CT_LEN: usize = 1088;
@@ -43,11 +46,49 @@ const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
 
 const INFO_ECDH: &[u8] = b"aster-inbound-v1";
 const INFO_PQ: &[u8] = b"aster-inbound-pq-v1";
+const INFO_ECDH_BOUND: &[u8] = b"aster-inbound-v2";
+const INFO_PQ_BOUND: &[u8] = b"aster-inbound-pq-v2";
+const BOUND_AAD_LABEL: &[u8] = b"aster-inbound-v2";
 
 #[derive(Zeroize, Clone)]
 pub struct InboundKeyCandidate {
     pub ecdh_secret_d: Vec<u8>,
     pub pq_decap_key: Option<Vec<u8>>,
+    #[zeroize(skip)]
+    pub owner: Option<[u8; 16]>,
+}
+
+pub fn bind_inbound_owner(candidates: &mut [InboundKeyCandidate], user_id: &uuid::Uuid) {
+    for candidate in candidates.iter_mut() {
+        candidate.owner = Some(*user_id.as_bytes());
+    }
+}
+
+pub fn is_inbound_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        INBOUND_ECDH_MARKER
+            | INBOUND_PQ_HYBRID_MARKER
+            | INBOUND_ECDH_BOUND_MARKER
+            | INBOUND_PQ_HYBRID_BOUND_MARKER
+    )
+}
+
+fn is_bound_marker(marker: u8) -> bool {
+    matches!(marker, INBOUND_ECDH_BOUND_MARKER | INBOUND_PQ_HYBRID_BOUND_MARKER)
+}
+
+fn is_pq_marker(marker: u8) -> bool {
+    matches!(marker, INBOUND_PQ_HYBRID_MARKER | INBOUND_PQ_HYBRID_BOUND_MARKER)
+}
+
+fn bound_aad(marker: u8, owner: &[u8; 16], header: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(BOUND_AAD_LABEL.len() + 1 + owner.len() + header.len());
+    aad.extend_from_slice(BOUND_AAD_LABEL);
+    aad.push(marker);
+    aad.extend_from_slice(owner);
+    aad.extend_from_slice(header);
+    aad
 }
 
 pub(crate) fn decode_pq_decap_key(expanded_b64: Option<&str>, seed_b64: Option<&str>) -> Option<Vec<u8>> {
@@ -83,6 +124,7 @@ fn push_candidate(
     candidates.push(InboundKeyCandidate {
         ecdh_secret_d,
         pq_decap_key: decode_pq_decap_key(pq_expanded_b64, pq_seed_b64),
+        owner: None,
     });
 }
 
@@ -117,10 +159,7 @@ pub fn is_inbound_payload(encrypted_data_b64: &str, nonce_b64: &str) -> bool {
     let Ok(data) = STANDARD.decode(encrypted_data_b64) else {
         return false;
     };
-    matches!(
-        data.first(),
-        Some(&INBOUND_ECDH_MARKER) | Some(&INBOUND_PQ_HYBRID_MARKER)
-    )
+    data.first().copied().is_some_and(is_inbound_marker)
 }
 
 fn hkdf_aes_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
@@ -131,7 +170,12 @@ fn hkdf_aes_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn decrypt_and_inflate(mut aes_key: [u8; 32], nonce_bytes: &[u8], ciphertext: &[u8]) -> Option<String> {
+fn decrypt_and_inflate(
+    mut aes_key: [u8; 32],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Option<String> {
     let cipher = match Aes256Gcm::new_from_slice(&aes_key) {
         Ok(c) => c,
         Err(_) => {
@@ -141,7 +185,7 @@ fn decrypt_and_inflate(mut aes_key: [u8; 32], nonce_bytes: &[u8], ciphertext: &[
     };
     aes_key.zeroize();
     let nonce = Nonce::from_slice(nonce_bytes);
-    let compressed = Zeroizing::new(cipher.decrypt(nonce, ciphertext).ok()?);
+    let compressed = Zeroizing::new(cipher.decrypt(nonce, Payload { msg: ciphertext, aad }).ok()?);
     let inflated = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
         &compressed,
         MAX_INFLATED_BYTES,
@@ -162,19 +206,24 @@ fn try_ecdh_candidate(
     ephemeral_point: &[u8],
     nonce_bytes: &[u8],
     ciphertext: &[u8],
+    info: &[u8],
+    aad: &[u8],
 ) -> Option<String> {
     let mut shared_x = ecdh_p256(&candidate.ecdh_secret_d, ephemeral_point).ok()?;
-    let key = hkdf_aes_key(&shared_x, INFO_ECDH).ok();
+    let key = hkdf_aes_key(&shared_x, info).ok();
     shared_x.zeroize();
-    decrypt_and_inflate(key?, nonce_bytes, ciphertext)
+    decrypt_and_inflate(key?, nonce_bytes, ciphertext, aad)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_pq_candidate(
     candidate: &InboundKeyCandidate,
     ephemeral_point: &[u8],
     kem_ciphertext: &[u8],
     nonce_bytes: &[u8],
     ciphertext: &[u8],
+    info: &[u8],
+    aad: &[u8],
 ) -> Option<String> {
     let pq_key = candidate.pq_decap_key.as_deref()?;
     let mut shared_x = ecdh_p256(&candidate.ecdh_secret_d, ephemeral_point).ok()?;
@@ -190,9 +239,9 @@ fn try_pq_candidate(
     ikm[32..].copy_from_slice(&kem_ss[..32]);
     shared_x.zeroize();
     kem_ss.zeroize();
-    let key = hkdf_aes_key(&ikm, INFO_PQ).ok();
+    let key = hkdf_aes_key(&ikm, info).ok();
     ikm.zeroize();
-    decrypt_and_inflate(key?, nonce_bytes, ciphertext)
+    decrypt_and_inflate(key?, nonce_bytes, ciphertext, aad)
 }
 
 pub fn decrypt_inbound_envelope(
@@ -206,49 +255,63 @@ pub fn decrypt_inbound_envelope(
     if candidates.is_empty() {
         return Err(BridgeError::Crypto("no inbound key candidates".to_string()));
     }
-    match payload.first() {
-        Some(&INBOUND_ECDH_MARKER) => {
-            if payload.len() < 1 + EPHEMERAL_POINT_LEN + GCM_TAG_LEN {
-                return Err(BridgeError::Crypto("inbound envelope too short".to_string()));
-            }
-            let ephemeral_point = &payload[1..1 + EPHEMERAL_POINT_LEN];
-            let ciphertext = &payload[1 + EPHEMERAL_POINT_LEN..];
-            for candidate in candidates {
-                if let Some(s) =
-                    try_ecdh_candidate(candidate, ephemeral_point, nonce_bytes, ciphertext)
-                {
-                    return Ok(s);
-                }
-            }
-            Err(BridgeError::Crypto(
-                "inbound envelope decrypt failed for all candidates".to_string(),
-            ))
-        }
-        Some(&INBOUND_PQ_HYBRID_MARKER) => {
-            if payload.len() < 1 + EPHEMERAL_POINT_LEN + ML_KEM_768_CT_LEN + GCM_TAG_LEN {
-                return Err(BridgeError::Crypto("inbound pq envelope too short".to_string()));
-            }
-            let ephemeral_point = &payload[1..1 + EPHEMERAL_POINT_LEN];
-            let kem_ciphertext =
-                &payload[1 + EPHEMERAL_POINT_LEN..1 + EPHEMERAL_POINT_LEN + ML_KEM_768_CT_LEN];
-            let ciphertext = &payload[1 + EPHEMERAL_POINT_LEN + ML_KEM_768_CT_LEN..];
-            for candidate in candidates {
-                if let Some(s) = try_pq_candidate(
-                    candidate,
-                    ephemeral_point,
-                    kem_ciphertext,
-                    nonce_bytes,
-                    ciphertext,
-                ) {
-                    return Ok(s);
-                }
-            }
-            Err(BridgeError::Crypto(
-                "inbound pq envelope decrypt failed for all candidates".to_string(),
-            ))
-        }
-        _ => Err(BridgeError::Crypto("not an inbound envelope".to_string())),
+    let marker = match payload.first() {
+        Some(&marker) if is_inbound_marker(marker) => marker,
+        _ => return Err(BridgeError::Crypto("not an inbound envelope".to_string())),
+    };
+    let pq = is_pq_marker(marker);
+    let bound = is_bound_marker(marker);
+    let header_len = if pq {
+        1 + EPHEMERAL_POINT_LEN + ML_KEM_768_CT_LEN
+    } else {
+        1 + EPHEMERAL_POINT_LEN
+    };
+    if payload.len() < header_len + GCM_TAG_LEN {
+        let reason = if pq {
+            "inbound pq envelope too short"
+        } else {
+            "inbound envelope too short"
+        };
+        return Err(BridgeError::Crypto(reason.to_string()));
     }
+    let ephemeral_point = &payload[1..1 + EPHEMERAL_POINT_LEN];
+    let kem_ciphertext = &payload[1 + EPHEMERAL_POINT_LEN..header_len];
+    let ciphertext = &payload[header_len..];
+    let info = match (pq, bound) {
+        (false, false) => INFO_ECDH,
+        (true, false) => INFO_PQ,
+        (false, true) => INFO_ECDH_BOUND,
+        (true, true) => INFO_PQ_BOUND,
+    };
+    for candidate in candidates {
+        let aad = match (bound, candidate.owner.as_ref()) {
+            (false, _) => Vec::new(),
+            (true, Some(owner)) => bound_aad(marker, owner, &payload[1..header_len]),
+            (true, None) => continue,
+        };
+        let plaintext = if pq {
+            try_pq_candidate(
+                candidate,
+                ephemeral_point,
+                kem_ciphertext,
+                nonce_bytes,
+                ciphertext,
+                info,
+                &aad,
+            )
+        } else {
+            try_ecdh_candidate(candidate, ephemeral_point, nonce_bytes, ciphertext, info, &aad)
+        };
+        if let Some(s) = plaintext {
+            return Ok(s);
+        }
+    }
+    let reason = if pq {
+        "inbound pq envelope decrypt failed for all candidates"
+    } else {
+        "inbound envelope decrypt failed for all candidates"
+    };
+    Err(BridgeError::Crypto(reason.to_string()))
 }
 
 #[cfg(test)]
@@ -264,6 +327,7 @@ mod tests {
         InboundKeyCandidate {
             ecdh_secret_d: sk.to_bytes().to_vec(),
             pq_decap_key,
+            owner: None,
         }
     }
 
@@ -454,5 +518,268 @@ mod tests {
         assert!(!is_inbound_payload(&other, &nonce12));
         assert!(!is_inbound_payload(&ecdh, &nonce1));
         assert!(!is_inbound_payload("!!!", &nonce12));
+    }
+
+    const OWNER: [u8; 16] = [0x3f, 0x2b, 0x8c, 0x1e, 0x7a, 0x4d, 0x4e, 0x9b, 0x9c, 0x60, 0x5d, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+    const OTHER_OWNER: [u8; 16] = [0x11; 16];
+
+    fn owned(mut candidate: InboundKeyCandidate, owner: [u8; 16]) -> InboundKeyCandidate {
+        candidate.owner = Some(owner);
+        candidate
+    }
+
+    fn seal_bound(key: &[u8; 32], nonce_bytes: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        let cipher = Aes256Gcm::new_from_slice(key).unwrap();
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(plaintext, 6);
+        cipher
+            .encrypt(
+                Nonce::from_slice(nonce_bytes),
+                Payload {
+                    msg: compressed.as_slice(),
+                    aad,
+                },
+            )
+            .unwrap()
+    }
+
+    fn encrypt_ecdh_bound(
+        plaintext: &[u8],
+        recipient: &SecretKey,
+        nonce_bytes: &[u8; 12],
+        owner: &[u8; 16],
+    ) -> Vec<u8> {
+        let recipient_pub = recipient.public_key().to_encoded_point(false);
+        let ephemeral = SecretKey::random(&mut OsRng);
+        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let shared_x =
+            ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
+        let key = hkdf_aes_key(&shared_x, INFO_ECDH_BOUND).unwrap();
+        let aad = bound_aad(INBOUND_ECDH_BOUND_MARKER, owner, eph_pub.as_bytes());
+        let ciphertext = seal_bound(&key, nonce_bytes, plaintext, &aad);
+        let mut out = vec![INBOUND_ECDH_BOUND_MARKER];
+        out.extend_from_slice(eph_pub.as_bytes());
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    fn encrypt_pq_bound(
+        plaintext: &[u8],
+        recipient: &SecretKey,
+        recipient_ek: &<MlKem768 as KemCore>::EncapsulationKey,
+        nonce_bytes: &[u8; 12],
+        owner: &[u8; 16],
+    ) -> Vec<u8> {
+        let recipient_pub = recipient.public_key().to_encoded_point(false);
+        let ephemeral = SecretKey::random(&mut OsRng);
+        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let shared_x =
+            ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
+        let (kem_ct, kem_ss) = recipient_ek.encapsulate(&mut OsRng).unwrap();
+        let mut ikm = [0u8; 64];
+        ikm[..32].copy_from_slice(&shared_x);
+        ikm[32..].copy_from_slice(&kem_ss.as_slice()[..32]);
+        let key = hkdf_aes_key(&ikm, INFO_PQ_BOUND).unwrap();
+        let mut header = eph_pub.as_bytes().to_vec();
+        header.extend_from_slice(kem_ct.as_slice());
+        let aad = bound_aad(INBOUND_PQ_HYBRID_BOUND_MARKER, owner, &header);
+        let ciphertext = seal_bound(&key, nonce_bytes, plaintext, &aad);
+        let mut out = vec![INBOUND_PQ_HYBRID_BOUND_MARKER];
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    #[test]
+    fn bound_ecdh_envelope_round_trips() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let nonce = [3u8; 12];
+        let json = r#"{"subject":"bound","body_text":"owner"}"#;
+        let payload = encrypt_ecdh_bound(json.as_bytes(), &recipient, &nonce, &OWNER);
+        let candidates = [owned(candidate_from(&recipient, None), OWNER)];
+        let out = decrypt_inbound_envelope(&payload, &nonce, &candidates).unwrap();
+        assert_eq!(out, json);
+    }
+
+    #[test]
+    fn bound_pq_envelope_round_trips() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let nonce = [4u8; 12];
+        let json = r#"{"subject":"bound pq","body_text":"owner"}"#;
+        let payload = encrypt_pq_bound(json.as_bytes(), &recipient, &ek, &nonce, &OWNER);
+        let candidates = [owned(
+            candidate_from(&recipient, Some(dk.as_bytes().to_vec())),
+            OWNER,
+        )];
+        let out = decrypt_inbound_envelope(&payload, &nonce, &candidates).unwrap();
+        assert_eq!(out, json);
+    }
+
+    #[test]
+    fn bound_envelope_fails_for_another_owner() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let nonce = [5u8; 12];
+        let ecdh = encrypt_ecdh_bound(b"{}", &recipient, &nonce, &OWNER);
+        let pq = encrypt_pq_bound(b"{}", &recipient, &ek, &nonce, &OWNER);
+        let candidates = [owned(
+            candidate_from(&recipient, Some(dk.as_bytes().to_vec())),
+            OTHER_OWNER,
+        )];
+        assert!(decrypt_inbound_envelope(&ecdh, &nonce, &candidates).is_err());
+        assert!(decrypt_inbound_envelope(&pq, &nonce, &candidates).is_err());
+    }
+
+    #[test]
+    fn bound_envelope_fails_without_an_owner() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let nonce = [6u8; 12];
+        let ecdh = encrypt_ecdh_bound(b"{}", &recipient, &nonce, &OWNER);
+        let pq = encrypt_pq_bound(b"{}", &recipient, &ek, &nonce, &OWNER);
+        let candidates = [candidate_from(&recipient, Some(dk.as_bytes().to_vec()))];
+        assert!(decrypt_inbound_envelope(&ecdh, &nonce, &candidates).is_err());
+        assert!(decrypt_inbound_envelope(&pq, &nonce, &candidates).is_err());
+    }
+
+    #[test]
+    fn bound_and_unbound_envelopes_cannot_be_relabeled() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let nonce = [8u8; 12];
+        let candidates = [owned(
+            candidate_from(&recipient, Some(dk.as_bytes().to_vec())),
+            OWNER,
+        )];
+        let swaps = [
+            (
+                encrypt_ecdh_bound(b"{}", &recipient, &nonce, &OWNER),
+                INBOUND_ECDH_MARKER,
+            ),
+            (
+                encrypt_ecdh(b"{}", &recipient, &nonce),
+                INBOUND_ECDH_BOUND_MARKER,
+            ),
+            (
+                encrypt_pq_bound(b"{}", &recipient, &ek, &nonce, &OWNER),
+                INBOUND_PQ_HYBRID_MARKER,
+            ),
+            (
+                encrypt_pq(b"{}", &recipient, &ek, &nonce),
+                INBOUND_PQ_HYBRID_BOUND_MARKER,
+            ),
+        ];
+        for (mut payload, marker) in swaps {
+            assert!(decrypt_inbound_envelope(&payload, &nonce, &candidates).is_ok());
+            payload[0] = marker;
+            assert!(decrypt_inbound_envelope(&payload, &nonce, &candidates).is_err());
+        }
+    }
+
+    #[test]
+    fn bound_envelope_fails_when_its_header_is_altered() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let nonce = [10u8; 12];
+        let candidates = [owned(
+            candidate_from(&recipient, Some(dk.as_bytes().to_vec())),
+            OWNER,
+        )];
+        let mut payload = encrypt_pq_bound(b"{}", &recipient, &ek, &nonce, &OWNER);
+        payload[1 + EPHEMERAL_POINT_LEN + 7] ^= 0x01;
+        assert!(decrypt_inbound_envelope(&payload, &nonce, &candidates).is_err());
+    }
+
+    #[test]
+    fn unbound_envelopes_still_open_for_an_owned_candidate() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let nonce = [11u8; 12];
+        let payload = encrypt_ecdh(b"{}", &recipient, &nonce);
+        let candidates = [owned(candidate_from(&recipient, None), OWNER)];
+        assert_eq!(
+            decrypt_inbound_envelope(&payload, &nonce, &candidates).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn binding_stamps_every_candidate_with_the_account_id() {
+        let recipient = SecretKey::random(&mut OsRng);
+        let mut candidates = vec![
+            candidate_from(&recipient, None),
+            candidate_from(&recipient, None),
+        ];
+        let user_id = uuid::Uuid::from_bytes(OWNER);
+        bind_inbound_owner(&mut candidates, &user_id);
+        assert!(candidates.iter().all(|c| c.owner == Some(OWNER)));
+    }
+
+    #[test]
+    fn bound_markers_are_recognized_as_inbound_payloads() {
+        for marker in [0x03u8, 0x04, 0x05, 0x06] {
+            assert!(is_inbound_marker(marker));
+        }
+        for marker in [0x00u8, 0x01, 0x02, 0x07] {
+            assert!(!is_inbound_marker(marker));
+        }
+    }
+
+    fn backend_bound_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/inbound_bound_envelope_vectors.json"
+        ))
+        .unwrap()
+    }
+
+    fn vector_bytes(vectors: &serde_json::Value, path: &[&str]) -> Vec<u8> {
+        let mut node = vectors;
+        for key in path {
+            node = &node[*key];
+        }
+        STANDARD.decode(node.as_str().unwrap()).unwrap()
+    }
+
+    fn vector_candidate(vectors: &serde_json::Value, owner: Option<[u8; 16]>) -> InboundKeyCandidate {
+        InboundKeyCandidate {
+            ecdh_secret_d: vector_bytes(vectors, &["recipient_p256_private_scalar_b64"]),
+            pq_decap_key: Some(vector_bytes(
+                vectors,
+                &["recipient_ml_kem768_decapsulation_key_b64"],
+            )),
+            owner,
+        }
+    }
+
+    #[test]
+    fn opens_bound_envelopes_produced_by_the_server() {
+        let vectors = backend_bound_vectors();
+        let owner = uuid::Uuid::parse_str(vectors["bound_owner_user_id"].as_str().unwrap())
+            .unwrap()
+            .into_bytes();
+        assert_eq!(owner, OWNER);
+        let expected = vectors["plaintext_utf8"].as_str().unwrap();
+        for (group, marker) in [
+            ("ecdh_bound", INBOUND_ECDH_BOUND_MARKER),
+            ("pq_hybrid_bound", INBOUND_PQ_HYBRID_BOUND_MARKER),
+        ] {
+            let payload = vector_bytes(&vectors, &[group, "envelope_b64"]);
+            let nonce = vector_bytes(&vectors, &[group, "nonce_b64"]);
+            assert_eq!(payload[0], marker);
+            let opened = decrypt_inbound_envelope(
+                &payload,
+                &nonce,
+                &[vector_candidate(&vectors, Some(owner))],
+            )
+            .unwrap();
+            assert_eq!(opened, expected);
+            for wrong in [None, Some(OTHER_OWNER)] {
+                assert!(decrypt_inbound_envelope(
+                    &payload,
+                    &nonce,
+                    &[vector_candidate(&vectors, wrong)]
+                )
+                .is_err());
+            }
+        }
     }
 }

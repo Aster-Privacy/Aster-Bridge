@@ -854,10 +854,11 @@ async fn upload_attachments(
             let passphrase = passphrase.to_vec();
             let own_key = own_key.map(str::to_string);
             tokio::task::spawn_blocking(move || {
-                crate::crypto::attachment::seal_attachment_with_own_key(
+                crate::crypto::attachment::seal_attachment_for_slot(
                     &attachment,
                     &passphrase,
                     own_key.as_deref(),
+                    seq,
                 )
             })
             .await

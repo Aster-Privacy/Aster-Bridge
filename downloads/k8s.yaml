@@ -18,7 +18,7 @@ data:
             return 302 https://github.com/Aster-Privacy/Aster-Bridge/releases/latest;
         }
 
-        location ~ ^/download/bridge/(.+)$ {
+        location ~ ^/download/bridge/([A-Za-z0-9][A-Za-z0-9._-]*)$ {
             add_header X-Content-Type-Options nosniff;
             return 302 https://github.com/Aster-Privacy/Aster-Bridge/releases/latest/download/$1;
         }

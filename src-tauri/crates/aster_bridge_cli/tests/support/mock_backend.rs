@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aster_bridge_core::auth::device_identity::seal_vault_envelope;
+use aster_bridge_core::crypto::vault::encrypt_vault_for_test;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -40,6 +41,7 @@ const VAULT_PASSPHRASE: &[u8] = b"mock-vault-passphrase";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeStatus {
     Confirm,
+    ConfirmForeignPassphrase,
     Pending,
     Expired,
     Gone,
@@ -169,6 +171,7 @@ fn router(inner: Arc<Inner>) -> Router {
         .route("/mail/v1/drafts", get(list_drafts))
         .route("/addresses/v1/aliases", get(list_aliases))
         .route("/addresses/v1/domains", get(list_domains))
+        .route("/mail/v1/labels", get(list_labels))
         .fallback(not_found)
         .with_state(inner)
 }
@@ -202,13 +205,27 @@ async fn device_code_status(State(inner): State<Arc<Inner>>) -> Response {
         CodeStatus::Pending => Json(json!({ "status": "pending" })).into_response(),
         CodeStatus::Expired => Json(json!({ "status": "expired" })).into_response(),
         CodeStatus::Gone => (StatusCode::GONE, Json(json!({ "error": "gone" }))).into_response(),
-        CodeStatus::Confirm => {
+        CodeStatus::Confirm | CodeStatus::ConfirmForeignPassphrase => {
+            let passphrase: &[u8] = if status == CodeStatus::Confirm {
+                VAULT_PASSPHRASE
+            } else {
+                b"passphrase-chosen-by-someone-else"
+            };
             let Some(request) = inner.code_requests.lock().unwrap().last().cloned() else {
                 return not_found().await;
             };
-            let mlkem_pk = request.body["mlkem_pk"].as_str().unwrap_or_default().to_string();
-            let x25519_pk = request.body["x25519_pk"].as_str().unwrap_or_default().to_string();
-            match seal_vault_envelope(&mlkem_pk, &x25519_pk, VAULT_PASSPHRASE) {
+            let key = |name: &str| request.body[name].as_str().unwrap_or_default().to_string();
+            let version = match request.body["envelope_versions"].as_array() {
+                Some(versions) if versions.iter().any(|v| v.as_u64() == Some(2)) => 2,
+                _ => 1,
+            };
+            match seal_vault_envelope(
+                &key("ed25519_pk"),
+                &key("mlkem_pk"),
+                &key("x25519_pk"),
+                passphrase,
+                version,
+            ) {
                 Ok(envelope) => Json(json!({
                     "status": "confirmed",
                     "device_id": inner.device_id,
@@ -235,14 +252,16 @@ async fn device_login(State(inner): State<Arc<Inner>>) -> Response {
         let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return (code, Json(json!({ "error": "device_login_failed" }))).into_response();
     }
+    let vault = json!({ "identity_key": "mock-identity-key" }).to_string();
+    let (encrypted_vault, vault_nonce) = encrypt_vault_for_test(vault.as_bytes(), VAULT_PASSPHRASE);
     Json(json!({
         "user_id": inner.user_id,
         "username": TEST_USERNAME,
         "email": TEST_EMAIL,
         "access_token": "mock-access-token",
         "refresh_token": "mock-refresh-token",
-        "encrypted_vault": "AAAA",
-        "vault_nonce": "AAAA",
+        "encrypted_vault": encrypted_vault,
+        "vault_nonce": vault_nonce,
     }))
     .into_response()
 }
@@ -320,6 +339,10 @@ async fn list_aliases() -> Json<Value> {
 
 async fn list_domains() -> Json<Value> {
     Json(json!({ "domains": [], "total": 0, "max_domains": 0 }))
+}
+
+async fn list_labels() -> Json<Value> {
+    Json(json!({ "labels": [], "has_more": false }))
 }
 
 async fn not_found() -> Response {

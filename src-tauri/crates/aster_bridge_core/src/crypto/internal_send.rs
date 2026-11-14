@@ -29,7 +29,10 @@ use crate::api_client::{ApiClient, PrekeyBundle, RecipientKeyLookup};
 use crate::auth::session::Session;
 use zeroize::Zeroizing;
 
-use crate::crypto::ratchet::{encrypt_bootstrap_versioned, RatchetMessage};
+use crate::crypto::ratchet::{
+    encrypt_bootstrap_one_time_bound, encrypt_bootstrap_versioned, RatchetMessage,
+    X3DH_VERSION_KEY_BOUND, X3DH_VERSION_ONE_TIME_BOUND,
+};
 use crate::crypto::sealed_details::{
     build_sealed_details, format_sent_at, sealed_sender_name, SealedMessageDetails,
 };
@@ -349,6 +352,14 @@ pub fn recipient_entry(message: &RatchetMessage) -> Value {
     if let Some(version) = message.x3dh_version.filter(|version| *version > 1) {
         entry["x3dh_v"] = json!(version);
     }
+    if message.x3dh_version == Some(X3DH_VERSION_ONE_TIME_BOUND) {
+        if let Some(key_id) = message.opk_id {
+            entry["opk_id"] = json!(key_id);
+        }
+        if let Some(signed_prekey_id) = &message.spk_id {
+            entry["spk_id"] = json!(signed_prekey_id);
+        }
+    }
     entry
 }
 
@@ -399,13 +410,31 @@ fn seal_for_recipient(
     target: &RatchetTarget,
     plaintext: &str,
 ) -> Result<RatchetMessage> {
+    let mut version = target.x3dh_version();
+    if version == X3DH_VERSION_ONE_TIME_BOUND {
+        if let Some(one_time) = &target.one_time_prekey {
+            if let Ok(message) = encrypt_bootstrap_one_time_bound(
+                sender_identity_secret_d,
+                &target.identity_public,
+                &target.signed_prekey,
+                target.pq_target.as_ref().map(|pq| pq.public_key.as_slice()),
+                target.pq_target.as_ref().map(|pq| pq.key_id),
+                one_time.key_id,
+                &one_time.public_key,
+                plaintext,
+            ) {
+                return Ok(message);
+            }
+        }
+        version = X3DH_VERSION_KEY_BOUND;
+    }
     encrypt_bootstrap_versioned(
         sender_identity_secret_d,
         &target.identity_public,
         &target.signed_prekey,
         target.pq_target.as_ref().map(|pq| pq.public_key.as_slice()),
         target.pq_target.as_ref().map(|pq| pq.key_id),
-        target.transcript_bound,
+        version,
         plaintext,
     )
     .map_err(BridgeError::Crypto)
@@ -632,6 +661,7 @@ fn local_address_bundle(keyring: &AddressKeyring, address: &str) -> Option<Preke
         pq_prekey: None,
         pq_kem_public_key: entry.pq_kem_public_key,
         x3dh_max_version: Some(2),
+        ec_one_time_prekey: None,
         address_scoped: Some(true),
     })
 }
@@ -844,8 +874,7 @@ async fn lookup_hosted_recipients(
         let fetched = fetch_hosted_keys(client, access_token, &username, &address).await;
         let (key_lookup, bundle) = match fetched {
             Ok(fetched) => fetched,
-            Err(error) if pin.is_some() => return Err(error),
-            Err(_) => continue,
+            Err(error) => return Err(error),
         };
         let owner_public_key = key_lookup.as_ref().and_then(|lookup| lookup.public_key.clone());
         let bundle_verified = match bundle.as_ref() {
@@ -1489,6 +1518,7 @@ mod tests {
             pq_prekey: None,
             pq_kem_public_key: Some(STANDARD.encode(encap.as_bytes())),
             x3dh_max_version: None,
+            ec_one_time_prekey: None,
             address_scoped: None,
         };
         Recipient {
@@ -1663,6 +1693,140 @@ mod tests {
             signed_prekey_public: bob.prekey_public.clone(),
         };
         assert_eq!(decrypt_bootstrap(&keys, &message).expect("decrypted"), plaintext);
+    }
+
+    fn offered_one_time_prekey(key_id: u32, one_time: &SecretKey) -> Option<Value> {
+        Some(json!({
+            "key_id": key_id,
+            "public_key": STANDARD
+                .encode(one_time.public_key().to_encoded_point(false).as_bytes()),
+        }))
+    }
+
+    #[test]
+    fn the_one_time_fields_are_written_only_for_the_one_time_bound_handshake() {
+        use crate::crypto::ratchet::signed_prekey_id;
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let account = owner("user");
+        let me = owner("sender");
+        let one_time = SecretKey::random(&mut OsRng);
+
+        for advertised in [None, Some(1i16), Some(2), Some(3)] {
+            let mut bob = recipient();
+            bob.bundle.x3dh_max_version = advertised;
+            bob.bundle.ec_one_time_prekey = offered_one_time_prekey(41, &one_time);
+            sign_v2(&mut bob.bundle, &account);
+            let envelope = seal_routed(
+                &sender(&me),
+                &[routed("user@astermail.org", Some(&bob.bundle), &account)],
+                "below the one-time bound handshake",
+            )
+            .expect("sealed");
+            let parsed: Value = serde_json::from_str(&envelope).expect("envelope json");
+            let entry = &parsed["recipients"]["user@astermail.org"];
+            assert!(entry.get("opk_id").is_none(), "{:?}", advertised);
+            assert!(entry.get("spk_id").is_none(), "{:?}", advertised);
+            match advertised.filter(|version| *version > 1) {
+                Some(version) => assert_eq!(entry["x3dh_v"], json!(version)),
+                None => assert!(entry.get("x3dh_v").is_none()),
+            }
+            let message = parse_recipient_message(&parsed, "user@astermail.org").expect("parsed");
+            assert_eq!(message.opk_id, None);
+            assert_eq!(message.spk_id, None);
+        }
+
+        let mut bob = recipient();
+        bob.bundle.x3dh_max_version = Some(4);
+        sign_v2(&mut bob.bundle, &account);
+        let envelope = seal_routed(
+            &sender(&me),
+            &[routed("user@astermail.org", Some(&bob.bundle), &account)],
+            "no one-time prekey offered",
+        )
+        .expect("sealed");
+        let parsed: Value = serde_json::from_str(&envelope).expect("envelope json");
+        let entry = &parsed["recipients"]["user@astermail.org"];
+        assert_eq!(entry["x3dh_v"], json!(3));
+        assert!(entry.get("opk_id").is_none());
+        assert!(entry.get("spk_id").is_none());
+
+        let plaintext = "bound to a one-time prekey";
+        let mut bob = recipient();
+        bob.bundle.x3dh_max_version = Some(4);
+        bob.bundle.ec_one_time_prekey = offered_one_time_prekey(41, &one_time);
+        sign_v2(&mut bob.bundle, &account);
+        let envelope = seal_routed(
+            &sender(&me),
+            &[routed("user@astermail.org", Some(&bob.bundle), &account)],
+            plaintext,
+        )
+        .expect("sealed");
+        let parsed: Value = serde_json::from_str(&envelope).expect("envelope json");
+        let entry = &parsed["recipients"]["user@astermail.org"];
+        assert_eq!(entry["x3dh_v"], json!(4));
+        assert_eq!(entry["opk_id"], json!(41));
+        assert_eq!(entry["spk_id"], json!(signed_prekey_id(&bob.prekey_public)));
+
+        let mut message = parse_recipient_message(&parsed, "user@astermail.org").expect("parsed");
+        assert_eq!(message.x3dh_version, Some(4));
+        assert_eq!(message.opk_id, Some(41));
+        message.pq_secret = Some(bob.pq_secret.clone());
+        let keys = RatchetReceiverKeys {
+            identity_secret_d: bob.identity.to_bytes().to_vec(),
+            signed_prekey_secret_d: bob.prekey.to_bytes().to_vec(),
+            signed_prekey_public: bob.prekey_public.clone(),
+        };
+        assert!(decrypt_bootstrap(&keys, &message).is_err());
+        message.opk_secret = Some(SecretKey::random(&mut OsRng).to_bytes().to_vec());
+        assert!(decrypt_bootstrap(&keys, &message).is_err());
+        message.opk_secret = Some(one_time.to_bytes().to_vec());
+        assert_eq!(decrypt_bootstrap(&keys, &message).expect("decrypted"), plaintext);
+    }
+
+    #[test]
+    fn an_unusable_one_time_prekey_falls_back_to_the_key_bound_handshake() {
+        use crate::crypto::recipient_trust::tests::owner;
+        use crate::crypto::recipient_trust::OneTimePrekeyTarget;
+
+        let account = owner("user");
+        let one_time = SecretKey::random(&mut OsRng);
+        let mut bob = recipient();
+        bob.bundle.x3dh_max_version = Some(4);
+        bob.bundle.ec_one_time_prekey = offered_one_time_prekey(41, &one_time);
+        sign_v2(&mut bob.bundle, &account);
+        let SendRoute::Ratchet(mut target) =
+            routed("user@astermail.org", Some(&bob.bundle), &account).route
+        else {
+            panic!("expected the ratchet route");
+        };
+        assert_eq!(target.x3dh_version(), 4);
+        let sender_secret = SecretKey::random(&mut OsRng).to_bytes().to_vec();
+
+        let bound = seal_for_recipient(&sender_secret, &target, "bound").expect("sealed");
+        assert_eq!(bound.x3dh_version, Some(4));
+        assert_eq!(bound.opk_id, Some(41));
+
+        for unusable in [
+            OneTimePrekeyTarget {
+                key_id: 41,
+                public_key: vec![0x04; 65],
+            },
+            OneTimePrekeyTarget {
+                key_id: 0,
+                public_key: one_time.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            },
+        ] {
+            target.one_time_prekey = Some(unusable);
+            let message = seal_for_recipient(&sender_secret, &target, "fallback").expect("sealed");
+            assert_eq!(message.x3dh_version, Some(3));
+            assert_eq!(message.opk_id, None);
+            assert_eq!(message.spk_id, None);
+            let entry = recipient_entry(&message);
+            assert_eq!(entry["x3dh_v"], json!(3));
+            assert!(entry.get("opk_id").is_none());
+            assert!(entry.get("spk_id").is_none());
+        }
     }
 
     #[test]
@@ -2321,6 +2485,8 @@ mod tests {
         assert!(!pin_to_save(Some(RecipientPin::default()), None, false).unwrap().hosted);
     }
 
+    const UNAVAILABLE: &str = "unavailable";
+
     struct FakeDirectory {
         keys: std::sync::Mutex<std::collections::HashMap<String, Value>>,
         bundles: std::sync::Mutex<std::collections::HashMap<String, Value>>,
@@ -2370,6 +2536,9 @@ mod tests {
         });
         let (keys, bundles, entries) = (directory.clone(), directory.clone(), directory.clone());
         let found = |value: Option<Value>| match value {
+            Some(Value::String(status)) if status == UNAVAILABLE => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
             Some(value) => axum::Json(value).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         };
@@ -2561,6 +2730,67 @@ mod tests {
         assert_eq!(primary["to"], json!(["sender@astermail.org"]));
         assert_eq!(primary["bcc"], json!(["bob@custom.example"]));
         assert!(primary.get(SELF_TO_PLACEHOLDER).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hosted_lookup_that_fails_holds_the_send_instead_of_sending_readable_mail() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let account = owner("bob");
+        let mut keys = recipient();
+        sign_v2(&mut keys.bundle, &account);
+        let payload_to = |to: &str| {
+            let message = format!("From: sender@astermail.org\r\nTo: {to}\r\nSubject: hi\r\n\r\nsecret body\r\n");
+            crate::smtp::server::build_send_payload(
+                message.as_bytes(),
+                Some("sender@astermail.org"),
+                &[to.to_string()],
+                "sender@astermail.org",
+                None,
+                b"pass",
+            )
+            .unwrap()
+        };
+        let payload = || payload_to("bob@custom.example");
+        let seal = |mut payload: Value| {
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                seal_internal_body_with(&mut payload, session, client, db, "token", false, &AddressEntryDirectory::new())
+                    .await
+                    .map(|_| payload)
+            }
+        };
+
+        directory.set_key("bob@custom.example", Some(json!(UNAVAILABLE)));
+        let error = seal(payload()).await.unwrap_err();
+        assert!(crate::smtp::server::is_transient_send_error(&error), "{error}");
+
+        directory.set_key(
+            "bob@custom.example",
+            Some(json!({"public_key": account.public_key, "internal": true})),
+        );
+        directory.set_bundle("bob@custom.example", Some(json!(UNAVAILABLE)));
+        let error = seal(payload()).await.unwrap_err();
+        assert!(crate::smtp::server::is_transient_send_error(&error), "{error}");
+
+        directory.set_bundle("bob@custom.example", Some(bundle_json(&keys.bundle)));
+        let sealed = seal(payload()).await.unwrap();
+        assert_eq!(sealed["is_e2e_encrypted"], json!(true));
+        assert!(!sealed.to_string().contains("secret body"));
+
+        directory.set_key("bob@custom.example", None);
+        directory.set_bundle("bob@custom.example", None);
+        let error = seal(payload()).await.unwrap_err();
+        assert!(!crate::smtp::server::is_transient_send_error(&error), "{error}");
+
+        let outside = seal(payload_to("carol@custom.example")).await.unwrap();
+        assert!(outside.to_string().contains("carol@custom.example"));
+        assert_ne!(outside["is_e2e_encrypted"], json!(true));
     }
 
     #[test]

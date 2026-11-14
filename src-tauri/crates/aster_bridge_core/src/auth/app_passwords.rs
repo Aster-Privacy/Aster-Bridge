@@ -124,6 +124,34 @@ fn rejection_sample(rng: &mut impl rand_core::RngCore, range: u32) -> u32 {
     }
 }
 
+pub const MAX_LABEL_CHARS: usize = 64;
+
+fn is_hidden_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+pub fn clean_label(raw: &str, fallback: &str) -> String {
+    let visible: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control() && !is_hidden_format_char(*ch))
+        .collect();
+    let capped: String = visible.trim().chars().take(MAX_LABEL_CHARS).collect();
+    let capped = capped.trim();
+    if capped.is_empty() {
+        fallback.to_string()
+    } else {
+        capped.to_string()
+    }
+}
+
 pub fn generate_app_password() -> String {
     let mut rng = OsRng;
     let charset_len = PASSWORD_CHARSET.len() as u32;
@@ -368,6 +396,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_with_key(dir.path(), &[42u8; 32]).unwrap());
         (dir, db)
+    }
+
+    #[test]
+    fn clean_label_keeps_an_ordinary_name() {
+        assert_eq!(clean_label("  Work laptop  ", "App Password"), "Work laptop");
+        assert_eq!(clean_label("B\u{00FC}ro \u{1F4EC}", "App Password"), "B\u{00FC}ro \u{1F4EC}");
+    }
+
+    #[test]
+    fn clean_label_drops_control_and_hidden_direction_characters() {
+        let raw = "Mail\r\n2026 WARN forged\u{0000}\u{001B}[31m\u{202E}gpj.exe\u{2066}\u{200B}\u{FEFF}\u{2028}";
+        assert_eq!(clean_label(raw, "App Password"), "Mail2026 WARN forged[31mgpj.exe");
+    }
+
+    #[test]
+    fn clean_label_caps_the_length_by_character() {
+        let long = "\u{00E9}".repeat(500);
+        let cleaned = clean_label(&long, "App Password");
+        assert_eq!(cleaned.chars().count(), MAX_LABEL_CHARS);
+        let padded = format!("{}   tail", "a".repeat(62));
+        assert_eq!(clean_label(&padded, "App Password"), "a".repeat(62));
+    }
+
+    #[test]
+    fn clean_label_falls_back_when_nothing_visible_is_left() {
+        assert_eq!(clean_label("", "App Password"), "App Password");
+        assert_eq!(clean_label(" \u{202E}\u{200B}\n ", "Auto-provisioned"), "Auto-provisioned");
     }
 
     #[test]

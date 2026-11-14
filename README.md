@@ -4,13 +4,13 @@
 
 Aster Bridge is a free, open-source local mail relay for Aster Mail. It lets any standard desktop email client connect to your Aster account over IMAP, SMTP, and JMAP, and lets any contacts app sync your address book over CardDAV.
 
-Your mail and contacts stay end-to-end encrypted on Aster's servers. The bridge decrypts them locally on your machine so your client can read them, and re-encrypts what you send before it leaves your device. We have no way to read your mail and we never will.
+Your mail and contacts are stored encrypted on Aster's servers. The bridge decrypts them locally on your machine so your client can read them, and it encrypts mail that you send to other Aster users before it leaves your device. Mail to an outside address is handed to the Aster mail server for delivery, unless the bridge can encrypt it with the recipient's OpenPGP key.
 
 You can sign up at [astermail.org](https://astermail.org). Aster Bridge requires a Star plan or higher.
 
 ## How it works
 
-The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. If you run the bridge in Docker on a home server, it also serves other devices on your private network, and it requires TLS for every connection. All encryption and decryption happens locally, and no plaintext travels over the network.
+The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. If you run the bridge in Docker on a home server, it also serves other devices on your private network, and it requires TLS for every connection. All encryption and decryption happens locally, and the connection to Aster always uses TLS.
 
 | Protocol | Default port |
 |---|---|

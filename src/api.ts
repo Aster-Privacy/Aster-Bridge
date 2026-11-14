@@ -295,7 +295,17 @@ export async function set_autostart_enabled(enabled: boolean): Promise<void> {
   return tauri_invoke("set_autostart", { enabled });
 }
 
+export interface WebkitSandboxStatus {
+  enabled: boolean;
+  reason: string;
+}
+
+export async function webkit_sandbox_status(): Promise<WebkitSandboxStatus> {
+  return tauri_invoke<WebkitSandboxStatus>("webkit_sandbox_status");
+}
+
 export interface ProvisionBundle {
+  password_id: string;
   email: string;
   app_password: string;
   label: string;

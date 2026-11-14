@@ -28,16 +28,16 @@ We don't pursue legal action against researchers who:
 
 ## Encryption architecture
 
-Aster Bridge decrypts your mail locally on your device using keys derived from your Aster vault. No plaintext leaves your device through the bridge, and the local IMAP, POP, SMTP, and JMAP servers only accept connections from clients on 127.0.0.1.
+Aster Bridge decrypts your mail locally on your device using keys derived from your Aster vault. Mail that you send to another Aster user is encrypted on your device before it leaves. Mail to an outside address is handed to the Aster mail server over TLS for delivery, unless the bridge can encrypt it with the recipient's OpenPGP key. The local IMAP, POP, SMTP, JMAP, and CardDAV servers only accept connections from clients on 127.0.0.1.
 
 | Channel | Protocol |
 |---|---|
 | Aster Bridge to Aster backend | TLS 1.2+ (HTTPS), bearer token auth with Ed25519 device keys |
 | Bridge to mail client (local) | Plaintext or self-signed TLS on loopback only |
 | Aster to Aster | X3DH and Double Ratchet with ML-KEM-768 (post-quantum) |
-| Aster to external recipients | Ed25519 OpenPGP, portable keys that work with any OpenPGP client |
+| Aster to external recipients | Ed25519 OpenPGP when the recipient publishes a key, with portable keys that work with any OpenPGP client |
 
-App passwords are stored in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service). Access tokens are zeroed from memory on drop.
+App passwords are stored as salted Argon2id hashes in the bridge's encrypted local database. The key for that database is kept in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service), or in a key file if you choose the file backend. Access tokens are zeroed from memory on drop.
 
 ## Coordinated disclosure
 

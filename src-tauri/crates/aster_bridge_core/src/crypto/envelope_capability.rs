@@ -28,12 +28,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api_client::{ApiClient, ReportEnvelopeCapability};
-use crate::crypto::inbound::INBOUND_PQ_HYBRID_MARKER;
-use crate::crypto::ratchet::X3DH_VERSION_TRANSCRIPT_BOUND;
+use crate::crypto::inbound::{BOUND_ENVELOPE_VERSION, INBOUND_PQ_HYBRID_MARKER};
+use crate::crypto::ratchet::{X3DH_VERSION_KEY_BOUND, X3DH_VERSION_ONE_TIME_BOUND};
 
 pub const MAX_ENVELOPE_MARKER: i16 = INBOUND_PQ_HYBRID_MARKER as i16;
 pub const PLATFORM: &str = "bridge";
-pub const X3DH_MAX_VERSION: i16 = X3DH_VERSION_TRANSCRIPT_BOUND as i16;
+pub const X3DH_MAX_VERSION: i16 = X3DH_VERSION_KEY_BOUND as i16;
+pub const X3DH_MAX_VERSION_ONE_TIME_BOUND: i16 = X3DH_VERSION_ONE_TIME_BOUND as i16;
 pub const PGP_EXTERNAL_VERSION: i16 = 1;
 pub const ADDRESS_IDENTITY_VERSION: i16 = 1;
 pub const REPORT_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -54,6 +55,31 @@ pub struct CapabilityState {
     pub last_reported_pgp_external_version: HashMap<String, i16>,
     #[serde(default)]
     pub last_reported_address_identity_version: HashMap<String, i16>,
+    #[serde(default)]
+    pub last_reported_bound_envelope_version: HashMap<String, i16>,
+    #[serde(default)]
+    pub last_reported_x3dh_max_version: HashMap<String, i16>,
+}
+
+pub fn reported_x3dh_max_version(one_time_keys_readable: bool) -> i16 {
+    if one_time_keys_readable {
+        X3DH_MAX_VERSION_ONE_TIME_BOUND
+    } else {
+        X3DH_MAX_VERSION
+    }
+}
+
+pub fn reported_x3dh_version_is_stale(
+    state: &CapabilityState,
+    user_id: &str,
+    x3dh_max_version: i16,
+) -> bool {
+    state
+        .last_reported_x3dh_max_version
+        .get(user_id)
+        .copied()
+        .unwrap_or(X3DH_MAX_VERSION)
+        != x3dh_max_version
 }
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
@@ -116,6 +142,8 @@ pub fn is_report_due_for(
 
 pub fn reported_capabilities_are_stale(state: &CapabilityState, user_id: &str) -> bool {
     state.last_reported_pgp_external_version.get(user_id).copied() != Some(PGP_EXTERNAL_VERSION)
+        || state.last_reported_bound_envelope_version.get(user_id).copied()
+            != Some(BOUND_ENVELOPE_VERSION)
         || state.last_reported_address_identity_version.get(user_id).copied()
             != Some(ADDRESS_IDENTITY_VERSION)
 }
@@ -139,11 +167,13 @@ pub async fn report_if_due(
     access_token: &str,
     user_id: &str,
     identity_public_b64: Option<&str>,
+    one_time_keys_readable: bool,
     data_dir: &Path,
 ) {
     if user_id.trim().is_empty() {
         return;
     }
+    let x3dh_max_version = reported_x3dh_max_version(one_time_keys_readable);
 
     let path = state_path(data_dir);
     let mut state = load_state(&path);
@@ -152,6 +182,7 @@ pub async fn report_if_due(
 
     if !is_report_due_for(&state, user_id, fingerprint.as_deref(), now)
         && !reported_capabilities_are_stale(&state, user_id)
+        && !reported_x3dh_version_is_stale(&state, user_id, x3dh_max_version)
     {
         return;
     }
@@ -162,8 +193,9 @@ pub async fn report_if_due(
         max_envelope_marker: MAX_ENVELOPE_MARKER,
         platform: PLATFORM,
         identity_fingerprint: fingerprint.as_deref(),
-        x3dh_max_version: X3DH_MAX_VERSION,
+        x3dh_max_version,
         pgp_external_version: PGP_EXTERNAL_VERSION,
+        bound_envelope_version: BOUND_ENVELOPE_VERSION,
         address_identity_version: ADDRESS_IDENTITY_VERSION,
     };
 
@@ -173,6 +205,12 @@ pub async fn report_if_due(
             state
                 .last_reported_pgp_external_version
                 .insert(user_id.to_string(), PGP_EXTERNAL_VERSION);
+            state
+                .last_reported_bound_envelope_version
+                .insert(user_id.to_string(), BOUND_ENVELOPE_VERSION);
+            state
+                .last_reported_x3dh_max_version
+                .insert(user_id.to_string(), x3dh_max_version);
             state
                 .last_reported_address_identity_version
                 .insert(user_id.to_string(), ADDRESS_IDENTITY_VERSION);
@@ -221,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_reports_transcript_bound_key_agreement() {
+    fn bridge_reports_key_bound_key_agreement() {
         let body = ReportEnvelopeCapability {
             client_id: "client",
             max_envelope_marker: MAX_ENVELOPE_MARKER,
@@ -229,13 +267,53 @@ mod tests {
             identity_fingerprint: None,
             x3dh_max_version: X3DH_MAX_VERSION,
             pgp_external_version: PGP_EXTERNAL_VERSION,
+            bound_envelope_version: BOUND_ENVELOPE_VERSION,
             address_identity_version: ADDRESS_IDENTITY_VERSION,
         };
         let value = serde_json::to_value(&body).unwrap();
 
-        assert_eq!(value["x3dh_max_version"], 2);
+        assert_eq!(value["x3dh_max_version"], 3);
         assert_eq!(value["pgp_external_version"], 1);
+        assert_eq!(value["bound_envelope_version"], 1);
         assert_eq!(value["address_identity_version"], 1);
+    }
+
+    #[test]
+    fn the_one_time_bound_handshake_is_reported_only_when_its_keys_are_readable() {
+        assert_eq!(reported_x3dh_max_version(false), 3);
+        assert_eq!(reported_x3dh_max_version(false), X3DH_MAX_VERSION);
+        assert_eq!(reported_x3dh_max_version(true), 4);
+
+        let body = ReportEnvelopeCapability {
+            client_id: "client",
+            max_envelope_marker: MAX_ENVELOPE_MARKER,
+            platform: PLATFORM,
+            identity_fingerprint: None,
+            x3dh_max_version: reported_x3dh_max_version(true),
+            pgp_external_version: PGP_EXTERNAL_VERSION,
+            bound_envelope_version: BOUND_ENVELOPE_VERSION,
+            address_identity_version: ADDRESS_IDENTITY_VERSION,
+        };
+        assert_eq!(serde_json::to_value(&body).unwrap()["x3dh_max_version"], 4);
+    }
+
+    #[test]
+    fn a_changed_key_agreement_version_is_reported_at_once() {
+        let mut state = CapabilityState::default();
+        assert!(!reported_x3dh_version_is_stale(&state, "user", 3));
+        assert!(reported_x3dh_version_is_stale(&state, "user", 4));
+
+        state.last_reported_x3dh_max_version.insert("user".to_string(), 4);
+        assert!(!reported_x3dh_version_is_stale(&state, "user", 4));
+        assert!(reported_x3dh_version_is_stale(&state, "user", 3));
+        assert!(reported_x3dh_version_is_stale(&state, "other", 4));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(dir.path());
+        std::fs::write(&path, r#"{"client_id":"c","last_reported_at":{"user":7}}"#).unwrap();
+        let loaded = load_state(&path);
+        assert!(loaded.last_reported_x3dh_max_version.is_empty());
+        assert!(!reported_x3dh_version_is_stale(&loaded, "user", 3));
     }
 
     #[test]
@@ -249,6 +327,12 @@ mod tests {
             .last_reported_pgp_external_version
             .insert("user".to_string(), PGP_EXTERNAL_VERSION);
         assert!(reported_capabilities_are_stale(&state, "user"));
+
+        state
+            .last_reported_bound_envelope_version
+            .insert("user".to_string(), BOUND_ENVELOPE_VERSION);
+        assert!(reported_capabilities_are_stale(&state, "user"));
+
         state
             .last_reported_address_identity_version
             .insert("user".to_string(), ADDRESS_IDENTITY_VERSION);

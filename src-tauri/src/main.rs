@@ -25,7 +25,6 @@ mod a11y_bus;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod shell;
-#[cfg(all(unix, not(target_os = "macos")))]
 mod webkit_sandbox;
 
 use aster_bridge_core::{api_client, auth, config, crypto, db, diagnostics, imap, ops, port_picker, runtime, sign_in_notice, sync, tls};
@@ -902,12 +901,8 @@ async fn generate_app_password(
         .ok_or_else(|| "not authenticated".to_string())?;
 
     let password = auth::app_passwords::generate_app_password();
-    let store_label = if label.trim().is_empty() {
-        "App Password"
-    } else {
-        label.trim()
-    };
-    passwords.store(store_label, &password)?;
+    let store_label = auth::app_passwords::clean_label(&label, "App Password");
+    passwords.store(&store_label, &password)?;
 
     Ok(password)
 }
@@ -1101,6 +1096,7 @@ async fn update_connection_settings(
 
 #[derive(serde::Serialize)]
 struct ProvisionBundle {
+    password_id: String,
     email: String,
     app_password: String,
     label: String,
@@ -1138,14 +1134,9 @@ async fn provision_bundle(
         .ok_or_else(|| "not authenticated".to_string())?;
     let email = session.read().await.email.clone();
 
-    let trimmed = label.trim();
-    let store_label = if trimmed.is_empty() {
-        "Auto-provisioned"
-    } else {
-        trimmed
-    };
+    let store_label = auth::app_passwords::clean_label(&label, "Auto-provisioned");
     let password = auth::app_passwords::generate_app_password();
-    passwords.store(store_label, &password)?;
+    let password_id = passwords.store(&store_label, &password)?;
 
     let imap_port = if guard.running() {
         guard.bound_ports().imap
@@ -1169,9 +1160,10 @@ async fn provision_bundle(
     };
 
     Ok(ProvisionBundle {
+        password_id,
         email,
         app_password: password,
-        label: store_label.to_string(),
+        label: store_label,
         imap_host: "127.0.0.1".to_string(),
         imap_port,
         smtp_host: "127.0.0.1".to_string(),
@@ -1598,11 +1590,7 @@ fn main() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("WEBKIT_DISABLE_THREADED_COMPOSITOR", "1");
-        if std::env::var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_err()
-            && !webkit_sandbox::can_start()
-        {
-            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
-        }
+        webkit_sandbox::apply_policy();
         a11y_bus::configure();
     }
 
@@ -1642,6 +1630,8 @@ fn main() {
         }
     };
     let _log_guard = log_guard;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    webkit_sandbox::log_status();
     tracing::info!(
         "Aster Bridge {} starting (pid {})",
         env!("CARGO_PKG_VERSION"),
@@ -1653,7 +1643,7 @@ fn main() {
             shell::show_main_window(app);
             for arg in argv.iter().skip(1) {
                 if arg.starts_with("aster-mail://") {
-                    tracing::info!("deep-link forwarded from second instance: {}", arg);
+                    tracing::info!("deep-link forwarded from second instance");
                     let _ = app.emit("deep_link", arg.clone());
                 }
             }
@@ -1705,6 +1695,7 @@ fn main() {
             set_require_post_quantum,
             set_autostart,
             provision_bundle,
+            webkit_sandbox::webkit_sandbox_status,
             take_pending_deep_link,
             trigger_sync,
             dismiss_insecure_sign_in,
@@ -1850,7 +1841,7 @@ fn main() {
                         .map(|url| url.to_string())
                         .find(|url| url.starts_with("aster-mail://"))
                     {
-                        tracing::info!("deep-link present at startup: {}", url);
+                        tracing::info!("deep-link present at startup");
                         if let Ok(mut pending) = app.state::<PendingDeepLink>().0.lock() {
                             *pending = Some(url);
                         }
@@ -1863,7 +1854,7 @@ fn main() {
                         if !url_str.starts_with("aster-mail://") {
                             continue;
                         }
-                        tracing::info!("deep-link received: {}", url_str);
+                        tracing::info!("deep-link received");
                         if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.unminimize();
