@@ -1360,9 +1360,16 @@ fn prepare_mail_item(
         });
     }
 
-    if let Ok(false) = db.replay_check_and_record(&item.id, &replay_marker(item)) {
-        tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
-        return Prepared::Done(CacheOutcome::default());
+    match db.replay_check_and_record(&item.id, &replay_marker(item)) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("rejecting envelope nonce mismatch (replay/rollback)");
+            return Prepared::Done(CacheOutcome::default());
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "envelope nonce check unavailable, item deferred");
+            return Prepared::Done(CacheOutcome::default());
+        }
     }
 
     let mut fingerprint = envelope_key_fingerprint(passphrase, identity_key, previous_keys, inbound_keys);

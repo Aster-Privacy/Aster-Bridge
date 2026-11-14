@@ -2699,6 +2699,7 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        use rusqlite::OptionalExtension;
         self.with_conn(|conn| {
             let existing: Option<String> = conn
                 .query_row(
@@ -2706,7 +2707,7 @@ impl Database {
                     [aster_id],
                     |r| r.get::<_, String>(0),
                 )
-                .ok();
+                .optional()?;
             if let Some(prev) = existing {
                 if prev != envelope_nonce {
                     let superseded: i64 = conn.query_row(
@@ -5237,6 +5238,18 @@ mod db_tests {
         assert!(db.replay_check_and_record("a2", "nonce1").unwrap(), "another message is judged by its own history");
         db.repair_cache().unwrap();
         assert!(db.replay_check_and_record("a1", "nonce1").unwrap(), "a rebuilt cache starts a new history");
+    }
+
+    #[test]
+    fn replay_check_reports_a_failed_lookup_instead_of_accepting() {
+        let (_d, db) = open_db();
+        assert!(db.replay_check_and_record("a1", "nonce1").unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch("DROP TABLE envelope_nonces")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.replay_check_and_record("a1", "nonce0").is_err());
     }
 
     #[test]
