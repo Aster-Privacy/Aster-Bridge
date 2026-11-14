@@ -103,6 +103,14 @@ fn missing_key_file_hint() -> String {
 If you moved the bridge from another computer, copy its key file to this path instead, because a new key can't read data that the old key protects.".to_string()
 }
 
+fn key_file_access_hint(path: &Path) -> String {
+    format!(
+        "Make the file readable only by the user that runs Aster Bridge, for example with: chmod 600 {}\nIn a container, you can also mount the key as a read-only secret under {}, owned by root or by that user.",
+        path.display(),
+        secrets::SECRET_MOUNT_DIR
+    )
+}
+
 fn build_file(data_dir: &Path) -> CliResult<SecretBackend> {
     let Some(path) = key_file_path() else {
         return Err(CliError::secret_store(format!(
@@ -113,7 +121,11 @@ fn build_file(data_dir: &Path) -> CliResult<SecretBackend> {
     };
     let key = secrets::load_key_file(&path).map_err(|e| {
         let error = CliError::secret_store(format!("Couldn't use the secret key file: {}", e));
-        if path.exists() {
+        if e.contains("by other users") {
+            error.with_hint(key_file_access_hint(&path))
+        } else if e.contains("os error 13") {
+            error.with_hint(crate::context::access_hint(&path))
+        } else if path.exists() {
             error.with_hint(key_file_hint())
         } else {
             error.with_hint(missing_key_file_hint())

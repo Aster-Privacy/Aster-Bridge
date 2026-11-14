@@ -86,8 +86,24 @@ pub fn forget_device(data_dir: &Path) {
 }
 
 pub fn load_config() -> CliResult<BridgeConfig> {
-    config::load_config()
-        .map_err(|e| CliError::coded(CODE_SETTINGS_READ, format!("Couldn't read the settings file: {}", e)))
+    config::load_config().map_err(settings_read_error)
+}
+
+fn settings_read_error(detail: String) -> CliError {
+    let Ok(dir) = config::data_dir() else {
+        return CliError::coded(CODE_SETTINGS_READ, format!("Couldn't read the settings file: {}", detail));
+    };
+    let path = dir.join("config.toml");
+    let error = CliError::coded(
+        CODE_SETTINGS_READ,
+        format!("Couldn't read the settings file {}: {}", path.display(), detail),
+    );
+    if detail.contains("os error 13") || detail.contains("os error 1)") {
+        let target = if path.exists() { path } else { dir };
+        error.with_hint(crate::context::access_hint(&target))
+    } else {
+        error
+    }
 }
 
 pub fn plan_label(code: Option<&str>) -> String {

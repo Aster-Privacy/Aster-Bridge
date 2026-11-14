@@ -105,16 +105,53 @@ pub fn is_writable(_dir: &std::path::Path) -> bool {
 
 #[cfg(unix)]
 pub fn not_writable_hint(dir: &std::path::Path) -> String {
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    format!(
-        "Aster Bridge runs as user {uid} and group {gid}, which can't write to {}. If you mounted a folder from your computer there, give that user access to it on the host with: sudo chown -R {uid}:{gid} <folder>",
-        dir.display()
-    )
+    access_hint(dir)
 }
 
 #[cfg(not(unix))]
 pub fn not_writable_hint(dir: &std::path::Path) -> String {
     format!("Check that you can write to {}, or pass --data-dir.", dir.display())
+}
+
+#[cfg(unix)]
+pub fn access_hint(path: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let found = path
+        .ancestors()
+        .find_map(|p| std::fs::metadata(p).ok().map(|meta| (p, (meta.uid(), meta.gid()))));
+    match found {
+        Some((p, owner)) => owner_hint(p, (uid, gid), Some(owner), crate::container::in_container()),
+        None => owner_hint(path, (uid, gid), None, crate::container::in_container()),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn access_hint(path: &std::path::Path) -> String {
+    format!("Check that you can read and write {}, or pass --data-dir.", path.display())
+}
+
+pub fn owner_hint(path: &std::path::Path, user: (u32, u32), owner: Option<(u32, u32)>, in_container: bool) -> String {
+    let (uid, gid) = user;
+    let chown = format!("sudo chown -R {}:{} <folder>", uid, gid);
+    match owner {
+        Some((o, g)) if (o, g) != (uid, gid) && in_container && o != 0 => format!(
+            "Aster Bridge runs as user {uid} and group {gid}, but {} belongs to user {o} and group {g}. To run Aster Bridge as the owner, set PUID={o} and PGID={g} on the container. To keep user {uid} instead, change the owner of the folder you mounted on the host with: {chown}",
+            path.display()
+        ),
+        Some((0, g)) if uid != 0 => format!(
+            "Aster Bridge runs as user {uid} and group {gid}, but {} belongs to user 0 (root) and group {g}. To let Aster Bridge use it, change the owner with: {chown}",
+            path.display()
+        ),
+        Some((o, g)) if (o, g) != (uid, gid) => format!(
+            "Aster Bridge runs as user {uid} and group {gid}, but {} belongs to user {o} and group {g}. Run Aster Bridge as that user, or change the owner with: {chown}",
+            path.display()
+        ),
+        _ => format!(
+            "Aster Bridge runs as user {uid} and group {gid}, which can't use {}. Check the permissions of the folder and the folders above it. If you mounted a folder from your computer there, change its owner on the host with: {chown}",
+            path.display()
+        ),
+    }
 }
 
 pub fn signed_out_poll_interval() -> Duration {
@@ -369,5 +406,28 @@ mod stderr_level_tests {
     fn an_explicit_level_always_wins() {
         assert_eq!(stderr_level(Some(LogLevel::Info), true, true), LevelFilter::INFO);
         assert_eq!(stderr_level(Some(LogLevel::Trace), false, true), LevelFilter::TRACE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_hint_names_both_users_and_the_fix() {
+        let path = std::path::Path::new("/data");
+        let hint = owner_hint(path, (10001, 10001), Some((1000, 1000)), true);
+        assert!(hint.contains("user 10001 and group 10001"));
+        assert!(hint.contains("belongs to user 1000 and group 1000"));
+        assert!(hint.contains("PUID=1000 and PGID=1000"));
+        assert!(hint.contains("sudo chown -R 10001:10001"));
+        let root_owned = owner_hint(path, (1000, 1000), Some((0, 0)), true);
+        assert!(!root_owned.contains("PUID"));
+        assert!(root_owned.contains("belongs to user 0 (root) and group 0"));
+        assert!(root_owned.contains("sudo chown -R 1000:1000"));
+        let host = owner_hint(path, (501, 20), Some((0, 0)), false);
+        assert!(!host.contains("PUID"));
+        let same = owner_hint(path, (1000, 1000), Some((1000, 1000)), true);
+        assert!(same.contains("can't use /data"));
     }
 }

@@ -69,6 +69,30 @@ pub async fn run(ctx: &Context, refresh: bool, live: bool) -> CliResult<i32> {
     Ok(exit_code(&snapshot))
 }
 
+pub const HEALTHY: i32 = 0;
+pub const UNHEALTHY: i32 = 1;
+
+pub async fn healthcheck(ctx: &Context) -> CliResult<i32> {
+    let snapshot = snapshot(ctx, false).await?;
+    let (code, text) = if !snapshot.signed_in && crate::lock::WaitingLock::is_held(&ctx.data_dir) {
+        (HEALTHY, "healthy: waiting for you to sign in")
+    } else if !snapshot.signed_in {
+        (UNHEALTHY, "unhealthy: not signed in")
+    } else if snapshot.denied() {
+        (UNHEALTHY, "unhealthy: the plan doesn't include Aster Bridge")
+    } else if !snapshot.running() {
+        (UNHEALTHY, "unhealthy: the mail servers aren't running")
+    } else {
+        (HEALTHY, "healthy: the mail servers are running")
+    };
+    if ctx.out.json {
+        ctx.out.json(json!({ "healthy": code == HEALTHY, "detail": text }));
+    } else {
+        ctx.out.line(text);
+    }
+    Ok(code)
+}
+
 async fn live_status(ctx: &Context) -> Option<Value> {
     control::call_running(&ctx.data_dir, "status", Value::Null)
         .await

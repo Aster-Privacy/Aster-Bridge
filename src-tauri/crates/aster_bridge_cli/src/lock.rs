@@ -24,6 +24,7 @@ use std::path::Path;
 use crate::exit::{CliError, CliResult, CODE_DATA_DIR};
 
 const LOCK_FILE: &str = "bridge.lock";
+const WAITING_FILE: &str = "waiting.lock";
 
 pub struct InstanceLock {
     _file: File,
@@ -77,6 +78,31 @@ impl InstanceLock {
     }
 }
 
+pub struct WaitingLock {
+    _file: File,
+}
+
+impl WaitingLock {
+    pub fn hold(data_dir: &Path) -> Option<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(data_dir.join(WAITING_FILE))
+            .ok()?;
+        file.try_lock().ok()?;
+        Some(WaitingLock { _file: file })
+    }
+
+    pub fn is_held(data_dir: &Path) -> bool {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(data_dir.join(WAITING_FILE)) else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(TryLockError::WouldBlock))
+    }
+}
+
 pub fn held_error() -> CliError {
     CliError::locked("Another aster-bridge process is using this data folder.").with_hint(
         "To continue, wait for it to finish or stop it. To run a separate copy, choose another folder with --data-dir.",
@@ -100,5 +126,16 @@ mod tests {
             InstanceLock::try_acquire(dir.path()).unwrap(),
             LockAttempt::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn waiting_lock_is_seen_only_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!WaitingLock::is_held(dir.path()));
+        let waiting = WaitingLock::hold(dir.path()).unwrap();
+        assert!(WaitingLock::is_held(dir.path()));
+        assert!(InstanceLock::try_acquire(dir.path()).is_ok());
+        drop(waiting);
+        assert!(!WaitingLock::is_held(dir.path()));
     }
 }

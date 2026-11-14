@@ -49,11 +49,14 @@ ENV ASTER_BRIDGE_DATA_DIR=/data \
     ASTER_BRIDGE_SECRET_KEY_FILE=/run/secrets/aster_bridge_secret_key \
     ASTER_BRIDGE_LISTEN=0.0.0.0 \
     ASTER_BRIDGE_COLOR=never \
+    ASTER_BRIDGE_IN_CONTAINER=1 \
+    PUID=10001 \
+    PGID=10001 \
     HOME=/data
-USER 10001:10001
+USER 0:0
 VOLUME ["/data", "/run/secrets"]
 EXPOSE 1143 1993 1025 1465 1110 1995 1080 1081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD ["/usr/local/bin/aster-bridge", "status"]
+    CMD ["/usr/local/bin/aster-bridge", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/aster-bridge"]
 CMD ["serve", "--service"]

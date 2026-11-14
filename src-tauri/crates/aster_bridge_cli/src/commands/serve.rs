@@ -47,7 +47,7 @@ use crate::control;
 use crate::events::{self, CliEvents, SinkGuard};
 use crate::exit::{
     CliError, CliResult, CODE_CACHE_REBUILD, CODE_CONTROL_UNREACHABLE, CODE_NOT_SIGNED_IN, CODE_OUTBOX_ALREADY_SENT,
-    CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
+    CODE_CODE_EXPIRED, CODE_LOCKED, CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
     CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, CODE_TLS_CERTIFICATE, EXIT_ERROR,
     EXIT_NOT_READY, EXIT_OK,
 };
@@ -82,6 +82,47 @@ pub struct ServeNetwork {
 struct ResolvedNetwork {
     policy: NetworkPolicy,
     tls_files: Option<(PathBuf, PathBuf)>,
+}
+
+pub const SIGN_IN_ON_START_ENV: &str = "ASTER_BRIDGE_SIGN_IN_ON_START";
+
+const CREDENTIAL_ENVS: &[&str] = &[
+    "ASTER_BRIDGE_EMAIL",
+    "ASTER_BRIDGE_USERNAME",
+    "ASTER_BRIDGE_PASSWORD",
+    "ASTER_BRIDGE_PASSWORD_FILE",
+    "ASTER_BRIDGE_TOTP",
+    "ASTER_BRIDGE_TOTP_FILE",
+    "ASTER_BRIDGE_TOTP_SECRET",
+    "ASTER_BRIDGE_2FA_CODE",
+    "ASTER_BRIDGE_APP_PASSWORD",
+    "ASTER_BRIDGE_APP_PASSWORD_FILE",
+];
+
+fn flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn sign_in_on_start() -> bool {
+    flag_enabled(std::env::var(SIGN_IN_ON_START_ENV).ok().as_deref())
+}
+
+fn credentials_in_env(is_set: impl Fn(&str) -> bool) -> CliResult<()> {
+    let found: Vec<&str> = CREDENTIAL_ENVS.iter().copied().filter(|name| is_set(name)).collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "Aster Bridge doesn't accept sign-in details from the environment, so it stopped instead of ignoring {}.",
+        found.join(", ")
+    ))
+    .with_hint(format!(
+        "Remove them from the container. Aster Bridge never uses your Aster Mail password: you approve each device in a browser where you're already signed in, including any two-factor step, and anyone who can run docker inspect can read environment variables. To sign in without opening a shell in the container, set {}=1 and approve the code that the container log shows.",
+        SIGN_IN_ON_START_ENV
+    )))
 }
 
 fn blank_to_none(value: &Option<String>) -> Option<&str> {
@@ -164,6 +205,7 @@ fn check_network_config(policy: &NetworkPolicy, config: &BridgeConfig) -> CliRes
 
 pub async fn run(ctx: &Context, json_events: bool, service: bool, network: ServeNetwork) -> CliResult<i32> {
     let network = resolve_network(&network)?;
+    credentials_in_env(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))?;
     check_network_config(&network.policy, &common::load_config()?)?;
     #[cfg(windows)]
     if service && owns_its_console() {
@@ -180,8 +222,15 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
         match serve(ctx, ndjson, &network).await {
             Err(error) if service && error.code == CODE_NOT_SIGNED_IN && !is_signed_in(&ctx.data_dir) => {
                 tracing::warn!("aster-bridge is waiting for you to sign in");
-                ctx.out.error(&error);
-                if !wait_for_sign_in(&ctx.data_dir).await {
+                let waiting = crate::lock::WaitingLock::hold(&ctx.data_dir);
+                let signed_in = if sign_in_on_start() {
+                    sign_in_from_service(ctx).await
+                } else {
+                    ctx.out.error(&error);
+                    wait_for_sign_in(&ctx.data_dir).await
+                };
+                drop(waiting);
+                if !signed_in {
                     return Ok(EXIT_OK);
                 }
                 tracing::info!("signed in, starting aster-bridge");
@@ -242,6 +291,29 @@ async fn wait_for_sign_in(dir: &std::path::Path) -> bool {
         }
         if ready_to_start(dir) {
             return true;
+        }
+    }
+}
+
+async fn sign_in_from_service(ctx: &Context) -> bool {
+    loop {
+        let result = tokio::select! {
+            result = super::login::run(ctx, false) => result,
+            _ = signals::shutdown() => return false,
+        };
+        match result {
+            Ok(_) if is_signed_in(&ctx.data_dir) => return true,
+            Ok(_) => {}
+            Err(error) if error.code == CODE_CODE_EXPIRED => {
+                tracing::info!("the sign-in code expired, asking for a new one");
+                continue;
+            }
+            Err(error) if error.code == CODE_LOCKED => return wait_for_sign_in(&ctx.data_dir).await,
+            Err(error) => ctx.out.error(&error),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(context::service_retry_delay()) => {}
+            _ = signals::shutdown() => return false,
         }
     }
 }
@@ -969,6 +1041,27 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_on_start_accepts_common_true_values() {
+        for value in ["1", "true", "YES", " on "] {
+            assert!(flag_enabled(Some(value)), "{value}");
+        }
+        for value in ["", "0", "false", "no", "2"] {
+            assert!(!flag_enabled(Some(value)), "{value}");
+        }
+        assert!(!flag_enabled(None));
+    }
+
+    #[test]
+    fn sign_in_details_in_the_environment_are_refused_by_name() {
+        assert!(credentials_in_env(|_| false).is_ok());
+        let error = credentials_in_env(|name| name == "ASTER_BRIDGE_PASSWORD" || name == "ASTER_BRIDGE_TOTP").unwrap_err();
+        assert_eq!(error.exit_code, crate::exit::EXIT_USAGE);
+        assert!(error.message.contains("ASTER_BRIDGE_PASSWORD, ASTER_BRIDGE_TOTP"));
+        let hint = error.hint.unwrap_or_default();
+        assert!(hint.contains(SIGN_IN_ON_START_ENV));
+    }
 
     fn raw(listen: Option<&str>, allow: Option<&str>, names: Option<&str>) -> ServeNetwork {
         ServeNetwork {

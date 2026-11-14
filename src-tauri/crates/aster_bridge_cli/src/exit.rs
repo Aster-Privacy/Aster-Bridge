@@ -103,7 +103,7 @@ pub const CATALOG: &[ErrorDoc] = &[
         code: CODE_SETTINGS_READ,
         exit_code: EXIT_ERROR,
         summary: "Aster Bridge can't read its settings file.",
-        resolution: "Check that you can read the data folder, then run: aster-bridge config get",
+        resolution: "Check that the user that runs Aster Bridge can read the data folder, then run: aster-bridge config get. In a container, set PUID and PGID to the owner of the folder you mounted.",
     },
     ErrorDoc {
         reference: "ASTER-1003",
@@ -229,7 +229,7 @@ pub const CATALOG: &[ErrorDoc] = &[
         code: CODE_DATA_DIR,
         exit_code: EXIT_ERROR,
         summary: "Aster Bridge can't use the data folder.",
-        resolution: "Check that the folder exists and that you can write to it, or pass --data-dir.",
+        resolution: "Check that the folder exists and that the user that runs Aster Bridge can write to it, or pass --data-dir. In a container, set PUID and PGID to the owner of the folder you mounted.",
     },
     ErrorDoc {
         reference: "ASTER-1021",

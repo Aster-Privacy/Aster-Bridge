@@ -20,12 +20,14 @@
 //
 mod cli;
 mod commands;
+mod container;
 mod context;
 mod control;
 mod events;
 mod exit;
 mod lock;
 mod output;
+mod privileges;
 mod secret_backend;
 mod signals;
 mod spinner;
@@ -55,7 +57,16 @@ fn run() -> i32 {
             return code;
         }
     };
+    let health = matches!(cli.command, cli::Command::Healthcheck);
     let out = output::Output::new(&cli.global);
+    match privileges::drop_root(cli.global.data_dir.as_deref()) {
+        Ok(Some(notice)) => out.warn(&notice),
+        Ok(None) => {}
+        Err(error) => {
+            out.error(&error);
+            return if health { commands::status::UNHEALTHY } else { error.exit_code };
+        }
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
@@ -68,11 +79,16 @@ fn run() -> i32 {
     };
     let result = runtime.block_on(commands::dispatch(cli, out));
     runtime.shutdown_timeout(Duration::from_secs(1));
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(error) => {
             out.error(&error);
             error.exit_code
         }
+    };
+    if health && code != exit::EXIT_OK {
+        commands::status::UNHEALTHY
+    } else {
+        code
     }
 }

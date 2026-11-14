@@ -186,21 +186,58 @@ pub fn create_key_file(path: &Path) -> Result<(), String> {
 pub fn load_key_file(path: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(path)
             .map_err(|e| format!("cannot read secret key file {}: {}", path.display(), e))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(format!(
-                "secret key file {} is readable by other users; run chmod 600 on it",
-                path.display()
-            ));
-        }
+        check_key_file_access(path, &meta)?;
     }
     let mut raw = std::fs::read(path)
         .map_err(|e| format!("cannot read secret key file {}: {}", path.display(), e))?;
     let result = parse_key_bytes(&raw);
     raw.zeroize();
     result.map_err(|e| format!("secret key file {}: {}", path.display(), e))
+}
+
+pub const SECRET_MOUNT_DIR: &str = "/run/secrets";
+
+#[cfg(unix)]
+fn check_key_file_access(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "secret key file {} can be changed by other users; run chmod 600 on it",
+            path.display()
+        ));
+    }
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    let owner = meta.uid();
+    let trusted_owner = owner == 0 || owner == effective_uid();
+    let read_only_for_others = mode & 0o033 == 0;
+    if read_only_for_others
+        && trusted_owner
+        && meta.is_file()
+        && is_in_secret_mount(path, Path::new(SECRET_MOUNT_DIR))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "secret key file {} is readable by other users; run chmod 600 on it",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+pub fn is_in_secret_mount(path: &Path, mount: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(mount)) {
+        (Ok(file), Ok(mount)) => file != mount && file.starts_with(&mount),
+        _ => false,
+    }
 }
 
 fn parse_key_bytes(raw: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -364,6 +401,41 @@ mod tests {
         let other = dir.path().join("other-key");
         create_key_file(&other).unwrap();
         assert_ne!(*load_key_file(&other).unwrap(), *first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_readable_by_others_is_refused_outside_a_secret_mount() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret-key");
+        create_key_file(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let err = load_key_file(&path).unwrap_err();
+        assert!(err.contains("readable by other users"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        load_key_file(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let err = load_key_file(&path).unwrap_err();
+        assert!(err.contains("can be changed by other users"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_mount_check_needs_a_file_inside_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("secrets");
+        std::fs::create_dir(&mount).unwrap();
+        let inside = mount.join("key");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = dir.path().join("key");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(is_in_secret_mount(&inside, &mount));
+        assert!(!is_in_secret_mount(&outside, &mount));
+        assert!(!is_in_secret_mount(&mount, &mount));
+        assert!(!is_in_secret_mount(&mount.join("..").join("key"), &mount));
+        std::os::unix::fs::symlink(&outside, mount.join("link")).unwrap();
+        assert!(!is_in_secret_mount(&mount.join("link"), &mount));
     }
 
     #[test]

@@ -304,12 +304,50 @@ fn service_mode_waits_for_sign_in_and_then_starts() {
     let mut serve = env.serve(&["--service"]);
     std::thread::sleep(Duration::from_secs(2));
     assert!(serve.is_running(), "service exited while signed out");
+    let waiting = env.run(&["healthcheck"]);
+    assert_eq!(waiting.code, 0, "{}", waiting.stdout);
+    assert!(waiting.stdout.contains("waiting for you to sign in"), "{}", waiting.stdout);
+    assert_eq!(env.run(&["status"]).code, 3);
     assert!(serve.seen.iter().all(|v| v["error"]["code"].is_null() || v["error"]["code"] == "not_signed_in"));
     env.login();
     serve.wait_event_after_errors("ready", READY_TIMEOUT);
     env.json(&["status"]).expect(0);
+    env.run(&["healthcheck"]).expect(0);
     env.json(&["logout", "--keep-cache"]).expect(0);
     serve.expect_exit(0, None);
+}
+
+#[test]
+fn healthcheck_exits_one_when_status_would_exit_three() {
+    let env = Env::new();
+    assert_eq!(env.run(&["status"]).code, 3);
+    let health = env.run(&["healthcheck"]);
+    assert_eq!(health.code, 1);
+    assert!(health.stdout.contains("not signed in"), "{}", health.stdout);
+}
+
+#[test]
+fn hints_inside_the_container_name_the_docker_command() {
+    let env = Env::new();
+    let plain = env.run(&["status"]);
+    assert!(plain.stdout.contains("run: aster-bridge login"), "{}", plain.stdout);
+    let output = env
+        .command(&["status"])
+        .env("ASTER_BRIDGE_IN_CONTAINER", "1")
+        .output()
+        .unwrap();
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        printed.contains("run: docker compose exec aster-bridge aster-bridge login"),
+        "{}",
+        printed
+    );
+    let json = env
+        .command(&["--json", "status"])
+        .env("ASTER_BRIDGE_IN_CONTAINER", "1")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&json.stdout).contains("docker compose"));
 }
 
 #[test]
@@ -343,6 +381,10 @@ fn unwritable_data_folder_names_the_user_to_give_access() {
     assert_eq!(status.error_code(), "data_dir_failed");
     let hint = status.json()["error"]["hint"].as_str().unwrap_or_default().to_string();
     assert!(hint.contains("chown"), "{}", hint);
+    std::fs::set_permissions(&env.data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let health = env.run(&["healthcheck"]);
+    std::fs::set_permissions(&env.data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(health.code, 1);
 
     let keys = env.data.parent().unwrap().join("locked-keys");
     std::fs::create_dir(&keys).unwrap();
