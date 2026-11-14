@@ -178,7 +178,7 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
     loop {
         let attempt_started = std::time::Instant::now();
         match serve(ctx, ndjson, &network).await {
-            Err(error) if service && error.code == CODE_NOT_SIGNED_IN => {
+            Err(error) if service && error.code == CODE_NOT_SIGNED_IN && !is_signed_in(&ctx.data_dir) => {
                 tracing::warn!("aster-bridge is waiting for you to sign in");
                 ctx.out.error(&error);
                 if !wait_for_sign_in(&ctx.data_dir).await {
@@ -224,9 +224,12 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
     }
 }
 
+fn is_signed_in(dir: &std::path::Path) -> bool {
+    state::load(dir).account.is_some() && secret_backend::has_record(dir)
+}
+
 fn ready_to_start(dir: &std::path::Path) -> bool {
-    let signed_in = state::load(dir).account.is_some() && secret_backend::has_record(dir);
-    signed_in && InstanceLock::acquire(dir).is_ok()
+    is_signed_in(dir) && InstanceLock::acquire(dir).is_ok()
 }
 
 async fn wait_for_sign_in(dir: &std::path::Path) -> bool {
