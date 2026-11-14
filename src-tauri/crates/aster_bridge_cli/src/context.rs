@@ -89,6 +89,42 @@ fn fold_path(data_dir: &std::path::Path) -> String {
     }
 }
 
+#[cfg(unix)]
+pub fn is_writable(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn is_writable(_dir: &std::path::Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+pub fn not_writable_hint(dir: &std::path::Path) -> String {
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    format!(
+        "Aster Bridge runs as user {uid} and group {gid}, which can't write to {}. If you mounted a folder from your computer there, give that user access to it on the host with: sudo chown -R {uid}:{gid} <folder>",
+        dir.display()
+    )
+}
+
+#[cfg(not(unix))]
+pub fn not_writable_hint(dir: &std::path::Path) -> String {
+    format!("Check that you can write to {}, or pass --data-dir.", dir.display())
+}
+
+pub fn signed_out_poll_interval() -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(ms) = env_u64("ASTER_BRIDGE_TEST_SIGN_IN_POLL_MS") {
+        return Duration::from_millis(ms);
+    }
+    Duration::from_secs(3)
+}
+
 pub fn service_retry_delay() -> Duration {
     #[cfg(feature = "test-support")]
     if let Some(ms) = env_u64("ASTER_BRIDGE_TEST_SERVICE_RETRY_MS") {
@@ -119,6 +155,13 @@ impl Context {
                 format!("Couldn't create the data folder {}: {}", dir.display(), e),
             )
         })?;
+        if !is_writable(&dir) {
+            return Err(CliError::coded(
+                CODE_DATA_DIR,
+                format!("Aster Bridge can't write to its data folder {}.", dir.display()),
+            )
+            .with_hint(not_writable_hint(&dir)));
+        }
         aster_bridge_core::secrets::restrict_permissions(&dir, true);
         aster_bridge_core::secrets::set_data_dir_override(Some(dir.clone()));
         Ok(Self {

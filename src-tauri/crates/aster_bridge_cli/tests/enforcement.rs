@@ -299,6 +299,65 @@ fn service_mode_exits_when_the_plan_is_denied() {
 }
 
 #[test]
+fn service_mode_waits_for_sign_in_and_then_starts() {
+    let env = Env::new();
+    let mut serve = env.serve(&["--service"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(serve.is_running(), "service exited while signed out");
+    assert!(serve.seen.iter().all(|v| v["error"]["code"].is_null() || v["error"]["code"] == "not_signed_in"));
+    env.login();
+    serve.wait_event_after_errors("ready", READY_TIMEOUT);
+    env.json(&["status"]).expect(0);
+    env.json(&["logout", "--keep-cache"]).expect(0);
+    serve.expect_exit(0, None);
+}
+
+#[test]
+fn missing_secret_key_file_explains_how_to_create_it() {
+    let env = Env::new();
+    let missing = env.data.parent().unwrap().join("not-created-yet");
+    let output = env
+        .command(&["--json", "login", "--no-wait"])
+        .env("ASTER_BRIDGE_SECRET_KEY_FILE", &missing)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hint = printed["error"]["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("aster-bridge secret-key create"), "{}", printed);
+    assert!(!hint.contains("--secret-backend file"), "{}", printed);
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_data_folder_names_the_user_to_give_access() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let env = Env::new();
+    std::fs::set_permissions(&env.data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let status = env.json(&["status"]);
+    std::fs::set_permissions(&env.data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ne!(status.code, 0);
+    assert_eq!(status.error_code(), "data_dir_failed");
+    let hint = status.json()["error"]["hint"].as_str().unwrap_or_default().to_string();
+    assert!(hint.contains("chown"), "{}", hint);
+
+    let keys = env.data.parent().unwrap().join("locked-keys");
+    std::fs::create_dir(&keys).unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let output = env
+        .command(&["--json", "secret-key", "create"])
+        .env("ASTER_BRIDGE_SECRET_KEY_FILE", keys.join("key"))
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("chown"));
+}
+
+#[test]
 fn config_rejects_unsafe_ports() {
     let env = Env::new();
     let before = env.config_port("imap_port");

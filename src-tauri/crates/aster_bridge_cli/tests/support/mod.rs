@@ -395,6 +395,18 @@ impl Serve {
     }
 
     pub fn wait_event(&mut self, name: &str, timeout: Duration) -> Value {
+        self.wait_for(name, timeout, false)
+    }
+
+    pub fn wait_event_after_errors(&mut self, name: &str, timeout: Duration) -> Value {
+        self.wait_for(name, timeout, true)
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        self.code.is_none() && self.child.try_wait().unwrap().is_none()
+    }
+
+    fn wait_for(&mut self, name: &str, timeout: Duration, allow_errors: bool) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -404,7 +416,7 @@ impl Serve {
                     if value["event"] == name {
                         return value;
                     }
-                    if value.get("error").is_some() {
+                    if !allow_errors && value.get("error").is_some() {
                         panic!("serve failed before {}: {}\n{}", name, value, self.context());
                     }
                 }

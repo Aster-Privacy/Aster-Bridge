@@ -98,6 +98,11 @@ fn key_file_hint() -> String {
     )
 }
 
+fn missing_key_file_hint() -> String {
+    "To create the key file, run: aster-bridge secret-key create
+If you moved the bridge from another computer, copy its key file to this path instead, because a new key can't read data that the old key protects.".to_string()
+}
+
 fn build_file(data_dir: &Path) -> CliResult<SecretBackend> {
     let Some(path) = key_file_path() else {
         return Err(CliError::secret_store(format!(
@@ -107,7 +112,12 @@ fn build_file(data_dir: &Path) -> CliResult<SecretBackend> {
         .with_hint(key_file_hint()));
     };
     let key = secrets::load_key_file(&path).map_err(|e| {
-        CliError::secret_store(format!("Couldn't use the secret key file: {}", e)).with_hint(key_file_hint())
+        let error = CliError::secret_store(format!("Couldn't use the secret key file: {}", e));
+        if path.exists() {
+            error.with_hint(key_file_hint())
+        } else {
+            error.with_hint(missing_key_file_hint())
+        }
     })?;
     let dir = data_dir.join(SECRETS_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| {
