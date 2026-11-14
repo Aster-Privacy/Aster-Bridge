@@ -907,12 +907,14 @@ mod tests {
     async fn apply_reply_thread_sets_token_and_chain() {
         let api = mock_thread_api().await;
         let client = ApiClient::new_with_base_url(&api.base);
-        let mut payload = json!({"to": ["a@x.test"]});
+        let mut payload = json!({"to": ["a@x.test"], "sender_email": "alias@aster.test", "sender_alias_hash": "AAAA"});
         let reply = ResolvedReply {
             parent_aster_id: Some("threaded".into()),
             in_reply_to: Some("<root@x.test> <p@x.test>".into()),
         };
         apply_reply_thread(&mut payload, &client, "t", &reply).await;
+        assert_eq!(payload["sender_email"], "alias@aster.test");
+        assert_eq!(payload["sender_alias_hash"], "AAAA");
         assert_eq!(payload["thread_token"], "existing-token");
         assert_eq!(payload["in_reply_to"], "<root@x.test> <p@x.test>");
     }

@@ -158,7 +158,7 @@ fn build_app(
 
 async fn loopback_only(req: Request, next: Next) -> Response {
     match req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() {
-        Some(ConnectInfo(addr)) if addr.ip().is_loopback() => next.run(req).await,
+        Some(ConnectInfo(addr)) if crate::network::current().peer_allowed(addr.ip()) => next.run(req).await,
         _ => (StatusCode::FORBIDDEN, "loopback only").into_response(),
     }
 }
@@ -169,12 +169,8 @@ async fn host_guard(req: Request, next: Next, port: u16, use_https: bool) -> Res
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let allowed = [
-        format!("127.0.0.1:{}", port),
-        format!("localhost:{}", port),
-        format!("[::1]:{}", port),
-    ];
-    if !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+    let policy = crate::network::current();
+    if !policy.host_allowed(host, port) {
         return (StatusCode::FORBIDDEN, "bad host").into_response();
     }
 
@@ -189,12 +185,7 @@ async fn host_guard(req: Request, next: Next, port: u16, use_https: bool) -> Res
 
     if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let scheme = if use_https { "https" } else { "http" };
-        let ok_origins = [
-            format!("{}://127.0.0.1:{}", scheme, port),
-            format!("{}://localhost:{}", scheme, port),
-            format!("{}://[::1]:{}", scheme, port),
-        ];
-        if !ok_origins.iter().any(|a| a.eq_ignore_ascii_case(origin)) {
+        if !policy.origin_allowed(origin, scheme, port) {
             return (StatusCode::FORBIDDEN, "bad origin").into_response();
         }
     }

@@ -973,6 +973,10 @@ impl Database {
             "ALTER TABLE recipient_key_pin ADD COLUMN hosted INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN address_rooted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_attachment (
@@ -1605,6 +1609,32 @@ impl Database {
             conn.execute(
                 "UPDATE message_cache SET subject=?2 WHERE aster_id=?1",
                 rusqlite::params![aster_id, subject],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_cached_addressing(
+        &self,
+        aster_id: &str,
+        sender: Option<&str>,
+        recipients: Option<&str>,
+        date: &str,
+    ) -> Result<(), String> {
+        let single_line = |text: &str| {
+            let flat: String = text
+                .chars()
+                .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+                .collect();
+            strip_c0_controls(flat.trim())
+        };
+        let sender = sender.map(single_line).filter(|s| !s.is_empty());
+        let recipients = recipients.map(single_line).filter(|s| !s.is_empty());
+        let date = single_line(date);
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE message_cache SET sender=COALESCE(?2, sender), recipients=?3, date=?4 WHERE aster_id=?1",
+                rusqlite::params![aster_id, sender, recipients, date],
             )?;
             Ok(())
         })
@@ -2716,7 +2746,7 @@ impl Database {
             conn.query_row(
                 "SELECT identity_fingerprint, owner_fingerprint, pq_seen, flagged,
                         pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint,
-                        hosted
+                        hosted, address_rooted
                  FROM recipient_key_pin WHERE pin_id = ?1",
                 [pin_id],
                 |r| {
@@ -2730,11 +2760,24 @@ impl Database {
                         binding_epoch: r.get(6)?,
                         binding_fingerprint: r.get(7)?,
                         hosted: r.get::<_, i64>(8)? != 0,
+                        address_rooted: r.get::<_, i64>(9)? != 0,
                     })
                 },
             )
             .optional()
         })
+    }
+
+    pub fn recipient_pin_first(
+        &self,
+        pin_ids: &[String],
+    ) -> Result<Option<crate::crypto::recipient_trust::RecipientPin>, String> {
+        for pin_id in pin_ids {
+            if let Some(pin) = self.recipient_pin_get(pin_id)? {
+                return Ok(Some(pin));
+            }
+        }
+        Ok(None)
     }
 
     pub fn recipient_pin_put(
@@ -2751,8 +2794,9 @@ impl Database {
             conn.execute(
                 "INSERT INTO recipient_key_pin
                     (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, flagged, updated_at,
-                     pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint, hosted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint, hosted,
+                     address_rooted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(pin_id) DO UPDATE SET
                     identity_fingerprint = excluded.identity_fingerprint,
                     owner_fingerprint = excluded.owner_fingerprint,
@@ -2763,7 +2807,8 @@ impl Database {
                     transcript_bound = excluded.transcript_bound,
                     binding_epoch = excluded.binding_epoch,
                     binding_fingerprint = excluded.binding_fingerprint,
-                    hosted = excluded.hosted",
+                    hosted = excluded.hosted,
+                    address_rooted = excluded.address_rooted",
                 rusqlite::params![
                     pin_id,
                     pin.identity_fingerprint,
@@ -2775,7 +2820,8 @@ impl Database {
                     pin.transcript_bound as i64,
                     pin.binding_epoch,
                     pin.binding_fingerprint,
-                    pin.hosted as i64
+                    pin.hosted as i64,
+                    pin.address_rooted as i64
                 ],
             )?;
             Ok(())
@@ -5633,6 +5679,7 @@ mod db_tests {
             binding_fingerprint: String::new(),
             hosted: false,
             flagged: false,
+            address_rooted: false,
         };
         db.recipient_pin_put("pin", &first).unwrap();
         assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(first.clone()));
@@ -5646,6 +5693,7 @@ mod db_tests {
             binding_fingerprint: "ee".to_string(),
             hosted: true,
             flagged: true,
+            address_rooted: true,
             ..first
         };
         db.recipient_pin_put("pin", &rotated).unwrap();

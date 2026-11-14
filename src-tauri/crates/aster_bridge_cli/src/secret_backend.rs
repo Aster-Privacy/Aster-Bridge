@@ -93,7 +93,7 @@ fn keyring_service(data_dir: &Path) -> String {
 
 fn key_file_hint() -> String {
     format!(
-        "To store keys in a file instead, create a key with: openssl rand -hex 32 > secret-key && chmod 600 secret-key\nThen set {}=/path/to/secret-key and run the command again with --secret-backend file.",
+        "To store keys in a file instead, set {}=/path/to/secret-key and create the key with: aster-bridge secret-key create\nThen run the command again with --secret-backend file.",
         KEY_FILE_ENV
     )
 }

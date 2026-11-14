@@ -32,6 +32,7 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::attachment::{decrypt_attachment_with_external_key, AttachmentKeyEntry};
 use crate::crypto::external_pgp_key::ExternalPgpKey;
+use crate::crypto::sealed_details::SEALED_DETAILS_META_KEY;
 use crate::db::{
     CachedAttachment, CachedMessage, CachedSyncState, Database, ATTACHMENTS_FAILED, ATTACHMENTS_NONE, ATTACHMENTS_PENDING,
     ATTACHMENTS_STORED,
@@ -581,7 +582,16 @@ fn backfill_cached_addresses(
         return false;
     };
     let addresses = EnvelopeAddresses::from_envelope(&parsed);
+    let sealed_cc = meta
+        .contains_key(SEALED_DETAILS_META_KEY)
+        .then(|| meta.get("cc").cloned());
     addresses.write_to(&mut meta);
+    if let Some(sealed_cc) = sealed_cc {
+        match sealed_cc {
+            Some(cc) => meta.insert("cc".to_string(), cc),
+            None => meta.remove("cc"),
+        };
+    }
     let raw = serde_json::Value::Object(meta).to_string();
     if let Err(e) = db.set_cached_raw_headers(&item.id, &raw) {
         tracing::warn!("address backfill failed for {}: {}", item.id, e);
@@ -1915,6 +1925,15 @@ async fn fetch_pq_secrets(
     Vec::new()
 }
 
+fn open_with_sets(
+    account: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    derived: &[crate::crypto::ratchet::RatchetReceiverKeys],
+    msg: &crate::crypto::ratchet::RatchetMessage,
+) -> Option<String> {
+    crate::crypto::ratchet::decrypt_with_key_sets(account, msg)
+        .or_else(|| crate::crypto::ratchet::decrypt_with_key_sets(derived, msg))
+}
+
 async fn try_bootstrap(
     ctx: &InternalDecryptContext<'_>,
     ratchet_obj: &serde_json::Value,
@@ -1925,7 +1944,7 @@ async fn try_bootstrap(
     }
     let mut msg = crate::crypto::ratchet::parse_recipient_message(ratchet_obj, address)?;
     if msg.x3dh_version != Some(crate::crypto::ratchet::X3DH_VERSION_ONE_TIME_BOUND) {
-        return open_bootstrap(ctx, &mut msg).await;
+        return open_bootstrap(ctx, &mut msg, address).await;
     }
     let one_time_key_id = msg.opk_id?;
     let one_time_secret = crate::crypto::one_time_prekeys::load_one_time_secret(
@@ -1937,7 +1956,7 @@ async fn try_bootstrap(
     )
     .await?;
     msg.opk_secret = Some(one_time_secret.to_vec());
-    let opened = open_bootstrap(ctx, &mut msg).await;
+    let opened = open_bootstrap(ctx, &mut msg, address).await;
     if let Some(mut s) = msg.opk_secret.take() {
         s.zeroize();
     }
@@ -1956,21 +1975,38 @@ async fn try_bootstrap(
 async fn open_bootstrap(
     ctx: &InternalDecryptContext<'_>,
     msg: &mut crate::crypto::ratchet::RatchetMessage,
+    address: &str,
 ) -> Option<String> {
-    let Some(key_id) = msg.pq_key_id else {
-        return crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, msg);
+    let mut derived = ctx.recovery.address_keys.receiver_key_sets(address);
+    let opened = match msg.pq_key_id {
+        None => open_with_sets(ctx.ratchet_keys, &derived, &*msg),
+        Some(key_id) => {
+            let mut secrets = fetch_pq_secrets(ctx, key_id).await;
+            if key_id == crate::crypto::ratchet::PQ_IDENTITY_KEY_ID {
+                for secret in ctx.recovery.address_keys.pq_secrets(address) {
+                    if !secrets.iter().any(|s| s.as_slice() == secret.as_slice()) {
+                        secrets.push(secret);
+                    }
+                }
+            }
+            let mut opened = None;
+            for secret in secrets {
+                msg.pq_secret = Some(secret.to_vec());
+                opened = open_with_sets(ctx.ratchet_keys, &derived, &*msg);
+                if let Some(mut s) = msg.pq_secret.take() {
+                    s.zeroize();
+                }
+                if opened.is_some() {
+                    break;
+                }
+            }
+            opened
+        }
     };
-    for secret in fetch_pq_secrets(ctx, key_id).await {
-        msg.pq_secret = Some(secret.to_vec());
-        let opened = crate::crypto::ratchet::decrypt_with_key_sets(ctx.ratchet_keys, msg);
-        if let Some(mut s) = msg.pq_secret.take() {
-            s.zeroize();
-        }
-        if opened.is_some() {
-            return opened;
-        }
+    for set in derived.iter_mut() {
+        set.zeroize();
     }
-    None
+    opened
 }
 
 async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
@@ -2083,7 +2119,20 @@ async fn try_decrypt_internal_mail(
                 &conversation,
                 sender_identity,
                 &ctx.recovery.lane_candidates,
-            );
+            )
+            .or_else(|| {
+                let mut derived = ctx.recovery.address_keys.lane_candidates(&attempt.address);
+                let result = crate::crypto::ratchet_recovery::decrypt_via_recovery_lane(
+                    attempt.data,
+                    &conversation,
+                    sender_identity,
+                    &derived,
+                );
+                for candidate in derived.iter_mut() {
+                    candidate.zeroize();
+                }
+                result
+            });
             if opened.is_some() {
                 sender_unverified = true;
                 break;
@@ -2265,6 +2314,15 @@ fn store_unsealed_message(
         meta_map.insert("sender_unverified".to_string(), serde_json::json!(true));
     } else {
         meta_map.remove("sender_unverified");
+        meta_map.remove("reply_to");
+    }
+    let details = bundle.details.as_ref().filter(|_| !bundle.sender_unverified);
+    if let Some(details) = details {
+        match details.cc_text() {
+            Some(cc) => meta_map.insert("cc".to_string(), serde_json::json!(cc)),
+            None => meta_map.remove("cc"),
+        };
+        meta_map.insert(SEALED_DETAILS_META_KEY.to_string(), serde_json::json!(true));
     }
     let flag = crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG;
     let mut meta = serde_json::Value::Object(meta_map);
@@ -2278,10 +2336,29 @@ fn store_unsealed_message(
         tracing::warn!("storing decrypted ratchet body for {} failed: {}", aster_id, e);
         return false;
     }
+    if let Some(details) = details {
+        let served_sender = db
+            .get_cached_message(aster_id)
+            .ok()
+            .flatten()
+            .and_then(|cached| cached.sender);
+        if let Err(e) = db.update_cached_addressing(
+            aster_id,
+            details.sender_text(served_sender.as_deref()).as_deref(),
+            details.to_text().as_deref(),
+            &normalize_date_rfc3339(&details.sent_at),
+        ) {
+            tracing::warn!("storing message details for {} failed: {}", aster_id, e);
+        }
+    }
     if !listed.is_empty() {
         reconcile_listed_attachments(db, aster_id, &listed);
     }
-    if let Some(subject) = bundle.subject.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(subject) = bundle
+        .subject
+        .as_deref()
+        .filter(|s| !bundle.sender_unverified || !s.trim().is_empty())
+    {
         if let Err(e) = db.update_cached_subject(aster_id, subject) {
             tracing::warn!("storing decrypted ratchet subject for {} failed: {}", aster_id, e);
         }
@@ -2313,7 +2390,8 @@ fn repair_cached_bundles(db: &Database) -> Vec<String> {
         let Ok(Some(cached)) = db.get_cached_message(&aster_id) else {
             continue;
         };
-        let bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&body);
+        let mut bundle = crate::crypto::ratchet_recovery::extract_subject_bundle(&body);
+        bundle.details = None;
         let sealed_subject = cached.subject.as_deref().is_none_or(|s| s.trim().is_empty());
         if bundle.subject.is_none() || !sealed_subject {
             if let Ok(mut s) = skipped.lock() {
@@ -4592,11 +4670,67 @@ mod tests {
             body: "hi".to_string(),
             sender_unverified,
             attachment_manifest: None,
+            details: None,
         };
         assert!(store_unsealed_message(&db, "r-aster", &bundle(true)));
         assert!(crate::message_render::sender_unverified(&cached_meta(&db, "r-aster")));
         assert!(store_unsealed_message(&db, "r-aster", &bundle(false)));
         assert!(!crate::message_render::sender_unverified(&cached_meta(&db, "r-aster")));
+    }
+
+    #[test]
+    fn sealed_fields_replace_every_server_supplied_field() {
+        let (_dir, db) = temp_db();
+        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let keys = [inbound_candidate(&recipient)];
+        let mut served = ratchet_envelope("Server Name <bob@astermail.org>", "BDh==");
+        served["subject"] = serde_json::json!("Server subject");
+        served["to"] = serde_json::json!([{"name": "Wrong", "email": "wrong@astermail.org"}]);
+        served["cc"] = serde_json::json!([{"name": "Extra", "email": "extra@astermail.org"}]);
+        served["raw_headers"] = serde_json::json!([{"name": "Reply-To", "value": "Thief <thief@example.com>"}]);
+        served["attachment_keys"] = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "swap.exe"}]);
+        for id in ["sealed-fields", "unverified-fields"] {
+            let item = inbound_item(id, &served, &recipient);
+            assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &keys).was_new);
+            assert_eq!(cached_meta(&db, id)["reply_to"], "Thief <thief@example.com>");
+        }
+        let details = crate::crypto::sealed_details::build_sealed_details(
+            "Bob Real",
+            &["me@astermail.org".to_string()],
+            &[],
+            "2026-11-12T10:15:00.000Z",
+        );
+        let sealed = |sender_unverified| crate::crypto::ratchet_recovery::SubjectBundle {
+            subject: Some(String::new()),
+            body: "real body".to_string(),
+            sender_unverified,
+            attachment_manifest: None,
+            details: Some(details.clone()),
+        };
+        assert!(store_unsealed_message(&db, "sealed-fields", &sealed(false)));
+        let cached = db.get_cached_message("sealed-fields").unwrap().unwrap();
+        let meta = cached_meta(&db, "sealed-fields");
+        assert_eq!(cached.subject.as_deref(), Some(""));
+        assert_eq!(cached.sender.as_deref(), Some("Bob Real <bob@astermail.org>"));
+        assert_eq!(cached.recipients.as_deref(), Some("me@astermail.org"));
+        assert!(cached.date.as_deref().unwrap_or_default().starts_with("2026-11-12T10:15:00"));
+        assert!(meta.get("reply_to").is_none());
+        assert!(meta.get("cc").is_none());
+        assert!(crate::message_render::attachments_unverified(&meta));
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(!rendered.contains("thief@example.com"));
+        assert!(!rendered.contains("Server subject"));
+        assert!(!rendered.contains("Server Name"));
+        assert!(rendered.contains(crate::message_render::ATTACHMENTS_UNVERIFIED_NOTE));
+
+        assert!(store_unsealed_message(&db, "unverified-fields", &sealed(true)));
+        let cached = db.get_cached_message("unverified-fields").unwrap().unwrap();
+        let meta = cached_meta(&db, "unverified-fields");
+        assert!(crate::message_render::sender_unverified(&meta));
+        assert!(meta.get(crate::crypto::sealed_details::SEALED_DETAILS_META_KEY).is_none());
+        assert_eq!(cached.subject.as_deref(), Some("Server subject"));
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(rendered.contains(crate::message_render::SENDER_UNVERIFIED_NOTE));
     }
 
     #[test]
@@ -4659,6 +4793,7 @@ mod tests {
         let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
             storage_keys: Vec::new(),
             lane_candidates: Vec::new(),
+            address_keys: Default::default(),
         };
         let escrow_keys = vec![key];
         let ctx = InternalDecryptContext {
@@ -4763,6 +4898,7 @@ mod tests {
         let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
             storage_keys: Vec::new(),
             lane_candidates: Vec::new(),
+            address_keys: Default::default(),
         };
 
         let cases = [
@@ -7333,6 +7469,7 @@ mod sealed_retry_tests {
                 "content_type": "application/pdf",
                 "is_inline": false,
             })]),
+            details: None,
         }
     }
 
@@ -7479,6 +7616,7 @@ mod sealed_retry_tests {
             body: "see attached".to_string(),
             sender_unverified: false,
             attachment_manifest: None,
+            details: None,
         };
 
         assert!(store_unsealed_message(&db, "no-manifest", &unlisted));
@@ -7518,6 +7656,7 @@ mod sealed_retry_tests {
             body: "<p>Hi there</p>".to_string(),
             sender_unverified: false,
             attachment_manifest: None,
+            details: None,
         };
         assert!(store_unsealed_message(&db, "sealed-1", &bundle));
         let cached = db.get_cached_message("sealed-1").unwrap().unwrap();
@@ -7535,6 +7674,7 @@ mod sealed_retry_tests {
             body: "text".to_string(),
             sender_unverified: true,
             attachment_manifest: None,
+            details: None,
         };
         assert!(store_unsealed_message(&db, "sealed-2", &no_subject));
         let kept = db.get_cached_message("sealed-2").unwrap().unwrap();
@@ -7542,5 +7682,117 @@ mod sealed_retry_tests {
         assert_eq!(kept.body_text.as_deref(), Some("text"));
         let kept_meta: serde_json::Value = serde_json::from_str(kept.raw_headers.as_deref().unwrap()).unwrap();
         assert_eq!(kept_meta["sender_unverified"], true);
+    }
+
+    const DETAILS_FIXTURE: &str = "{\"v\":1,\"from_name\":\"Ana Real\",\"to\":[{\"name\":\"\",\"email\":\"bo@astermail.org\"},{\"name\":\"Cy Real\",\"email\":\"cy@astermail.org\"}],\"cc\":[{\"name\":\"Di Real\",\"email\":\"di@astermail.org\"}],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}";
+
+    fn cache_served(db: &Database, id: &str) {
+        db.upsert_cached_message(
+            id,
+            "INBOX",
+            Some(""),
+            Some("Served Name <ana@astermail.org>"),
+            Some("served-to@astermail.org"),
+            Some("2026-11-12T09:00:00+00:00"),
+            1,
+            Some(RATCHET_PLACEHOLDER),
+            Some("{\"is_html\":false,\"message_id\":\"<m@x>\",\"cc\":\"served-cc@astermail.org\",\"bcc\":\"me@astermail.org\"}"),
+        )
+        .unwrap();
+    }
+
+    fn details_bundle(details: &str, sender_unverified: bool) -> SubjectBundle {
+        let text = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"Plan\",\"b\":\"<p>Hi</p>\",\"details\":{}}}",
+            details
+        );
+        unsealed_bundle(&text, sender_unverified)
+    }
+
+    #[test]
+    fn sealed_details_replace_the_served_name_recipients_and_date() {
+        let (_dir, db) = temp_db();
+        cache_served(&db, "with-details");
+        assert!(store_unsealed_message(&db, "with-details", &details_bundle(DETAILS_FIXTURE, false)));
+        let cached = db.get_cached_message("with-details").unwrap().unwrap();
+        assert_eq!(cached.sender.as_deref(), Some("Ana Real <ana@astermail.org>"));
+        assert_eq!(
+            cached.recipients.as_deref(),
+            Some("bo@astermail.org, Cy Real <cy@astermail.org>")
+        );
+        assert_eq!(cached.date.as_deref(), Some("2026-11-12T10:15:00.000Z"));
+        assert_eq!(cached.subject.as_deref(), Some("Plan"));
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["cc"], "Di Real <di@astermail.org>");
+        assert_eq!(meta["bcc"], "me@astermail.org");
+        assert_eq!(meta[SEALED_DETAILS_META_KEY], true);
+        let rendered = crate::message_render::render_text(&cached, &[]);
+        assert!(rendered.contains("From: Ana Real <ana@astermail.org>\r\n"));
+        assert!(rendered.contains("To: bo@astermail.org, Cy Real <cy@astermail.org>\r\n"));
+        assert!(rendered.contains("Cc: Di Real <di@astermail.org>\r\n"));
+        assert!(rendered.contains("Date: Thu, 12 Nov 2026 10:15:00 +0000\r\n"));
+        assert!(!rendered.contains("served-to@astermail.org"));
+        assert!(!rendered.contains("served-cc@astermail.org"));
+
+        cache_served(&db, "no-cc");
+        let no_cc = "{\"v\":1,\"from_name\":\"\",\"to\":[{\"name\":\"\",\"email\":\"bo@astermail.org\"}],\"cc\":[],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}";
+        assert!(store_unsealed_message(&db, "no-cc", &details_bundle(no_cc, false)));
+        let cached = db.get_cached_message("no-cc").unwrap().unwrap();
+        assert_eq!(cached.sender.as_deref(), Some("ana@astermail.org"));
+        assert_eq!(cached.recipients.as_deref(), Some("bo@astermail.org"));
+        let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+        assert!(meta.get("cc").is_none());
+    }
+
+    #[test]
+    fn served_values_stay_without_usable_sealed_details() {
+        let (_dir, db) = temp_db();
+        let absent = unsealed_bundle("\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":\"Plan\",\"b\":\"<p>Hi</p>\"}", false);
+        let cases = [
+            ("absent", absent),
+            ("malformed", details_bundle("{\"v\":1,\"from_name\":7}", false)),
+            ("wrong-version", details_bundle(&DETAILS_FIXTURE.replace("\"v\":1", "\"v\":2"), false)),
+            ("unverified", details_bundle(DETAILS_FIXTURE, true)),
+        ];
+        for (id, bundle) in &cases {
+            cache_served(&db, id);
+            assert!(store_unsealed_message(&db, id, bundle), "{id}");
+            let cached = db.get_cached_message(id).unwrap().unwrap();
+            assert_eq!(cached.sender.as_deref(), Some("Served Name <ana@astermail.org>"), "{id}");
+            assert_eq!(cached.recipients.as_deref(), Some("served-to@astermail.org"), "{id}");
+            assert_eq!(cached.date.as_deref(), Some("2026-11-12T09:00:00+00:00"), "{id}");
+            assert_eq!(cached.subject.as_deref(), Some("Plan"), "{id}");
+            assert_eq!(cached.body_text.as_deref(), Some("<p>Hi</p>"), "{id}");
+            let meta: serde_json::Value = serde_json::from_str(cached.raw_headers.as_deref().unwrap()).unwrap();
+            assert_eq!(meta["cc"], "served-cc@astermail.org", "{id}");
+            assert!(meta.get(SEALED_DETAILS_META_KEY).is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_cached_bundle_repair_never_applies_details() {
+        let (_dir, db) = temp_db();
+        let body = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"Plan\",\"b\":\"<p>Hi</p>\",\"details\":{}}}",
+            DETAILS_FIXTURE
+        );
+        db.upsert_cached_message(
+            "legacy",
+            "INBOX",
+            Some(""),
+            Some("Served Name <ana@astermail.org>"),
+            Some("served-to@astermail.org"),
+            Some("2026-11-12T09:00:00+00:00"),
+            1,
+            Some(&body),
+            Some("{\"is_html\":false}"),
+        )
+        .unwrap();
+        assert_eq!(repair_cached_bundles(&db), vec!["legacy".to_string()]);
+        let cached = db.get_cached_message("legacy").unwrap().unwrap();
+        assert_eq!(cached.subject.as_deref(), Some("Plan"));
+        assert_eq!(cached.sender.as_deref(), Some("Served Name <ana@astermail.org>"));
+        assert_eq!(cached.recipients.as_deref(), Some("served-to@astermail.org"));
+        assert_eq!(cached.date.as_deref(), Some("2026-11-12T09:00:00+00:00"));
     }
 }

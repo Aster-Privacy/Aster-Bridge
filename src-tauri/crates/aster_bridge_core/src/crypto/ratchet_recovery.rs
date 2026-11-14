@@ -26,9 +26,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::crypto::address_identity::AddressKeyring;
 use crate::crypto::inbound::decode_pq_decap_key;
 use crate::crypto::ratchet::{
     b64_decode, ecdh_p256, hkdf_sha256, jwk_d_bytes, ml_kem768_decapsulate, serialize_header_ad,
+};
+use crate::crypto::sealed_details::{
+    parse_sealed_details, serialize_sealed_details, SealedMessageDetails, SEALED_DETAILS_FIELD,
 };
 use crate::crypto::vault::VaultContents;
 
@@ -82,6 +86,7 @@ pub struct LaneCandidate {
 pub struct RecoveryMaterial {
     pub storage_keys: Vec<Zeroizing<[u8; 32]>>,
     pub lane_candidates: Vec<LaneCandidate>,
+    pub address_keys: AddressKeyring,
 }
 
 impl Drop for RecoveryMaterial {
@@ -101,6 +106,7 @@ impl RecoveryMaterial {
         Self {
             storage_keys: derive_storage_base_keys(vault, passphrase, iterations),
             lane_candidates: build_lane_candidates(vault),
+            address_keys: AddressKeyring::from_vault(vault),
         }
     }
 
@@ -653,15 +659,46 @@ fn bundle_payload(text: &str) -> Option<&str> {
 }
 
 pub fn wrap_subject_bundle(subject: &str, body: &str, attachment_manifest: &[Value]) -> String {
+    wrap_subject_bundle_with_details(subject, body, attachment_manifest, None)
+}
+
+pub fn wrap_subject_bundle_with_details(
+    subject: &str,
+    body: &str,
+    attachment_manifest: &[Value],
+    details: Option<&SealedMessageDetails>,
+) -> String {
+    let mut fields = format!(
+        "\"s\":{},\"b\":{}",
+        Value::String(subject.to_string()),
+        Value::String(body.to_string()),
+    );
+    if !attachment_manifest.is_empty() {
+        fields.push_str(&format!(
+            ",\"{}\":{}",
+            crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD,
+            Value::Array(attachment_manifest.to_vec()),
+        ));
+    }
+    if let Some(details) = details {
+        fields.push_str(&format!(
+            ",\"{}\":{}",
+            SEALED_DETAILS_FIELD,
+            serialize_sealed_details(details),
+        ));
+    }
     format!(
-        "{delimiter}{marker}{delimiter}{{\"s\":{subject},\"b\":{body},\"{field}\":{manifest}}}",
+        "{delimiter}{marker}{delimiter}{{{fields}}}",
         delimiter = SUBJECT_BUNDLE_DELIMITER,
         marker = SUBJECT_BUNDLE_MARKER,
-        subject = Value::String(subject.to_string()),
-        body = Value::String(body.to_string()),
-        field = crate::crypto::attachment::ATTACHMENT_MANIFEST_FIELD,
-        manifest = Value::Array(attachment_manifest.to_vec()),
     )
+}
+
+fn bundle_details(payload: &str) -> Option<SealedMessageDetails> {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(payload) else {
+        return None;
+    };
+    parse_sealed_details(map.get(SEALED_DETAILS_FIELD))
 }
 
 fn unwrap_subject_bundle_layer(text: &str) -> Option<(Option<String>, String)> {
@@ -688,10 +725,12 @@ pub struct SubjectBundle {
     pub body: String,
     pub sender_unverified: bool,
     pub attachment_manifest: Option<Vec<Value>>,
+    pub details: Option<SealedMessageDetails>,
 }
 
 pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
     let attachment_manifest = bundle_payload(decrypted).and_then(bundle_attachment_manifest);
+    let details = bundle_payload(decrypted).and_then(bundle_details);
     let mut subject: Option<String> = None;
     let mut body = decrypted.to_string();
     let mut unwrapped = false;
@@ -711,6 +750,7 @@ pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
             body,
             sender_unverified: false,
             attachment_manifest: None,
+            details: None,
         };
     }
     SubjectBundle {
@@ -718,6 +758,7 @@ pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
         body,
         sender_unverified: false,
         attachment_manifest,
+        details,
     }
 }
 
@@ -1289,6 +1330,77 @@ mod tests {
             Value::String(inner)
         );
         assert_eq!(extract_subject_bundle(&nested).attachment_manifest, None);
+    }
+
+    const DETAILS_FIXTURE: &str = "{\"v\":1,\"from_name\":\"Ana Real\",\"to\":[{\"name\":\"\",\"email\":\"bo@astermail.org\"},{\"name\":\"Cy Real\",\"email\":\"cy@astermail.org\"}],\"cc\":[{\"name\":\"Di Real\",\"email\":\"di@astermail.org\"}],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}";
+
+    #[test]
+    fn a_bundle_in_the_shared_shape_yields_its_details() {
+        let text = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"Plan\",\"b\":\"<p>Hi</p>\",\"details\":{}}}",
+            DETAILS_FIXTURE
+        );
+        let opened = extract_subject_bundle(&text);
+        assert_eq!(opened.subject.as_deref(), Some("Plan"));
+        assert_eq!(opened.body, "<p>Hi</p>");
+        let details = opened.details.expect("details");
+        assert_eq!(details.from_name, "Ana Real");
+        assert_eq!(details.to.len(), 2);
+        assert_eq!(details.to[1].name, "Cy Real");
+        assert_eq!(details.cc[0].email, "di@astermail.org");
+        assert_eq!(details.sent_at, "2026-11-12T10:15:00.000Z");
+
+        let rewrapped = wrap_subject_bundle_with_details("Plan", "<p>Hi</p>", &[], Some(&details));
+        assert_eq!(rewrapped, text);
+
+        let manifest = vec![serde_json::json!({"seq": 0})];
+        let with_manifest = wrap_subject_bundle_with_details("Plan", "b", &manifest, Some(&details));
+        let manifest_at = with_manifest.find("\"attachment_manifest\":").unwrap();
+        let details_at = with_manifest.find("\"details\":").unwrap();
+        assert!(manifest_at < details_at);
+        assert_eq!(extract_subject_bundle(&with_manifest).details, Some(details));
+    }
+
+    #[test]
+    fn a_bundle_without_details_or_with_malformed_details_keeps_its_content() {
+        let absent = extract_subject_bundle("\u{1}ASTER_BUNDLE_V2\u{1}{\"s\":\"x\",\"b\":\"y\"}");
+        assert_eq!(absent.details, None);
+        assert_eq!(extract_subject_bundle("just a body").details, None);
+
+        for malformed in [
+            "{\"v\":1}",
+            "{\"v\":2,\"from_name\":\"A\",\"to\":[],\"cc\":[],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}",
+            "{\"v\":1,\"from_name\":7,\"to\":[],\"cc\":[],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}",
+            "{\"v\":1,\"from_name\":\"A\",\"to\":\"bo\",\"cc\":[],\"sent_at\":\"2026-11-12T10:15:00.000Z\"}",
+            "{\"v\":1,\"from_name\":\"A\",\"to\":[],\"cc\":[],\"sent_at\":\"not a date\"}",
+            "[1,2]",
+            "\"text\"",
+            "null",
+        ] {
+            let text = format!(
+                "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"Plan\",\"b\":\"body\",\"details\":{}}}",
+                malformed
+            );
+            let opened = extract_subject_bundle(&text);
+            assert_eq!(opened.details, None, "{malformed}");
+            assert_eq!(opened.subject.as_deref(), Some("Plan"), "{malformed}");
+            assert_eq!(opened.body, "body", "{malformed}");
+        }
+    }
+
+    #[test]
+    fn details_quoted_inside_the_body_are_ignored() {
+        let inner = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"in\",\"b\":\"body\",\"details\":{}}}",
+            DETAILS_FIXTURE
+        );
+        let nested = format!(
+            "\u{1}ASTER_BUNDLE_V2\u{1}{{\"s\":\"out\",\"b\":{}}}",
+            Value::String(inner)
+        );
+        let opened = extract_subject_bundle(&nested);
+        assert_eq!(opened.body, "body");
+        assert_eq!(opened.details, None);
     }
 
     #[test]

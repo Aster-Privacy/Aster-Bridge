@@ -1,0 +1,24 @@
+name: aster-bridge
+
+services:
+  aster-bridge:
+    image: ghcr.io/aster-privacy/aster-bridge:latest
+    container_name: aster-bridge
+    restart: unless-stopped
+    init: true
+    environment:
+      ASTER_BRIDGE_HOSTNAMES: ${ASTER_BRIDGE_HOSTNAMES:-}
+      ASTER_BRIDGE_ALLOW_FROM: ${ASTER_BRIDGE_ALLOW_FROM:-}
+    volumes:
+      - aster-bridge-data:/data
+      - aster-bridge-secrets:/run/secrets
+    ports:
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1993:1993"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1465:1465"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1995:1995"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1080:1080"
+      - "${ASTER_BRIDGE_PUBLISH_IP:-0.0.0.0}:1081:1081"
+
+volumes:
+  aster-bridge-data:
+  aster-bridge-secrets:

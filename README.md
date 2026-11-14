@@ -10,7 +10,7 @@ You can sign up at [astermail.org](https://astermail.org). Aster Bridge requires
 
 ## How it works
 
-The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. All encryption and decryption happens locally, and the connection to Aster always uses TLS.
+The bridge runs silently in the background and exposes local IMAP, SMTP, JMAP, POP3, and CardDAV servers on 127.0.0.1. Your mail client and contacts app connect to these local ports using an app password you generate inside the bridge. If you run the bridge in Docker on a home server, it also serves other devices on your private network, and it requires TLS for every connection. All encryption and decryption happens locally, and the connection to Aster always uses TLS.
 
 | Protocol | Default port |
 |---|---|
@@ -124,12 +124,11 @@ Use `aster-bridge service status` to check the service and `aster-bridge service
 
 ### Store keys without a system keychain
 
-The tool stores its keys in the system keychain: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux. Servers often don't run a Secret Service. To store keys in an encrypted file instead, create a key and point the tool at it:
+The tool stores its keys in the system keychain: the macOS Keychain, Windows Credential Manager, or the Secret Service on Linux. Servers often don't run a Secret Service. To store keys in an encrypted file instead, point the tool at a key file and create the key:
 
 ```
-openssl rand -hex 32 > ~/.config/aster-bridge.key
-chmod 600 ~/.config/aster-bridge.key
 export ASTER_BRIDGE_SECRET_KEY_FILE=~/.config/aster-bridge.key
+aster-bridge secret-key create
 aster-bridge --secret-backend file login
 ```
 
@@ -175,6 +174,10 @@ Add `--json` to any command for machine-readable output. Every command exits wit
 | 5 | The session expired or this device was signed out. |
 | 6 | The keychain or key file isn't available. |
 | 7 | Another Aster Bridge process is using the data folder. |
+
+## Run Aster Bridge in Docker
+
+To run Aster Bridge on a home server or NAS, use the `ghcr.io/aster-privacy/aster-bridge` image. The container serves every device on your private network, keeps TLS on, and accepts connections only from private addresses. The image runs on 64-bit Intel and ARM hardware. For setup steps and a Compose file, see the [Docker setup guide](packaging/docker/README.md).
 
 ## Build from source
 

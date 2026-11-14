@@ -19,6 +19,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 pub mod account_key;
+pub mod address_directory;
+pub mod address_identity;
 pub mod alias;
 pub mod attachment;
 pub mod contacts;
@@ -37,6 +39,7 @@ pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;
 pub mod recipient_trust;
+pub mod sealed_details;
 pub mod sent_copy;
 #[cfg(test)]
 mod storage_key_call_sites;

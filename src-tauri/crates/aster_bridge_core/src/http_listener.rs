@@ -78,7 +78,7 @@ where
             }
         };
         let Some(permit) = acquire() else {
-            tracing::debug!("HTTP connection limit reached, refusing {}", peer);
+            tracing::debug!("HTTP connection limit reached, refusing a connection");
             drop(stream);
             continue;
         };

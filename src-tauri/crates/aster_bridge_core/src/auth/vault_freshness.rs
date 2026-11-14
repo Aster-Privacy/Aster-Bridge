@@ -374,6 +374,7 @@ pub(crate) mod tests {
             ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial {
                 storage_keys: data_kek.into_iter().map(Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
+                address_keys: Default::default(),
             },
             external_pgp_key: None,
         }

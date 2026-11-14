@@ -31,6 +31,7 @@ use aster_bridge_core::auth::session::{self, Session};
 use aster_bridge_core::config::{self, BridgeConfig};
 use aster_bridge_core::crypto::recipient_trust::RECIPIENT_TRUST_PROTOCOL;
 use aster_bridge_core::db::Database;
+use aster_bridge_core::network::{self, NetworkPolicy};
 use aster_bridge_core::runtime::{
     self, BridgeRuntime, ClientProfile, RunningBridge, RuntimeDeps, Service, StartError,
     StartOptions, StopReason, LOOPBACK_HOST,
@@ -69,7 +70,101 @@ fn supervisor_restarts_every_failure() -> bool {
     cfg!(target_os = "macos")
 }
 
-pub async fn run(ctx: &Context, json_events: bool, service: bool) -> CliResult<i32> {
+#[derive(Debug, Clone, Default)]
+pub struct ServeNetwork {
+    pub listen: Option<String>,
+    pub allow_from: Option<String>,
+    pub hostnames: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+}
+
+struct ResolvedNetwork {
+    policy: NetworkPolicy,
+    tls_files: Option<(PathBuf, PathBuf)>,
+}
+
+fn blank_to_none(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+fn resolve_network(raw: &ServeNetwork) -> CliResult<ResolvedNetwork> {
+    let tls_files = match (&raw.tls_cert, &raw.tls_key) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(CliError::usage(
+                "To use your own certificate, give both --tls-cert and --tls-key.",
+            ))
+        }
+    };
+    let Some(listen) = blank_to_none(&raw.listen) else {
+        if blank_to_none(&raw.allow_from).is_some() || blank_to_none(&raw.hostnames).is_some() {
+            return Err(CliError::usage(
+                "--allow-from and --hostname only apply when --listen is set to an address other than 127.0.0.1.",
+            ));
+        }
+        return Ok(ResolvedNetwork {
+            policy: NetworkPolicy::loopback(),
+            tls_files,
+        });
+    };
+    let bind: std::net::IpAddr = listen
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| {
+            CliError::usage(format!(
+                "{} isn't an IP address. Use an address such as 0.0.0.0 or 192.168.1.20.",
+                listen
+            ))
+        })?;
+    let peers = match blank_to_none(&raw.allow_from) {
+        Some(ranges) => network::parse_peer_ranges(ranges).map_err(CliError::usage)?,
+        None => Vec::new(),
+    };
+    let hostnames = blank_to_none(&raw.hostnames)
+        .map(|names| {
+            names
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let policy = NetworkPolicy::network(bind, peers, hostnames).map_err(CliError::usage)?;
+    Ok(ResolvedNetwork { policy, tls_files })
+}
+
+fn check_network_config(policy: &NetworkPolicy, config: &BridgeConfig) -> CliResult<()> {
+    if !policy.is_network() {
+        return Ok(());
+    }
+    let setting = if !config.tls_enabled {
+        Some("tls_enabled")
+    } else if config.jmap_enabled && !config.jmap_https_enabled {
+        Some("jmap_https_enabled")
+    } else if config.carddav_enabled && !config.carddav_https_enabled {
+        Some("carddav_https_enabled")
+    } else {
+        None
+    };
+    match setting {
+        Some(key) => Err(CliError::usage(format!(
+            "Aster Bridge only accepts connections from other devices over encrypted connections, and {} is off.",
+            key
+        ))
+        .with_hint(format!(
+            "To turn it on, run: aster-bridge config set {} true",
+            key
+        ))),
+        None => Ok(()),
+    }
+}
+
+pub async fn run(ctx: &Context, json_events: bool, service: bool, network: ServeNetwork) -> CliResult<i32> {
+    let network = resolve_network(&network)?;
+    check_network_config(&network.policy, &common::load_config()?)?;
     #[cfg(windows)]
     if service && owns_its_console() {
         unsafe {
@@ -82,7 +177,7 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool) -> CliResult<i
     let mut delay = base_delay;
     loop {
         let attempt_started = std::time::Instant::now();
-        match serve(ctx, ndjson).await {
+        match serve(ctx, ndjson, &network).await {
             Err(error) if service && error.exit_code >= EXIT_NOT_READY => {
                 tracing::error!("aster-bridge stopped: {} ({})", error.message, error.code);
                 ctx.out.error(&error);
@@ -192,7 +287,7 @@ fn start_error(error: StartError) -> CliError {
     }
 }
 
-async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
+async fn serve(ctx: &Context, ndjson: bool, network: &ResolvedNetwork) -> CliResult<i32> {
     let dir = ctx.data_dir.clone();
     let _lock = InstanceLock::acquire(&dir)?;
     let cached = state::load(&dir);
@@ -204,6 +299,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     }
     tls::install_default_crypto_provider();
     let config = common::load_config()?;
+    check_network_config(&network.policy, &config)?;
     let identity = device_identity::get_or_create_identity(&dir)
         .map_err(|e| map_store_error("Couldn't load the device identity", e))?;
     let Some(device_id) = identity.device_id else {
@@ -271,7 +367,11 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
     });
 
     let tls_config = if config.tls_enabled {
-        let server_config = tls::ensure_cert(&dir)
+        let material = match &network.tls_files {
+            Some((cert, key)) => tls::load_cert_files(cert, key),
+            None => tls::ensure_cert_with_names(&dir, &network.policy.tls_names()),
+        };
+        let server_config = material
             .and_then(|(certs, key)| tls::server_config(certs, key))
             .map_err(|e| {
                 tracing::warn!("TLS certificate unavailable: {}", e);
@@ -309,6 +409,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
                 signing_key: identity.ed25519_signing_key.clone(),
                 profile: ClientProfile::Cli,
                 tuning,
+                network: network.policy.clone(),
             },
         ),
     )
@@ -337,6 +438,7 @@ async fn serve(ctx: &Context, ndjson: bool) -> CliResult<i32> {
         stop: stop.clone(),
         started_at: state::now(),
         config,
+        host: network.policy.bind_host(),
         refresh_lock: Mutex::new(()),
     });
     let control_server = control::start(&dir, handler(shared.clone()))
@@ -519,6 +621,14 @@ async fn wait_for_stop(
     }
 }
 
+fn host_label(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
 pub fn service_rows(services: &[Value]) -> Vec<Vec<String>> {
     services
         .iter()
@@ -527,7 +637,7 @@ pub fn service_rows(services: &[Value]) -> Vec<Vec<String>> {
                 service["label"].as_str().unwrap_or_default().to_string(),
                 format!(
                     "{}:{}",
-                    service["host"].as_str().unwrap_or(LOOPBACK_HOST),
+                    host_label(service["host"].as_str().unwrap_or(LOOPBACK_HOST)),
                     service["port"].as_u64().unwrap_or_default()
                 ),
                 common::security_label(service["security"].as_str().unwrap_or_default())
@@ -597,6 +707,7 @@ struct Shared {
     stop: Arc<Notify>,
     started_at: i64,
     config: BridgeConfig,
+    host: String,
     refresh_lock: Mutex<()>,
 }
 
@@ -714,7 +825,7 @@ impl Shared {
             json!({
                 "name": service,
                 "label": service.label(),
-                "host": LOOPBACK_HOST,
+                "host": self.host,
                 "port": port,
                 "security": security,
                 "running": self.running.service_running(service),
@@ -821,5 +932,72 @@ impl Shared {
             self.running.stop(StopReason::AccessRevoked);
         }
         Ok(json!({ "refreshed": true, "plan": plan }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(listen: Option<&str>, allow: Option<&str>, names: Option<&str>) -> ServeNetwork {
+        ServeNetwork {
+            listen: listen.map(str::to_string),
+            allow_from: allow.map(str::to_string),
+            hostnames: names.map(str::to_string),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+
+    #[test]
+    fn no_listen_address_keeps_the_bridge_on_loopback() {
+        let resolved = resolve_network(&raw(None, None, None)).unwrap();
+        assert!(!resolved.policy.is_network());
+        let resolved = resolve_network(&raw(Some("  "), None, None)).unwrap();
+        assert!(!resolved.policy.is_network());
+        let resolved = resolve_network(&raw(Some("127.0.0.1"), None, None)).unwrap();
+        assert!(!resolved.policy.is_network());
+    }
+
+    #[test]
+    fn a_wildcard_listen_address_uses_private_ranges_by_default() {
+        let resolved = resolve_network(&raw(Some("0.0.0.0"), None, Some("nas.home.arpa, mail.lan"))).unwrap();
+        assert!(resolved.policy.is_network());
+        assert!(resolved.policy.peer_allowed("172.17.0.1".parse().unwrap()));
+        assert!(!resolved.policy.peer_allowed("8.8.8.8".parse().unwrap()));
+        assert_eq!(resolved.policy.hostnames(), ["nas.home.arpa", "mail.lan"]);
+    }
+
+    #[test]
+    fn invalid_network_options_are_usage_errors() {
+        assert!(resolve_network(&raw(Some("not-an-ip"), None, None)).is_err());
+        assert!(resolve_network(&raw(Some("0.0.0.0"), Some("garbage/99"), None)).is_err());
+        assert!(resolve_network(&raw(None, Some("10.0.0.0/8"), None)).is_err());
+        let mut half = raw(None, None, None);
+        half.tls_cert = Some(PathBuf::from("cert.pem"));
+        assert!(resolve_network(&half).is_err());
+    }
+
+    #[test]
+    fn network_mode_requires_encryption_on_every_enabled_service() {
+        let policy = resolve_network(&raw(Some("0.0.0.0"), None, None)).unwrap().policy;
+        let mut config = BridgeConfig::default();
+        config.tls_enabled = true;
+        config.jmap_https_enabled = true;
+        config.carddav_https_enabled = true;
+        assert!(check_network_config(&policy, &config).is_ok());
+        config.tls_enabled = false;
+        assert!(check_network_config(&policy, &config).is_err());
+        assert!(check_network_config(&NetworkPolicy::loopback(), &config).is_ok());
+        config.tls_enabled = true;
+        config.jmap_enabled = true;
+        config.jmap_https_enabled = false;
+        assert!(check_network_config(&policy, &config).is_err());
+    }
+
+    #[test]
+    fn ipv6_hosts_are_bracketed_in_service_rows() {
+        assert_eq!(host_label("::"), "[::]");
+        assert_eq!(host_label("0.0.0.0"), "0.0.0.0");
     }
 }

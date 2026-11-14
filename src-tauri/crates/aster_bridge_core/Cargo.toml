@@ -54,10 +54,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 async-stream = "0.3"
 percent-encoding = "2"
+ipnet = "2"
 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-p256 = { version = "0.13", features = ["ecdh"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 ml-kem = { version = "0.2", features = ["deterministic", "zeroize"] }
 miniz_oxide = "0.8"
 chacha20poly1305 = "0.10"

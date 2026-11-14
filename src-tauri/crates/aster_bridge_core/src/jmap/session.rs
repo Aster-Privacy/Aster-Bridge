@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -16,11 +17,17 @@ use super::auth::AuthedAccount;
 use super::server::AppState;
 use super::state::{compose_session_state, snapshot_all_states, JmapContext};
 
-pub async fn well_known(State(state): State<AppState>) -> Response {
+fn request_authority(headers: &HeaderMap, port: u16) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    crate::network::current().advertised_authority(host, port)
+}
+
+pub async fn well_known(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let scheme = if state.use_https { "https" } else { "http" };
+    let authority = request_authority(&headers, state.bind_port);
     let body = json!({
         "@type": "Session",
-        "redirectUrl": format!("{}://127.0.0.1:{}/jmap/session", scheme, state.bind_port)
+        "redirectUrl": format!("{}://{}/jmap/session", scheme, authority)
     });
     (axum::http::StatusCode::OK, Json(body)).into_response()
 }
@@ -28,11 +35,13 @@ pub async fn well_known(State(state): State<AppState>) -> Response {
 pub async fn session_resource(
     _auth: AuthedAccount,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
-    Json(build_session(&state.ctx, state.bind_port, state.use_https).await).into_response()
+    let authority = request_authority(&headers, state.bind_port);
+    Json(build_session_for(&state.ctx, &authority, state.use_https).await).into_response()
 }
 
-pub async fn build_session(ctx: &Arc<JmapContext>, port: u16, use_https: bool) -> serde_json::Value {
+pub async fn build_session_for(ctx: &Arc<JmapContext>, authority: &str, use_https: bool) -> serde_json::Value {
     let scheme = if use_https { "https" } else { "http" };
     let ws_scheme = if use_https { "wss" } else { "ws" };
     let account_id = ctx.account_id().await;
@@ -66,7 +75,7 @@ pub async fn build_session(ctx: &Arc<JmapContext>, port: u16, use_https: bool) -
                 "submissionExtensions": {}
             },
             "urn:ietf:params:jmap:websocket": {
-                "url": format!("{}://127.0.0.1:{}/jmap/ws", ws_scheme, port),
+                "url": format!("{}://{}/jmap/ws", ws_scheme, authority),
                 "supportsPush": true
             }
         },
@@ -86,10 +95,10 @@ pub async fn build_session(ctx: &Arc<JmapContext>, port: u16, use_https: bool) -
             "urn:ietf:params:jmap:submission": &account_id
         },
         "username": email,
-        "apiUrl": format!("{}://127.0.0.1:{}/jmap/api", scheme, port),
-        "downloadUrl": format!("{}://127.0.0.1:{}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}", scheme, port),
-        "uploadUrl": format!("{}://127.0.0.1:{}/jmap/upload/{{accountId}}", scheme, port),
-        "eventSourceUrl": format!("{}://127.0.0.1:{}/jmap/eventsource?types={{types}}&closeafter={{closeafter}}&ping={{ping}}", scheme, port),
+        "apiUrl": format!("{}://{}/jmap/api", scheme, authority),
+        "downloadUrl": format!("{}://{}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}", scheme, authority),
+        "uploadUrl": format!("{}://{}/jmap/upload/{{accountId}}", scheme, authority),
+        "eventSourceUrl": format!("{}://{}/jmap/eventsource?types={{types}}&closeafter={{closeafter}}&ping={{ping}}", scheme, authority),
         "state": session_state
     })
 }
@@ -134,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn build_session_advertises_capabilities() {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 9000, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:9000", false).await;
         let caps = s["capabilities"].as_object().unwrap();
         assert!(caps.contains_key("urn:ietf:params:jmap:core"));
         assert!(caps.contains_key("urn:ietf:params:jmap:mail"));
@@ -145,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn build_session_account_keyed_by_id() {
         let (ctx, account, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 9000, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:9000", false).await;
         assert!(s["accounts"].get(&account).is_some());
         assert_eq!(s["accounts"][&account]["name"], json!("user@aster.test"));
         assert_eq!(s["primaryAccounts"]["urn:ietf:params:jmap:mail"], json!(account));
@@ -155,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn build_session_http_urls_when_no_tls() {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 12345, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:12345", false).await;
         assert_eq!(s["apiUrl"], json!("http://127.0.0.1:12345/jmap/api"));
         let ws = s["capabilities"]["urn:ietf:params:jmap:websocket"]["url"]
             .as_str()
@@ -166,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn build_session_https_urls_when_tls() {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 443, true).await;
+        let s = build_session_for(&ctx, "127.0.0.1:443", true).await;
         assert!(s["apiUrl"].as_str().unwrap().starts_with("https://"));
         assert!(s["downloadUrl"].as_str().unwrap().starts_with("https://"));
         let ws = s["capabilities"]["urn:ietf:params:jmap:websocket"]["url"]
@@ -176,9 +185,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_session_for_uses_the_given_authority() {
+        let (ctx, _a, _d) = test_ctx("user@aster.test");
+        let s = build_session_for(&ctx, "192.168.1.5:1080", true).await;
+        assert_eq!(s["apiUrl"], json!("https://192.168.1.5:1080/jmap/api"));
+        assert_eq!(s["uploadUrl"], json!("https://192.168.1.5:1080/jmap/upload/{accountId}"));
+        let ws = s["capabilities"]["urn:ietf:params:jmap:websocket"]["url"]
+            .as_str()
+            .unwrap();
+        assert_eq!(ws, "wss://192.168.1.5:1080/jmap/ws");
+    }
+
+    #[test]
+    fn loopback_mode_ignores_the_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "192.168.1.5:1080".parse().unwrap());
+        assert_eq!(
+            crate::network::NetworkPolicy::loopback().advertised_authority(
+                headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+                1080
+            ),
+            "127.0.0.1:1080"
+        );
+    }
+
+    #[tokio::test]
     async fn build_session_state_starts_at_zeros() {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 80, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:80", false).await;
         assert_eq!(s["state"], json!("0-0-0"));
     }
 
@@ -187,14 +221,14 @@ mod tests {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
         ctx.db.jmap_state_bump("Email").unwrap();
         ctx.db.jmap_state_bump("Thread").unwrap();
-        let s = build_session(&ctx, 80, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:80", false).await;
         assert_eq!(s["state"], json!("1-0-1"));
     }
 
     #[tokio::test]
     async fn build_session_download_url_has_placeholders() {
         let (ctx, _a, _d) = test_ctx("user@aster.test");
-        let s = build_session(&ctx, 80, false).await;
+        let s = build_session_for(&ctx, "127.0.0.1:80", false).await;
         let url = s["downloadUrl"].as_str().unwrap();
         assert!(url.contains("{accountId}"));
         assert!(url.contains("{blobId}"));

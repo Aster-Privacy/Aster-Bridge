@@ -31,7 +31,7 @@ pub mod status;
 pub mod stop;
 pub mod tags;
 
-use crate::cli::{Cli, Command, SyncCommand, TlsCommand};
+use crate::cli::{Cli, Command, SecretKeyCommand, SyncCommand, TlsCommand};
 use crate::context::{self, Context};
 use crate::exit::CliResult;
 use crate::output::Output;
@@ -44,6 +44,9 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
     if let Command::Errors { code } = &command {
         return misc::errors(&out, code.as_deref());
     }
+    if let Command::SecretKey(SecretKeyCommand::Create) = &command {
+        return misc::secret_key_create(&out);
+    }
     let ctx = Context::new(global, out)?;
     let _log = match command {
         Command::Serve { .. } => None,
@@ -55,13 +58,28 @@ pub async fn dispatch(cli: Cli, out: Output) -> CliResult<i32> {
         Command::Serve {
             json_events,
             service,
-        } => serve::run(&ctx, json_events, service).await,
+            listen,
+            allow_from,
+            hostnames,
+            tls_cert,
+            tls_key,
+        } => {
+            let network = serve::ServeNetwork {
+                listen,
+                allow_from,
+                hostnames,
+                tls_cert,
+                tls_key,
+            };
+            serve::run(&ctx, json_events, service, network).await
+        }
         Command::Status { refresh, live } => status::run(&ctx, refresh, live).await,
         Command::Stop => stop::run(&ctx).await,
         Command::AppPassword(command) => app_password::run(&ctx, command).await,
         Command::Outbox(command) => outbox::run(&ctx, command).await,
         Command::Sync(SyncCommand::Now) => misc::sync_now(&ctx).await,
         Command::Tls(TlsCommand::Fingerprint) => misc::tls_fingerprint(&ctx),
+        Command::SecretKey(SecretKeyCommand::Create) => misc::secret_key_create(&ctx.out),
         Command::Config(command) => misc::config(&ctx, command).await,
         Command::RepairCache => misc::repair_cache(&ctx).await,
         Command::RecipientKey(command) => recipient_key::run(&ctx, command).await,

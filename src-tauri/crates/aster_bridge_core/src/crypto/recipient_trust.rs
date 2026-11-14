@@ -23,7 +23,8 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::api_client::{ApiClient, PrekeyBundle};
-use crate::crypto::internal_send::key_lookup_username;
+use crate::crypto::address_identity::verify_address_entry;
+use crate::crypto::internal_send::{is_internal_address, key_lookup_username};
 use crate::crypto::ratchet::{
     is_p256_public, is_valid_one_time_prekey_id, PQ_IDENTITY_KEY_ID, X3DH_VERSION_KEY_BOUND,
     X3DH_VERSION_LEGACY, X3DH_VERSION_ONE_TIME_BOUND, X3DH_VERSION_TRANSCRIPT_BOUND,
@@ -69,6 +70,7 @@ pub struct RecipientPin {
     pub binding_fingerprint: String,
     pub hosted: bool,
     pub flagged: bool,
+    pub address_rooted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,14 +220,153 @@ pub fn verify_bundle(bundle: &PrekeyBundle, owner_public_key: Option<&str>) -> B
     BundleVerdict::Tampered
 }
 
-pub fn pin_id(account_id: &str, address: &str) -> String {
+fn spelling_pin_id(account_id: &str, spelling: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(PIN_ID_DOMAIN);
     hasher.update([0u8]);
     hasher.update(account_id.as_bytes());
     hasher.update([0u8]);
-    hasher.update(address.trim().to_lowercase().as_bytes());
+    hasher.update(spelling.as_bytes());
     hex(&hasher.finalize())
+}
+
+fn split_pin_address(lowered: &str) -> Option<(&str, &str)> {
+    let at = lowered.rfind('@')?;
+    Some((&lowered[..at], &lowered[at + 1..]))
+}
+
+fn base_local_part(local: &str) -> &str {
+    local.split('+').next().unwrap_or(local)
+}
+
+pub fn canonical_pin_address(address: &str) -> String {
+    let lowered = address.trim().to_lowercase();
+    let Some((local, domain)) = split_pin_address(&lowered) else {
+        return lowered;
+    };
+    let base = base_local_part(local);
+    let folded = if is_internal_address(&lowered) {
+        base.replace('.', "")
+    } else {
+        base.to_string()
+    };
+    if folded.is_empty() || domain.is_empty() {
+        return lowered;
+    }
+    format!("{}@{}", folded, domain)
+}
+
+pub fn pin_id(account_id: &str, address: &str) -> String {
+    spelling_pin_id(account_id, &canonical_pin_address(address))
+}
+
+fn dotted_spellings(canonical: &str, limit: usize) -> Vec<String> {
+    let Some((local, domain)) = split_pin_address(canonical) else {
+        return Vec::new();
+    };
+    let letters: Vec<char> = local.chars().collect();
+    if letters.len() < 2 || limit == 0 {
+        return Vec::new();
+    }
+    let gaps = letters.len() - 1;
+    let mut spellings = Vec::new();
+    struct DotLayout<'a> {
+        letters: &'a [char],
+        domain: &'a str,
+        gaps: usize,
+        limit: usize,
+    }
+    fn place(layout: &DotLayout, remaining: usize, start: usize, dots: &mut Vec<usize>, spellings: &mut Vec<String>) {
+        let DotLayout { letters, domain, gaps, limit } = *layout;
+        if spellings.len() >= limit {
+            return;
+        }
+        if remaining == 0 {
+            let mut spelled = String::new();
+            for (index, letter) in letters.iter().enumerate() {
+                spelled.push(*letter);
+                if dots.contains(&index) {
+                    spelled.push('.');
+                }
+            }
+            spellings.push(format!("{}@{}", spelled, domain));
+            return;
+        }
+        let mut gap = start;
+        while gap + remaining <= gaps {
+            dots.push(gap);
+            place(layout, remaining - 1, gap + 1, dots, spellings);
+            dots.pop();
+            if spellings.len() >= limit {
+                return;
+            }
+            gap += 1;
+        }
+    }
+    let layout = DotLayout { letters: &letters, domain, gaps, limit };
+    let mut count = 1;
+    while count <= gaps && spellings.len() < limit {
+        place(&layout, count, 0, &mut Vec::new(), &mut spellings);
+        count += 1;
+    }
+    spellings
+}
+
+const DOTTED_SPELLING_LIMIT: usize = 2048;
+
+pub fn legacy_pin_ids(account_id: &str, address: &str) -> Vec<String> {
+    let lowered = address.trim().to_lowercase();
+    let canonical = canonical_pin_address(&lowered);
+    let mut spellings = vec![lowered.clone()];
+    if let Some((local, domain)) = split_pin_address(&lowered) {
+        let base = base_local_part(local);
+        if !base.is_empty() && !domain.is_empty() {
+            spellings.push(format!("{}@{}", base, domain));
+            let tag = &local[base.len()..];
+            let dotless = base.replace('.', "");
+            if !tag.is_empty() && !dotless.is_empty() && is_internal_address(&lowered) {
+                spellings.push(format!("{}{}@{}", dotless, tag, domain));
+            }
+        }
+    }
+    if is_internal_address(&lowered) {
+        spellings.extend(dotted_spellings(&canonical, DOTTED_SPELLING_LIMIT));
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for spelling in spellings {
+        if spelling == canonical {
+            continue;
+        }
+        let id = spelling_pin_id(account_id, &spelling);
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRead {
+    pub id: String,
+    pub pin: Option<RecipientPin>,
+    pub from_legacy: bool,
+}
+
+pub fn read_recipient_pin(db: &Database, account_id: &str, address: &str) -> Result<PinRead, String> {
+    let id = pin_id(account_id, address);
+    if let Some(pin) = db.recipient_pin_get(&id)? {
+        return Ok(PinRead {
+            id,
+            pin: Some(pin),
+            from_legacy: false,
+        });
+    }
+    let legacy = db.recipient_pin_first(&legacy_pin_ids(account_id, address))?;
+    Ok(PinRead {
+        from_legacy: legacy.is_some(),
+        id,
+        pin: legacy,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,8 +426,9 @@ pub fn accept_recipient_key(
     else {
         return Ok(KeyAcceptance::Mismatch { fingerprint: current });
     };
-    let id = pin_id(account_id, address);
-    let existing = db.recipient_pin_get(&id)?.unwrap_or_default();
+    let read = read_recipient_pin(db, account_id, address)?;
+    let id = read.id;
+    let existing = read.pin.unwrap_or_default();
     db.recipient_pin_put(&id, &accepted_pin(existing, &fingerprint))?;
     Ok(KeyAcceptance::Accepted { fingerprint })
 }
@@ -299,6 +441,18 @@ fn accepted_pin(existing: RecipientPin, fingerprint: &str) -> RecipientPin {
     } else {
         (existing.binding_epoch, existing.binding_fingerprint.clone())
     };
+    if existing.address_rooted {
+        return RecipientPin {
+            owner_fingerprint: fingerprint.to_string(),
+            identity_fingerprint: String::new(),
+            pq_fingerprint: String::new(),
+            binding_epoch,
+            binding_fingerprint,
+            flagged: false,
+            address_rooted: false,
+            ..existing
+        };
+    }
     RecipientPin {
         owner_fingerprint: fingerprint.to_string(),
         binding_epoch,
@@ -500,8 +654,9 @@ pub fn evaluate_recipient(
             .as_deref()
             .is_some_and(|current| base.owner_fingerprint.eq_ignore_ascii_case(current));
     let verdict = bundle.map(|bundle| verify_bundle(bundle, owner_public_key));
+    let leaves_address_keys = base.address_rooted && bundle.is_some();
 
-    if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged {
+    if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged || leaves_address_keys {
         return Evaluation {
             pin: changed_pin(
                 existing,
@@ -584,6 +739,7 @@ pub fn evaluate_recipient(
             binding_fingerprint,
             hosted: base.hosted,
             flagged: false,
+            address_rooted: base.address_rooted,
         };
         return Evaluation {
             pin: changed_pin(existing, pin),
@@ -614,6 +770,172 @@ pub fn evaluate_recipient(
             },
         ),
         outcome: Ok(SendRoute::AccountKey),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryTrust {
+    Account,
+    Entry,
+    Endorsed,
+    Replaced,
+    Invalid,
+    Downgraded,
+}
+
+impl DirectoryTrust {
+    pub fn is_rejected(self) -> bool {
+        matches!(self, Self::Replaced | Self::Invalid | Self::Downgraded)
+    }
+}
+
+fn key_fingerprint_hex(public_key_b64: &str) -> Option<String> {
+    STANDARD
+        .decode(public_key_b64.trim())
+        .ok()
+        .map(|bytes| hex(&Sha256::digest(bytes)))
+}
+
+pub fn is_address_scoped(bundle: &PrekeyBundle) -> bool {
+    bundle.address_scoped == Some(true)
+}
+
+pub fn unscoped_trust(existing: Option<&RecipientPin>) -> DirectoryTrust {
+    if existing.is_some_and(|pin| pin.address_rooted) {
+        DirectoryTrust::Downgraded
+    } else {
+        DirectoryTrust::Account
+    }
+}
+
+pub fn classify_scoped_entry(
+    address: &str,
+    bundle: &PrekeyBundle,
+    existing: Option<&RecipientPin>,
+) -> DirectoryTrust {
+    let rooted = existing.is_some_and(|pin| pin.address_rooted);
+    let verification = verify_address_entry(
+        address,
+        &bundle.kem_identity_key,
+        &bundle.signed_prekey,
+        advertised_pq_identity_key(bundle),
+        bundle.signed_prekey_signature.as_deref().unwrap_or(""),
+    );
+    if !verification.valid {
+        return if rooted {
+            DirectoryTrust::Invalid
+        } else {
+            DirectoryTrust::Account
+        };
+    }
+    let Some(pin) = existing.filter(|pin| !pin.identity_fingerprint.is_empty()) else {
+        return if existing.is_some_and(|pin| !pin.owner_fingerprint.is_empty()) {
+            DirectoryTrust::Account
+        } else {
+            DirectoryTrust::Entry
+        };
+    };
+    let pinned = |key: &str| {
+        key_fingerprint_hex(key).is_some_and(|fingerprint| pin.identity_fingerprint.eq_ignore_ascii_case(&fingerprint))
+    };
+    if pinned(&bundle.kem_identity_key) {
+        return DirectoryTrust::Entry;
+    }
+    if verification.endorsers.iter().any(|endorser| pinned(endorser)) {
+        return DirectoryTrust::Endorsed;
+    }
+    if rooted {
+        DirectoryTrust::Replaced
+    } else {
+        DirectoryTrust::Account
+    }
+}
+
+pub fn evaluate_address_entry(
+    address: &str,
+    bundle: &PrekeyBundle,
+    trust: DirectoryTrust,
+    existing: Option<&RecipientPin>,
+    owner_public_key: Option<&str>,
+) -> Evaluation {
+    let base = existing.cloned().unwrap_or_default();
+    let refused = !matches!(trust, DirectoryTrust::Entry | DirectoryTrust::Endorsed);
+    if refused || base.flagged {
+        return Evaluation {
+            pin: changed_pin(
+                existing,
+                RecipientPin {
+                    flagged: true,
+                    ..base
+                },
+            ),
+            outcome: Err(untrusted(address, key_fingerprint(owner_public_key).as_deref())),
+        };
+    }
+    let pq_key = advertised_pq_identity_key(bundle);
+    if base.pq_seen && pq_key.is_none() {
+        return Evaluation {
+            pin: None,
+            outcome: Err(downgraded(address)),
+        };
+    }
+    let decoded = (|| -> Result<RatchetTarget, BridgeError> {
+        let pq_target = match pq_key {
+            Some(key) => {
+                let public_key = decode_key(address, key, "post-quantum identity key")?;
+                if public_key.len() != ML_KEM_768_PUBLIC_KEY_BYTES {
+                    return Err(refuse(
+                        address,
+                        "the published post-quantum key is malformed, and the message is not sent with weaker encryption",
+                    ));
+                }
+                Some(PqTarget {
+                    public_key,
+                    key_id: PQ_IDENTITY_KEY_ID,
+                    signed: true,
+                })
+            }
+            None => None,
+        };
+        Ok(RatchetTarget {
+            identity_public: decode_key(address, &bundle.kem_identity_key, "identity key")?,
+            signed_prekey: decode_key(address, &bundle.signed_prekey, "signed prekey")?,
+            pq_target,
+            transcript_bound: bundle.x3dh_max_version.unwrap_or(1)
+                >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND)
+                || base.transcript_bound,
+            key_bound: bundle.x3dh_max_version.unwrap_or(1) >= i16::from(X3DH_VERSION_KEY_BOUND),
+            one_time_prekey: select_one_time_prekey(bundle),
+        })
+    })();
+    let target = match decoded {
+        Ok(target) => target,
+        Err(error) => {
+            return Evaluation {
+                pin: None,
+                outcome: Err(error),
+            }
+        }
+    };
+    let pin = RecipientPin {
+        identity_fingerprint: hex(&Sha256::digest(&target.identity_public)),
+        owner_fingerprint: base.owner_fingerprint.clone(),
+        pq_seen: base.pq_seen || target.pq_target.is_some(),
+        pq_fingerprint: target
+            .pq_target
+            .as_ref()
+            .map(|pq| hex(&Sha256::digest(&pq.public_key)))
+            .unwrap_or_default(),
+        transcript_bound: target.transcript_bound,
+        binding_epoch: base.binding_epoch,
+        binding_fingerprint: base.binding_fingerprint.clone(),
+        hosted: base.hosted,
+        flagged: false,
+        address_rooted: true,
+    };
+    Evaluation {
+        pin: changed_pin(existing, pin),
+        outcome: Ok(SendRoute::Ratchet(target)),
     }
 }
 
@@ -812,6 +1134,7 @@ X1OEWHpsCOAO
             pq_kem_public_key: pq_identity.map(|key| STANDARD.encode(key)),
             x3dh_max_version: None,
             ec_one_time_prekey: None,
+            address_scoped: None,
         }
     }
 
@@ -1725,5 +2048,258 @@ X1OEWHpsCOAO
         assert_eq!(pin_id("a", "Bob@Astermail.org"), pin_id("a", "bob@astermail.org"));
         assert_ne!(pin_id("a", "bob@astermail.org"), pin_id("b", "bob@astermail.org"));
         assert_eq!(pin_id("a", "bob@astermail.org").len(), 64);
+    }
+
+    #[test]
+    fn dotted_and_tagged_spellings_share_one_pin() {
+        let canonical = pin_id("a", "bob@astermail.org");
+        for spelling in ["b.o.b@astermail.org", "Bob+news@astermail.org", "b.ob+x@Astermail.org", " bob@astermail.org "] {
+            assert_eq!(pin_id("a", spelling), canonical, "{spelling}");
+        }
+        assert_eq!(canonical_pin_address("b.ob+x@aster.cx"), "bob@aster.cx");
+        assert_eq!(canonical_pin_address("j.doe+x@example.com"), "j.doe@example.com");
+        assert_ne!(pin_id("a", "j.doe@example.com"), pin_id("a", "jdoe@example.com"));
+    }
+
+    fn pin_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[3u8; 32]).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn a_pin_saved_under_a_dotted_spelling_is_found_for_every_variant() {
+        let (_dir, db) = pin_db();
+        let pin = RecipientPin {
+            identity_fingerprint: "ab".repeat(32),
+            ..Default::default()
+        };
+        let legacy = spelling_pin_id("a", "b.ob@astermail.org");
+        db.recipient_pin_put(&legacy, &pin).unwrap();
+        for spelling in ["bob@astermail.org", "b.o.b+news@astermail.org", "bo.b@astermail.org"] {
+            let read = read_recipient_pin(&db, "a", spelling).unwrap();
+            assert_eq!(read.pin.as_ref(), Some(&pin), "{spelling}");
+            assert!(read.from_legacy);
+            assert_eq!(read.id, pin_id("a", "bob@astermail.org"));
+        }
+        db.recipient_pin_put(&pin_id("a", "bob@astermail.org"), &pin).unwrap();
+        let read = read_recipient_pin(&db, "a", "b.ob+x@astermail.org").unwrap();
+        assert!(!read.from_legacy);
+        assert_eq!(read.pin, Some(pin));
+    }
+
+    #[test]
+    fn unreadable_pin_storage_is_an_error_not_a_first_contact() {
+        let (_dir, db) = pin_db();
+        db.with_conn(|conn| conn.execute_batch("DROP TABLE recipient_key_pin")).unwrap();
+        assert!(read_recipient_pin(&db, "a", "bob@astermail.org").is_err());
+    }
+
+    fn scoped_entry(address: &str) -> PrekeyBundle {
+        let entry = crate::crypto::address_identity::tests::fixed_keyring()
+            .sign_entry(address)
+            .unwrap();
+        PrekeyBundle {
+            kem_identity_key: entry.kem_identity_key,
+            signed_prekey: entry.signed_prekey,
+            signed_prekey_signature: Some(entry.signed_prekey_signature),
+            pq_prekey: None,
+            pq_kem_public_key: entry.pq_kem_public_key,
+            x3dh_max_version: Some(2),
+            ec_one_time_prekey: None,
+            address_scoped: Some(true),
+        }
+    }
+
+    fn pinned_to(key_b64: &str, rooted: bool) -> RecipientPin {
+        RecipientPin {
+            identity_fingerprint: key_fingerprint_hex(key_b64).unwrap(),
+            address_rooted: rooted,
+            ..Default::default()
+        }
+    }
+
+    const ALIAS: &str = "alias@example.org";
+
+    #[test]
+    fn a_valid_entry_on_first_contact_is_trusted_and_roots_the_pin() {
+        let bundle = scoped_entry(ALIAS);
+        assert!(is_address_scoped(&bundle));
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, None), DirectoryTrust::Entry);
+        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, None, None);
+        let pin = evaluation.pin.unwrap();
+        assert!(pin.address_rooted);
+        assert_eq!(pin.identity_fingerprint, key_fingerprint_hex(&bundle.kem_identity_key).unwrap());
+        assert!(matches!(evaluation.outcome, Ok(SendRoute::Ratchet(_))));
+        let pinned = pinned_to(&bundle.kem_identity_key, true);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pinned)), DirectoryTrust::Entry);
+    }
+
+    #[test]
+    fn an_entry_endorsed_by_the_pinned_key_is_accepted() {
+        let bundle = scoped_entry(ALIAS);
+        let verification = crate::crypto::address_identity::verify_address_entry(
+            ALIAS,
+            &bundle.kem_identity_key,
+            &bundle.signed_prekey,
+            bundle.pq_kem_public_key.as_deref(),
+            bundle.signed_prekey_signature.as_deref().unwrap(),
+        );
+        assert!(verification.valid);
+        let endorser = verification.endorsers.first().expect("the fixed vault endorses its entries");
+        let pinned = pinned_to(endorser, true);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pinned)), DirectoryTrust::Endorsed);
+        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Endorsed, Some(&pinned), None).outcome.is_ok());
+    }
+
+    #[test]
+    fn a_replaced_or_invalid_entry_for_a_rooted_pin_is_refused() {
+        let bundle = scoped_entry(ALIAS);
+        let other = STANDARD.encode([0x04u8; 65]);
+        let rooted = pinned_to(&other, true);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&rooted)), DirectoryTrust::Replaced);
+        assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Replaced, Some(&rooted), None).outcome.is_err());
+
+        let loose = pinned_to(&other, false);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&loose)), DirectoryTrust::Account);
+
+        let mut forged = scoped_entry(ALIAS);
+        forged.signed_prekey = STANDARD.encode([0x11u8; 65]);
+        let pinned = pinned_to(&bundle.kem_identity_key, true);
+        assert_eq!(classify_scoped_entry(ALIAS, &forged, Some(&pinned)), DirectoryTrust::Invalid);
+        assert!(evaluate_address_entry(ALIAS, &forged, DirectoryTrust::Invalid, Some(&pinned), None).outcome.is_err());
+        assert_eq!(classify_scoped_entry(ALIAS, &forged, None), DirectoryTrust::Account);
+        assert_eq!(classify_scoped_entry("other@example.org", &bundle, None), DirectoryTrust::Account);
+    }
+
+    fn offers_to_accept(outcome: &Result<SendRoute, BridgeError>) -> bool {
+        matches!(outcome, Err(BridgeError::RecipientKey(message)) if message.contains("recipient-key accept"))
+    }
+
+    #[test]
+    fn a_refused_address_entry_can_be_accepted_like_any_changed_key() {
+        let (_dir, db) = pin_db();
+        let account = owner("alias");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let bundle = scoped_entry(ALIAS);
+        let mut forged = scoped_entry(ALIAS);
+        forged.signed_prekey = STANDARD.encode([0x11u8; 65]);
+        let other = STANDARD.encode([0x04u8; 65]);
+        let cases = [
+            (DirectoryTrust::Replaced, &bundle, pinned_to(&other, true)),
+            (DirectoryTrust::Downgraded, &bundle, pinned_to(&other, true)),
+            (DirectoryTrust::Invalid, &forged, pinned_to(&bundle.kem_identity_key, true)),
+        ];
+        for (trust, served, rooted) in cases {
+            let rooted = RecipientPin {
+                owner_fingerprint: shown.clone(),
+                pq_seen: true,
+                pq_fingerprint: "pq".to_string(),
+                ..rooted
+            };
+            let id = read_recipient_pin(&db, "a", ALIAS).unwrap().id;
+            db.recipient_pin_put(&id, &rooted).unwrap();
+
+            let refused = evaluate_address_entry(ALIAS, served, trust, Some(&rooted), Some(&account.public_key));
+            assert!(offers_to_accept(&refused.outcome), "{trust:?}");
+            let flagged = refused.pin.expect("the refusal is recorded");
+            assert!(flagged.flagged && flagged.address_rooted);
+            db.recipient_pin_put(&id, &flagged).unwrap();
+
+            assert_eq!(
+                accept_recipient_key(&db, "a", ALIAS, Some(&account.public_key), &shown).unwrap(),
+                KeyAcceptance::Accepted { fingerprint: shown.clone() }
+            );
+            let accepted = read_recipient_pin(&db, "a", ALIAS).unwrap().pin.unwrap();
+            assert!(!accepted.flagged && !accepted.address_rooted);
+            assert!(accepted.identity_fingerprint.is_empty());
+            assert!(accepted.pq_seen);
+            assert_eq!(classify_scoped_entry(ALIAS, served, Some(&accepted)), DirectoryTrust::Account);
+            let next = evaluate_recipient(
+                ALIAS,
+                Some(&signed_v2_bundle(&account)),
+                Some(&account.public_key),
+                Some(&accepted),
+            );
+            assert!(matches!(next.outcome, Ok(SendRoute::Ratchet(_))), "{trust:?}");
+        }
+    }
+
+    #[test]
+    fn a_flagged_entry_pin_offers_the_accept_path() {
+        let account = owner("alias");
+        let bundle = scoped_entry(ALIAS);
+        let flagged = RecipientPin {
+            flagged: true,
+            ..pinned_to(&bundle.kem_identity_key, true)
+        };
+        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, Some(&flagged), Some(&account.public_key));
+        assert!(offers_to_accept(&evaluation.outcome));
+        assert!(evaluation.pin.is_none());
+    }
+
+    #[test]
+    fn a_rooted_pin_answered_by_the_account_bundle_offers_the_accept_path() {
+        let account = owner("alias");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let rooted = RecipientPin {
+            owner_fingerprint: shown.clone(),
+            ..pinned_to(&STANDARD.encode([0x04u8; 65]), true)
+        };
+        let account_bundle = signed_v2_bundle(&account);
+        let refused = evaluate_recipient(ALIAS, Some(&account_bundle), Some(&account.public_key), Some(&rooted));
+        assert!(offers_to_accept(&refused.outcome));
+        let flagged = refused.pin.unwrap();
+        assert!(flagged.flagged);
+
+        let accepted = accepted_pin(flagged, &shown);
+        assert!(!accepted.address_rooted && !accepted.flagged);
+        let next = evaluate_recipient(ALIAS, Some(&account_bundle), Some(&account.public_key), Some(&accepted));
+        assert!(matches!(next.outcome, Ok(SendRoute::Ratchet(_))));
+
+        let no_bundle = evaluate_recipient(ALIAS, None, Some(&account.public_key), Some(&rooted));
+        assert!(matches!(no_bundle.outcome, Ok(SendRoute::AccountKey)));
+    }
+
+    #[test]
+    fn accepting_a_key_for_a_pin_without_an_address_entry_is_unchanged() {
+        let loose = RecipientPin {
+            identity_fingerprint: "id".to_string(),
+            owner_fingerprint: "old".to_string(),
+            pq_seen: true,
+            pq_fingerprint: "pq".to_string(),
+            binding_epoch: 3,
+            binding_fingerprint: "binding".to_string(),
+            transcript_bound: true,
+            hosted: true,
+            flagged: true,
+            address_rooted: false,
+        };
+        assert_eq!(
+            accepted_pin(loose.clone(), "old"),
+            RecipientPin {
+                flagged: false,
+                ..loose.clone()
+            }
+        );
+        assert_eq!(
+            accepted_pin(loose.clone(), "new"),
+            RecipientPin {
+                owner_fingerprint: "new".to_string(),
+                binding_epoch: 0,
+                binding_fingerprint: String::new(),
+                flagged: false,
+                ..loose
+            }
+        );
+    }
+
+    #[test]
+    fn an_unscoped_answer_for_a_rooted_pin_is_a_downgrade() {
+        let rooted = pinned_to(&STANDARD.encode([0x04u8; 65]), true);
+        assert_eq!(unscoped_trust(Some(&rooted)), DirectoryTrust::Downgraded);
+        assert_eq!(unscoped_trust(None), DirectoryTrust::Account);
+        let loose = pinned_to(&STANDARD.encode([0x04u8; 65]), false);
+        assert_eq!(unscoped_trust(Some(&loose)), DirectoryTrust::Account);
     }
 }
