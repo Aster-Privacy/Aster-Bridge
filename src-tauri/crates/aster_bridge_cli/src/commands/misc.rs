@@ -176,7 +176,10 @@ pub fn secret_key_create(out: &Output) -> CliResult<i32> {
         if path.exists() {
             error.with_hint("The existing key protects your stored secrets, so keep it. To start over with a new key, sign out with aster-bridge logout, move the old file somewhere safe, and run this command again.")
         } else {
-            error
+            match path.parent().filter(|dir| !crate::context::is_writable(dir)) {
+                Some(dir) => error.with_hint(crate::context::not_writable_hint(dir)),
+                None => error,
+            }
         }
     })?;
     let shown = path.display().to_string();

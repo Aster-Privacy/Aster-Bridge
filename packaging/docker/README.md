@@ -34,7 +34,13 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 
    The bridge shows a code. Enter it at [app.astermail.org/link-device](https://app.astermail.org/link-device) in a browser where you're signed in to Aster Mail.
 
-4. To start the bridge, run `docker compose up -d`. If the container starts before you sign in, it waits a minute, restarts, and checks again until you sign in. If it loses its connection to Aster, it keeps running and reconnects by itself.
+4. To start the bridge, run `docker compose up -d`. If the container starts before you sign in, it keeps running and starts the mail servers a few seconds after you sign in. You can also sign in to a running container, which helps when your NAS shows only a terminal for running containers:
+
+   ```
+   docker compose exec aster-bridge aster-bridge login
+   ```
+
+   If the bridge loses its connection to Aster, it keeps running and reconnects by itself.
 
 5. To create a password for your mail app, run:
 
@@ -57,6 +63,26 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 The Compose file publishes only these TLS ports. The STARTTLS ports (1143, 1025, and 1110) stay inside the container, because a device on your network could remove STARTTLS from the server's reply and read the password your mail app sends.
 
 To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. Docker runs the same command as the container health check, so `docker compose ps` shows the container as healthy once you're signed in and the servers are running.
+
+## Store the data in a folder on your server
+
+The Compose file keeps your data in Docker volumes. To keep it in folders on your server instead, such as a share on your NAS, replace the two lines under `volumes` with folder paths:
+
+```
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets
+```
+
+The bridge runs as user 10001, so that user needs to own both folders. Create them and set the owner before you run any other step:
+
+```
+mkdir data secrets
+sudo chown 10001:10001 data secrets
+sudo chmod 700 data secrets
+```
+
+To run the bridge as a different user instead, such as the owner of an existing folder, add `user: "1000:1000"` to the service with that user's ID and group ID. If the bridge can't write to a folder, it tells you which user needs access.
 
 ## Certificates
 

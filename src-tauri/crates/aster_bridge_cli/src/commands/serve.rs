@@ -46,7 +46,7 @@ use crate::context::{self, Context};
 use crate::control;
 use crate::events::{self, CliEvents, SinkGuard};
 use crate::exit::{
-    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CONTROL_UNREACHABLE, CODE_OUTBOX_ALREADY_SENT,
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CONTROL_UNREACHABLE, CODE_NOT_SIGNED_IN, CODE_OUTBOX_ALREADY_SENT,
     CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
     CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, CODE_TLS_CERTIFICATE, EXIT_ERROR,
     EXIT_NOT_READY, EXIT_OK,
@@ -178,6 +178,15 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
     loop {
         let attempt_started = std::time::Instant::now();
         match serve(ctx, ndjson, &network).await {
+            Err(error) if service && error.code == CODE_NOT_SIGNED_IN => {
+                tracing::warn!("aster-bridge is waiting for you to sign in");
+                ctx.out.error(&error);
+                if !wait_for_sign_in(&ctx.data_dir).await {
+                    return Ok(EXIT_OK);
+                }
+                tracing::info!("signed in, starting aster-bridge");
+                delay = base_delay;
+            }
             Err(error) if service && error.exit_code >= EXIT_NOT_READY => {
                 tracing::error!("aster-bridge stopped: {} ({})", error.message, error.code);
                 ctx.out.error(&error);
@@ -211,6 +220,25 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
                 return Err(error);
             }
             Ok(code) => return Ok(code),
+        }
+    }
+}
+
+fn ready_to_start(dir: &std::path::Path) -> bool {
+    let signed_in = state::load(dir).account.is_some() && secret_backend::has_record(dir);
+    signed_in && InstanceLock::acquire(dir).is_ok()
+}
+
+async fn wait_for_sign_in(dir: &std::path::Path) -> bool {
+    let shutdown = signals::shutdown();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(context::signed_out_poll_interval()) => {}
+            _ = &mut shutdown => return false,
+        }
+        if ready_to_start(dir) {
+            return true;
         }
     }
 }
