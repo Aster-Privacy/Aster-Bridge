@@ -62,7 +62,7 @@ Never publish the bridge ports to the internet. Reach it from outside your home 
 
 The Compose file publishes only these TLS ports. The STARTTLS ports (1143, 1025, and 1110) stay inside the container, because a device on your network could remove STARTTLS from the server's reply and read the password your mail app sends.
 
-To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. The container health check runs `aster-bridge healthcheck`, which exits with 0 when you're signed in and the servers are running and with 1 otherwise, so `docker compose ps` shows the container as healthy only then. The `status` command keeps its own exit codes for scripts.
+To check the bridge, run `docker compose exec aster-bridge aster-bridge status`. The container health check runs `aster-bridge healthcheck`, which exits with 0 when the servers are running or when the bridge is running and waiting for you to sign in, and with 1 otherwise. Waiting for sign-in counts as healthy so that Docker Swarm doesn't replace the container while it shows a sign-in code. The `status` command keeps its own exit codes for scripts.
 
 When a message inside the container suggests a command, it shows the `docker compose` form you run on your server, such as `docker compose exec aster-bridge aster-bridge login`. If your service has a different name in your Compose file, use that name instead.
 

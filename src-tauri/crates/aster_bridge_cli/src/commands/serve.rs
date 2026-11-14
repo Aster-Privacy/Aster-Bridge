@@ -222,12 +222,14 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
         match serve(ctx, ndjson, &network).await {
             Err(error) if service && error.code == CODE_NOT_SIGNED_IN && !is_signed_in(&ctx.data_dir) => {
                 tracing::warn!("aster-bridge is waiting for you to sign in");
+                let waiting = crate::lock::WaitingLock::hold(&ctx.data_dir);
                 let signed_in = if sign_in_on_start() {
                     sign_in_from_service(ctx).await
                 } else {
                     ctx.out.error(&error);
                     wait_for_sign_in(&ctx.data_dir).await
                 };
+                drop(waiting);
                 if !signed_in {
                     return Ok(EXIT_OK);
                 }

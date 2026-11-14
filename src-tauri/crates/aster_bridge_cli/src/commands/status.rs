@@ -74,7 +74,9 @@ pub const UNHEALTHY: i32 = 1;
 
 pub async fn healthcheck(ctx: &Context) -> CliResult<i32> {
     let snapshot = snapshot(ctx, false).await?;
-    let (code, text) = if !snapshot.signed_in {
+    let (code, text) = if !snapshot.signed_in && crate::lock::WaitingLock::is_held(&ctx.data_dir) {
+        (HEALTHY, "healthy: waiting for you to sign in")
+    } else if !snapshot.signed_in {
         (UNHEALTHY, "unhealthy: not signed in")
     } else if snapshot.denied() {
         (UNHEALTHY, "unhealthy: the plan doesn't include Aster Bridge")

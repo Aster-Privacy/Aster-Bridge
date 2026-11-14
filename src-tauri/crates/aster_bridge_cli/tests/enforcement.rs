@@ -304,6 +304,10 @@ fn service_mode_waits_for_sign_in_and_then_starts() {
     let mut serve = env.serve(&["--service"]);
     std::thread::sleep(Duration::from_secs(2));
     assert!(serve.is_running(), "service exited while signed out");
+    let waiting = env.run(&["healthcheck"]);
+    assert_eq!(waiting.code, 0, "{}", waiting.stdout);
+    assert!(waiting.stdout.contains("waiting for you to sign in"), "{}", waiting.stdout);
+    assert_eq!(env.run(&["status"]).code, 3);
     assert!(serve.seen.iter().all(|v| v["error"]["code"].is_null() || v["error"]["code"] == "not_signed_in"));
     env.login();
     serve.wait_event_after_errors("ready", READY_TIMEOUT);
