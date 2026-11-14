@@ -103,6 +103,7 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn make_substring_snippet(text: &str, term: &str) -> String {
@@ -113,7 +114,7 @@ fn make_substring_snippet(text: &str, term: &str) -> String {
     let needle = term.to_lowercase();
     let lower_full = text.to_lowercase();
     let Some(match_byte) = lower_full.find(&needle) else {
-        return truncate_chars(text, max_chars);
+        return html_escape(&truncate_chars(text, max_chars));
     };
     let pre_chars = lower_full[..match_byte].chars().count();
     let needle_chars = needle.chars().count();
@@ -121,7 +122,7 @@ fn make_substring_snippet(text: &str, term: &str) -> String {
     let collected: Vec<char> = text.chars().skip(window_start).take(max_chars).collect();
     let local_match = pre_chars - window_start;
     if local_match + needle_chars > collected.len() {
-        return collected.iter().collect();
+        return html_escape(&collected.iter().collect::<String>());
     }
     let prefix: String = collected[..local_match].iter().collect();
     let middle: String = collected[local_match..local_match + needle_chars].iter().collect();
@@ -217,6 +218,20 @@ mod tests {
         let s = make_substring_snippet("hello world", "zzz");
         assert_eq!(s, "hello world");
         assert!(!s.contains("<mark>"));
+    }
+
+    #[test]
+    fn make_substring_snippet_escapes_unmatched_text() {
+        let s = make_substring_snippet("<img src=x onerror='a'>", "zzz");
+        assert_eq!(s, "&lt;img src=x onerror=&#39;a&#39;&gt;");
+    }
+
+    #[test]
+    fn make_substring_snippet_escapes_a_match_cut_by_the_window() {
+        let text = format!("<b>{}", "n".repeat(250));
+        let s = make_substring_snippet(&text, &"n".repeat(199));
+        assert!(!s.contains('<'), "{s}");
+        assert!(s.contains("&lt;b&gt;"), "{s}");
     }
 
     #[test]

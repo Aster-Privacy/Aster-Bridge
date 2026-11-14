@@ -150,6 +150,17 @@ enum SmtpState {
     Data,
 }
 
+fn ends_data(line: &[u8], crlf_client: bool) -> bool {
+    if crlf_client {
+        return line == b".\r\n";
+    }
+    let mut bytes = line;
+    while bytes.last() == Some(&b'\r') || bytes.last() == Some(&b'\n') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes == b"."
+}
+
 struct SmtpSession {
     state: SmtpState,
     authenticated: bool,
@@ -340,6 +351,7 @@ where
     let mut refreshed_identities = false;
 
     let mut line_bytes: Vec<u8> = Vec::new();
+    let mut crlf_client = false;
 
     loop {
         let in_data = smtp.state == SmtpState::Data;
@@ -372,7 +384,7 @@ where
             while bytes.last() == Some(&b'\r') || bytes.last() == Some(&b'\n') {
                 bytes = &bytes[..bytes.len() - 1];
             }
-            if bytes == b"." {
+            if ends_data(&line_bytes, crlf_client) {
                 let raw_message = std::mem::take(&mut smtp.data_buffer);
 
                 let header_section = {
@@ -480,10 +492,7 @@ where
                             }
                         };
                         if dn == 0 { break; }
-                        let dl: &[u8] = &line_bytes[..];
-                        let dl = if dl.last() == Some(&b'\n') { &dl[..dl.len()-1] } else { dl };
-                        let dl = if dl.last() == Some(&b'\r') { &dl[..dl.len()-1] } else { dl };
-                        if dl == b"." { break; }
+                        if ends_data(&line_bytes, crlf_client) { break; }
                     }
                     if drain_failed {
                         writer.write_all(b"421 4.3.0 Message exceeds maximum size, closing connection\r\n").await?;
@@ -499,6 +508,7 @@ where
             continue;
         }
 
+        crlf_client = line_bytes.ends_with(b"\r\n");
         let line = String::from_utf8_lossy(&line_bytes).into_owned();
         let trimmed = line.trim_end().to_string();
 
@@ -1263,6 +1273,16 @@ mod tests {
 
     fn io_err() -> BridgeError {
         BridgeError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+    }
+
+    #[test]
+    fn data_ends_on_the_line_ending_the_client_uses() {
+        assert!(ends_data(b".\r\n", true));
+        assert!(!ends_data(b".\n", true));
+        assert!(!ends_data(b".\r", true));
+        assert!(ends_data(b".\n", false));
+        assert!(ends_data(b".\r\n", false));
+        assert!(!ends_data(b"..\r\n", false));
     }
 
     #[test]
