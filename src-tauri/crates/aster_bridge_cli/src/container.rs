@@ -1,6 +1,8 @@
 //
 // Aster Communications Inc.
 //
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
 // Copyright (c) 2026 Aster Communications Inc.
 //
 // This file is part of this project.
