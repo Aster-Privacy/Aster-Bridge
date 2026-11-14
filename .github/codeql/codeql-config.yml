@@ -1,9 +1,0 @@
-name: Aster Bridge CodeQL config
-
-paths-ignore:
-  - src-tauri/gen/**
-  - src-tauri/target/**
-  - dist/**
-  - node_modules/**
-  - '**/*.test.ts'
-  - '**/*.test.tsx'
