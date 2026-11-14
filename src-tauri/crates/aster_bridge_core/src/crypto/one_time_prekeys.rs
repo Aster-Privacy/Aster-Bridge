@@ -197,7 +197,10 @@ mod tests {
     use base64::Engine as _;
 
     const SYNC_KEY: [u8; 32] = [7u8; 32];
-    const WRAP_NONCE: [u8; 12] = [9u8; 12];
+
+    fn wrap_nonce() -> [u8; WRAP_NONCE_LEN] {
+        rand::random()
+    }
 
     fn scalar() -> Vec<u8> {
         let mut scalar = vec![0u8; 32];
@@ -213,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_wrapped_one_time_secret_opens_with_the_sync_key() {
-        let (wrapped, nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &scalar());
+        let (wrapped, nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &scalar());
         assert_eq!(STANDARD.decode(&wrapped).unwrap().len(), 48);
         assert_eq!(STANDARD.decode(&nonce).unwrap().len(), 12);
 
@@ -223,7 +226,7 @@ mod tests {
 
     #[test]
     fn a_wrapped_one_time_secret_is_refused_unless_it_matches_the_format() {
-        let (wrapped, nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &scalar());
+        let (wrapped, nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &scalar());
 
         assert!(unwrap_one_time_secret(&[8u8; 32], &wrapped, &nonce).is_err());
         assert!(unwrap_one_time_secret(&SYNC_KEY[..16], &wrapped, &nonce).is_err());
@@ -240,14 +243,14 @@ mod tests {
         tampered[0] ^= 0x01;
         assert!(unwrap_one_time_secret(&SYNC_KEY, &STANDARD.encode(&tampered), &nonce).is_err());
 
-        let (short, short_wrap_nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &scalar()[..31]);
+        let (short, short_wrap_nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &scalar()[..31]);
         assert!(unwrap_one_time_secret(&SYNC_KEY, &short, &short_wrap_nonce).is_err());
-        let (long, long_wrap_nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &[5u8; 33]);
+        let (long, long_wrap_nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &[5u8; 33]);
         assert!(unwrap_one_time_secret(&SYNC_KEY, &long, &long_wrap_nonce).is_err());
 
-        let (zero, zero_nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &[0u8; 32]);
+        let (zero, zero_nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &[0u8; 32]);
         assert!(unwrap_one_time_secret(&SYNC_KEY, &zero, &zero_nonce).is_err());
-        let (above_order, above_order_nonce) = wrap(&SYNC_KEY, &WRAP_NONCE, &[0xffu8; 32]);
+        let (above_order, above_order_nonce) = wrap(&SYNC_KEY, &wrap_nonce(), &[0xffu8; 32]);
         assert!(unwrap_one_time_secret(&SYNC_KEY, &above_order, &above_order_nonce).is_err());
 
         assert!(unwrap_one_time_secret(&SYNC_KEY, "not base64", &nonce).is_err());

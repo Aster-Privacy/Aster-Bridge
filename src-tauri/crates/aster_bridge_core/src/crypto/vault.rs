@@ -162,8 +162,8 @@ fn vault_cipher(passphrase: &[u8], salt: &[u8], iterations: u32) -> Result<Aes25
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn encrypt_vault_for_test(plaintext: &[u8], passphrase: &[u8]) -> (String, String) {
-    let salt = [13u8; SALT_LEN];
-    let nonce_bytes = [21u8; 12];
+    let salt: [u8; SALT_LEN] = rand::random();
+    let nonce_bytes: [u8; 12] = rand::random();
     let cipher = vault_cipher(passphrase, &salt, PBKDF2_ITERATIONS).expect("vault cipher");
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)

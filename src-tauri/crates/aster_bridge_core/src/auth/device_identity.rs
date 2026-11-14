@@ -27,6 +27,7 @@ use hkdf::Hkdf;
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
+use rand::Rng;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -623,8 +624,7 @@ pub fn seal_vault_envelope(
     let eph_public = XPublicKey::from(&eph_secret);
     let ss_cl = eph_secret.diffie_hellman(&XPublicKey::from(x25519_bytes));
 
-    let mut nonce_bytes = [0u8; ENVELOPE_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; ENVELOPE_NONCE_LEN] = OsRng.gen();
 
     let transcript = if version == 2 {
         Some(envelope_v2_transcript(&recipient, eph_public.as_bytes(), ct.as_slice())?)
