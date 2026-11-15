@@ -1500,10 +1500,6 @@ where
                     write_no(&mut writer, &tag, &format!("[PRIVACYREQUIRED] {}", crate::sign_in_notice::TLS_REQUIRED_TEXT)).await?;
                     continue;
                 }
-                if let Some(text) = crate::sign_in_notice::pending_reply() {
-                    write_no(&mut writer, &tag, &format!("[UNAVAILABLE] {}", text)).await?;
-                    continue;
-                }
                 let ok = handle_login(&mut writer, &session, &passwords, &mut conn, &tag, &args).await?;
                 if !ok {
                     failed_auth = failed_auth.saturating_add(1);
@@ -1550,10 +1546,6 @@ where
                         }
                     };
 
-                    if let Some(text) = crate::sign_in_notice::pending_reply() {
-                        write_no(&mut writer, &tag, &format!("[UNAVAILABLE] {}", text)).await?;
-                        continue;
-                    }
                     let mut ok = false;
                     if let Ok(decoded) = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
@@ -1570,6 +1562,10 @@ where
                             };
                             if username_ok {
                                 if let Some(pw_id) = passwords.verify_and_id_cached(&authcid, &password).await {
+                                    if let Some(text) = crate::sign_in_notice::pending_reply() {
+                                        write_no(&mut writer, &tag, &format!("[UNAVAILABLE] {}", text)).await?;
+                                        continue;
+                                    }
                                     conn.state = ImapState::Authenticated;
                                     passwords.record_use(&pw_id, Some("imap"));
                                     crate::sign_in_notice::record_signed_in("imap");
@@ -3163,6 +3159,10 @@ async fn handle_login(
     }
 
     if let Some(pw_id) = passwords.verify_and_id_cached(username, password).await {
+        if let Some(text) = crate::sign_in_notice::pending_reply() {
+            write_no(writer, tag, &format!("[UNAVAILABLE] {}", text)).await?;
+            return Ok(true);
+        }
         conn.state = ImapState::Authenticated;
         passwords.record_use(&pw_id, Some("imap"));
         crate::sign_in_notice::record_signed_in("imap");
@@ -4931,7 +4931,7 @@ mod tests {
         use crate::sign_in_notice::test_support::{pending_at, set_pending, PENDING_LINE};
         set_pending(Some(Some(pending_at())));
         let out = imap_transcript(
-            "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 AUTHENTICATE PLAIN\r\nAHRlc3RlcgB4\r\na4 NOOP\r\na5 LOGOUT\r\n",
+            "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlckBhc3Rlci50ZXN0AGFiY2QtZWZnaC1pamtsLW1ub3A=\r\na3 AUTHENTICATE PLAIN\r\nAHRlc3RlckBhc3Rlci50ZXN0AGFiY2QtZWZnaC1pamtsLW1ub3A=\r\na4 NOOP\r\na5 SELECT INBOX\r\na6 LOGOUT\r\n",
             false,
         )
         .await;
@@ -4944,8 +4944,25 @@ mod tests {
             );
         }
         assert!(out.contains("a4 OK"), "{:?}", out);
-        assert!(out.contains("a5 OK"), "{:?}", out);
+        assert!(!out.contains("a5 OK"), "{:?}", out);
+        assert!(out.contains("a6 OK"), "{:?}", out);
         assert!(!out.contains("AUTHENTICATIONFAILED"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = imap_transcript(
+            "a1 LOGIN tester@aster.test wrong-password\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 LOGOUT\r\n",
+            false,
+        )
+        .await;
+        set_pending(None);
+        assert!(out.contains("a1 NO [AUTHENTICATIONFAILED]"), "{:?}", out);
+        assert!(out.contains("a2 NO [AUTHENTICATIONFAILED]"), "{:?}", out);
+        assert!(!out.contains("UNAVAILABLE"), "{:?}", out);
+        assert!(!out.contains("activation"), "{:?}", out);
     }
 
     #[tokio::test]

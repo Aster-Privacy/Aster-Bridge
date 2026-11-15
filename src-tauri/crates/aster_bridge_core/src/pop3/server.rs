@@ -420,10 +420,6 @@ where
                         writer.write_all(b"-ERR USER required first\r\n").await?;
                         continue;
                     };
-                    if let Some(text) = crate::sign_in_notice::pending_reply() {
-                        writer.write_all(format!("-ERR [SYS/TEMP] {}\r\n", text).as_bytes()).await?;
-                        continue;
-                    }
                     let mut pw_match = passwords.verify_and_id_cached(&name, &args).await;
                     if pw_match.is_some() && !session.read().await.accepts_login_name(&name) {
                         if !refreshed_identities {
@@ -435,6 +431,10 @@ where
                         }
                     }
                     if let Some(pw_id) = pw_match {
+                        if let Some(text) = crate::sign_in_notice::pending_reply() {
+                            writer.write_all(format!("-ERR [SYS/TEMP] {}\r\n", text).as_bytes()).await?;
+                            continue;
+                        }
                         if POP3_SESSION_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                             writer.write_all(b"-ERR [IN-USE] Maildrop already locked by another session\r\n").await?;
                             break;
@@ -732,6 +732,17 @@ mod tests {
         );
         assert!(!out.contains("maildrop ready"), "{:?}", out);
         assert!(out.contains("+OK"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS wrong\r\nQUIT\r\n", false).await;
+        set_pending(None);
+        assert!(!out.contains("SYS/TEMP"), "{:?}", out);
+        assert!(!out.contains("waiting for activation"), "{:?}", out);
+        assert!(out.contains("-ERR Sign-in failed."), "{:?}", out);
     }
 
     #[tokio::test]

@@ -631,15 +631,17 @@ where
                     continue;
                 };
 
-                if let Some(text) = crate::sign_in_notice::pending_reply() {
-                    writer.write_all(format!("454 4.7.0 {}\r\n", text).as_bytes()).await?;
-                    continue;
-                }
                 let mut ok = false;
                 if let Some((login_name, password)) = credentials_str {
                     let mut pw_match = passwords
                         .verify_and_id_cached(login_name.as_deref().unwrap_or(""), &password)
                         .await;
+                    if pw_match.is_some() {
+                        if let Some(text) = crate::sign_in_notice::pending_reply() {
+                            writer.write_all(format!("454 4.7.0 {}\r\n", text).as_bytes()).await?;
+                            continue;
+                        }
+                    }
                     if let (Some(_), Some(name)) = (&pw_match, &login_name) {
                         if !session.read().await.accepts_login_name(name) {
                             if !refreshed_identities {
@@ -1596,6 +1598,16 @@ mod tests {
         assert!(!out.contains("\r\n235 "), "{:?}", out);
         assert!(!out.contains("\r\n535 "), "{:?}", out);
         assert!(out.contains("\r\n221"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB3cm9uZw==\r\nQUIT\r\n", false).await;
+        set_pending(None);
+        assert!(out.contains("\r\n535 5.7.8 "), "{:?}", out);
+        assert!(!out.contains("454 4.7.0"), "{:?}", out);
     }
 
     #[tokio::test]
