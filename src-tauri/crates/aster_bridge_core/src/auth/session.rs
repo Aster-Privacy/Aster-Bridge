@@ -1429,4 +1429,131 @@ mod tests {
         refresh_external_pgp_key(&session, &client).await.unwrap();
         assert_eq!(loaded_external_fingerprint(&session).await, None);
     }
+
+    mod guard_refresh {
+        use super::*;
+        use axum::http::{StatusCode, Uri};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const GUARD_TOKEN: &str = "guard-token-must-stay-private";
+
+        struct Mock {
+            login_body: serde_json::Value,
+            logins: AtomicUsize,
+            unmatched: AtomicUsize,
+        }
+
+        async fn spawn(mock: Arc<Mock>) -> String {
+            let login_mock = mock.clone();
+            let fallback_mock = mock.clone();
+            let app = Router::new()
+                .route(
+                    "/core/v1/auth/refresh",
+                    post(|| async {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({"error": "expired"})),
+                        )
+                    }),
+                )
+                .route(
+                    "/core/v1/auth/device/challenge",
+                    post(|| async {
+                        Json(serde_json::json!({
+                            "challenge_id": Uuid::new_v4(),
+                            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                            "expires_in": 60,
+                        }))
+                    }),
+                )
+                .route(
+                    "/core/v1/auth/device/login",
+                    post(move || {
+                        let mock = login_mock.clone();
+                        async move {
+                            mock.logins.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::FORBIDDEN, Json(mock.login_body.clone())).into_response()
+                        }
+                    }),
+                )
+                .fallback(move |uri: Uri| {
+                    let mock = fallback_mock.clone();
+                    async move {
+                        mock.unmatched.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::NOT_FOUND, uri.path().to_string())
+                    }
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("http://127.0.0.1:{}", port)
+        }
+
+        fn session_with_refresh() -> Arc<tokio::sync::RwLock<Session>> {
+            let mut session = sample_session();
+            session.refresh_token = Some(Zeroizing::new("refresh-abc".to_string()));
+            Arc::new(tokio::sync::RwLock::new(session))
+        }
+
+        async fn refresh_against(login_body: serde_json::Value) -> (Result<()>, Arc<Mock>, Arc<tokio::sync::RwLock<Session>>) {
+            let mock = Arc::new(Mock {
+                login_body,
+                logins: AtomicUsize::new(0),
+                unmatched: AtomicUsize::new(0),
+            });
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let session = session_with_refresh();
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            let result = refresh_access_token(&session, Uuid::new_v4(), &key, &client).await;
+            (result, mock, session)
+        }
+
+        #[tokio::test]
+        async fn device_login_that_needs_approval_asks_to_sign_in_again() {
+            let request_id = Uuid::new_v4();
+            let (result, mock, session) = refresh_against(serde_json::json!({
+                "error": crate::guard::error::REQUIRED_TEXT,
+                "code": "GUARD_REQUIRED",
+                "details": {"request_id": request_id, "guard_token": GUARD_TOKEN, "expires_at": "2026-11-15T10:00:00Z", "methods": ["number"]},
+                "request_id": request_id,
+                "guard_token": GUARD_TOKEN,
+            }))
+            .await;
+            let err = result.expect_err("the server asks for approval");
+            assert!(matches!(err, BridgeError::GuardRequired(_)));
+            assert!(!crate::runtime::is_definitive_device_failure(&err));
+            assert!(!err.to_string().contains(GUARD_TOKEN));
+            assert!(!format!("{:?}", err).contains(GUARD_TOKEN));
+            assert_eq!(
+                crate::account_state::classify_error(&err),
+                Some(crate::account_state::AccountState::SignInAgain)
+            );
+            assert_eq!(mock.logins.load(Ordering::SeqCst), 1);
+            assert_eq!(mock.unmatched.load(Ordering::SeqCst), 0);
+            let s = session.read().await;
+            assert_eq!(s.access_token.as_str(), "token-abc");
+            assert_eq!(s.refresh_token.as_ref().map(|t| t.as_str()), Some("refresh-abc"));
+        }
+
+        #[tokio::test]
+        async fn device_login_held_for_activation_reports_pending() {
+            let device_id = Uuid::new_v4();
+            let (result, mock, _) = refresh_against(serde_json::json!({
+                "error": "This device is waiting for activation.",
+                "code": "GUARD_DEVICE_PENDING",
+                "details": {"device_id": device_id, "activates_at": "2026-11-15T11:00:00Z", "change_id": null},
+            }))
+            .await;
+            let err = result.expect_err("the device is held");
+            assert!(matches!(err, BridgeError::GuardPending { device_id: id, .. } if id == device_id));
+            assert!(!crate::runtime::is_definitive_device_failure(&err));
+            assert_eq!(mock.unmatched.load(Ordering::SeqCst), 0);
+        }
+    }
 }

@@ -237,6 +237,22 @@ pub fn token_refresh_wait(
 }
 
 const EARLY_REFRESH_MIN_GAP: Duration = Duration::from_secs(60);
+const GUARD_PENDING_MIN_WAIT: Duration = Duration::from_secs(60);
+
+pub fn guard_pending_wait(
+    activates_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    retry_wait: Option<Duration>,
+) -> Duration {
+    let until_active = (activates_at - now).to_std().unwrap_or(Duration::ZERO);
+    until_active
+        .max(GUARD_PENDING_MIN_WAIT)
+        .max(retry_wait.unwrap_or(Duration::ZERO))
+}
+
+fn with_retry_after(wait: Duration, retry_wait: Option<Duration>) -> Duration {
+    wait.max(retry_wait.unwrap_or(Duration::ZERO))
+}
 
 fn should_refresh_early(
     consecutive_failures: u32,
@@ -795,6 +811,7 @@ impl BridgeRuntime {
             let signing_key = opts.signing_key.clone();
             let profile = opts.profile;
             let tuning = opts.tuning;
+            let data_dir = opts.config.data_dir.clone();
             let stop = stop_signal_tx.clone();
             handles.push((
                 Service::TokenRefresh,
@@ -817,6 +834,7 @@ impl BridgeRuntime {
                             }
                         }
                         last_attempt = tokio::time::Instant::now();
+                        let mut guard_wait: Option<Duration> = None;
                         let network_retry = match crate::auth::session::refresh_access_token(
                             &s,
                             device_id,
@@ -832,7 +850,44 @@ impl BridgeRuntime {
                                 consecutive_failures = 0;
                                 definitive_failures = 0;
                                 crate::auth::session::set_session_rejected(false);
+                                if crate::account_state::current()
+                                    == crate::account_state::AccountState::GuardPending
+                                {
+                                    crate::guard::pending::clear(&data_dir);
+                                }
+                                crate::account_state::clear_guard_state();
                                 false
+                            }
+                            Err(BridgeError::GuardPending { device_id: held, activates_at, change_id }) => {
+                                tracing::info!("this device is waiting for activation; token refresh resumes later");
+                                if held == device_id {
+                                    if let Err(e) = crate::guard::pending::save(
+                                        &data_dir,
+                                        &crate::guard::pending::PendingActivation {
+                                            device_id: held,
+                                            activates_at,
+                                            change_id,
+                                        },
+                                    ) {
+                                        tracing::warn!("couldn't record the pending activation: {}", e);
+                                    }
+                                }
+                                crate::account_state::record_pending(activates_at);
+                                crate::auth::session::set_session_rejected(true);
+                                guard_wait = Some(guard_pending_wait(
+                                    activates_at,
+                                    chrono::Utc::now(),
+                                    crate::guard::error::retry_wait(),
+                                ));
+                                false
+                            }
+                            Err(BridgeError::GuardRequired(_)) => {
+                                tracing::warn!("this device needs to sign in again; token refresh stopped");
+                                crate::account_state::record(
+                                    crate::account_state::AccountState::SignInAgain,
+                                );
+                                crate::auth::session::set_session_rejected(true);
+                                return;
                             }
                             Err(e @ BridgeError::Network(_)) => {
                                 tracing::warn!(
@@ -877,8 +932,13 @@ impl BridgeRuntime {
                                 false
                             }
                         };
-                        due = tokio::time::Instant::now()
-                            + token_refresh_wait(&tuning, consecutive_failures, network_retry);
+                        let wait = guard_wait.unwrap_or_else(|| {
+                            with_retry_after(
+                                token_refresh_wait(&tuning, consecutive_failures, network_retry),
+                                crate::guard::error::retry_wait(),
+                            )
+                        });
+                        due = tokio::time::Instant::now() + wait;
                     }
                 }),
             ));
@@ -967,6 +1027,58 @@ mod token_refresh_wait_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utc(raw: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn guard_pending_waits_until_activation_with_a_floor() {
+        let now = utc("2026-11-15T10:00:00Z");
+        assert_eq!(
+            guard_pending_wait(utc("2026-11-15T11:00:00Z"), now, None),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            guard_pending_wait(utc("2026-11-15T10:00:10Z"), now, None),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            guard_pending_wait(utc("2026-11-15T09:00:00Z"), now, None),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            guard_pending_wait(utc("2026-11-15T10:05:00Z"), now, Some(Duration::from_secs(900))),
+            Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn retry_after_stretches_the_refresh_wait() {
+        assert_eq!(
+            with_retry_after(Duration::from_secs(30), Some(Duration::from_secs(120))),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            with_retry_after(Duration::from_secs(300), Some(Duration::from_secs(120))),
+            Duration::from_secs(300)
+        );
+        assert_eq!(with_retry_after(Duration::from_secs(30), None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn guard_errors_never_count_as_a_revoked_device() {
+        assert!(!is_definitive_device_failure(&BridgeError::GuardRequired(
+            "approval needed".to_string()
+        )));
+        assert!(!is_definitive_device_failure(&BridgeError::GuardPending {
+            device_id: uuid::Uuid::nil(),
+            activates_at: utc("2026-11-15T11:00:00Z"),
+            change_id: None,
+        }));
+    }
 
     #[test]
     fn jmap_drifting_off_a_busy_port_does_not_take_the_carddav_port() {

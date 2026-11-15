@@ -34,6 +34,7 @@ use aster_bridge_core::runtime;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use super::guard_text;
 use crate::context::{self, Context};
 use crate::exit::{
     CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
@@ -138,6 +139,8 @@ pub fn account_state_label(account_state: AccountState) -> &'static str {
         AccountState::DeletionScheduled => "Scheduled for deletion",
         AccountState::FamilyPolicy => "Needs two-factor authentication",
         AccountState::UpdateRequired => "Update required",
+        AccountState::GuardPending => guard_text::PENDING_LABEL,
+        AccountState::SignInAgain => guard_text::SIGN_IN_AGAIN_LABEL,
     }
 }
 
@@ -159,6 +162,14 @@ pub fn account_state_error(account_state: AccountState) -> CliError {
             "This version of Aster Bridge can't connect to your account.",
             "To continue, install the latest version of Aster Bridge, then start it again. You stay signed in.".to_string(),
         ),
+        AccountState::GuardPending => (
+            guard_text::PENDING_MESSAGE,
+            guard_text::pending_hint(account_state::activates_at()),
+        ),
+        AccountState::SignInAgain => (
+            guard_text::SIGN_IN_AGAIN_MESSAGE,
+            guard_text::SIGN_IN_AGAIN_HINT.to_string(),
+        ),
         AccountState::Active => {
             return CliError::coded(CODE_SIGN_IN, "Aster Mail refused the sign-in.");
         }
@@ -174,8 +185,7 @@ pub fn network_error(detail: &str) -> CliError {
 }
 
 pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
-    let text = error.to_string();
-    if let Some(account_state) = account_state::classify(&text) {
+    if let Some(account_state) = account_state::record_error(&error) {
         save_state(data_dir, |s| s.account_state = account_state);
         return account_state_error(account_state);
     }
