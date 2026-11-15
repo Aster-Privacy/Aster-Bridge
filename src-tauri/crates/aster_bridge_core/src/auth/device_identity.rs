@@ -50,6 +50,7 @@ struct StoredIdentity {
     x25519_sk_bytes: [u8; 32],
 }
 
+#[derive(Clone)]
 pub struct DeviceIdentity {
     pub device_id: Option<Uuid>,
     pub ed25519_signing_key: SigningKey,

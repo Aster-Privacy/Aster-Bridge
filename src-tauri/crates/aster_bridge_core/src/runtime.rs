@@ -237,7 +237,8 @@ pub fn token_refresh_wait(
 }
 
 const EARLY_REFRESH_MIN_GAP: Duration = Duration::from_secs(60);
-const GUARD_PENDING_MIN_WAIT: Duration = Duration::from_secs(60);
+const GUARD_PENDING_POLL: Duration = Duration::from_secs(60);
+const GUARD_PENDING_SLACK: Duration = Duration::from_secs(2);
 
 pub fn guard_pending_wait(
     activates_at: chrono::DateTime<chrono::Utc>,
@@ -245,9 +246,18 @@ pub fn guard_pending_wait(
     retry_wait: Option<Duration>,
 ) -> Duration {
     let until_active = (activates_at - now).to_std().unwrap_or(Duration::ZERO);
-    until_active
-        .max(GUARD_PENDING_MIN_WAIT)
-        .max(retry_wait.unwrap_or(Duration::ZERO))
+    let wait = if until_active.is_zero() {
+        GUARD_PENDING_POLL
+    } else {
+        (until_active + GUARD_PENDING_SLACK).min(GUARD_PENDING_POLL)
+    };
+    wait.max(retry_wait.unwrap_or(Duration::ZERO))
+}
+
+fn note_guard_required() {
+    tracing::warn!("this device needs to sign in again; token refresh keeps trying");
+    crate::account_state::record(crate::account_state::AccountState::SignInAgain);
+    crate::auth::session::set_session_rejected(true);
 }
 
 pub fn guard_pending_wait_from_now(activates_at: chrono::DateTime<chrono::Utc>) -> Duration {
@@ -886,12 +896,9 @@ impl BridgeRuntime {
                                 false
                             }
                             Err(BridgeError::GuardRequired(_)) => {
-                                tracing::warn!("this device needs to sign in again; token refresh stopped");
-                                crate::account_state::record(
-                                    crate::account_state::AccountState::SignInAgain,
-                                );
-                                crate::auth::session::set_session_rejected(true);
-                                return;
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                note_guard_required();
+                                false
                             }
                             Err(e @ BridgeError::Network(_)) => {
                                 tracing::warn!(
@@ -1039,23 +1046,45 @@ mod tests {
     }
 
     #[test]
-    fn guard_pending_waits_until_activation_with_a_floor() {
+    fn guard_pending_checks_the_server_at_least_every_minute() {
         let now = utc("2026-11-15T10:00:00Z");
         assert_eq!(
             guard_pending_wait(utc("2026-11-15T11:00:00Z"), now, None),
-            Duration::from_secs(3600)
+            Duration::from_secs(60)
         );
         assert_eq!(
             guard_pending_wait(utc("2026-11-15T10:00:10Z"), now, None),
-            Duration::from_secs(60)
+            Duration::from_secs(12)
         );
         assert_eq!(
             guard_pending_wait(utc("2026-11-15T09:00:00Z"), now, None),
             Duration::from_secs(60)
         );
+        assert_eq!(guard_pending_wait(now, now, None), Duration::from_secs(60));
         assert_eq!(
             guard_pending_wait(utc("2026-11-15T10:05:00Z"), now, Some(Duration::from_secs(900))),
             Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn guard_required_on_refresh_keeps_the_device_and_retries() {
+        let _state = crate::account_state::tests::state_lock();
+        crate::account_state::record(crate::account_state::AccountState::Active);
+        note_guard_required();
+        assert_eq!(
+            crate::account_state::current(),
+            crate::account_state::AccountState::SignInAgain
+        );
+        assert!(crate::auth::session::session_rejected());
+        let tuning = RuntimeTuning::for_config(&crate::config::BridgeConfig::default());
+        let wait = token_refresh_wait(&tuning, 1, false);
+        assert!(wait <= tuning.token_refresh_interval.max(tuning.token_retry_interval));
+        crate::auth::session::set_session_rejected(false);
+        crate::account_state::clear_guard_state();
+        assert_eq!(
+            crate::account_state::current(),
+            crate::account_state::AccountState::Active
         );
     }
 

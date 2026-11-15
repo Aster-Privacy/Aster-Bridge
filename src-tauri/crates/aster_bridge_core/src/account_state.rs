@@ -80,6 +80,23 @@ impl AccountState {
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 static ACTIVATES_AT: AtomicI64 = AtomicI64::new(0);
 
+fn error_code(error: &str) -> Option<&str> {
+    if let Some(start) = error.find("\"code\"") {
+        let rest = error[start + 6..].trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        return rest.find('"').map(|end| &rest[..end]);
+    }
+    error.split_once(':').map(|(label, _)| label.trim())
+}
+
+fn guard_state(error: &str) -> Option<AccountState> {
+    match error_code(error)? {
+        "GUARD_DEVICE_PENDING" | "guard_device_pending" => Some(AccountState::GuardPending),
+        "GUARD_REQUIRED" | "guard_required" => Some(AccountState::SignInAgain),
+        _ => None,
+    }
+}
+
 pub fn classify(error: &str) -> Option<AccountState> {
     if error.contains("ACCOUNT_SUSPENDED") {
         Some(AccountState::Suspended)
@@ -89,12 +106,8 @@ pub fn classify(error: &str) -> Option<AccountState> {
         Some(AccountState::FamilyPolicy)
     } else if error.contains("CLIENT_UPGRADE_REQUIRED") || error.contains("client_upgrade_required") {
         Some(AccountState::UpdateRequired)
-    } else if error.contains("GUARD_DEVICE_PENDING") || error.contains("guard_device_pending") {
-        Some(AccountState::GuardPending)
-    } else if error.contains("GUARD_REQUIRED") || error.contains("guard_required") {
-        Some(AccountState::SignInAgain)
     } else {
-        None
+        guard_state(error)
     }
 }
 
@@ -222,6 +235,21 @@ pub(crate) mod tests {
             classify("guard_required: Aster Guard needs to approve this sign-in."),
             Some(AccountState::SignInAgain)
         );
+    }
+
+    #[test]
+    fn classify_needs_the_exact_guard_code() {
+        assert_eq!(
+            classify(r#"403 Forbidden: {"error":"x", "code": "GUARD_REQUIRED"}"#),
+            Some(AccountState::SignInAgain)
+        );
+        assert_eq!(classify(r#"403 Forbidden: {"code":"NOT_GUARD_REQUIRED"}"#), None);
+        assert_eq!(classify(r#"403 Forbidden: {"code":"GUARD_REQUIRED_SOON"}"#), None);
+        assert_eq!(
+            classify(r#"400 Bad Request: {"error":"guard_required is not a field"}"#),
+            None
+        );
+        assert_eq!(classify("sync failed: the server said guard_required"), None);
     }
 
     #[test]

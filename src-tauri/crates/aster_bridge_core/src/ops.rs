@@ -85,11 +85,25 @@ pub async fn request_device_code(
 pub enum SignInPoll {
     Pending(String),
     Expired,
+    Denied,
     Confirmed(Box<Session>),
     ActivationPending {
         device_id: Uuid,
         activates_at: DateTime<Utc>,
     },
+}
+
+const MAX_PASSPHRASE_BYTES: usize = 4096;
+
+pub(crate) fn check_unsealed_passphrase(passphrase: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(passphrase)
+        .map_err(|_| BridgeError::Auth("the sign-in did not unlock this account".to_string()))?;
+    if text.trim().is_empty() || passphrase.len() > MAX_PASSPHRASE_BYTES || text.contains(char::from(0)) {
+        return Err(BridgeError::Auth(
+            "the sign-in did not unlock this account".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn hold_for_activation(
@@ -138,6 +152,7 @@ pub async fn poll_device_sign_in(
                 device_identity::unseal_vault_envelope(identity, &sealed_envelope)
                     .map_err(BridgeError::Crypto)?,
             );
+            check_unsealed_passphrase(&passphrase)?;
             if state == "activation_pending" {
                 if let Some(activates_at) = status.activates_at {
                     return hold_for_activation(
@@ -188,6 +203,7 @@ pub async fn poll_device_sign_in(
             Ok(SignInPoll::Confirmed(Box::new(session)))
         }
         "expired" => Ok(SignInPoll::Expired),
+        "denied" => Ok(SignInPoll::Denied),
         other => Ok(SignInPoll::Pending(other.to_string())),
     }
 }
@@ -440,5 +456,66 @@ mod tests {
                 .expect("the device is active");
             assert_eq!(pending::load(dir.path()), None);
         }
+
+        #[tokio::test]
+        async fn denied_status_ends_the_sign_in_without_storing_anything() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let mock = mock_with(serde_json::json!({"status": "denied"}));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::Denied));
+            assert_eq!(identity.device_id, None);
+            assert_eq!(pending::load(dir.path()), None);
+            assert_eq!(mock.challenges.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn unknown_status_keeps_waiting() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let mock = mock_with(serde_json::json!({"status": "rejected"}));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::Pending(status) if status == "rejected"));
+        }
+
+        #[tokio::test]
+        async fn held_sign_in_with_an_unusable_passphrase_stores_nothing() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            for payload in [b"   ".to_vec(), vec![0xff, 0xfe, 0x41], vec![b'a'; MAX_PASSPHRASE_BYTES + 1]] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+                let (ed, mlkem, x) = device_identity::get_pubkeys(&identity);
+                let sealed =
+                    device_identity::seal_vault_envelope(&ed, &mlkem, &x, &payload, 2).unwrap();
+                let mock = mock_with(serde_json::json!({
+                    "status": "activation_pending",
+                    "device_id": Uuid::new_v4(),
+                    "sealed_envelope": sealed,
+                    "activates_at": ACTIVATES_AT,
+                }));
+                let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+                let result =
+                    poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234").await;
+                assert!(matches!(result, Err(BridgeError::Auth(_))));
+                assert_eq!(identity.device_id, None);
+                assert_eq!(pending::load(dir.path()), None);
+                assert_eq!(device_identity::load_passphrase(dir.path()).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn unsealed_passphrase_check_accepts_a_normal_passphrase() {
+        assert!(check_unsealed_passphrase(b"correct horse battery staple").is_ok());
+        assert!(check_unsealed_passphrase(b"").is_err());
+        assert!(check_unsealed_passphrase(b"bad\0byte").is_err());
     }
 }
