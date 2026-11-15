@@ -250,6 +250,10 @@ pub fn guard_pending_wait(
         .max(retry_wait.unwrap_or(Duration::ZERO))
 }
 
+pub fn guard_pending_wait_from_now(activates_at: chrono::DateTime<chrono::Utc>) -> Duration {
+    guard_pending_wait(activates_at, chrono::Utc::now(), crate::guard::error::retry_wait())
+}
+
 fn with_retry_after(wait: Duration, retry_wait: Option<Duration>) -> Duration {
     wait.max(retry_wait.unwrap_or(Duration::ZERO))
 }

@@ -32,3 +32,11 @@ export async function notify_native(title: string, body: string): Promise<void> 
     // Notifications are best effort.
   }
 }
+
+export function should_notify_activation(
+  was_pending: boolean,
+  pending: boolean,
+  enrolled: boolean,
+): boolean {
+  return was_pending && !pending && enrolled;
+}

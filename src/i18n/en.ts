@@ -396,6 +396,19 @@ const en = {
   elapsed_hours_minutes: "{{hours}}h {{minutes}}m",
   elapsed_minutes: "{{minutes}}m",
   elapsed_seconds: "{{seconds}}s",
+  guard_pending_title: "Waiting for activation",
+  guard_pending_body: "You approved this sign-in. New Aster Bridge sign-ins wait one hour before mail apps can connect.",
+  guard_pending_skip_hint: "To end the wait sooner, open Aster on a device you already use and approve Aster Bridge there.",
+  guard_countdown_label: "Time remaining",
+  guard_activation_wait_one: "Mail apps can connect in {{count}} minute, at {{local_time}}.",
+  guard_activation_wait_other: "Mail apps can connect in {{count}} minutes, at {{local_time}}.",
+  guard_activation_finishing: "Finishing activation. This takes a few moments.",
+  guard_activation_unknown: "Aster Bridge checks again in a few moments and connects when this device is activated.",
+  guard_activated_title: "Aster Bridge is ready",
+  guard_activated: "This device is activated, and your mail apps can connect now.",
+  guard_denied_title: "Sign-in declined",
+  guard_denied: "The sign-in was declined on another Aster device. To try again, get a new code.",
+  guard_sign_in_again: "Aster Bridge needs you to sign in again. Approve the new sign-in on one of your Aster devices.",
 };
 
 export default en;

@@ -63,6 +63,30 @@ export interface BridgeState {
   port_conflict: PortConflict | null;
   insecure_sign_in: InsecureSignIn | null;
   update_required: boolean;
+  guard_pending: GuardPending | null;
+  sign_in_again: boolean;
+}
+
+export interface GuardPending {
+  activates_at: string | null;
+}
+
+export type SetupConfirmation = "confirmed" | "expired" | "pending" | "activation_pending" | "denied";
+
+export function guard_pending_from_status(status: {
+  connected: boolean;
+  activates_at?: string | null;
+}): GuardPending | null {
+  if (status.connected || !status.activates_at) return null;
+  return { activates_at: status.activates_at };
+}
+
+export function setup_confirmation_from(result: { status: string; done: boolean }): SetupConfirmation {
+  if (result.status === "confirmed" && result.done) return "confirmed";
+  if (result.status === "activation_pending") return "activation_pending";
+  if (result.status === "denied") return "denied";
+  if (result.status === "expired") return "expired";
+  return "pending";
 }
 
 async function tauri_invoke<T>(
@@ -92,6 +116,8 @@ export async function get_bridge_state(): Promise<BridgeState> {
     port_conflict: PortConflict | null;
     insecure_sign_in: InsecureSignIn | null;
     update_required?: boolean;
+    activates_at?: string | null;
+    sign_in_again?: boolean;
   }>("get_bridge_status");
 
   let passwords: AppPassword[] = [];
@@ -118,6 +144,8 @@ export async function get_bridge_state(): Promise<BridgeState> {
     port_conflict: status.port_conflict ?? null,
     insecure_sign_in: status.insecure_sign_in ?? null,
     update_required: status.update_required ?? false,
+    guard_pending: guard_pending_from_status(status),
+    sign_in_again: status.sign_in_again ?? false,
   };
 }
 
@@ -155,13 +183,11 @@ export async function get_setup_code(): Promise<SetupCode> {
   return tauri_invoke<SetupCode>("get_setup_code");
 }
 
-export async function check_setup_confirmation(): Promise<"confirmed" | "expired" | "pending"> {
+export async function check_setup_confirmation(): Promise<SetupConfirmation> {
   const result = await tauri_invoke<{ status: string; done: boolean }>(
     "check_setup_status",
   );
-  if (result.status === "confirmed" && result.done) return "confirmed";
-  if (result.status === "expired") return "expired";
-  return "pending";
+  return setup_confirmation_from(result);
 }
 
 export async function start_bridge(): Promise<void> {
