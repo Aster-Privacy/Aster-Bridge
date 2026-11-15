@@ -627,6 +627,11 @@ fn login_reports_the_activation_wait_and_finishes_after_it() {
     assert_eq!(status.json()["activates_at"], HELD_UNTIL_RFC3339);
     assert_eq!(status.json()["signed_in"], false);
 
+    let health = env.json(&["healthcheck"]);
+    health.expect(0);
+    assert_eq!(health.json()["healthy"], true);
+    assert_eq!(health.json()["ready"], false);
+
     let codes = env.mock.code_requests().len();
     env.json(&["login"]).expect(8);
     assert_eq!(env.mock.code_requests().len(), codes);
@@ -654,6 +659,21 @@ fn login_names_the_activation_time_in_plain_text() {
     let status = env.run(&["status"]);
     status.expect(8);
     assert!(status.stdout.contains("Waiting for activation"), "{}", status.stdout);
+}
+
+#[test]
+fn held_sign_in_explains_that_aster_guard_sets_the_wait() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let reason = "Aster Guard is on for your account, so new sign-ins wait one hour.";
+    let run = env.run(&["login"]);
+    run.expect(8);
+    assert!(run.stdout.contains(reason), "{}", run.stdout);
+    let status = env.run(&["status"]);
+    status.expect(8);
+    assert!(status.stdout.contains(reason), "{}", status.stdout);
+    let json = env.json(&["status"]);
+    assert!(!json.stdout.contains("Aster Guard is on"), "{}", json.stdout);
 }
 
 #[test]
@@ -704,3 +724,49 @@ fn a_sign_in_without_guard_works_as_before() {
 }
 
 const EXIT_NOT_RUNNING: i32 = 3;
+
+#[test]
+fn declined_sign_in_stops_waiting_and_stores_nothing() {
+    let env = Env::new();
+    env.mock.set_code_status(CodeStatus::Denied);
+    let run = env.json(&["login"]);
+    run.expect(5);
+    assert_eq!(run.error_code(), "sign_in_declined");
+    assert!(!env.data.join("guard_pending.json").exists());
+    let status = env.json(&["status"]);
+    status.expect(3);
+    assert_eq!(status.json()["signed_in"], false);
+    assert_eq!(env.mock.login_calls(), 0);
+}
+
+#[test]
+fn declined_sign_in_reads_as_plain_text() {
+    let env = Env::new();
+    env.mock.set_code_status(CodeStatus::Denied);
+    let run = env.run(&["login"]);
+    run.expect(5);
+    let text = format!("{}{}", run.stdout, run.stderr);
+    assert!(text.contains("Someone declined this sign-in"), "{}", text);
+}
+
+#[test]
+fn serve_follows_an_earlier_activation_time_from_the_server() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    let mut serve = env.serve(&[]);
+    let first = serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert_eq!(first["activates_at"], HELD_UNTIL_RFC3339);
+    env.mock.hold_device_until(Some("2029-06-01T08:00:00Z"));
+    let mut seen = false;
+    for _ in 0..5 {
+        let event = serve.wait_event("guard_pending", READY_TIMEOUT);
+        if event["activates_at"] == "2029-06-01T08:00:00+00:00" {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen);
+    env.mock.hold_device_until(None);
+    serve.wait_event("ready", READY_TIMEOUT);
+}

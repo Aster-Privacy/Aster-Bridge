@@ -67,6 +67,7 @@ pub const CODE_NOT_RUNNING: &str = "not_running";
 pub const CODE_ACCESS_REQUIRED: &str = "bridge_access_required";
 pub const CODE_DEVICE_REVOKED: &str = "device_revoked";
 pub const CODE_CODE_EXPIRED: &str = "code_expired";
+pub const CODE_SIGN_IN_DECLINED: &str = "sign_in_declined";
 pub const CODE_SECRET_STORE: &str = "secret_store_unavailable";
 pub const CODE_SECRET_KEY_FILE_MISSING: &str = "secret_key_file_missing";
 pub const CODE_SECRET_KEY_FILE_INVALID: &str = "secret_key_file_invalid";
@@ -373,6 +374,13 @@ pub const CATALOG: &[ErrorDoc] = &[
         exit_code: EXIT_DEVICE,
         summary: "The sign-in code expired before you entered it.",
         resolution: "To get a new code, run: aster-bridge login",
+    },
+    ErrorDoc {
+        reference: "ASTER-5003",
+        code: CODE_SIGN_IN_DECLINED,
+        exit_code: EXIT_DEVICE,
+        summary: "Someone declined this sign-in on another Aster device.",
+        resolution: "If you started this sign-in, run aster-bridge login and approve it on your device.",
     },
     ErrorDoc {
         reference: "ASTER-6001",

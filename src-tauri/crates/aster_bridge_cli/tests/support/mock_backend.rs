@@ -45,6 +45,7 @@ pub enum CodeStatus {
     ActivationPending,
     Pending,
     Expired,
+    Denied,
     Gone,
 }
 
@@ -217,6 +218,7 @@ async fn device_code_status(State(inner): State<Arc<Inner>>) -> Response {
     match status {
         CodeStatus::Pending => Json(json!({ "status": "pending" })).into_response(),
         CodeStatus::Expired => Json(json!({ "status": "expired" })).into_response(),
+        CodeStatus::Denied => Json(json!({ "status": "denied" })).into_response(),
         CodeStatus::Gone => (StatusCode::GONE, Json(json!({ "error": "gone" }))).into_response(),
         CodeStatus::Confirm | CodeStatus::ConfirmForeignPassphrase | CodeStatus::ActivationPending => {
             let passphrase: &[u8] = if status != CodeStatus::ConfirmForeignPassphrase {

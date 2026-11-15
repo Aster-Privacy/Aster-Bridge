@@ -308,6 +308,7 @@ fn announce_pending(ctx: &Context, activates_at: Option<chrono::DateTime<chrono:
     out.banner(Tone::Warn, guard_text::PENDING_LABEL);
     out.blank();
     out.line(guard_text::PENDING_MESSAGE);
+    out.line(guard_text::GUARD_REASON);
     out.line(guard_text::activation_line(activates_at));
     out.line(out.dim(guard_text::SERVE_PENDING_NEXT));
     out.blank();

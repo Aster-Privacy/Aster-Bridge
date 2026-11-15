@@ -21,6 +21,7 @@
 pub const PENDING_LABEL: &str = "Waiting for activation";
 pub const SIGN_IN_AGAIN_LABEL: &str = "Sign in again";
 pub const PENDING_MESSAGE: &str = "This device is waiting for activation.";
+pub const GUARD_REASON: &str = "Aster Guard is on for your account, so new sign-ins wait one hour.";
 pub const SIGN_IN_AGAIN_MESSAGE: &str = "Aster Bridge needs you to sign in again.";
 pub const SIGN_IN_AGAIN_HINT: &str =
     "To continue, run: aster-bridge login. Then approve the sign-in on one of your Aster devices.";
@@ -29,6 +30,9 @@ pub const LOGIN_PENDING_NEXT: &str =
     "To connect your mail apps when the wait ends, run: aster-bridge serve";
 pub const SERVE_PENDING_NEXT: &str =
     "Aster Bridge starts the mail servers when this device is activated.";
+pub const DECLINED_MESSAGE: &str = "Someone declined this sign-in on another Aster device.";
+pub const DECLINED_HINT: &str =
+    "If you started this sign-in, run aster-bridge login and approve it on your device.";
 
 pub fn activation_line(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match activates_at {

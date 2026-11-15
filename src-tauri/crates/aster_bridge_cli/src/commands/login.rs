@@ -39,7 +39,7 @@ use super::common;
 use super::guard_text;
 use crate::context::{self, Context};
 use crate::exit::{
-    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CODE_EXPIRED, CODE_SIGN_IN,
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CODE_EXPIRED, CODE_SIGN_IN, CODE_SIGN_IN_DECLINED,
     CODE_SIGN_IN_CANCELED, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, EXIT_PENDING, LINK_DEVICE_URL,
 };
 use crate::lock::InstanceLock;
@@ -148,6 +148,7 @@ fn hold(ctx: &Context, activates_at: DateTime<Utc>) -> i32 {
         out.banner(Tone::Warn, guard_text::PENDING_LABEL);
         out.blank();
         out.line(guard_text::PENDING_MESSAGE);
+        out.line(guard_text::GUARD_REASON);
         out.line(guard_text::activation_line(Some(activates_at)));
         out.blank();
         out.line(out.dim(guard_text::LOGIN_PENDING_NEXT));
@@ -207,6 +208,12 @@ fn expired(dir: &Path) -> CliError {
         .with_hint("To get a new code, run: aster-bridge login")
 }
 
+fn declined(dir: &Path) -> CliError {
+    state::clear_pending(dir);
+    CliError::new(EXIT_DEVICE, CODE_SIGN_IN_DECLINED, guard_text::DECLINED_MESSAGE)
+        .with_hint(guard_text::DECLINED_HINT)
+}
+
 async fn wait_for_confirmation(
     out: &Output,
     client: &ApiClient,
@@ -258,6 +265,7 @@ async fn wait_for_confirmation(
                 match polled {
                     Ok(SignInPoll::Pending(_)) => {}
                     Ok(SignInPoll::Expired) => break Err(expired(dir)),
+                    Ok(SignInPoll::Denied) => break Err(declined(dir)),
                     Ok(SignInPoll::Confirmed(session)) => break Ok(Confirmation::Signed(session)),
                     Ok(SignInPoll::ActivationPending { activates_at, .. }) => {
                         break Ok(Confirmation::Held(activates_at));

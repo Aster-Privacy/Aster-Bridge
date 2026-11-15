@@ -82,21 +82,21 @@ pub const UNHEALTHY: i32 = 1;
 
 pub async fn healthcheck(ctx: &Context) -> CliResult<i32> {
     let snapshot = snapshot(ctx, false).await?;
-    let (code, text) = if snapshot.pending() {
-        (HEALTHY, "healthy: waiting for this device to be activated")
+    let (code, ready, text) = if snapshot.pending() {
+        (HEALTHY, false, "healthy: waiting for this device to be activated")
     } else if !snapshot.signed_in && crate::lock::WaitingLock::is_held(&ctx.data_dir) {
-        (HEALTHY, "healthy: waiting for you to sign in")
+        (HEALTHY, false, "healthy: waiting for you to sign in")
     } else if !snapshot.signed_in {
-        (UNHEALTHY, "unhealthy: not signed in")
+        (UNHEALTHY, false, "unhealthy: not signed in")
     } else if snapshot.denied() {
-        (UNHEALTHY, "unhealthy: the plan doesn't include Aster Bridge")
+        (UNHEALTHY, false, "unhealthy: the plan doesn't include Aster Bridge")
     } else if !snapshot.running() {
-        (UNHEALTHY, "unhealthy: the mail servers aren't running")
+        (UNHEALTHY, false, "unhealthy: the mail servers aren't running")
     } else {
-        (HEALTHY, "healthy: the mail servers are running")
+        (HEALTHY, true, "healthy: the mail servers are running")
     };
     if ctx.out.json {
-        ctx.out.json(json!({ "healthy": code == HEALTHY, "detail": text }));
+        ctx.out.json(json!({ "healthy": code == HEALTHY, "ready": ready, "detail": text }));
     } else {
         ctx.out.line(text);
     }
@@ -211,6 +211,7 @@ fn render(ctx: &Context, s: &Snapshot) {
         out.banner(Tone::Warn, guard_text::PENDING_LABEL);
         out.blank();
         out.line(guard_text::PENDING_MESSAGE);
+        out.line(guard_text::GUARD_REASON);
         out.line(guard_text::activation_line(s.activates_at));
         if !s.running() {
             out.blank();
