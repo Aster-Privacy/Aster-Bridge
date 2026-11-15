@@ -232,6 +232,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_from_the_current_release_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = serde_json::json!({
+            "account": {"user_id": "8d4f2b1e-3c6a-4e5f-9a7b-1c2d3e4f5a6b", "email": "alex@example.com", "username": "alex"},
+            "plan": {"code": "star", "has_bridge_access": true, "checked_at": 1_700_000_000},
+            "account_state": "active",
+            "ports": {"imap": 1143, "imaps": 1993, "smtp": 1025, "smtps": 1465, "pop3": 1110, "pop3s": 1995, "jmap": 1080, "carddav": 1081},
+            "last_stop": null,
+            "last_sync": {"at": 1_700_000_100, "failed": false},
+            "cache_user_id": "8d4f2b1e-3c6a-4e5f-9a7b-1c2d3e4f5a6b"
+        });
+        std::fs::write(dir.path().join(STATE_FILE), written.to_string()).unwrap();
+        let state = load(dir.path());
+        assert_eq!(state.account.as_ref().unwrap().email, "alex@example.com");
+        assert_eq!(state.account_state, AccountState::Active);
+        assert_eq!(state.ports.unwrap().imap, 1143);
+        assert!(aster_bridge_core::guard::pending::load(dir.path()).is_none());
+    }
+
+    #[test]
     fn missing_or_corrupt_state_loads_as_default() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(dir.path()).account.is_none());

@@ -688,3 +688,19 @@ fn logout_forgets_a_held_sign_in() {
     env.json(&["logout"]).expect(0);
     assert!(!env.data.join("guard_pending.json").exists());
 }
+
+#[test]
+fn a_sign_in_without_guard_works_as_before() {
+    let env = Env::new();
+    let run = env.json(&["login"]);
+    run.expect(0);
+    assert_eq!(run.json()["status"], "signed_in");
+    assert!(!env.data.join("guard_pending.json").exists());
+    let status = env.json(&["status"]);
+    status.expect(EXIT_NOT_RUNNING);
+    assert_eq!(status.json()["signed_in"], true);
+    assert_eq!(status.json()["account_state"], "active");
+    assert!(status.json()["activates_at"].is_null());
+}
+
+const EXIT_NOT_RUNNING: i32 = 3;

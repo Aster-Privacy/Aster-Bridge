@@ -3198,4 +3198,89 @@ mod guard_tests {
         .unwrap();
         assert!(body.get("action_pk").is_none());
     }
+
+    #[test]
+    fn current_backend_device_code_replies_still_parse() {
+        let pending: DeviceCodeStatusResponse =
+            serde_json::from_str(r#"{"status":"pending","device_id":null,"sealed_envelope":null}"#).unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(pending.device_id.is_none() && pending.activates_at.is_none());
+        let expired: DeviceCodeStatusResponse =
+            serde_json::from_str(r#"{"status":"expired","device_id":null,"sealed_envelope":null}"#).unwrap();
+        assert_eq!(expired.status, "expired");
+        let confirmed: DeviceCodeStatusResponse = serde_json::from_str(&format!(
+            r#"{{"status":"confirmed","device_id":"{}","sealed_envelope":"AAEC"}}"#,
+            DEVICE_ID
+        ))
+        .unwrap();
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(confirmed.device_id, Some(Uuid::parse_str(DEVICE_ID).unwrap()));
+        assert_eq!(confirmed.sealed_envelope.as_deref(), Some("AAEC"));
+        assert!(confirmed.activates_at.is_none());
+    }
+
+    #[test]
+    fn current_backend_device_login_reply_still_parses() {
+        let body = serde_json::json!({
+            "user_id": DEVICE_ID,
+            "username": "alex",
+            "email": "alex@example.com",
+            "csrf_token": "csrf",
+            "encrypted_vault": "dmF1bHQ=",
+            "vault_nonce": "bm9uY2U=",
+            "vault_kdf_iterations": 600000,
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "needs_prekey_replenishment": false,
+            "login_challenge_required": null,
+            "challenge_id": null,
+            "is_suspended": null
+        });
+        let parsed: DeviceLoginResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.email, "alex@example.com");
+        assert_eq!(parsed.vault_kdf_iterations, Some(600000));
+        assert_eq!(parsed.access_token.as_deref(), Some("access"));
+    }
+
+    #[test]
+    fn an_old_build_shows_the_fixed_guard_text() {
+        let body = serde_json::json!({
+            "error": crate::guard::error::REQUIRED_TEXT,
+            "code": "GUARD_REQUIRED",
+            "request_id": REQUEST_ID
+        })
+        .to_string();
+        match legacy_error_body(reqwest::StatusCode::FORBIDDEN, &body) {
+            BridgeError::Api(msg) => {
+                assert!(msg.starts_with("403"));
+                assert!(msg.contains(crate::guard::error::REQUIRED_TEXT));
+            }
+            other => panic!("expected Api, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_polls_carry_the_guard_header() {
+        let seen: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let seen_in = seen.clone();
+        let app = Router::new().route(
+            "/core/v1/auth/device/code/status",
+            axum::routing::get(move |headers: AxumHeaderMap| {
+                let seen_in = seen_in.clone();
+                async move {
+                    *seen_in.lock().await = headers
+                        .get("x-aster-guard")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    Json(serde_json::json!({"status": "pending", "device_id": null, "sealed_envelope": null}))
+                        .into_response()
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let reply = client.poll_device_code_status("K7QM4XRT").await.unwrap();
+        assert_eq!(reply.status, "pending");
+        assert_eq!(seen.lock().await.as_deref(), Some("1"));
+    }
 }
