@@ -420,6 +420,10 @@ where
                         writer.write_all(b"-ERR USER required first\r\n").await?;
                         continue;
                     };
+                    if let Some(text) = crate::sign_in_notice::pending_reply() {
+                        writer.write_all(format!("-ERR [SYS/TEMP] {}\r\n", text).as_bytes()).await?;
+                        continue;
+                    }
                     let mut pw_match = passwords.verify_and_id_cached(&name, &args).await;
                     if pw_match.is_some() && !session.read().await.accepts_login_name(&name) {
                         if !refreshed_identities {
@@ -708,6 +712,38 @@ mod tests {
             crate::sign_in_notice::last_insecure().map(|l| l.protocol),
             Some("pop3")
         );
+    }
+
+    #[tokio::test]
+    async fn pass_while_the_device_is_held_is_a_temporary_failure() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending, PENDING_LINE};
+        set_pending(Some(Some(pending_at())));
+        let out = pop3_transcript(
+            "USER tester@aster.test\r\nPASS abcd-efgh-ijkl-mnop\r\nPASS abcd-efgh-ijkl-mnop\r\nQUIT\r\n",
+            false,
+        )
+        .await;
+        set_pending(None);
+        assert_eq!(
+            out.matches(&format!("-ERR [SYS/TEMP] {}\r\n", PENDING_LINE)).count(),
+            2,
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("maildrop ready"), "{:?}", out);
+        assert!(out.contains("+OK"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn without_a_hold_a_wrong_password_is_refused_as_before() {
+        crate::sign_in_notice::test_support::set_pending(None);
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS wrong\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("-ERR Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("SYS/TEMP"), "{:?}", out);
     }
 
     #[tokio::test]
