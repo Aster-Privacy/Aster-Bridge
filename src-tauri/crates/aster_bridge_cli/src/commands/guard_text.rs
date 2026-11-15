@@ -25,14 +25,26 @@ pub const SIGN_IN_AGAIN_MESSAGE: &str = "Aster Bridge needs you to sign in again
 pub const SIGN_IN_AGAIN_HINT: &str =
     "To continue, run: aster-bridge login. Then approve the sign-in on one of your Aster devices.";
 
-pub fn pending_hint(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+pub const LOGIN_PENDING_NEXT: &str =
+    "To connect your mail apps when the wait ends, run: aster-bridge serve";
+pub const SERVE_PENDING_NEXT: &str =
+    "Aster Bridge starts the mail servers when this device is activated.";
+
+pub fn activation_line(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match activates_at {
         Some(at) => format!(
-            "Mail apps can connect after {} UTC. Aster Bridge keeps checking, so you don't need to sign in again.",
+            "Mail apps can connect after {} UTC.",
             at.format("%Y-%m-%d %H:%M")
         ),
-        None => "Mail apps can connect about one hour after you approved this sign-in. Aster Bridge keeps checking, so you don't need to sign in again.".to_string(),
+        None => "Mail apps can connect about one hour after you approved this sign-in.".to_string(),
     }
+}
+
+pub fn pending_hint(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    format!(
+        "{} Aster Bridge keeps checking, so you don't need to sign in again.",
+        activation_line(activates_at)
+    )
 }
 
 #[cfg(test)]

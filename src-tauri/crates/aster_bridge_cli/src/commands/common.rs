@@ -41,7 +41,7 @@ use crate::exit::{
     CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_RECIPIENT_KEY_LOOKUP,
     CODE_RECIPIENT_KEY_MISMATCH, CODE_SETTINGS_READ,
     CODE_SIGN_IN,
-    EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL,
+    EXIT_ACCESS, EXIT_ERROR, EXIT_PENDING, UPGRADE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::title_case;
@@ -79,6 +79,7 @@ pub fn forget_device(data_dir: &Path) {
     let _ = device_identity::clear_device_id(data_dir);
     device_identity::clear_passphrase(data_dir);
     state::clear_pending(data_dir);
+    aster_bridge_core::guard::pending::clear(data_dir);
     save_state(data_dir, |s| {
         s.account = None;
         s.plan = None;
@@ -174,7 +175,12 @@ pub fn account_state_error(account_state: AccountState) -> CliError {
             return CliError::coded(CODE_SIGN_IN, "Aster Mail refused the sign-in.");
         }
     };
-    CliError::new(EXIT_ACCESS, account_state.as_str(), message).with_hint(hint)
+    let exit_code = if account_state == AccountState::GuardPending {
+        EXIT_PENDING
+    } else {
+        EXIT_ACCESS
+    };
+    CliError::new(exit_code, account_state.as_str(), message).with_hint(hint)
 }
 
 pub fn network_error(detail: &str) -> CliError {

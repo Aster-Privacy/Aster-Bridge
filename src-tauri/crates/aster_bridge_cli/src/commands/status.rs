@@ -22,13 +22,16 @@ use std::io::Write;
 use std::time::Duration;
 
 use aster_bridge_core::account_state::AccountState;
+use aster_bridge_core::guard::pending as held_device;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::common;
+use super::guard_text;
 use super::serve::service_rows;
 use crate::context::Context;
 use crate::control;
-use crate::exit::{CliResult, EXIT_ACCESS, EXIT_NOT_READY, EXIT_OK};
+use crate::exit::{CliResult, EXIT_ACCESS, EXIT_NOT_READY, EXIT_OK, EXIT_PENDING};
 use crate::lock::InstanceLock;
 use crate::output::{format_relative, format_timestamp, Tone};
 use crate::secret_backend;
@@ -42,6 +45,7 @@ struct Snapshot {
     signed_in: bool,
     live: Option<Value>,
     refreshed: Option<bool>,
+    activates_at: Option<DateTime<Utc>>,
 }
 
 impl Snapshot {
@@ -50,6 +54,10 @@ impl Snapshot {
             .as_ref()
             .and_then(|v| v["running"].as_bool())
             .unwrap_or(false)
+    }
+
+    fn pending(&self) -> bool {
+        self.state.account_state == AccountState::GuardPending
     }
 
     fn denied(&self) -> bool {
@@ -74,7 +82,9 @@ pub const UNHEALTHY: i32 = 1;
 
 pub async fn healthcheck(ctx: &Context) -> CliResult<i32> {
     let snapshot = snapshot(ctx, false).await?;
-    let (code, text) = if !snapshot.signed_in && crate::lock::WaitingLock::is_held(&ctx.data_dir) {
+    let (code, text) = if snapshot.pending() {
+        (HEALTHY, "healthy: waiting for this device to be activated")
+    } else if !snapshot.signed_in && crate::lock::WaitingLock::is_held(&ctx.data_dir) {
         (HEALTHY, "healthy: waiting for you to sign in")
     } else if !snapshot.signed_in {
         (UNHEALTHY, "unhealthy: not signed in")
@@ -117,11 +127,17 @@ async fn snapshot(ctx: &Context, refresh: bool) -> CliResult<Snapshot> {
     }
     let state = state::load(dir);
     let signed_in = state.account.is_some() && secret_backend::has_record(dir);
+    let activates_at = if state.account_state == AccountState::GuardPending {
+        held_device::load(dir).map(|held| held.activates_at)
+    } else {
+        None
+    };
     Ok(Snapshot {
         state,
         signed_in,
         live,
         refreshed,
+        activates_at,
     })
 }
 
@@ -139,7 +155,9 @@ async fn refresh_offline(ctx: &Context) -> CliResult<bool> {
 }
 
 fn exit_code(snapshot: &Snapshot) -> i32 {
-    if !snapshot.signed_in {
+    if snapshot.pending() {
+        EXIT_PENDING
+    } else if !snapshot.signed_in {
         EXIT_NOT_READY
     } else if snapshot.denied() {
         EXIT_ACCESS
@@ -159,6 +177,7 @@ fn to_json(ctx: &Context, s: &Snapshot) -> Value {
         "account": if s.signed_in { json!(s.state.account) } else { Value::Null },
         "plan": s.state.plan,
         "account_state": s.state.account_state,
+        "activates_at": s.activates_at.map(|at| at.to_rfc3339()),
         "last_sync": s.state.last_sync,
         "last_stop": s.state.last_stop,
         "pid": pick("pid"),
@@ -186,6 +205,17 @@ fn render(ctx: &Context, s: &Snapshot) {
     let out = &ctx.out;
     if out.json {
         out.json(to_json(ctx, s));
+        return;
+    }
+    if !s.signed_in && s.pending() {
+        out.banner(Tone::Warn, guard_text::PENDING_LABEL);
+        out.blank();
+        out.line(guard_text::PENDING_MESSAGE);
+        out.line(guard_text::activation_line(s.activates_at));
+        if !s.running() {
+            out.blank();
+            out.line(guard_text::LOGIN_PENDING_NEXT);
+        }
         return;
     }
     if !s.signed_in {
@@ -243,7 +273,10 @@ fn render(ctx: &Context, s: &Snapshot) {
     if s.state.account_state != AccountState::Active {
         rows.push((
             "Account status",
-            out.tone(common::account_state_label(s.state.account_state), Tone::Bad),
+            out.tone(
+                common::account_state_label(s.state.account_state),
+                if s.pending() { Tone::Warn } else { Tone::Bad },
+            ),
         ));
     }
     rows.push((
@@ -313,6 +346,8 @@ fn render(ctx: &Context, s: &Snapshot) {
     }
     if denied {
         hints.push(common::upgrade_then_refresh_hint());
+    } else if s.pending() {
+        hints.push(guard_text::pending_hint(s.activates_at));
     } else if s.state.account_state != AccountState::Active {
         if let Some(hint) = common::account_state_error(s.state.account_state).hint {
             hints.push(hint);

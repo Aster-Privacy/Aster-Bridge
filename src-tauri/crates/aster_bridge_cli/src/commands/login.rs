@@ -21,10 +21,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aster_bridge_core::account_state::AccountState;
+use aster_bridge_core::account_state::{self, AccountState};
 use aster_bridge_core::api_client::ApiClient;
 use aster_bridge_core::auth::device_identity::{self, DeviceIdentity};
-use aster_bridge_core::auth::session::Session;
+use aster_bridge_core::auth::session::{self, Session};
+use aster_bridge_core::guard::pending as held_device;
+use chrono::{DateTime, Utc};
 use aster_bridge_core::db::Database;
 use aster_bridge_core::error::BridgeError;
 use aster_bridge_core::ops::{self, SignInPoll};
@@ -34,10 +36,11 @@ use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
 
 use super::common;
+use super::guard_text;
 use crate::context::{self, Context};
 use crate::exit::{
     CliError, CliResult, CODE_CACHE_REBUILD, CODE_CODE_EXPIRED, CODE_SIGN_IN,
-    CODE_SIGN_IN_CANCELED, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, LINK_DEVICE_URL,
+    CODE_SIGN_IN_CANCELED, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, EXIT_PENDING, LINK_DEVICE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::{Output, Tone};
@@ -78,6 +81,13 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
         .map_err(|e| map_store_error("Couldn't create the device identity", e))?;
     let client = context::api_client();
 
+    if let Some(held) = held_device::load(&dir) {
+        if identity.device_id == Some(held.device_id) {
+            return resume_held(ctx, &client, &identity).await;
+        }
+        held_device::clear(&dir);
+    }
+
     let pending = match state::load_pending(&dir) {
         Some(pending) if pending.expires_at - state::now() > PENDING_REUSE_MARGIN => pending,
         _ => {
@@ -100,9 +110,49 @@ pub async fn run(ctx: &Context, no_wait: bool) -> CliResult<i32> {
         return Ok(EXIT_OK);
     }
 
-    let session = wait_for_confirmation(&out, &client, &mut identity, &dir, &pending).await?;
-    drop(identity);
-    finish(ctx, &client, session).await
+    match wait_for_confirmation(&out, &client, &mut identity, &dir, &pending).await? {
+        Confirmation::Signed(session) => {
+            drop(identity);
+            finish(ctx, &client, *session).await
+        }
+        Confirmation::Held(activates_at) => Ok(hold(ctx, activates_at)),
+    }
+}
+
+enum Confirmation {
+    Signed(Box<Session>),
+    Held(DateTime<Utc>),
+}
+
+async fn resume_held(ctx: &Context, client: &ApiClient, identity: &DeviceIdentity) -> CliResult<i32> {
+    let config = common::load_config()?;
+    match session::restore_or_login(&config, identity, client).await {
+        Ok(session) => finish(ctx, client, session).await,
+        Err(BridgeError::GuardPending { activates_at, .. }) => Ok(hold(ctx, activates_at)),
+        Err(error) => Err(common::map_login_error(&ctx.data_dir, error)),
+    }
+}
+
+fn hold(ctx: &Context, activates_at: DateTime<Utc>) -> i32 {
+    let out = &ctx.out;
+    state::clear_pending(&ctx.data_dir);
+    account_state::record_pending(activates_at);
+    common::save_state(&ctx.data_dir, |s| s.account_state = AccountState::GuardPending);
+    if out.json {
+        out.json(json!({
+            "status": "activation_pending",
+            "activates_at": activates_at.to_rfc3339(),
+        }));
+    } else {
+        out.blank();
+        out.banner(Tone::Warn, guard_text::PENDING_LABEL);
+        out.blank();
+        out.line(guard_text::PENDING_MESSAGE);
+        out.line(guard_text::activation_line(Some(activates_at)));
+        out.blank();
+        out.line(out.dim(guard_text::LOGIN_PENDING_NEXT));
+    }
+    EXIT_PENDING
 }
 
 fn request_error(error: BridgeError) -> CliError {
@@ -163,7 +213,7 @@ async fn wait_for_confirmation(
     identity: &mut DeviceIdentity,
     dir: &Path,
     pending: &PendingLogin,
-) -> CliResult<Session> {
+) -> CliResult<Confirmation> {
     let animated = out.animates();
     let mut poll = tokio::time::interval(context::login_poll_interval());
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -208,10 +258,9 @@ async fn wait_for_confirmation(
                 match polled {
                     Ok(SignInPoll::Pending(_)) => {}
                     Ok(SignInPoll::Expired) => break Err(expired(dir)),
-                    Ok(SignInPoll::Confirmed(session)) => break Ok(*session),
-                    Ok(SignInPoll::ActivationPending { .. }) => {
-                        state::clear_pending(dir);
-                        break Err(CliError::coded(CODE_SIGN_IN, "This sign-in is waiting for activation."));
+                    Ok(SignInPoll::Confirmed(session)) => break Ok(Confirmation::Signed(session)),
+                    Ok(SignInPoll::ActivationPending { activates_at, .. }) => {
+                        break Ok(Confirmation::Held(activates_at));
                     }
                     Err(BridgeError::Network(e)) => {
                         if !warned {
@@ -250,6 +299,7 @@ async fn finish(ctx: &Context, client: &ApiClient, session: Session) -> CliResul
     let dir = &ctx.data_dir;
     let out = &ctx.out;
     state::clear_pending(dir);
+    account_state::clear_guard_state();
 
     let profile = client.get_user_profile(session.access_token.as_str()).await.ok();
     let user_id = profile

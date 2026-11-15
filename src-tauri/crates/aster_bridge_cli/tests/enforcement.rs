@@ -600,3 +600,91 @@ fn logout_keeping_the_cache_still_deletes_old_copies() {
         ]
     );
 }
+
+const HELD_UNTIL: &str = "2030-01-01T10:00:00Z";
+const HELD_UNTIL_RFC3339: &str = "2030-01-01T10:00:00+00:00";
+
+fn hold_new_sign_in(env: &Env) {
+    env.mock.hold_device_until(Some(HELD_UNTIL));
+    env.mock.set_code_status(CodeStatus::ActivationPending);
+}
+
+#[test]
+fn login_reports_the_activation_wait_and_finishes_after_it() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let run = env.json(&["login"]);
+    run.expect(8);
+    let body = run.json();
+    assert_eq!(body["status"], "activation_pending");
+    assert_eq!(body["activates_at"], HELD_UNTIL_RFC3339);
+    assert!(!run.stdout.contains("mock-access-token"));
+    assert!(!run.stdout.contains("mock-refresh-token"));
+
+    let status = env.json(&["status"]);
+    status.expect(8);
+    assert_eq!(status.json()["account_state"], "guard_pending");
+    assert_eq!(status.json()["activates_at"], HELD_UNTIL_RFC3339);
+    assert_eq!(status.json()["signed_in"], false);
+
+    let codes = env.mock.code_requests().len();
+    env.json(&["login"]).expect(8);
+    assert_eq!(env.mock.code_requests().len(), codes);
+
+    env.mock.hold_device_until(None);
+    let done = env.json(&["login"]);
+    done.expect(0);
+    assert_eq!(done.json()["status"], "signed_in");
+    assert_eq!(env.mock.code_requests().len(), codes);
+    let status = env.json(&["status"]);
+    assert_eq!(status.json()["signed_in"], true);
+    assert_eq!(status.json()["account_state"], "active");
+    assert!(status.json()["activates_at"].is_null());
+}
+
+#[test]
+fn login_names_the_activation_time_in_plain_text() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let run = env.run(&["login"]);
+    run.expect(8);
+    assert!(run.stdout.contains("Waiting for activation"), "{}", run.stdout);
+    assert!(run.stdout.contains("2030-01-01 10:00 UTC"), "{}", run.stdout);
+    assert!(run.stdout.contains("aster-bridge serve"), "{}", run.stdout);
+    let status = env.run(&["status"]);
+    status.expect(8);
+    assert!(status.stdout.contains("Waiting for activation"), "{}", status.stdout);
+}
+
+#[test]
+fn serve_waits_for_activation_and_then_starts() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    let imap = env.config_port("imap_port");
+    let mut serve = env.serve(&[]);
+    let first = serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert_eq!(first["activates_at"], HELD_UNTIL_RFC3339);
+    let calls = env.mock.login_calls();
+    serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert!(env.mock.login_calls() > calls);
+    assert!(serve.is_running());
+    assert!(!port_open(imap));
+
+    env.mock.hold_device_until(None);
+    let ready = serve.wait_event("ready", READY_TIMEOUT);
+    assert_eq!(ready["account"], TEST_EMAIL);
+    assert!(port_open(imap));
+    let status = env.json(&["status"]);
+    status.expect(0);
+    assert_eq!(status.json()["account_state"], "active");
+}
+
+#[test]
+fn logout_forgets_a_held_sign_in() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    env.json(&["logout"]).expect(0);
+    assert!(!env.data.join("guard_pending.json").exists());
+}

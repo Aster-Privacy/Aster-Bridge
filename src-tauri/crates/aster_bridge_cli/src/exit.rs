@@ -28,6 +28,7 @@ pub const EXIT_ACCESS: i32 = 4;
 pub const EXIT_DEVICE: i32 = 5;
 pub const EXIT_SECRET_STORE: i32 = 6;
 pub const EXIT_LOCKED: i32 = 7;
+pub const EXIT_PENDING: i32 = 8;
 
 pub const UPGRADE_URL: &str = "https://app.astermail.org/settings/billing";
 pub const LINK_DEVICE_URL: &str = "https://app.astermail.org/link-device";
@@ -73,6 +74,8 @@ pub const CODE_PORT_UNAVAILABLE: &str = "port_unavailable";
 pub const CODE_OUTBOX_ALREADY_SENT: &str = "outbox_already_sent";
 pub const CODE_LOCKED: &str = "locked";
 pub const CODE_NOT_FOUND: &str = "not_found";
+pub const CODE_SIGN_IN_AGAIN: &str = "sign_in_again";
+pub const CODE_GUARD_PENDING: &str = "guard_pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorDoc {
@@ -351,6 +354,13 @@ pub const CATALOG: &[ErrorDoc] = &[
         resolution: "Turn on two-factor authentication at app.astermail.org/settings.",
     },
     ErrorDoc {
+        reference: "ASTER-4005",
+        code: CODE_SIGN_IN_AGAIN,
+        exit_code: EXIT_ACCESS,
+        summary: "Aster Bridge needs you to sign in again.",
+        resolution: "Run aster-bridge login, then approve the sign-in on one of your Aster devices.",
+    },
+    ErrorDoc {
         reference: "ASTER-5001",
         code: CODE_DEVICE_REVOKED,
         exit_code: EXIT_DEVICE,
@@ -391,6 +401,13 @@ pub const CATALOG: &[ErrorDoc] = &[
         exit_code: EXIT_LOCKED,
         summary: "Another Aster Bridge process is using this data folder.",
         resolution: "Stop the other process, or pass --data-dir to use a folder of your own.",
+    },
+    ErrorDoc {
+        reference: "ASTER-8001",
+        code: CODE_GUARD_PENDING,
+        exit_code: EXIT_PENDING,
+        summary: "This device is waiting for activation after you approved the sign-in.",
+        resolution: "Mail apps can connect about one hour after you approve the sign-in. To connect them when the wait ends, run: aster-bridge serve",
     },
 ];
 
@@ -499,7 +516,7 @@ impl CliError {
                 .get("exit_code")
                 .and_then(Value::as_i64)
                 .and_then(|c| i32::try_from(c).ok())
-                .filter(|c| (EXIT_OK..=EXIT_LOCKED).contains(c))
+                .filter(|c| (EXIT_OK..=EXIT_PENDING).contains(c))
                 .unwrap_or(EXIT_ERROR),
             code: text("code").unwrap_or_else(|| "error".to_string()),
             message: text("message").unwrap_or_else(|| "Aster Bridge returned an error.".to_string()),
@@ -559,6 +576,17 @@ mod tests {
         assert_eq!(err.exit_code, EXIT_ERROR);
         assert_eq!(err.reference(), Some("ASTER-1005"));
         assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn a_pending_device_keeps_its_own_exit_code() {
+        let err = CliError::new(EXIT_PENDING, CODE_GUARD_PENDING, "This device is waiting for activation.");
+        assert_eq!(err.reference(), Some("ASTER-8001"));
+        let restored = CliError::from_json(&err.to_json());
+        assert_eq!(restored.exit_code, EXIT_PENDING);
+        assert_eq!(restored.code, CODE_GUARD_PENDING);
+        assert_eq!(lookup("aster-8001").unwrap().exit_code, EXIT_PENDING);
+        assert_eq!(lookup(CODE_SIGN_IN_AGAIN).unwrap().exit_code, EXIT_ACCESS);
     }
 
     #[test]

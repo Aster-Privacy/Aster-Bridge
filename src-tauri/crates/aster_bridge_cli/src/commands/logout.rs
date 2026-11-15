@@ -76,6 +76,7 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
         let _ = std::fs::remove_file(dir.join(name));
     }
     state::clear_pending(dir);
+    aster_bridge_core::guard::pending::clear(dir);
 
     if keep_cache {
         let kept = CliState {
