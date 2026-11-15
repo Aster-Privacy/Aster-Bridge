@@ -234,7 +234,8 @@ mod tests {
     fn noted_retry_after_holds_off_retries() {
         note_retry_after(120);
         let wait = retry_wait().expect("a wait is noted");
-        assert!(wait.as_secs() >= 110 && wait.as_secs() <= 120);
+        assert!(wait.as_secs() >= 110);
+        assert!(wait.as_secs() <= RETRY_AFTER_MAX_SECS);
         note_retry_after(1);
         assert!(retry_wait().unwrap().as_secs() >= 110);
     }

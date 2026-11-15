@@ -20,10 +20,15 @@
 //
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
 use crate::api_client::{ApiClient, DeviceCodeRequest};
 use crate::auth::device_identity::{self, DeviceIdentity};
 use crate::auth::session::{self, Session};
 use crate::error::{BridgeError, Result};
+use crate::guard::pending::{self, PendingActivation};
 use crate::runtime::ClientProfile;
 
 pub const DEVICE_TYPE: &str = "bridge";
@@ -81,6 +86,36 @@ pub enum SignInPoll {
     Pending(String),
     Expired,
     Confirmed(Box<Session>),
+    ActivationPending {
+        device_id: Uuid,
+        activates_at: DateTime<Utc>,
+    },
+}
+
+fn hold_for_activation(
+    identity: &mut DeviceIdentity,
+    data_dir: &Path,
+    device_id: Uuid,
+    passphrase: &[u8],
+    activates_at: DateTime<Utc>,
+    change_id: Option<Uuid>,
+) -> Result<SignInPoll> {
+    device_identity::set_device_id(data_dir, device_id).map_err(BridgeError::Auth)?;
+    device_identity::store_passphrase(data_dir, passphrase).map_err(BridgeError::Auth)?;
+    identity.device_id = Some(device_id);
+    pending::save(
+        data_dir,
+        &PendingActivation {
+            device_id,
+            activates_at,
+            change_id,
+        },
+    )
+    .map_err(BridgeError::Auth)?;
+    Ok(SignInPoll::ActivationPending {
+        device_id,
+        activates_at,
+    })
 }
 
 pub async fn poll_device_sign_in(
@@ -90,18 +125,56 @@ pub async fn poll_device_sign_in(
     normalized_code: &str,
 ) -> Result<SignInPoll> {
     let status = client.poll_device_code_status(normalized_code).await?;
-    match status.status.as_str() {
-        "confirmed" => {
+    let state = status.status.as_str();
+    match state {
+        "confirmed" | "activation_pending" => {
             let device_id = status
                 .device_id
                 .ok_or_else(|| BridgeError::Auth("no device_id in confirmation".to_string()))?;
             let sealed_envelope = status
                 .sealed_envelope
                 .ok_or_else(|| BridgeError::Auth("no sealed envelope in confirmation".to_string()))?;
-            let passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
-                .map_err(BridgeError::Crypto)?;
-            let session =
-                session::login_with_passphrase(identity, device_id, passphrase, client).await?;
+            let passphrase = Zeroizing::new(
+                device_identity::unseal_vault_envelope(identity, &sealed_envelope)
+                    .map_err(BridgeError::Crypto)?,
+            );
+            if state == "activation_pending" {
+                if let Some(activates_at) = status.activates_at {
+                    return hold_for_activation(
+                        identity,
+                        data_dir,
+                        device_id,
+                        &passphrase,
+                        activates_at,
+                        None,
+                    );
+                }
+            }
+            let session = match session::login_with_passphrase(
+                identity,
+                device_id,
+                passphrase.to_vec(),
+                client,
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(BridgeError::GuardPending {
+                    device_id: held_device_id,
+                    activates_at,
+                    change_id,
+                }) if held_device_id == device_id => {
+                    return hold_for_activation(
+                        identity,
+                        data_dir,
+                        device_id,
+                        &passphrase,
+                        activates_at,
+                        change_id,
+                    );
+                }
+                Err(e) => return Err(e),
+            };
             if session.identity_key.is_none() {
                 return Err(BridgeError::Auth(
                     "the sign-in did not unlock this account".to_string(),
@@ -111,6 +184,7 @@ pub async fn poll_device_sign_in(
             device_identity::store_passphrase(data_dir, &session.vault_passphrase)
                 .map_err(BridgeError::Auth)?;
             identity.device_id = Some(device_id);
+            pending::clear(data_dir);
             Ok(SignInPoll::Confirmed(Box::new(session)))
         }
         "expired" => Ok(SignInPoll::Expired),
@@ -154,5 +228,217 @@ mod tests {
         assert!(validate_port(27017).is_err());
         assert!(validate_port(1024).is_ok());
         assert!(validate_port(1143).is_ok());
+    }
+
+    mod guard_flow {
+        use super::*;
+        use crate::config::BridgeConfig;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const CHANGE_ID: &str = "11111111-2222-4333-8444-555555555555";
+        const ACTIVATES_AT: &str = "2026-11-15T11:00:00Z";
+        const PASSPHRASE: &[u8] = b"correct horse battery staple";
+
+        struct Mock {
+            status: serde_json::Value,
+            login_pending: AtomicBool,
+            challenges: AtomicUsize,
+        }
+
+        async fn spawn(mock: Arc<Mock>) -> String {
+            let status_mock = mock.clone();
+            let challenge_mock = mock.clone();
+            let login_mock = mock.clone();
+            let app = Router::new()
+                .route(
+                    "/core/v1/auth/device/code/status",
+                    get(move || {
+                        let mock = status_mock.clone();
+                        async move { Json(mock.status.clone()) }
+                    }),
+                )
+                .route(
+                    "/core/v1/auth/device/challenge",
+                    post(move || {
+                        let mock = challenge_mock.clone();
+                        async move {
+                            mock.challenges.fetch_add(1, Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "challenge_id": Uuid::new_v4(),
+                                "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                                "expires_in": 60,
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/core/v1/auth/device/login",
+                    post(move || {
+                        let mock = login_mock.clone();
+                        async move {
+                            let device_id = mock.status["device_id"].clone();
+                            if mock.login_pending.load(Ordering::SeqCst) {
+                                (
+                                    StatusCode::FORBIDDEN,
+                                    Json(serde_json::json!({
+                                        "error": "This device is waiting for activation.",
+                                        "code": "GUARD_DEVICE_PENDING",
+                                        "details": {"device_id": device_id, "activates_at": ACTIVATES_AT, "change_id": CHANGE_ID},
+                                    })),
+                                )
+                                    .into_response()
+                            } else {
+                                Json(serde_json::json!({
+                                    "user_id": Uuid::new_v4(),
+                                    "username": "sample",
+                                    "email": "sample@example.invalid",
+                                    "access_token": "access-sample",
+                                    "refresh_token": "refresh-sample",
+                                    "encrypted_vault": "AAAA",
+                                    "vault_nonce": "AAAA",
+                                }))
+                                .into_response()
+                            }
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("http://127.0.0.1:{}", port)
+        }
+
+        fn sealed_for(identity: &DeviceIdentity) -> String {
+            let (ed, mlkem, x) = device_identity::get_pubkeys(identity);
+            device_identity::seal_vault_envelope(&ed, &mlkem, &x, PASSPHRASE, 2).unwrap()
+        }
+
+        fn activates_at() -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(ACTIVATES_AT).unwrap().with_timezone(&Utc)
+        }
+
+        fn mock_with(status: serde_json::Value) -> Arc<Mock> {
+            Arc::new(Mock {
+                status,
+                login_pending: AtomicBool::new(true),
+                challenges: AtomicUsize::new(0),
+            })
+        }
+
+        #[tokio::test]
+        async fn activation_pending_status_stores_credentials_without_signing_in() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let device_id = Uuid::new_v4();
+            let mock = mock_with(serde_json::json!({
+                "status": "activation_pending",
+                "device_id": device_id,
+                "sealed_envelope": sealed_for(&identity),
+                "activates_at": ACTIVATES_AT,
+            }));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(
+                result,
+                SignInPoll::ActivationPending { device_id: id, activates_at: at } if id == device_id && at == activates_at()
+            ));
+            assert_eq!(mock.challenges.load(Ordering::SeqCst), 0);
+            assert_eq!(identity.device_id, Some(device_id));
+            assert_eq!(
+                device_identity::load_passphrase(dir.path()).unwrap().as_deref(),
+                Some(PASSPHRASE)
+            );
+            let reloaded = device_identity::get_or_create_identity(dir.path()).unwrap();
+            assert_eq!(reloaded.device_id, Some(device_id));
+            let record = pending::load(dir.path()).unwrap();
+            assert_eq!(record.device_id, device_id);
+            assert_eq!(record.activates_at, activates_at());
+        }
+
+        #[tokio::test]
+        async fn confirmed_sign_in_held_by_the_server_waits_for_activation() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let device_id = Uuid::new_v4();
+            let mock = mock_with(serde_json::json!({
+                "status": "confirmed",
+                "device_id": device_id,
+                "sealed_envelope": sealed_for(&identity),
+            }));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::ActivationPending { .. }));
+            assert_eq!(mock.challenges.load(Ordering::SeqCst), 1);
+            let record = pending::load(dir.path()).unwrap();
+            assert_eq!(record.change_id.map(|id| id.to_string()).as_deref(), Some(CHANGE_ID));
+            assert_eq!(
+                device_identity::load_passphrase(dir.path()).unwrap().as_deref(),
+                Some(PASSPHRASE)
+            );
+        }
+
+        #[tokio::test]
+        async fn activation_pending_without_a_time_signs_in_like_confirmed() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let device_id = Uuid::new_v4();
+            let mock = mock_with(serde_json::json!({
+                "status": "activation_pending",
+                "device_id": device_id,
+                "sealed_envelope": sealed_for(&identity),
+            }));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::ActivationPending { .. }));
+            assert_eq!(mock.challenges.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn restore_records_the_hold_and_clears_it_once_active() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let device_id = Uuid::new_v4();
+            device_identity::set_device_id(dir.path(), device_id).unwrap();
+            device_identity::store_passphrase(dir.path(), PASSPHRASE).unwrap();
+            identity.device_id = Some(device_id);
+            let mock = mock_with(serde_json::json!({"device_id": device_id}));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let config = BridgeConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..BridgeConfig::default()
+            };
+            let err = session::restore_or_login(&config, &identity, &client)
+                .await
+                .err()
+                .expect("the server holds the device");
+            assert!(matches!(err, BridgeError::GuardPending { .. }));
+            assert_eq!(pending::load(dir.path()).unwrap().device_id, device_id);
+            assert_eq!(
+                device_identity::load_passphrase(dir.path()).unwrap().as_deref(),
+                Some(PASSPHRASE)
+            );
+            mock.login_pending.store(false, Ordering::SeqCst);
+            session::restore_or_login(&config, &identity, &client)
+                .await
+                .expect("the device is active");
+            assert_eq!(pending::load(dir.path()), None);
+        }
     }
 }

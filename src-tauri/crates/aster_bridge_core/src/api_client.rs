@@ -574,6 +574,8 @@ pub struct DeviceCodeStatusResponse {
     pub status: String,
     pub device_id: Option<Uuid>,
     pub sealed_envelope: Option<String>,
+    #[serde(default)]
+    pub activates_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3164,5 +3166,36 @@ mod guard_tests {
         assert!(matches!(err, BridgeError::Api(ref msg) if msg.starts_with("429")));
         assert_eq!(seen.lock().await.as_deref(), Some("1"));
         assert!(crate::guard::error::retry_wait().unwrap().as_secs() >= 590);
+    }
+
+    #[test]
+    fn device_code_status_reads_an_optional_activation_time() {
+        let with_time: DeviceCodeStatusResponse = serde_json::from_str(&format!(
+            r#"{{"status":"activation_pending","device_id":"{}","sealed_envelope":"AA","activates_at":"2026-11-15T11:00:00Z"}}"#,
+            DEVICE_ID
+        ))
+        .unwrap();
+        assert_eq!(with_time.status, "activation_pending");
+        assert_eq!(
+            with_time.activates_at.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-11-15T11:00:00+00:00")
+        );
+        let without: DeviceCodeStatusResponse =
+            serde_json::from_str(r#"{"status":"pending"}"#).unwrap();
+        assert_eq!(without.activates_at, None);
+    }
+
+    #[test]
+    fn device_code_request_never_sends_an_action_key() {
+        let body = serde_json::to_value(DeviceCodeRequest {
+            ed25519_pk: "ed".to_string(),
+            mlkem_pk: "kem".to_string(),
+            x25519_pk: "x".to_string(),
+            machine_name: "Desktop".to_string(),
+            device_type: "bridge".to_string(),
+            envelope_versions: vec![1, 2],
+        })
+        .unwrap();
+        assert!(body.get("action_pk").is_none());
     }
 }

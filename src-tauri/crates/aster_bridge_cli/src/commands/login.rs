@@ -209,6 +209,10 @@ async fn wait_for_confirmation(
                     Ok(SignInPoll::Pending(_)) => {}
                     Ok(SignInPoll::Expired) => break Err(expired(dir)),
                     Ok(SignInPoll::Confirmed(session)) => break Ok(*session),
+                    Ok(SignInPoll::ActivationPending { .. }) => {
+                        state::clear_pending(dir);
+                        break Err(CliError::coded(CODE_SIGN_IN, "This sign-in is waiting for activation."));
+                    }
                     Err(BridgeError::Network(e)) => {
                         if !warned {
                             spinner.clear();

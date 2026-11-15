@@ -466,7 +466,36 @@ pub async fn restore_or_login(
         .map_err(BridgeError::Auth)?
         .ok_or_else(|| BridgeError::Auth("no stored passphrase - first-time setup required".to_string()))?;
 
-    login_with_passphrase(identity, device_id, passphrase, client).await
+    match login_with_passphrase(identity, device_id, passphrase, client).await {
+        Ok(session) => {
+            crate::guard::pending::clear(&config.data_dir);
+            Ok(session)
+        }
+        Err(BridgeError::GuardPending {
+            device_id: held_device_id,
+            activates_at,
+            change_id,
+        }) => {
+            if held_device_id == device_id {
+                if let Err(e) = crate::guard::pending::save(
+                    &config.data_dir,
+                    &crate::guard::pending::PendingActivation {
+                        device_id,
+                        activates_at,
+                        change_id,
+                    },
+                ) {
+                    tracing::warn!("couldn't save the pending activation record: {}", e);
+                }
+            }
+            Err(BridgeError::GuardPending {
+                device_id: held_device_id,
+                activates_at,
+                change_id,
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn login_with_passphrase(

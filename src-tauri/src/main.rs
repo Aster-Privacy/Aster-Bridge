@@ -675,6 +675,16 @@ async fn check_setup_status(state: State<'_, AppState>) -> Result<SetupStatusRes
             status,
             done: false,
         }),
+        ops::SignInPoll::ActivationPending { .. } => {
+            guard.pending_code = None;
+            guard.pending_code_normalized = None;
+            guard.pending_expires_in = None;
+
+            Ok(SetupStatusResponse {
+                status: "activation_pending".to_string(),
+                done: true,
+            })
+        }
     }
 }
 
