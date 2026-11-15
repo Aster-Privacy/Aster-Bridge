@@ -42,6 +42,7 @@ fn default_headers() -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("x-aster-client", reqwest::header::HeaderValue::from_static("aster-bridge"));
     headers.insert(VAULT_LEVEL_HEADER, reqwest::header::HeaderValue::from_static(VAULT_LEVEL));
+    headers.insert(crate::guard::error::GUARD_HEADER, reqwest::header::HeaderValue::from_static("1"));
     headers
 }
 
@@ -78,8 +79,46 @@ fn urlencoding_path(segment: &str) -> String {
 
 async fn map_response_error(resp: reqwest::Response) -> BridgeError {
     let status = resp.status();
+    let retry_after = crate::guard::error::parse_retry_after_header(
+        resp.headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+    );
     let body = resp.text().await.unwrap_or_default();
-    map_error_body(status, &body)
+    map_error_parts(status, &body, retry_after)
+}
+
+fn map_guard_signal(status: reqwest::StatusCode, signal: crate::guard::error::GuardSignal) -> BridgeError {
+    use crate::guard::error::GuardSignal;
+    match signal {
+        GuardSignal::Required { message } => BridgeError::GuardRequired(message),
+        GuardSignal::Pending { device_id, activates_at, change_id } => BridgeError::GuardPending {
+            device_id,
+            activates_at,
+            change_id,
+        },
+        GuardSignal::Throttled { message, retry_after_secs } => {
+            if let Some(secs) = retry_after_secs {
+                crate::guard::error::note_retry_after(secs);
+            }
+            BridgeError::Api(format!("{}: {}", status, message))
+        }
+        GuardSignal::Other { message } => BridgeError::Api(format!("{}: {}", status, message)),
+    }
+}
+
+fn map_error_parts(status: reqwest::StatusCode, body: &str, retry_after: Option<u64>) -> BridgeError {
+    if let Some(signal) = crate::guard::error::parse_guard_signal(body, retry_after) {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            crate::auth::session::request_token_refresh();
+        }
+        return map_guard_signal(status, signal);
+    }
+    legacy_error_body(status, body)
+}
+
+fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
+    map_error_parts(status, body, None)
 }
 
 fn is_plan_limit_error(status: reqwest::StatusCode, body: &str) -> bool {
@@ -95,7 +134,7 @@ fn is_plan_limit_error(status: reqwest::StatusCode, body: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn map_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
+fn legacy_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
     if status == reqwest::StatusCode::UNAUTHORIZED {
         crate::auth::session::request_token_refresh();
     }
@@ -2978,5 +3017,152 @@ mod tests {
         assert!(item.ephemeral_key.is_none());
         assert!(item.thread_token.is_none());
         assert!(item.is_spam.is_none());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use axum::http::{HeaderMap as AxumHeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Json, Router};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    const REQUEST_ID: &str = "00112233-4455-6677-8899-aabbccddeeff";
+    const DEVICE_ID: &str = "8d4f2b1e-3c6a-4e5f-9a7b-1c2d3e4f5a6b";
+    const CHANGE_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    async fn spawn(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn sample_login() -> DeviceLoginRequest {
+        DeviceLoginRequest {
+            challenge_id: Uuid::parse_str(DEVICE_ID).unwrap(),
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn guard_required_maps_to_its_own_variant_without_the_token() {
+        let body = serde_json::json!({
+            "error": crate::guard::error::REQUIRED_TEXT,
+            "code": "GUARD_REQUIRED",
+            "details": {"request_id": REQUEST_ID, "guard_token": "gt-hidden-value", "expires_at": "2026-11-15T10:00:00Z", "methods": ["number"]},
+            "request_id": REQUEST_ID,
+            "guard_token": "gt-hidden-value",
+        })
+        .to_string();
+        let err = map_error_body(reqwest::StatusCode::FORBIDDEN, &body);
+        match &err {
+            BridgeError::GuardRequired(msg) => assert_eq!(msg, crate::guard::error::REQUIRED_TEXT),
+            other => panic!("expected GuardRequired, got {:?}", other),
+        }
+        assert!(!err.to_string().contains("gt-hidden-value"));
+        assert!(!format!("{:?}", err).contains("gt-hidden-value"));
+        assert!(!crate::runtime::is_definitive_device_failure(&err));
+    }
+
+    #[test]
+    fn guard_device_pending_carries_the_hold() {
+        let body = serde_json::json!({
+            "error": "This device is waiting for activation.",
+            "code": "GUARD_DEVICE_PENDING",
+            "details": {"device_id": DEVICE_ID, "activates_at": "2026-11-15T11:00:00Z", "change_id": CHANGE_ID},
+        })
+        .to_string();
+        match map_error_body(reqwest::StatusCode::FORBIDDEN, &body) {
+            BridgeError::GuardPending { device_id, activates_at, change_id } => {
+                assert_eq!(device_id.to_string(), DEVICE_ID);
+                assert_eq!(activates_at.to_rfc3339(), "2026-11-15T11:00:00+00:00");
+                assert_eq!(change_id.map(|id| id.to_string()).as_deref(), Some(CHANGE_ID));
+            }
+            other => panic!("expected GuardPending, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn guard_held_stays_an_api_error_with_its_text() {
+        for status in [reqwest::StatusCode::CONFLICT, reqwest::StatusCode::ACCEPTED] {
+            let body = serde_json::json!({
+                "error": "This change is on hold.",
+                "code": "GUARD_HELD",
+                "details": {"id": CHANGE_ID, "kind": "device_add", "apply_after": "2026-11-15T11:00:00Z"},
+            })
+            .to_string();
+            match map_error_body(status, &body) {
+                BridgeError::Api(msg) => {
+                    assert!(msg.contains("This change is on hold."));
+                    assert!(!msg.contains(CHANGE_ID));
+                }
+                other => panic!("expected Api, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_malformed_guard_bodies_fall_back_to_api() {
+        let unknown = r#"{"error":"forbidden","code":"SOMETHING_ELSE"}"#;
+        assert!(matches!(
+            map_error_body(reqwest::StatusCode::FORBIDDEN, unknown),
+            BridgeError::Api(msg) if msg.starts_with("403")
+        ));
+        for body in [
+            r#"{"code":"GUARD_DEVICE_PENDING","details":{"device_id":"nope"}}"#,
+            r#"{"code":"GUARD_REQUIRED","details":"oops"}"#,
+            "not json",
+        ] {
+            assert!(matches!(
+                map_error_body(reqwest::StatusCode::FORBIDDEN, body),
+                BridgeError::Api(msg) if msg.starts_with("403")
+            ));
+        }
+    }
+
+    #[test]
+    fn guard_throttle_records_the_wait_and_stays_transient() {
+        let body = r#"{"error":"Too many approval requests.","code":"GUARD_TOO_MANY_REQUESTS","details":{"retry_after_secs":300}}"#;
+        let err = map_error_parts(reqwest::StatusCode::TOO_MANY_REQUESTS, body, Some(5));
+        match &err {
+            BridgeError::Api(msg) => assert!(msg.starts_with("429")),
+            other => panic!("expected Api, got {:?}", other),
+        }
+        assert!(crate::guard::error::retry_wait().unwrap().as_secs() >= 290);
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_guard_header_and_read_retry_after() {
+        let seen: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let seen_in = seen.clone();
+        let app = Router::new().route(
+            "/core/v1/auth/device/login",
+            post(move |headers: AxumHeaderMap| {
+                let seen_in = seen_in.clone();
+                async move {
+                    *seen_in.lock().await = headers
+                        .get("x-aster-guard")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "600")],
+                        Json(serde_json::json!({"error": "Paused.", "code": "GUARD_PAUSED"})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client.device_login(&sample_login()).await.unwrap_err();
+        assert!(matches!(err, BridgeError::Api(ref msg) if msg.starts_with("429")));
+        assert_eq!(seen.lock().await.as_deref(), Some("1"));
+        assert!(crate::guard::error::retry_wait().unwrap().as_secs() >= 590);
     }
 }

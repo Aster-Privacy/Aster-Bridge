@@ -63,6 +63,16 @@ pub enum BridgeError {
 
     #[error("recipient key not trusted: {0}")]
     RecipientKey(String),
+
+    #[error("guard_required: {0}")]
+    GuardRequired(String),
+
+    #[error("guard_device_pending: activates at {activates_at}")]
+    GuardPending {
+        device_id: uuid::Uuid,
+        activates_at: chrono::DateTime<chrono::Utc>,
+        change_id: Option<uuid::Uuid>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
