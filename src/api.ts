@@ -76,9 +76,12 @@ export type SetupConfirmation = "confirmed" | "expired" | "pending" | "activatio
 export function guard_pending_from_status(status: {
   connected: boolean;
   activates_at?: string | null;
+  activation_pending?: boolean;
 }): GuardPending | null {
-  if (status.connected || !status.activates_at) return null;
-  return { activates_at: status.activates_at };
+  if (status.connected) return null;
+  if (status.activates_at) return { activates_at: status.activates_at };
+  if (status.activation_pending) return { activates_at: null };
+  return null;
 }
 
 export function setup_confirmation_from(result: { status: string; done: boolean }): SetupConfirmation {
@@ -117,6 +120,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     insecure_sign_in: InsecureSignIn | null;
     update_required?: boolean;
     activates_at?: string | null;
+    activation_pending?: boolean;
     sign_in_again?: boolean;
   }>("get_bridge_status");
 

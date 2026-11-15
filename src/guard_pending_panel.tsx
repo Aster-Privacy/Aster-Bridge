@@ -18,9 +18,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Button } from "@aster/ui";
+import { InformationCircleIcon } from "@heroicons/react/24/outline";
+import { ShieldCheckIcon } from "@heroicons/react/20/solid";
+import { Button, Popover, PopoverContent, PopoverTrigger } from "@aster/ui";
+
+const INFO_CLOSE_DELAY_MS = 150;
 
 export function seconds_until(activates_at: string | null, now_ms: number): number | null {
   if (!activates_at) return null;
@@ -39,6 +43,82 @@ export function format_countdown(seconds: number): string {
 
 export function format_local_time(activates_at: string, locale?: string): string {
   return new Date(activates_at).toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+}
+
+export function GuardInfoButton() {
+  const { t } = useTranslation();
+  const [open, set_open] = useState(false);
+  const close_timer = useRef<number | null>(null);
+
+  const cancel_close = () => {
+    if (close_timer.current !== null) {
+      window.clearTimeout(close_timer.current);
+      close_timer.current = null;
+    }
+  };
+  const show = () => {
+    cancel_close();
+    set_open(true);
+  };
+  const hide_soon = () => {
+    cancel_close();
+    close_timer.current = window.setTimeout(() => set_open(false), INFO_CLOSE_DELAY_MS);
+  };
+
+  useEffect(() => cancel_close, []);
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        cancel_close();
+        set_open(next);
+      }}
+    >
+      <PopoverTrigger asChild>
+        <button
+          aria-label={t("guard_info_label")}
+          className="-m-1 inline-flex items-center justify-center p-1 rounded-full text-txt-muted hover:text-txt-secondary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+          type="button"
+          onBlur={hide_soon}
+          onClick={(event) => {
+            event.preventDefault();
+            show();
+          }}
+          onFocus={show}
+          onMouseEnter={show}
+          onMouseLeave={hide_soon}
+        >
+          <InformationCircleIcon aria-hidden="true" className="w-4 h-4" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="center"
+        className="aster_info_popover text-left"
+        collisionPadding={12}
+        sideOffset={6}
+        onMouseEnter={show}
+        onMouseLeave={hide_soon}
+        onOpenAutoFocus={(event) => event.preventDefault()}
+      >
+        <p className="aster_info_popover_title">
+          <ShieldCheckIcon aria-hidden="true" />
+          <span>{t("guard_info_title")}</span>
+        </p>
+        <p className="aster_info_popover_body">{t("guard_info_body")}</p>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+export function GuardProtectedBadge() {
+  const { t } = useTranslation();
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--aster-field-bg)] px-3 py-1 text-xs font-medium text-txt-secondary">
+      <ShieldCheckIcon aria-hidden="true" className="w-3.5 h-3.5 text-txt-muted" />
+      {t("guard_protected_badge")}
+    </span>
+  );
 }
 
 export function GuardPendingPanel({
@@ -79,12 +159,18 @@ export function GuardPendingPanel({
           <p className="text-sm mt-2 leading-relaxed text-txt-tertiary text-center">{t("guard_pending_body")}</p>
           {seconds !== null && seconds > 0 && (
             <div className="w-full mt-6 rounded-[var(--aster-radius-item)] bg-[var(--aster-field-bg)] py-4 text-center">
-              <span className="block text-xs font-medium text-txt-muted">{t("guard_countdown_label")}</span>
+              <span className="flex items-center justify-center gap-1.5 text-xs font-medium text-txt-muted">
+                {t("guard_countdown_label")}
+                <GuardInfoButton />
+              </span>
               <span aria-hidden="true" className="block mt-1 text-3xl font-mono font-bold tabular-nums text-txt-primary">
                 {format_countdown(seconds)}
               </span>
             </div>
           )}
+          <div className={seconds !== null && seconds > 0 ? "mt-3" : "mt-6"}>
+            <GuardProtectedBadge />
+          </div>
           <p aria-live="polite" role="status" className="text-sm mt-4 leading-relaxed text-txt-secondary text-center">
             {announced}
           </p>

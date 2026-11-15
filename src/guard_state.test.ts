@@ -25,6 +25,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 vi.mock("@aster/ui", () => ({
   Button: ({ children, onClick }: { children: unknown; onClick?: () => void }) =>
     createElement("button", { onClick }, children as string),
+  Popover: ({ children }: { children: unknown }) => createElement("div", { "data-popover": "" }, children as string),
+  PopoverTrigger: ({ children }: { children: unknown }) => children,
+  PopoverContent: ({ children }: { children: unknown }) =>
+    createElement("div", { "data-popover-content": "" }, children as string),
 }));
 
 import "./i18n";
@@ -44,6 +48,13 @@ describe("bridge status mapping", () => {
   it("keeps old status replies unchanged", () => {
     expect(guard_pending_from_status({ connected: false })).toBeNull();
     expect(guard_pending_from_status({ connected: false, activates_at: null })).toBeNull();
+    expect(guard_pending_from_status({ connected: false, activation_pending: false })).toBeNull();
+  });
+
+  it("stays on the waiting screen when the activation time is missing", () => {
+    expect(guard_pending_from_status({ connected: false, activation_pending: true })).toEqual({ activates_at: null });
+    expect(guard_pending_from_status({ connected: false, activates_at: null, activation_pending: true })).toEqual({ activates_at: null });
+    expect(guard_pending_from_status({ connected: true, activation_pending: true })).toBeNull();
   });
 });
 
@@ -98,7 +109,7 @@ describe("waiting panel", () => {
     expect(html).toContain("Mail apps can connect in 30 minutes, at");
     expect(html).toContain('aria-live="polite"');
     expect(html).toContain("Cancel");
-    expect(html.split("<button").length - 1).toBe(1);
+    expect(html.split("<button").length - 1).toBe(2);
   });
 
   it("uses the singular for the last minute", () => {
@@ -122,5 +133,24 @@ describe("waiting panel", () => {
     );
     expect(html).toContain("checks again in a few moments");
     expect(html).not.toContain("Time remaining");
+    expect(html).toContain("Protected by Aster Guard");
+  });
+
+  it("explains the timer with an info button after the time remaining label", () => {
+    const html = renderToStaticMarkup(
+      createElement(GuardPendingPanel, { activates_at, on_cancel: () => {}, initial_now_ms: at_ms - 30 * 60_000 }),
+    );
+    const label = html.indexOf("Time remaining");
+    const info = html.indexOf('aria-label="About the activation wait"');
+    expect(label).toBeGreaterThan(-1);
+    expect(info).toBeGreaterThan(label);
+    expect(info).toBeLessThan(html.indexOf("30:00"));
+    expect(html).toContain('type="button"');
+    expect(html).toContain("Aster Guard is on");
+    expect(html).toContain(
+      "Aster Guard protects your account, so new Aster Bridge sign-ins wait one hour before mail apps can connect. This gives you time to stop a sign-in you didn&#x27;t make.",
+    );
+    expect(html).toContain("Protected by Aster Guard");
+    expect(html).not.toContain("<a ");
   });
 });

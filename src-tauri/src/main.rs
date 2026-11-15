@@ -139,6 +139,7 @@ struct BridgeStatusResponse {
     insecure_sign_in: Option<sign_in_notice::InsecureSignIn>,
     update_required: bool,
     activates_at: Option<String>,
+    activation_pending: bool,
     sign_in_again: bool,
 }
 
@@ -257,9 +258,9 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         update_required: aster_bridge_core::account_state::current()
             == aster_bridge_core::account_state::AccountState::UpdateRequired,
         activates_at: guard_status::held_activation(&guard.config.data_dir, connected),
-        sign_in_again: !connected
-            && aster_bridge_core::account_state::current()
-                == aster_bridge_core::account_state::AccountState::SignInAgain,
+        activation_pending: guard_status::is_held(&guard.config.data_dir, connected),
+        sign_in_again: aster_bridge_core::account_state::current()
+            == aster_bridge_core::account_state::AccountState::SignInAgain,
     })
 }
 
@@ -441,6 +442,7 @@ async fn stop_bridge_inner(state: &State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn sign_out(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut guard = state.0.lock().await;
+    guard_status::SIGN_IN_GENERATION.advance();
 
     guard.stop_runtime_and_wait(runtime::StopReason::UserRequested).await;
 
@@ -591,6 +593,7 @@ async fn get_user_preferences(
 #[tauri::command]
 async fn get_setup_code(state: State<'_, AppState>) -> Result<SetupCodeResponse, String> {
     let mut guard = state.0.lock().await;
+    guard_status::SIGN_IN_GENERATION.advance();
     let code = ops::request_device_code(
         &guard.client,
         &guard.identity,
@@ -684,7 +687,7 @@ async fn check_setup_status(
                 done: true,
             })
         }
-        ops::SignInPoll::Pending(status) if guard_status::ends_setup(&status) => {
+        ops::SignInPoll::Denied => {
             guard.pending_code = None;
             guard.pending_code_normalized = None;
             guard.pending_expires_in = None;
@@ -715,20 +718,36 @@ async fn check_setup_status(
     }
 }
 
-async fn adopt_session(app_handle: &tauri::AppHandle, session: auth::session::Session) {
-    aster_bridge_core::account_state::clear_guard_state();
+async fn adopt_session(
+    app_handle: &tauri::AppHandle,
+    session: auth::session::Session,
+    generation: u64,
+) {
     let app_state: State<AppState> = app_handle.state();
-    let mut guard = app_state.0.lock().await;
-    let session_arc = Arc::new(RwLock::new(session));
-    guard.session = Some(session_arc.clone());
+    let client = app_state.0.lock().await.client.clone();
+    let profile = client.get_user_profile(&session.access_token).await.ok();
 
-    {
-        let s = session_arc.read().await;
-        if let Ok(profile) = guard.client.get_user_profile(&s.access_token).await {
-            guard.display_name = profile.display_name;
-            guard.profile_picture = profile.profile_picture;
-            guard.profile_color = profile.profile_color;
+    let mut guard = app_state.0.lock().await;
+    if !guard_status::may_adopt(
+        guard_status::SIGN_IN_GENERATION.is_current(generation),
+        guard.identity.device_id.is_some(),
+        guard.session.is_some(),
+    ) {
+        tracing::info!("a sign-in finished after it was canceled; discarding it");
+        let data_dir = guard.config.data_dir.clone();
+        let signed_out = guard.identity.device_id.is_none();
+        drop(guard);
+        if signed_out {
+            aster_bridge_core::guard::pending::clear(&data_dir);
         }
+        return;
+    }
+    aster_bridge_core::account_state::clear_guard_state();
+    guard.session = Some(Arc::new(RwLock::new(session)));
+    if let Some(profile) = profile {
+        guard.display_name = profile.display_name;
+        guard.profile_picture = profile.profile_picture;
+        guard.profile_color = profile.profile_color;
     }
     if guard.passwords.is_none() {
         guard.passwords = Some(Arc::new(auth::app_passwords::AppPasswords::new(guard.db.clone())));
@@ -750,9 +769,20 @@ async fn adopt_session(app_handle: &tauri::AppHandle, session: auth::session::Se
     shell::refresh_tray(app_handle);
 }
 
-async fn forget_device(app_handle: &tauri::AppHandle) {
+async fn discard_stale_sign_in(app_handle: &tauri::AppHandle) {
+    let app_state: State<AppState> = app_handle.state();
+    let guard = app_state.0.lock().await;
+    if guard.identity.device_id.is_none() {
+        aster_bridge_core::guard::pending::clear(&guard.config.data_dir);
+    }
+}
+
+async fn forget_device(app_handle: &tauri::AppHandle, generation: u64) {
     let app_state: State<AppState> = app_handle.state();
     let mut guard = app_state.0.lock().await;
+    if !guard_status::SIGN_IN_GENERATION.is_current(generation) {
+        return;
+    }
     let data_dir = guard.config.data_dir.clone();
     let _ = auth::device_identity::clear_device_id(&data_dir);
     auth::device_identity::clear_passphrase(&data_dir);
@@ -771,8 +801,16 @@ async fn forget_device(app_handle: &tauri::AppHandle) {
     let _ = app_handle.emit("session_expired", ());
 }
 
-async fn handle_restore_failure(app_handle: &tauri::AppHandle, e: aster_bridge_core::error::BridgeError) {
+async fn handle_restore_failure(
+    app_handle: &tauri::AppHandle,
+    e: aster_bridge_core::error::BridgeError,
+    generation: u64,
+) {
     use aster_bridge_core::error::BridgeError;
+    if !guard_status::SIGN_IN_GENERATION.is_current(generation) {
+        discard_stale_sign_in(app_handle).await;
+        return;
+    }
     match &e {
         BridgeError::GuardPending { .. } => {
             tracing::info!("this device is waiting for activation");
@@ -782,9 +820,11 @@ async fn handle_restore_failure(app_handle: &tauri::AppHandle, e: aster_bridge_c
             return;
         }
         BridgeError::GuardRequired(_) => {
-            tracing::warn!("auto-login needs a new sign-in");
-            aster_bridge_core::account_state::record_error(&e);
-            forget_device(app_handle).await;
+            tracing::warn!("this device needs to sign in again; its stored sign-in is kept");
+            aster_bridge_core::account_state::record(
+                aster_bridge_core::account_state::AccountState::SignInAgain,
+            );
+            let _ = app_handle.emit("state_updated", ());
             return;
         }
         _ => {}
@@ -796,16 +836,12 @@ async fn handle_restore_failure(app_handle: &tauri::AppHandle, e: aster_bridge_c
             aster_bridge_core::account_state::AccountState::UpdateRequired,
         );
     } else if msg.contains("401") || msg.to_lowercase().contains("unauthorized") {
-        forget_device(app_handle).await;
+        forget_device(app_handle, generation).await;
     }
 }
 
 fn watch_activation(app_handle: tauri::AppHandle) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WATCHING: AtomicBool = AtomicBool::new(false);
-    if WATCHING.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let generation = guard_status::SIGN_IN_GENERATION.advance();
     tauri::async_runtime::spawn(async move {
         loop {
             let data_dir = {
@@ -818,19 +854,26 @@ fn watch_activation(app_handle: tauri::AppHandle) {
             };
             tokio::time::sleep(runtime::guard_pending_wait_from_now(held.activates_at)).await;
 
-            let app_state: State<AppState> = app_handle.state();
-            let guard = app_state.0.lock().await;
-            if guard.session.is_some()
-                || aster_bridge_core::guard::pending::load(&guard.config.data_dir).is_none()
-            {
+            let (config, identity, client) = {
+                let app_state: State<AppState> = app_handle.state();
+                let guard = app_state.0.lock().await;
+                if !guard_status::SIGN_IN_GENERATION.is_current(generation)
+                    || guard.session.is_some()
+                    || aster_bridge_core::guard::pending::load(&guard.config.data_dir).is_none()
+                {
+                    break;
+                }
+                (guard.config.clone(), guard.identity.clone(), guard.client.clone())
+            };
+            let result = auth::session::restore_or_login(&config, &identity, &client).await;
+            drop(identity);
+            if !guard_status::SIGN_IN_GENERATION.is_current(generation) {
+                discard_stale_sign_in(&app_handle).await;
                 break;
             }
-            let result =
-                auth::session::restore_or_login(&guard.config, &guard.identity, &guard.client).await;
-            drop(guard);
             match result {
                 Ok(session) => {
-                    adopt_session(&app_handle, session).await;
+                    adopt_session(&app_handle, session, generation).await;
                     break;
                 }
                 Err(e @ aster_bridge_core::error::BridgeError::GuardPending { .. }) => {
@@ -838,12 +881,11 @@ fn watch_activation(app_handle: tauri::AppHandle) {
                     let _ = app_handle.emit("state_updated", ());
                 }
                 Err(e) => {
-                    handle_restore_failure(&app_handle, e).await;
+                    handle_restore_failure(&app_handle, e, generation).await;
                     break;
                 }
             }
         }
-        WATCHING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -2050,20 +2092,20 @@ fn main() {
             if has_device_id {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let app_state: State<AppState> = app_handle.state();
-                    let guard = app_state.0.lock().await;
+                    let generation = guard_status::SIGN_IN_GENERATION.current();
+                    let (config, identity, client) = {
+                        let app_state: State<AppState> = app_handle.state();
+                        let guard = app_state.0.lock().await;
+                        (guard.config.clone(), guard.identity.clone(), guard.client.clone())
+                    };
 
-                    let restore_result = auth::session::restore_or_login(
-                        &guard.config,
-                        &guard.identity,
-                        &guard.client,
-                    )
-                    .await;
-                    drop(guard);
+                    let restore_result =
+                        auth::session::restore_or_login(&config, &identity, &client).await;
+                    drop(identity);
 
                     match restore_result {
-                        Ok(session) => adopt_session(&app_handle, session).await,
-                        Err(e) => handle_restore_failure(&app_handle, e).await,
+                        Ok(session) => adopt_session(&app_handle, session, generation).await,
+                        Err(e) => handle_restore_failure(&app_handle, e, generation).await,
                     }
                 });
             }
