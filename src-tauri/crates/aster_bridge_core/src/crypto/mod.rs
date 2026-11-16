@@ -35,6 +35,7 @@ pub mod internal_send;
 #[allow(dead_code)]
 pub mod metadata;
 pub mod one_time_prekeys;
+pub mod pgp_mime;
 pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;

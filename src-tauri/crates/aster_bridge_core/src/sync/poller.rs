@@ -1310,6 +1310,7 @@ struct PreparedMessage {
     sender_unverified: bool,
     sealed_ratchet: bool,
     external_key_allowed: bool,
+    decrypted_parts: Vec<CachedAttachment>,
 }
 
 enum Prepared {
@@ -1490,6 +1491,21 @@ fn prepare_mail_item(
         body_text = Some(RATCHET_PLACEHOLDER.to_string());
         is_html = false;
     }
+    let mut decrypted_parts = Vec::new();
+    let opened = body_text
+        .as_deref()
+        .filter(|body| !is_ratchet_envelope && crate::crypto::pgp_mime::is_armored_message(body))
+        .and_then(|armored| {
+            crate::crypto::pgp_mime::open_armored_body(armored, identity_key, previous_keys, passphrase, external_key)
+        });
+    if let Some(opened) = opened {
+        let (body, html) = opened.body().unwrap_or_default();
+        body_text = Some(body);
+        is_html = html;
+        if !unencrypted {
+            decrypted_parts = opened.attachments;
+        }
+    }
     let attachments = if unencrypted {
         Vec::new()
     } else {
@@ -1532,6 +1548,7 @@ fn prepare_mail_item(
         sender_unverified,
         sealed_ratchet: is_ratchet_envelope,
         external_key_allowed,
+        decrypted_parts,
     })
 }
 
@@ -1592,15 +1609,41 @@ fn on_demand_parts(entries: &[EnvelopeAttachment], count: usize) -> Vec<CachedAt
     parts
 }
 
+fn merge_decrypted_parts(
+    downloaded: Option<Vec<CachedAttachment>>,
+    local: Vec<CachedAttachment>,
+    server_count: usize,
+) -> (Option<Vec<CachedAttachment>>, usize) {
+    if local.is_empty() {
+        return (downloaded, 0);
+    }
+    let added = local.len();
+    match downloaded {
+        Some(mut list) if !list.is_empty() => {
+            let next = list.iter().map(|a| a.seq).max().unwrap_or(-1) + 1;
+            list.extend(local.into_iter().enumerate().map(|(offset, mut part)| {
+                part.seq = next + offset as i64;
+                part
+            }));
+            (Some(list), added)
+        }
+        _ if server_count == 0 => (Some(local), added),
+        other => (other, 0),
+    }
+}
+
 fn commit_prepared(
     db: &Database,
     folder: &str,
     item: &MailItem,
-    prepared: PreparedMessage,
+    mut prepared: PreparedMessage,
     downloaded: Option<Vec<CachedAttachment>>,
     on_demand: bool,
 ) -> CacheOutcome {
-    let attachment_count = prepared.expected_attachments;
+    let local_parts = std::mem::take(&mut prepared.decrypted_parts);
+    let (downloaded, local_count) =
+        merge_decrypted_parts(downloaded, local_parts, prepared.expected_attachments);
+    let attachment_count = prepared.expected_attachments + local_count;
     let size = prepared
         .body_text
         .as_ref()
@@ -4319,6 +4362,61 @@ mod tests {
         let body = cached.body_text.unwrap();
         assert!(body.contains("end-to-end encrypted"));
         assert!(!body.contains("ciphertext-blob"));
+    }
+
+    #[test]
+    fn cache_mail_item_keeps_attachments_from_an_encrypted_multipart_body() {
+        use crate::crypto::pgp_mime::fixtures::*;
+        let (_dir, db) = temp_db();
+        let key = aster_crypto::generate_keypair("throwaway test key", "test-key@example.invalid").unwrap();
+        let secret = key.to_armored().unwrap();
+        let big = big_payload(2 * 1024 * 1024);
+        let armored = aster_crypto::encrypt_message(&forwarded_tree(&big), &[&key.public_key()]).unwrap();
+        let json = serde_json::json!({
+            "subject": "Forwarded report",
+            "body_text": String::from_utf8(armored).unwrap()
+        });
+        let item = item_with_envelope("msg-pgp-mime", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[secret], &[]).was_new);
+
+        let cached = db.get_cached_message("msg-pgp-mime").unwrap().unwrap();
+        let body = cached.body_text.clone().unwrap();
+        assert!(body.contains("See the attached report."));
+        assert!(!body.contains("BEGIN PGP MESSAGE"));
+        let raw = cached.raw_headers.clone().unwrap();
+        assert!(raw.contains("\"is_html\":true"));
+        assert!(raw.contains("\"attachment_count\":4"));
+
+        let stored = db.get_message_attachments("msg-pgp-mime").unwrap();
+        let names: Vec<&str> = stored.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"report.pdf"));
+        assert!(names.contains(&NOTES_NAME));
+        assert!(names.contains(&REPORT_NAME));
+        let report = stored.iter().find(|a| a.name == REPORT_NAME).unwrap();
+        assert_eq!(
+            crate::crypto::attachment::sha256_hex(&report.data),
+            crate::crypto::attachment::sha256_hex(&big)
+        );
+
+        let rendered = crate::message_render::render(&cached, &stored, true);
+        assert!(rendered.text.contains("multipart/mixed"));
+        assert!(rendered.text.contains("report.pdf"));
+        assert!(rendered.text.contains("Content-ID: <chart@forward>"));
+        assert!(!rendered.text.contains("BEGIN PGP MESSAGE"));
+    }
+
+    #[test]
+    fn cache_mail_item_leaves_an_unreadable_armored_body_as_is() {
+        let (_dir, db) = temp_db();
+        let theirs = aster_crypto::generate_keypair("other test key", "other-key@example.invalid").unwrap();
+        let armored = aster_crypto::encrypt_message(b"hi", &[&theirs.public_key()]).unwrap();
+        let armored = String::from_utf8(armored).unwrap();
+        let json = serde_json::json!({"subject": "s", "body_text": armored});
+        let item = item_with_envelope("msg-pgp-other", &json);
+        assert!(cache_mail_item(&db, "inbox", &item, b"pass", IK, &[], &[]).was_new);
+        let cached = db.get_cached_message("msg-pgp-other").unwrap().unwrap();
+        assert!(cached.body_text.unwrap().contains("BEGIN PGP MESSAGE"));
+        assert!(db.get_message_attachments("msg-pgp-other").unwrap().is_empty());
     }
 
     #[test]
