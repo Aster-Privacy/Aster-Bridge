@@ -280,7 +280,17 @@ mod tests {
 
     #[test]
     fn user_texts_are_single_line_and_plain() {
-        for text in [TLS_REQUIRED_TEXT, BAD_CREDENTIALS_TEXT] {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let texts = [
+            TLS_REQUIRED_TEXT.to_string(),
+            BAD_CREDENTIALS_TEXT.to_string(),
+            pending_text(Some(at)),
+            pending_text(None),
+        ];
+        for text in texts {
+            assert!(text.is_ascii());
             assert!(!text.chars().any(char::is_control));
             assert!(!text.contains('\u{2014}'));
         }
