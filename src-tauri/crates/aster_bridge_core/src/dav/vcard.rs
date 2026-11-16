@@ -18,11 +18,16 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
+
+use super::vcard_links;
 
 const FOLD_WIDTH: usize = 73;
 
 pub struct VCardProperty {
+    pub group: Option<String>,
     pub name: String,
     pub params: Vec<(String, String)>,
     pub value: String,
@@ -37,6 +42,24 @@ impl VCardProperty {
             .map(|v| v.trim().trim_matches('"').to_lowercase())
             .filter(|v| !v.is_empty())
             .collect()
+    }
+
+    pub fn raw_types(&self) -> Vec<String> {
+        self.params
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("TYPE"))
+            .flat_map(|(_, v)| v.split(','))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    }
+
+    pub fn param(&self, key: &str) -> Option<String> {
+        self.params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
     }
 }
 
@@ -183,8 +206,13 @@ pub fn parse_properties(text: &str) -> Vec<VCardProperty> {
             .unwrap_or(raw_name)
             .trim()
             .to_uppercase();
+        let group = raw_name
+            .rsplit_once('.')
+            .map(|(prefix, _)| prefix.trim().to_lowercase())
+            .filter(|prefix| !prefix.is_empty());
 
         properties.push(VCardProperty {
+            group,
             name,
             params,
             value: value.to_string(),
@@ -474,18 +502,40 @@ pub fn contact_to_vcard(uid: &str, contact: &Value, revision: &str) -> String {
         }
     }
 
-    for entry in entries(contact, "social_networks") {
-        let entry_type = string_field(entry, "type").to_uppercase();
-        let entry_type = if entry_type.is_empty() {
+    let mut group_counter = 0usize;
+    let social_networks =
+        vcard_links::normalize_social_networks(entries(contact, "social_networks").to_vec());
+    for entry in &social_networks {
+        let value = escape_value(string_field(entry, "value"));
+        let kind = string_field(entry, "type");
+        let label = string_field(entry, "label");
+        if !vcard_links::is_known_social(kind) && !label.is_empty() {
+            group_counter += 1;
+            let type_param = vcard_links::social_type_param(label);
+            push_property(
+                &mut out,
+                &format!("item{}.X-SOCIALPROFILE", group_counter),
+                &[("TYPE", type_param.as_str())],
+                &value,
+            );
+            push_property(
+                &mut out,
+                &format!("item{}.X-ABLabel", group_counter),
+                &[],
+                &escape_value(label),
+            );
+            continue;
+        }
+        let entry_type = if kind.is_empty() {
             "OTHER".to_string()
         } else {
-            entry_type
+            kind.to_uppercase()
         };
         push_property(
             &mut out,
             "X-SOCIALPROFILE",
             &[("TYPE", entry_type.as_str())],
-            &escape_value(string_field(entry, "value")),
+            &value,
         );
     }
 
@@ -504,18 +554,22 @@ pub fn contact_to_vcard(uid: &str, contact: &Value, revision: &str) -> String {
         );
     }
 
-    for entry in entries(contact, "related_people") {
-        let entry_type = string_field(entry, "type").to_uppercase();
-        let entry_type = if entry_type.is_empty() {
-            "OTHER".to_string()
-        } else {
-            entry_type
-        };
+    let related_people =
+        vcard_links::normalize_related_people(entries(contact, "related_people").to_vec());
+    for relation in related_people.iter().filter_map(vcard_links::decode_relation) {
+        group_counter += 1;
+        let std_type = vcard_links::relation_vcard_type(&relation.kind).unwrap_or("");
         push_property(
             &mut out,
-            "X-ASTER-RELATED",
-            &[("TYPE", entry_type.as_str())],
-            &escape_value(string_field(entry, "value")),
+            &format!("item{}.RELATED", group_counter),
+            &[("TYPE", std_type), ("VALUE", "text")],
+            &escape_value(&relation.value),
+        );
+        push_property(
+            &mut out,
+            &format!("item{}.X-ABLabel", group_counter),
+            &[],
+            &escape_value(&vcard_links::relation_ab_label(&relation)),
         );
     }
 
@@ -599,8 +653,27 @@ pub fn vcard_to_contact(text: &str) -> Map<String, Value> {
     let mut groups: Vec<Value> = Vec::new();
     let mut formatted_name = String::new();
 
-    for property in parse_properties(text) {
+    let properties = parse_properties(text);
+    let mut group_labels: HashMap<String, String> = HashMap::new();
+    for property in &properties {
+        if property.name != "X-ABLABEL" {
+            continue;
+        }
+        if let Some(group) = &property.group {
+            let label = unescape_value(&property.value).trim().to_string();
+            if !label.is_empty() {
+                group_labels.entry(group.clone()).or_insert(label);
+            }
+        }
+    }
+
+    for property in properties {
         let value = unescape_value(&property.value);
+        let group_label = property
+            .group
+            .as_ref()
+            .and_then(|group| group_labels.get(group))
+            .map(|label| label.as_str());
         match property.name.as_str() {
             "FN" => formatted_name = value.trim().to_string(),
             "N" => {
@@ -729,26 +802,32 @@ pub fn vcard_to_contact(text: &str) -> Map<String, Value> {
                 }
             }
             "X-SOCIALPROFILE" => {
-                let handle = value.trim().to_string();
+                let raw_handle = value.trim().to_string();
+                let is_apple = raw_handle
+                    .get(..8)
+                    .map(|prefix| prefix.eq_ignore_ascii_case("x-apple:"))
+                    .unwrap_or(false);
+                let handle = if is_apple {
+                    property
+                        .param("x-user")
+                        .unwrap_or_else(|| raw_handle[8..].trim().to_string())
+                } else {
+                    raw_handle
+                };
                 if !handle.is_empty() {
-                    let entry_type = normalized_type(
-                        &property,
-                        &[
-                            "twitter",
-                            "linkedin",
-                            "github",
-                            "instagram",
-                            "facebook",
-                            "mastodon",
-                            "bluesky",
-                            "other",
-                        ],
-                        "other",
-                    );
-                    social_networks.push(serde_json::json!({
+                    let mut tokens: Vec<String> =
+                        property.param("x-service-type").into_iter().collect();
+                    tokens.extend(property.raw_types());
+                    let (entry_type, label) =
+                        vcard_links::social_from_tokens(&tokens, group_label);
+                    let mut entry = serde_json::json!({
                         "value": handle,
                         "type": entry_type,
-                    }));
+                    });
+                    if let Some(label) = label {
+                        entry["label"] = Value::from(label);
+                    }
+                    social_networks.push(entry);
                 }
             }
             "IMPP" => {
@@ -765,28 +844,33 @@ pub fn vcard_to_contact(text: &str) -> Map<String, Value> {
                     }));
                 }
             }
-            "X-ASTER-RELATED" => {
+            "RELATED" | "X-ABRELATEDNAMES" | "X-ASTER-RELATED" => {
                 let person = value.trim().to_string();
-                if !person.is_empty() {
-                    let entry_type = normalized_type(
-                        &property,
-                        &[
-                            "assistant",
-                            "manager",
-                            "spouse",
-                            "partner",
-                            "child",
-                            "parent",
-                            "sibling",
-                            "friend",
-                            "other",
-                        ],
-                        "other",
-                    );
-                    related_people.push(serde_json::json!({
-                        "value": person,
-                        "type": entry_type,
-                    }));
+                let is_uri = person
+                    .get(..9)
+                    .map(|prefix| prefix.eq_ignore_ascii_case("urn:uuid:"))
+                    .unwrap_or(false);
+                if !person.is_empty() && !is_uri {
+                    let (kind, label) = match group_label {
+                        Some(label) => vcard_links::relation_from_label(label),
+                        None => vcard_links::relation_from_types(&property.raw_types()),
+                    };
+                    related_people.push(vcard_links::encode_relation(&kind, &label, &person));
+                }
+            }
+            "X-ANDROID-CUSTOM" => {
+                let parts: Vec<String> = split_unescaped(&property.value, ';')
+                    .iter()
+                    .map(|part| unescape_value(part))
+                    .collect();
+                let field = |index: usize| parts.get(index).map(|p| p.trim()).unwrap_or("");
+                if field(0).eq_ignore_ascii_case("vnd.android.cursor.item/relation")
+                    && !field(1).is_empty()
+                {
+                    let type_int = field(2).parse::<i64>().unwrap_or(0);
+                    let (kind, label) =
+                        vcard_links::relation_from_android_type(type_int, field(3));
+                    related_people.push(vcard_links::encode_relation(&kind, &label, field(1)));
                 }
             }
             "CATEGORIES" => {
@@ -856,9 +940,15 @@ pub fn vcard_to_contact(text: &str) -> Map<String, Value> {
     insert_list("phone_entries", phone_entries);
     insert_list("address_entries", address_entries);
     insert_list("websites", websites);
-    insert_list("social_networks", social_networks);
+    insert_list(
+        "social_networks",
+        vcard_links::normalize_social_networks(social_networks),
+    );
     insert_list("instant_messengers", instant_messengers);
-    insert_list("related_people", related_people);
+    insert_list(
+        "related_people",
+        vcard_links::normalize_related_people(related_people),
+    );
     insert_list("date_entries", date_entries);
     insert_list("groups", groups);
 
@@ -1109,5 +1199,222 @@ mod tests {
         assert_eq!(parsed["last_name"], Value::from(""));
         assert_eq!(parsed["emails"], Value::Array(vec![]));
         assert_eq!(parsed["is_favorite"], Value::from(false));
+    }
+
+    fn card_with(lines: &[&str]) -> String {
+        let mut card = String::from("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada\r\n");
+        for line in lines {
+            card.push_str(line);
+            card.push_str("\r\n");
+        }
+        card.push_str("END:VCARD\r\n");
+        card
+    }
+
+    fn decoded(parsed: &Map<String, Value>) -> Vec<(String, String, String)> {
+        parsed
+            .get("related_people")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(vcard_links::decode_relation)
+                    .map(|r| (r.kind, r.label, r.value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn rel(kind: &str, label: &str, value: &str) -> (String, String, String) {
+        (kind.to_string(), label.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn relations_round_trip_every_kind_and_custom_label() {
+        let kinds = [
+            "friend", "manager", "partner", "assistant", "spouse", "relative", "child", "mother",
+            "father", "brother", "sister", "custom",
+        ];
+        let related: Vec<Value> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let label = if *kind == "custom" { "Godparent" } else { "" };
+                vcard_links::encode_relation(kind, label, &format!("Person {}", index))
+            })
+            .collect();
+        let contact = serde_json::json!({ "first_name": "Ada", "related_people": related });
+        let card = contact_to_vcard("uid-r", &contact, "rev");
+
+        assert!(card.contains(".RELATED;TYPE=parent;VALUE=text:Person 7\r\n"));
+        assert!(card.contains(".X-ABLabel:_$!<Mother>!$_\r\n"));
+        assert!(card.contains(".X-ABLabel:Godparent\r\n"));
+        assert!(!card.contains("X-ASTER-RELATED"));
+        let parsed = vcard_to_contact(&card);
+        let expected: Vec<_> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let label = if *kind == "custom" { "Godparent" } else { "" };
+                rel(kind, label, &format!("Person {}", index))
+            })
+            .collect();
+        assert_eq!(decoded(&parsed), expected);
+    }
+
+    #[test]
+    fn relation_values_keep_separators_emoji_and_rtl_text() {
+        let value = "Ana; Lima, \u{0645}\u{0631}\u{064a}\u{0645} \u{1F338}";
+        let contact = serde_json::json!({
+            "first_name": "Ada",
+            "related_people": [{ "value": value, "type": "other", "label": "Tutor, music" }]
+        });
+        let parsed = vcard_to_contact(&contact_to_vcard("uid-r", &contact, "rev"));
+
+        assert_eq!(
+            parsed["related_people"],
+            serde_json::json!([{ "value": value, "type": "other", "label": "Tutor, music" }])
+        );
+    }
+
+    #[test]
+    fn a_contact_without_relations_writes_none() {
+        let card = contact_to_vcard("uid-1", &sample_contact(), "rev");
+
+        assert!(!card.contains("RELATED"));
+        assert!(!vcard_to_contact(&card).contains_key("related_people"));
+    }
+
+    #[test]
+    fn reads_vcard_four_related_types() {
+        let parsed = vcard_to_contact(&card_with(&[
+            "RELATED;TYPE=kin;VALUE=text:Mei",
+            "RELATED;TYPE=spouse:Sam",
+            "RELATED;TYPE=co-worker;VALUE=text:Kim",
+            "RELATED;VALUE=uri:urn:uuid:4fbe8971-0bc3-424c-9c26-36c3e1eff6b1",
+        ]));
+
+        assert_eq!(
+            decoded(&parsed),
+            vec![
+                rel("relative", "", "Mei"),
+                rel("spouse", "", "Sam"),
+                rel("custom", "co-worker", "Kim"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_apple_related_names_with_group_labels() {
+        let parsed = vcard_to_contact(&card_with(&[
+            "item1.X-ABRELATEDNAMES:Ana Lima",
+            "item1.X-ABLabel:_$!<Mother>!$_",
+            "item2.X-ABRELATEDNAMES:Rui",
+            "item2.X-ABLabel:Godparent",
+            "item3.X-ABRELATEDNAMES;type=pref:Leo",
+            "item3.X-ABLabel:_$!<Brother>!$_",
+        ]));
+
+        assert_eq!(
+            decoded(&parsed),
+            vec![
+                rel("mother", "", "Ana Lima"),
+                rel("custom", "Godparent", "Rui"),
+                rel("brother", "", "Leo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_android_custom_relations_and_ignores_other_mimetypes() {
+        let parsed = vcard_to_contact(&card_with(&[
+            "X-ANDROID-CUSTOM:vnd.android.cursor.item/relation;Ana Lima;8;;;;;;;;;;;;;",
+            "X-ANDROID-CUSTOM:vnd.android.cursor.item/relation;Rui;0;Godparent;;;;;;;;;;;;",
+            "X-ANDROID-CUSTOM:vnd.android.cursor.item/nickname;Ace;1;;;;;;;;;;;;;",
+        ]));
+
+        assert_eq!(
+            decoded(&parsed),
+            vec![rel("mother", "", "Ana Lima"), rel("custom", "Godparent", "Rui")]
+        );
+    }
+
+    #[test]
+    fn reads_legacy_bridge_relation_lines() {
+        let parsed = vcard_to_contact(&card_with(&[
+            "X-ASTER-RELATED;TYPE=PARENT:Bo",
+            "X-ASTER-RELATED;TYPE=OTHER:Rui",
+            "X-ASTER-RELATED;TYPE=FRIEND:Sam",
+            "X-ASTER-RELATED;TYPE=FRIEND:sam",
+            "X-ASTER-RELATED;TYPE=FRIEND:   ",
+        ]));
+
+        assert_eq!(
+            decoded(&parsed),
+            vec![rel("parent", "", "Bo"), rel("custom", "", "Rui"), rel("friend", "", "Sam")]
+        );
+    }
+
+    #[test]
+    fn custom_socials_round_trip_with_labels() {
+        let contact = serde_json::json!({
+            "first_name": "Ada",
+            "social_networks": [
+                { "value": "https://studio.example.net/a", "type": "other", "label": "Band page" },
+                { "value": "pat_the_coach", "type": "other", "label": "Strava" },
+                { "value": "@ada@hachyderm.io", "type": "mastodon" },
+                { "value": "ada", "type": "github" },
+                { "value": "  ", "type": "other", "label": "Empty" }
+            ]
+        });
+        let card = contact_to_vcard("uid-s", &contact, "rev");
+
+        assert!(card.contains("item1.X-SOCIALPROFILE;TYPE=Band-page:https://studio.example.net/a\r\n"));
+        assert!(card.contains("item1.X-ABLabel:Band page\r\n"));
+        assert!(card.contains("X-SOCIALPROFILE;TYPE=GITHUB:ada\r\n"));
+        let parsed = vcard_to_contact(&card);
+        assert_eq!(
+            parsed["social_networks"],
+            serde_json::json!([
+                { "value": "https://studio.example.net/a", "type": "other", "label": "Band page" },
+                { "value": "pat_the_coach", "type": "other", "label": "Strava" },
+                { "value": "@ada@hachyderm.io", "type": "mastodon" },
+                { "value": "ada", "type": "github" }
+            ])
+        );
+    }
+
+    #[test]
+    fn reads_apple_social_profiles_and_old_unlabeled_cards() {
+        let parsed = vcard_to_contact(&card_with(&[
+            "item1.X-SOCIALPROFILE;type=Strava;x-user=pat:x-apple:pat",
+            "item1.X-ABLabel:Strava",
+            "X-SOCIALPROFILE;type=twitter:https://x.com/ada",
+            "X-SOCIALPROFILE;TYPE=Band:https://band.example/",
+            "X-SOCIALPROFILE;TYPE=LINKEDIN:https://linkedin.com/in/ada",
+        ]));
+
+        assert_eq!(
+            parsed["social_networks"],
+            serde_json::json!([
+                { "value": "pat", "type": "other", "label": "Strava" },
+                { "value": "https://x.com/ada", "type": "twitter" },
+                { "value": "https://band.example/", "type": "other", "label": "Band" },
+                { "value": "https://linkedin.com/in/ada", "type": "linkedin" }
+            ])
+        );
+    }
+
+    #[test]
+    fn a_social_label_cannot_inject_a_property() {
+        let contact = serde_json::json!({
+            "first_name": "Eve",
+            "social_networks": [
+                { "value": "x", "type": "other", "label": "Bad\r\nNOTE:pwned;a=b:c" }
+            ]
+        });
+        let card = contact_to_vcard("uid-e", &contact, "rev");
+
+        assert!(!card.contains("\r\nNOTE:pwned"));
+        assert!(!parse_properties(&card).iter().any(|p| p.name == "NOTE"));
     }
 }
