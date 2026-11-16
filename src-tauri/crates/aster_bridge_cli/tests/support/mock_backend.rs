@@ -77,6 +77,7 @@ struct Inner {
     login_status: AtomicU16,
     held_until: Mutex<Option<String>>,
     login_calls: AtomicUsize,
+    status_calls: AtomicUsize,
     expires_in: AtomicU64,
     plan_calls: AtomicUsize,
     sync_calls: AtomicUsize,
@@ -100,6 +101,7 @@ impl Mock {
             login_status: AtomicU16::new(200),
             held_until: Mutex::new(None),
             login_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
             expires_in: AtomicU64::new(600),
             plan_calls: AtomicUsize::new(0),
             sync_calls: AtomicUsize::new(0),
@@ -148,6 +150,10 @@ impl Mock {
 
     pub fn login_calls(&self) -> usize {
         self.inner.login_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn status_calls(&self) -> usize {
+        self.inner.status_calls.load(Ordering::SeqCst)
     }
 
     pub fn set_expires_in(&self, secs: u64) {
@@ -214,13 +220,22 @@ async fn device_code(
 }
 
 async fn device_code_status(State(inner): State<Arc<Inner>>) -> Response {
+    inner.status_calls.fetch_add(1, Ordering::SeqCst);
     let status = *inner.code_status.lock().unwrap();
     match status {
+        CodeStatus::ActivationPending => Json(json!({
+            "status": "activation_pending",
+            "device_id": inner.device_id,
+            "sealed_envelope": null,
+            "code_secret_sealed": null,
+            "activates_at": inner.held_until.lock().unwrap().clone(),
+        }))
+        .into_response(),
         CodeStatus::Pending => Json(json!({ "status": "pending" })).into_response(),
         CodeStatus::Expired => Json(json!({ "status": "expired" })).into_response(),
         CodeStatus::Denied => Json(json!({ "status": "denied" })).into_response(),
         CodeStatus::Gone => (StatusCode::GONE, Json(json!({ "error": "gone" }))).into_response(),
-        CodeStatus::Confirm | CodeStatus::ConfirmForeignPassphrase | CodeStatus::ActivationPending => {
+        CodeStatus::Confirm | CodeStatus::ConfirmForeignPassphrase => {
             let passphrase: &[u8] = if status != CodeStatus::ConfirmForeignPassphrase {
                 VAULT_PASSPHRASE
             } else {
@@ -241,13 +256,6 @@ async fn device_code_status(State(inner): State<Arc<Inner>>) -> Response {
                 passphrase,
                 version,
             ) {
-                Ok(envelope) if status == CodeStatus::ActivationPending => Json(json!({
-                    "status": "activation_pending",
-                    "device_id": inner.device_id,
-                    "sealed_envelope": envelope,
-                    "activates_at": inner.held_until.lock().unwrap().clone(),
-                }))
-                .into_response(),
                 Ok(envelope) => Json(json!({
                     "status": "confirmed",
                     "device_id": inner.device_id,

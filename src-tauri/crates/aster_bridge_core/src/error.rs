@@ -73,6 +73,12 @@ pub enum BridgeError {
         activates_at: chrono::DateTime<chrono::Utc>,
         change_id: Option<uuid::Uuid>,
     },
+
+    #[error("sign_in_denied: the sign-in was declined")]
+    SignInDenied,
+
+    #[error("sign_in_expired: the sign-in code expired")]
+    SignInExpired,
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;

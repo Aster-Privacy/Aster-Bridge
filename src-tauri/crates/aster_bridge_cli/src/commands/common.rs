@@ -40,8 +40,8 @@ use crate::exit::{
     CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
     CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_RECIPIENT_KEY_LOOKUP,
     CODE_RECIPIENT_KEY_MISMATCH, CODE_SETTINGS_READ,
-    CODE_SIGN_IN,
-    EXIT_ACCESS, EXIT_ERROR, EXIT_PENDING, UPGRADE_URL,
+    CODE_CODE_EXPIRED, CODE_SIGN_IN, CODE_SIGN_IN_DECLINED,
+    EXIT_ACCESS, EXIT_DEVICE, EXIT_ERROR, EXIT_PENDING, UPGRADE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::title_case;
@@ -190,6 +190,16 @@ pub fn network_error(detail: &str) -> CliError {
     ))
 }
 
+pub fn code_expired() -> CliError {
+    CliError::new(EXIT_DEVICE, CODE_CODE_EXPIRED, "The sign-in code expired.")
+        .with_hint("To get a new code, run: aster-bridge login")
+}
+
+pub fn sign_in_declined() -> CliError {
+    CliError::new(EXIT_DEVICE, CODE_SIGN_IN_DECLINED, guard_text::DECLINED_MESSAGE)
+        .with_hint(guard_text::DECLINED_HINT)
+}
+
 pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
     if let Some(account_state) = account_state::record_error(&error) {
         save_state(data_dir, |s| s.account_state = account_state);
@@ -199,7 +209,14 @@ pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
         forget_device(data_dir);
         return CliError::device_revoked();
     }
+    if matches!(error, BridgeError::SignInDenied | BridgeError::SignInExpired) {
+        state::clear_pending(data_dir);
+        account_state::clear_guard_state();
+        save_state(data_dir, |s| s.account_state = AccountState::Active);
+    }
     match error {
+        BridgeError::SignInDenied => sign_in_declined(),
+        BridgeError::SignInExpired => code_expired(),
         BridgeError::PlanUpgradeRequired(_) => access_denied(None),
         BridgeError::Auth(message) if message.contains("first-time setup required") => {
             CliError::not_signed_in()

@@ -27,7 +27,7 @@ pub const SIGN_IN_AGAIN_HINT: &str =
     "To continue, run: aster-bridge login. Then approve the sign-in on one of your Aster devices.";
 
 pub const LOGIN_PENDING_NEXT: &str =
-    "To connect your mail apps when the wait ends, run: aster-bridge serve";
+    "To finish signing in when the wait ends, run aster-bridge login again. To keep checking and connect your mail apps, run: aster-bridge serve";
 pub const SERVE_PENDING_NEXT: &str =
     "Aster Bridge starts the mail servers when this device is activated.";
 pub const DECLINED_MESSAGE: &str = "Someone declined this sign-in on another Aster device.";

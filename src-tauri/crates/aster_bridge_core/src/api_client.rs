@@ -3171,11 +3171,12 @@ mod guard_tests {
     #[test]
     fn device_code_status_reads_an_optional_activation_time() {
         let with_time: DeviceCodeStatusResponse = serde_json::from_str(&format!(
-            r#"{{"status":"activation_pending","device_id":"{}","sealed_envelope":"AA","activates_at":"2026-11-15T11:00:00Z"}}"#,
+            r#"{{"status":"activation_pending","device_id":"{}","sealed_envelope":null,"code_secret_sealed":null,"activates_at":"2026-11-15T11:00:00Z"}}"#,
             DEVICE_ID
         ))
         .unwrap();
         assert_eq!(with_time.status, "activation_pending");
+        assert_eq!(with_time.sealed_envelope, None);
         assert_eq!(
             with_time.activates_at.map(|t| t.to_rfc3339()).as_deref(),
             Some("2026-11-15T11:00:00+00:00")

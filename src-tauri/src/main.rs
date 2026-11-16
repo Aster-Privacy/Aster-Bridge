@@ -801,6 +801,42 @@ async fn forget_device(app_handle: &tauri::AppHandle, generation: u64) {
     let _ = app_handle.emit("session_expired", ());
 }
 
+async fn end_held_sign_in(app_handle: &tauri::AppHandle, generation: u64, ending: &'static str) {
+    let app_state: State<AppState> = app_handle.state();
+    let mut guard = app_state.0.lock().await;
+    if !guard_status::SIGN_IN_GENERATION.is_current(generation) || guard.session.is_some() {
+        return;
+    }
+    let data_dir = guard.config.data_dir.clone();
+    guard.identity.device_id = auth::device_identity::get_or_create_identity(&data_dir)
+        .ok()
+        .and_then(|stored| stored.device_id);
+    guard.pending_code = None;
+    guard.pending_code_normalized = None;
+    guard.pending_expires_in = None;
+    drop(guard);
+    aster_bridge_core::account_state::clear_guard_state();
+    let _ = app_handle.emit("sign_in_ended", ending);
+    let _ = app_handle.emit("state_updated", ());
+    shell::refresh_tray(app_handle);
+}
+
+async fn keep_waiting_on_held_code(app_handle: &tauri::AppHandle) -> bool {
+    let data_dir = {
+        let app_state: State<AppState> = app_handle.state();
+        let guard = app_state.0.lock().await;
+        guard.config.data_dir.clone()
+    };
+    let Some(held) = aster_bridge_core::guard::pending::load(&data_dir).filter(|held| held.code.is_some()) else {
+        return false;
+    };
+    tracing::info!("the held sign-in could not be checked; trying again later");
+    aster_bridge_core::account_state::record_pending(held.activates_at);
+    watch_activation(app_handle.clone());
+    let _ = app_handle.emit("state_updated", ());
+    true
+}
+
 async fn handle_restore_failure(
     app_handle: &tauri::AppHandle,
     e: aster_bridge_core::error::BridgeError,
@@ -819,6 +855,16 @@ async fn handle_restore_failure(
             let _ = app_handle.emit("state_updated", ());
             return;
         }
+        BridgeError::SignInDenied => {
+            tracing::info!("the held sign-in was declined");
+            end_held_sign_in(app_handle, generation, "denied").await;
+            return;
+        }
+        BridgeError::SignInExpired => {
+            tracing::info!("the held sign-in code expired");
+            end_held_sign_in(app_handle, generation, "expired").await;
+            return;
+        }
         BridgeError::GuardRequired(_) => {
             tracing::warn!("this device needs to sign in again; its stored sign-in is kept");
             aster_bridge_core::account_state::record(
@@ -826,6 +872,16 @@ async fn handle_restore_failure(
             );
             let _ = app_handle.emit("state_updated", ());
             return;
+        }
+        BridgeError::Network(_) => {
+            if keep_waiting_on_held_code(app_handle).await {
+                return;
+            }
+        }
+        BridgeError::Api(msg) if msg.starts_with("429") || msg.starts_with('5') => {
+            if keep_waiting_on_held_code(app_handle).await {
+                return;
+            }
         }
         _ => {}
     }

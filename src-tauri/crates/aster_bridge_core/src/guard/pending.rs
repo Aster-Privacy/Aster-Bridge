@@ -32,6 +32,10 @@ pub struct PendingActivation {
     pub activates_at: DateTime<Utc>,
     #[serde(default)]
     pub change_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_device_id: Option<Uuid>,
 }
 
 impl PendingActivation {
@@ -74,6 +78,8 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             change_id: None,
+            code: None,
+            replaced_device_id: None,
         }
     }
 
@@ -99,6 +105,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(PENDING_FILE), b"{not json").unwrap();
         assert_eq!(load(dir.path()), None);
+    }
+
+    #[test]
+    fn a_record_without_a_code_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PENDING_FILE),
+            br#"{"device_id":"8d4f2b1e-3c6a-4e5f-9a7b-1c2d3e4f5a6b","activates_at":"2026-11-15T11:00:00Z","change_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()), Some(sample()));
+    }
+
+    #[test]
+    fn a_held_code_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = PendingActivation {
+            code: Some("ABCD1234".to_string()),
+            ..sample()
+        };
+        save(dir.path(), &record).unwrap();
+        assert_eq!(load(dir.path()).unwrap().code.as_deref(), Some("ABCD1234"));
     }
 
     #[test]

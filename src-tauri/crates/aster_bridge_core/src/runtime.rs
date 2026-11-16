@@ -881,6 +881,8 @@ impl BridgeRuntime {
                                             device_id: held,
                                             activates_at,
                                             change_id,
+                                            code: None,
+                                            replaced_device_id: None,
                                         },
                                     ) {
                                         tracing::warn!("couldn't record the pending activation: {}", e);

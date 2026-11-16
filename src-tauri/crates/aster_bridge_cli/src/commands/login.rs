@@ -39,8 +39,8 @@ use super::common;
 use super::guard_text;
 use crate::context::{self, Context};
 use crate::exit::{
-    CliError, CliResult, CODE_CACHE_REBUILD, CODE_CODE_EXPIRED, CODE_SIGN_IN, CODE_SIGN_IN_DECLINED,
-    CODE_SIGN_IN_CANCELED, EXIT_DEVICE, EXIT_ERROR, EXIT_OK, EXIT_PENDING, LINK_DEVICE_URL,
+    CliError, CliResult, CODE_CACHE_REBUILD, CODE_SIGN_IN, CODE_SIGN_IN_CANCELED, EXIT_ERROR,
+    EXIT_OK, EXIT_PENDING, LINK_DEVICE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::{Output, Tone};
@@ -142,6 +142,7 @@ fn hold(ctx: &Context, activates_at: DateTime<Utc>) -> i32 {
         out.json(json!({
             "status": "activation_pending",
             "activates_at": activates_at.to_rfc3339(),
+            "next": guard_text::LOGIN_PENDING_NEXT,
         }));
     } else {
         out.blank();
@@ -204,14 +205,12 @@ fn show_code(out: &Output, pending: &PendingLogin, fingerprint: &str, no_wait: b
 
 fn expired(dir: &Path) -> CliError {
     state::clear_pending(dir);
-    CliError::new(EXIT_DEVICE, CODE_CODE_EXPIRED, "The sign-in code expired.")
-        .with_hint("To get a new code, run: aster-bridge login")
+    common::code_expired()
 }
 
 fn declined(dir: &Path) -> CliError {
     state::clear_pending(dir);
-    CliError::new(EXIT_DEVICE, CODE_SIGN_IN_DECLINED, guard_text::DECLINED_MESSAGE)
-        .with_hint(guard_text::DECLINED_HINT)
+    common::sign_in_declined()
 }
 
 async fn wait_for_confirmation(

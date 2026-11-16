@@ -415,7 +415,7 @@ pub const CATALOG: &[ErrorDoc] = &[
         code: CODE_GUARD_PENDING,
         exit_code: EXIT_PENDING,
         summary: "This device is waiting for activation after you approved the sign-in.",
-        resolution: "Mail apps can connect about one hour after you approve the sign-in. To connect them when the wait ends, run: aster-bridge serve",
+        resolution: "Mail apps can connect about one hour after you approve the sign-in. To finish signing in when the wait ends, run aster-bridge login again. To keep checking and connect your mail apps, run: aster-bridge serve",
     },
 ];
 

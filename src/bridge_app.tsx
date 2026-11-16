@@ -178,6 +178,7 @@ const UPGRADE_URL = "https://app.astermail.org/settings/billing";
 
 
 type View = "loading" | "setup" | "guard_pending" | "dashboard";
+type SignInEnding = "denied" | "expired";
 type Tab = "status" | "passwords" | "settings";
 type ToastType = "success" | "error" | "info" | "warning";
 
@@ -790,14 +791,16 @@ function SetupView({
   on_activation_pending,
   can_go_back,
   on_back,
+  initial_state,
 }: {
   on_enrolled: () => void;
   on_activation_pending: () => void;
   can_go_back: boolean;
   on_back: () => void;
+  initial_state?: SignInEnding;
 }) {
   const { t } = useTranslation();
-  const [state, set_state] = useState<SetupState>("idle");
+  const [state, set_state] = useState<SetupState>(initial_state ?? "idle");
   const [code, set_code] = useState<string | null>(null);
   const [device_fingerprint, set_device_fingerprint] = useState("");
   const [time_left, set_time_left] = useState(0);
@@ -2862,6 +2865,7 @@ export function BridgeApp() {
   const sign_in_again_shown = useRef(false);
   const was_guard_pending = useRef(false);
   const [guard_pending, set_guard_pending] = useState<GuardPending | null>(null);
+  const [sign_in_ending, set_sign_in_ending] = useState<SignInEnding | null>(null);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [outbox_count, set_outbox_count] = useState(0);
@@ -2916,6 +2920,9 @@ export function BridgeApp() {
       }
       was_guard_pending.current = state.guard_pending !== null;
       set_guard_pending(state.guard_pending);
+      if (state.enrolled || state.guard_pending) {
+        set_sign_in_ending(null);
+      }
       if (state.enrolled) {
         set_view("dashboard");
         set_email(state.email);
@@ -3134,6 +3141,19 @@ export function BridgeApp() {
   }, []);
 
   useEffect(() => {
+    const sub = listen_tauri<string>("sign_in_ended", async (event) => {
+      if (event.payload !== "denied" && event.payload !== "expired") return;
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().show().catch(() => {});
+      was_guard_pending.current = false;
+      set_guard_pending(null);
+      set_sign_in_ending(event.payload);
+      force_link_device();
+    });
+    return sub.unlisten;
+  }, [force_link_device]);
+
+  useEffect(() => {
     const sub = listen_tauri("session_expired", async () => {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().show();
@@ -3243,7 +3263,7 @@ export function BridgeApp() {
   if (view === "setup") {
     return (
       <>
-        <SetupView on_enrolled={handle_enrolled} on_activation_pending={load_state} can_go_back={was_enrolled} on_back={handle_back_to_dashboard} />
+        <SetupView key={sign_in_ending ?? "setup"} initial_state={sign_in_ending ?? undefined} on_enrolled={handle_enrolled} on_activation_pending={load_state} can_go_back={was_enrolled} on_back={handle_back_to_dashboard} />
         <ToastContainer />
       </>
     );

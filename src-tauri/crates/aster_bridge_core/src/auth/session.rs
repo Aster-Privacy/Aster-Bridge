@@ -462,6 +462,10 @@ pub async fn restore_or_login(
         .device_id
         .ok_or_else(|| BridgeError::Auth("no device_id stored - first-time setup required".to_string()))?;
 
+    if let Some(code) = crate::ops::held_code(&config.data_dir, device_id) {
+        return crate::ops::finish_held_sign_in(client, identity, &config.data_dir, &code).await;
+    }
+
     let passphrase = device_identity::load_passphrase(&config.data_dir)
         .map_err(BridgeError::Auth)?
         .ok_or_else(|| BridgeError::Auth("no stored passphrase - first-time setup required".to_string()))?;
@@ -483,6 +487,8 @@ pub async fn restore_or_login(
                         device_id,
                         activates_at,
                         change_id,
+                        code: None,
+                        replaced_device_id: None,
                     },
                 ) {
                     tracing::warn!("couldn't save the pending activation record: {}", e);
