@@ -49,13 +49,27 @@ fn pending_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PENDING_FILE)
 }
 
-fn read_record(data_dir: &Path) -> Option<PendingActivation> {
+const HELD_LINK_FIELD: &str = "held_link";
+
+fn read_record(data_dir: &Path) -> Option<(PendingActivation, bool)> {
     let bytes = std::fs::read(pending_path(data_dir)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let held_link = value
+        .get(HELD_LINK_FIELD)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let record = serde_json::from_value(value).ok()?;
+    Some((record, held_link))
 }
 
 fn write_record(data_dir: &Path, pending: &PendingActivation) -> Result<(), String> {
-    let bytes = serde_json::to_vec(pending).map_err(|e| e.to_string())?;
+    let mut value = serde_json::to_value(pending).map_err(|e| e.to_string())?;
+    if pending.code.is_some() {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert(HELD_LINK_FIELD.to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     crate::atomic_file::write(&pending_path(data_dir), &bytes)
 }
 
@@ -70,15 +84,16 @@ fn move_plain_code(data_dir: &Path, record: &PendingActivation, code: &str) {
 }
 
 pub fn load(data_dir: &Path) -> Option<PendingActivation> {
-    let mut record = read_record(data_dir)?;
+    let (mut record, held_link) = read_record(data_dir)?;
     match record.code.as_deref() {
         Some(code) => move_plain_code(data_dir, &record, code),
-        None => {
+        None if held_link => {
             record.code = crate::secrets::get(CODE_SECRET).unwrap_or_else(|e| {
                 tracing::warn!("couldn't read the held link code: {}", e);
                 None
             });
         }
+        None => {}
     }
     Some(record)
 }
@@ -221,6 +236,24 @@ mod tests {
         save(dir.path(), &sample()).unwrap();
         assert_eq!(load(dir.path()), Some(sample()));
         assert_eq!(crate::secrets::get(CODE_SECRET).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_leftover_link_code_never_attaches_to_a_record_without_one() {
+        let _secrets = crate::secrets::test_backend_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &PendingActivation { change_id: Some(Uuid::nil()), ..sample() }).unwrap();
+        crate::secrets::set(CODE_SECRET, "STALE123").unwrap();
+        assert_eq!(load(dir.path()).unwrap().code, None);
+        std::fs::write(
+            dir.path().join(PENDING_FILE),
+            br#"{"device_id":"8d4f2b1e-3c6a-4e5f-9a7b-1c2d3e4f5a6b","activates_at":"2026-11-15T11:00:00Z","change_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()), Some(sample()));
+        let device_id = sample().device_id;
+        assert_eq!(crate::ops::held_code(dir.path(), device_id), None);
+        clear(dir.path());
     }
 
     #[test]
