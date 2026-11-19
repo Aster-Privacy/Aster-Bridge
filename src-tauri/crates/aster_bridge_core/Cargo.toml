@@ -42,7 +42,6 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "ht
 tower-service = "0.3"
 rcgen = "0.13"
 rustls = { workspace = true }
-rustls-pemfile = "2"
 der = "0.7"
 webpki-roots = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
@@ -58,7 +57,7 @@ ipnet = "2"
 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom"] }
 ml-kem = { version = "0.2", features = ["deterministic", "zeroize"] }
 miniz_oxide = "0.8"
 chacha20poly1305 = "0.10"

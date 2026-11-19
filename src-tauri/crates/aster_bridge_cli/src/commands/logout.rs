@@ -98,6 +98,9 @@ pub async fn run(ctx: &Context, keep_cache: bool) -> CliResult<i32> {
         state::remove(dir);
         secret_backend::remove_record(dir);
         let _ = std::fs::remove_dir_all(secret_backend::secrets_dir(dir));
+        if let Err(e) = aster_bridge_core::auth::vault_floor::forget_all(dir) {
+            out.warn(format!("Couldn't delete the saved record of account keys: {}", e));
+        }
     }
     let _ = std::fs::remove_file(control::control_path(dir));
 

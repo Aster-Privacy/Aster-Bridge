@@ -1774,7 +1774,7 @@ mod tests {
     )
     .as_bytes();
 
-    fn open_send_attachment(value: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
+    fn open_send_attachment(slot: usize, value: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
         use aes_gcm::aead::Aead;
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use base64::engine::general_purpose::STANDARD;
@@ -1787,7 +1787,9 @@ mod tests {
         let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
         let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        (cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap(), meta)
+        let aad = crate::crypto::attachment::attachment_data_aad(slot as i64);
+        let payload = aes_gcm::aead::Payload { msg: ct.as_ref(), aad: &aad };
+        (cipher.decrypt(Nonce::from_slice(&nonce), payload).unwrap(), meta)
     }
 
     #[test]
@@ -1817,8 +1819,11 @@ mod tests {
                 assert!(entry[key].is_string(), "missing {}", key);
             }
         }
-        let opened: Vec<(Vec<u8>, serde_json::Value)> =
-            list.iter().map(open_send_attachment).collect();
+        let opened: Vec<(Vec<u8>, serde_json::Value)> = list
+            .iter()
+            .enumerate()
+            .map(|(slot, entry)| open_send_attachment(slot, entry))
+            .collect();
         let pdf = opened
             .iter()
             .find(|(_, m)| m["filename"] == "report.pdf")

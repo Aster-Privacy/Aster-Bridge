@@ -131,6 +131,7 @@ pub fn access_hint(path: &std::path::Path) -> String {
     format!("Check that you can read and write {}, or pass --data-dir.", path.display())
 }
 
+#[cfg(any(unix, test))]
 pub fn owner_hint(path: &std::path::Path, user: (u32, u32), owner: Option<(u32, u32)>, in_container: bool) -> String {
     let (uid, gid) = user;
     let chown = format!("sudo chown -R {}:{} <folder>", uid, gid);

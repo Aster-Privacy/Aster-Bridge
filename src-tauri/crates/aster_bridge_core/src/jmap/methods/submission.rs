@@ -453,7 +453,9 @@ mod tests {
         let nonce = STANDARD.decode(value["data_nonce"].as_str().unwrap()).unwrap();
         let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        (cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap(), meta)
+        let aad = crate::crypto::attachment::attachment_data_aad(0);
+        let payload = aes_gcm::aead::Payload { msg: ct.as_ref(), aad: &aad };
+        (cipher.decrypt(Nonce::from_slice(&nonce), payload).unwrap(), meta)
     }
 
     #[tokio::test]

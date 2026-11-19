@@ -259,16 +259,22 @@ fn clean_content_type(ct: &str) -> String {
     }
 }
 
-fn boundary_for(aster_id: &str, level: u8) -> String {
+fn boundary_for(aster_id: &str, level: u8, attempt: u8) -> String {
     let mut h = Sha256::new();
     h.update(aster_id.as_bytes());
-    let digest = h.finalize();
-    let hex: String = digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{:02x}", b))
-        .collect();
+    if attempt > 0 {
+        h.update([0, attempt]);
+    }
+    let hex: String = h.finalize()[..8].iter().map(|b| format!("{:02x}", b)).collect();
     format!("=_aster_{}_{}", hex, level)
+}
+
+fn pick_boundaries(aster_id: &str, text: &TextPart<'_>) -> (String, String) {
+    let pair = |attempt| (boundary_for(aster_id, 0, attempt), boundary_for(aster_id, 1, attempt));
+    (0..u8::MAX)
+        .map(pair)
+        .find(|(outer, inner)| !text.contains(outer) && !text.contains(inner))
+        .unwrap_or_else(|| pair(u8::MAX))
 }
 
 fn escape_html_text(s: &str) -> String {
@@ -536,6 +542,10 @@ impl<'a> TextPart<'a> {
             None => out.len += self.body_len_hint,
         }
         out.push(&self.suffix);
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.body.is_some_and(|b| b.contains(needle)) || self.suffix.contains(needle)
     }
 
     fn structure(&self, text: &str) -> String {
@@ -809,22 +819,21 @@ fn render_with(
         }
     }
 
-    let outer_boundary = boundary_for(&msg.aster_id, 0);
-    let inner_boundary = boundary_for(&msg.aster_id, 1);
+    let (outer_boundary, inner_boundary) = pick_boundaries(&msg.aster_id, &text);
     let (subtype, boundary, children): (&str, String, Vec<Child<'_>>) = if inline.is_empty() {
         let mut c = vec![Child::Text(text_header)];
         c.extend(regular.iter().map(|a| Child::Attachment(a, false)));
-        ("MIXED", outer_boundary.clone(), c)
+        ("MIXED", outer_boundary, c)
     } else if regular.is_empty() {
         let mut c = vec![Child::Text(text_header)];
         c.extend(inline.iter().map(|a| Child::Attachment(a, true)));
-        ("RELATED", outer_boundary.clone(), c)
+        ("RELATED", outer_boundary, c)
     } else {
         let mut related = vec![Child::Text(text_header)];
         related.extend(inline.iter().map(|a| Child::Attachment(a, true)));
-        let mut c = vec![Child::Related(inner_boundary.clone(), related)];
+        let mut c = vec![Child::Related(inner_boundary, related)];
         c.extend(regular.iter().map(|a| Child::Attachment(a, false)));
-        ("MIXED", outer_boundary.clone(), c)
+        ("MIXED", outer_boundary, c)
     };
 
     top.push_str(&format!(
@@ -1281,5 +1290,73 @@ X-Evil"
             assert_eq!(out.buf.len(), base64_encoded_len(n), "n={}", n);
             assert_eq!(out.len, base64_encoded_len(n));
         }
+    }
+
+    fn outer_boundary_of(r: &Rendered) -> String {
+        let header = r.header();
+        let start = header.find("boundary=\"").unwrap() + "boundary=\"".len();
+        let end = start + header[start..].find('"').unwrap();
+        header[start..end].to_string()
+    }
+
+    #[test]
+    fn boundary_of_an_ordinary_message_is_the_one_already_served() {
+        let digest = Sha256::digest(b"msg-1");
+        let hex: String = digest[..8].iter().map(|b| format!("{:02x}", b)).collect();
+        let atts = vec![att(0, "a.txt", "text/plain", b"x")];
+        let r = render(&msg(Some("b"), None, ATTACHMENTS_STORED), &atts, true);
+        assert_eq!(outer_boundary_of(&r), format!("=_aster_{}_0", hex));
+        let mut logo = att(0, "logo.png", "image/png", &[1u8; 10]);
+        logo.is_inline = true;
+        logo.content_id = Some("<logo@x>".to_string());
+        let pdf = att(1, "doc.pdf", "application/pdf", b"pdf");
+        let both = render(&msg(Some("<p>b</p>"), Some("{\"is_html\":true}"), ATTACHMENTS_STORED), &[logo, pdf], true);
+        assert_eq!(outer_boundary_of(&both), format!("=_aster_{}_0", hex));
+        assert!(both.part_header("1").unwrap().contains(&format!("=_aster_{}_1", hex)));
+    }
+
+    #[test]
+    fn body_that_contains_the_boundary_gets_a_different_one() {
+        let atts = vec![att(0, "a.txt", "text/plain", b"x")];
+        let first = render(&msg(Some("b"), None, ATTACHMENTS_STORED), &atts, true);
+        let taken = outer_boundary_of(&first);
+        let body = format!(
+            "hi\r\n--{}\r\nContent-Type: text/html\r\n\r\n<b>fake</b>\r\n--{}--\r\n",
+            taken, taken
+        );
+        let m = msg(Some(&body), None, ATTACHMENTS_STORED);
+        let r = render(&m, &atts, true);
+        let used = outer_boundary_of(&r);
+        assert_ne!(used, taken);
+        assert_eq!(used.len(), taken.len());
+        assert!(!body.contains(&used));
+        assert_eq!(r.text.matches(&format!("--{}\r\n", used)).count(), 2);
+        assert_eq!(r.size, r.text.len());
+        assert_eq!(rendered_size(&m, &atts), r.text.len());
+        assert!(r.part_header("2").unwrap().contains("a.txt"));
+        assert!(r.part_header("3").is_none());
+    }
+
+    #[test]
+    fn related_and_mixed_boundaries_both_avoid_the_body() {
+        let mut logo = att(0, "logo.png", "image/png", &[1u8; 10]);
+        logo.is_inline = true;
+        logo.content_id = Some("<logo@x>".to_string());
+        let pdf = att(1, "doc.pdf", "application/pdf", b"pdf");
+        let inner = boundary_for("msg-1", 1, 0);
+        let body = format!("<p>--{}</p>", inner);
+        let text = TextPart {
+            body: Some(&body),
+            body_len_hint: 0,
+            suffix: String::new(),
+            is_html: true,
+        };
+        let (outer_used, inner_used) = pick_boundaries("msg-1", &text);
+        assert_ne!(inner_used, inner);
+        assert!(!body.contains(&outer_used) && !body.contains(&inner_used));
+        let m = msg(Some(&body), Some("{\"is_html\":true}"), ATTACHMENTS_STORED);
+        let r = render(&m, &[logo, pdf], true);
+        assert!(r.part_header("1").unwrap().contains(&inner_used));
+        assert_eq!(r.size, r.text.len());
     }
 }

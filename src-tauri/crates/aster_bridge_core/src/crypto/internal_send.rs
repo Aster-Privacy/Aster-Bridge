@@ -38,8 +38,8 @@ use crate::crypto::sealed_details::{
 };
 use crate::crypto::recipient_trust::{
     classify_scoped_entry, evaluate_address_entry, evaluate_recipient, is_address_scoped,
-    read_recipient_pin, verify_bundle, BundleVerdict, DirectoryTrust, Evaluation, PinRead,
-    RatchetTarget, RecipientPin, SendRoute,
+    needs_root_review, read_recipient_pin, review_legacy_root, verify_bundle, BundleVerdict,
+    DirectoryTrust, Evaluation, PinRead, RatchetTarget, RecipientPin, SendRoute,
 };
 use crate::crypto::address_directory::{AddressEntryDirectory, AddressEntryState, ADDRESS_ENTRIES};
 use crate::crypto::address_identity::{address_entry_forms, is_primary_address, AddressKeyring, SignedAddressEntry};
@@ -746,6 +746,13 @@ fn has_post_quantum_protection(route: &SendRoute) -> bool {
     )
 }
 
+fn has_unconfirmed_post_quantum_key(route: &SendRoute) -> bool {
+    matches!(
+        route,
+        SendRoute::Ratchet(target) if target.pq_target.as_ref().is_some_and(|pq| !pq.signed)
+    )
+}
+
 fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()> {
     if !required {
         return Ok(());
@@ -754,6 +761,10 @@ fn enforce_post_quantum(routed: &[RoutedRecipient], required: bool) -> Result<()
         .iter()
         .find(|recipient| !has_post_quantum_protection(&recipient.route))
     {
+        Some(recipient) if has_unconfirmed_post_quantum_key(&recipient.route) => Err(BridgeError::RecipientKey(format!(
+            "{} has a post-quantum key that Aster Bridge can't confirm belongs to them, and Aster Bridge is set to require confirmed post-quantum protection, so the message was not sent. To send it, compare the recipient's key fingerprint with them and accept it in Settings > Advanced, or turn off Require post-quantum protection for Aster recipients in the Aster Bridge settings.",
+            recipient.address
+        ))),
         Some(recipient) => Err(BridgeError::RecipientKey(format!(
             "{} cannot receive post-quantum protected mail yet, and Aster Bridge is set to require it, so the message was not sent. To send it anyway, turn off Require post-quantum protection for Aster recipients in the Aster Bridge settings.",
             recipient.address
@@ -879,7 +890,7 @@ async fn lookup_hosted_recipients(
         let owner_public_key = key_lookup.as_ref().and_then(|lookup| lookup.public_key.clone());
         let bundle_verified = match bundle.as_ref() {
             Some(bundle) if is_address_scoped(bundle) => {
-                classify_scoped_entry(&address, bundle, None) == DirectoryTrust::Entry
+                classify_scoped_entry(&address, bundle, None) == DirectoryTrust::Unverified
             }
             Some(bundle) => owner_public_key.as_deref().is_some_and(|owner| {
                 matches!(verify_bundle(bundle, Some(owner)), BundleVerdict::Verified { .. })
@@ -922,7 +933,110 @@ async fn fetch_hosted_keys(
     Ok((key_lookup, bundle))
 }
 
+async fn reviewed_legacy_root(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+    first: Option<&PrekeyBundle>,
+    owner_public_key: Option<&str>,
+    existing: Option<&RecipientPin>,
+) -> Option<RecipientPin> {
+    let pin = existing.filter(|pin| needs_root_review(pin))?;
+    let scoped = first.filter(|bundle| is_address_scoped(bundle));
+    if pin.owner_fingerprint.is_empty() {
+        return Some(review_legacy_root(address, pin, scoped, None, owner_public_key));
+    }
+    let fetched;
+    let account_bundle = match first.filter(|bundle| !is_address_scoped(bundle)) {
+        Some(bundle) => bundle,
+        None => {
+            fetched = client
+                .find_prekey_bundle_in_scope(access_token, username, address, false)
+                .await
+                .ok()
+                .flatten()
+                .filter(|bundle| !is_address_scoped(bundle))?;
+            &fetched
+        }
+    };
+    Some(review_legacy_root(address, pin, scoped, Some(account_bundle), owner_public_key))
+}
+
+fn one_time_refetch_wanted(evaluation: &Evaluation, existing: Option<&RecipientPin>) -> bool {
+    evaluation.one_time_withheld && existing.is_some_and(|pin| pin.opk_seen)
+}
+
 async fn resolve_recipient_route(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+    first: Option<PrekeyBundle>,
+    owner_public_key: Option<&str>,
+    existing: Option<&RecipientPin>,
+) -> Result<Evaluation> {
+    let evaluation =
+        resolve_recipient_route_once(client, access_token, username, address, first, owner_public_key, existing)
+            .await?;
+    if !one_time_refetch_wanted(&evaluation, existing) {
+        return Ok(evaluation);
+    }
+    let Ok(fresh) = client
+        .find_prekey_bundle_in_scope(access_token, username, address, true)
+        .await
+    else {
+        return Ok(evaluation);
+    };
+    match resolve_recipient_route_once(client, access_token, username, address, fresh, owner_public_key, existing).await {
+        Ok(retry)
+            if !retry.one_time_withheld
+                && matches!(&retry.outcome, Ok(SendRoute::Ratchet(target)) if target.one_time_prekey.is_some()) =>
+        {
+            Ok(retry)
+        }
+        _ => {
+            if evaluation.one_time_withheld {
+                tracing::warn!("{}", ONE_TIME_PREKEY_WITHHELD_WARNING);
+            }
+            Ok(evaluation)
+        }
+    }
+}
+
+pub const ONE_TIME_PREKEY_WITHHELD_WARNING: &str =
+    "A recipient's server sent no one-time prekey, so the message was sealed with the signed prekey alone and has downgraded forward secrecy for its first reply.";
+
+async fn resolve_recipient_route_once(
+    client: &ApiClient,
+    access_token: &str,
+    username: &str,
+    address: &str,
+    first: Option<PrekeyBundle>,
+    owner_public_key: Option<&str>,
+    existing: Option<&RecipientPin>,
+) -> Result<Evaluation> {
+    let reviewed = reviewed_legacy_root(
+        client,
+        access_token,
+        username,
+        address,
+        first.as_ref(),
+        owner_public_key,
+        existing,
+    )
+    .await
+    .filter(|pin| Some(pin) != existing);
+    let current = reviewed.as_ref().or(existing);
+    let mut evaluation =
+        route_with_pin(client, access_token, username, address, first, owner_public_key, current).await?;
+    if evaluation.pin.is_none() {
+        evaluation.pin = reviewed;
+    }
+    Ok(evaluation)
+}
+
+async fn route_with_pin(
     client: &ApiClient,
     access_token: &str,
     username: &str,
@@ -1234,12 +1348,40 @@ fn seal_shared_and_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_that_published_one_time_prekeys_gets_one_fresh_bundle_request() {
+        let seen = RecipientPin {
+            opk_seen: true,
+            ..RecipientPin::default()
+        };
+        let pgp_route = Evaluation {
+            one_time_withheld: false,
+            pin: None,
+            outcome: Ok(SendRoute::AccountKey),
+        };
+        assert!(!one_time_refetch_wanted(&pgp_route, Some(&seen)));
+        let withheld_route = Evaluation {
+            one_time_withheld: true,
+            pin: None,
+            outcome: Ok(SendRoute::AccountKey),
+        };
+        assert!(one_time_refetch_wanted(&withheld_route, Some(&seen)));
+        assert!(!one_time_refetch_wanted(&withheld_route, Some(&RecipientPin::default())));
+        assert!(!one_time_refetch_wanted(&withheld_route, None));
+        let refused = Evaluation {
+            one_time_withheld: false,
+            pin: None,
+            outcome: Err(BridgeError::RecipientKey("refused".to_string())),
+        };
+        assert!(!one_time_refetch_wanted(&refused, Some(&seen)));
+    }
     use crate::crypto::recipient_trust::pin_id;
     use crate::crypto::ratchet::{
         decrypt_bootstrap, encrypt_bootstrap, parse_recipient_message, RatchetReceiverKeys,
     };
     use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::SecretKey;
     use rand_core::OsRng;
 
@@ -1441,19 +1583,19 @@ mod tests {
     #[test]
     fn a_sealed_envelope_round_trips_through_the_recipient_parser() {
         let plaintext = "internal body the server must never see";
-        let recipient_identity = SecretKey::random(&mut OsRng);
-        let recipient_prekey = SecretKey::random(&mut OsRng);
-        let sender_identity = SecretKey::random(&mut OsRng);
+        let recipient_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let recipient_prekey = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let sender_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (decap, encap) = MlKem768::generate(&mut OsRng);
 
         let identity_public = recipient_identity
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let prekey_public = recipient_prekey
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
 
@@ -1506,13 +1648,13 @@ mod tests {
     }
 
     fn recipient() -> Recipient {
-        let identity = SecretKey::random(&mut OsRng);
-        let prekey = SecretKey::random(&mut OsRng);
+        let identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let prekey = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (decap, encap) = MlKem768::generate(&mut OsRng);
-        let prekey_public = prekey.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let prekey_public = prekey.public_key().to_sec1_point(false).as_bytes().to_vec();
         let bundle = crate::api_client::PrekeyBundle {
             kem_identity_key: STANDARD
-                .encode(identity.public_key().to_encoded_point(false).as_bytes()),
+                .encode(identity.public_key().to_sec1_point(false).as_bytes()),
             signed_prekey: STANDARD.encode(&prekey_public),
             signed_prekey_signature: None,
             pq_prekey: None,
@@ -1542,7 +1684,7 @@ mod tests {
 
     fn sender(account: &crate::crypto::recipient_trust::tests::Owner) -> SenderKeys {
         SenderKeys {
-            identity_secret_d: SecretKey::random(&mut OsRng).to_bytes().to_vec(),
+            identity_secret_d: <SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec(),
             username: "sender".to_string(),
             account_id: "account".to_string(),
             account_key: Some(Zeroizing::new(account.keypair.to_armored().unwrap())),
@@ -1699,7 +1841,7 @@ mod tests {
         Some(json!({
             "key_id": key_id,
             "public_key": STANDARD
-                .encode(one_time.public_key().to_encoded_point(false).as_bytes()),
+                .encode(one_time.public_key().to_sec1_point(false).as_bytes()),
         }))
     }
 
@@ -1710,7 +1852,7 @@ mod tests {
 
         let account = owner("user");
         let me = owner("sender");
-        let one_time = SecretKey::random(&mut OsRng);
+        let one_time = <SecretKey as p256::elliptic_curve::Generate>::generate();
 
         for advertised in [None, Some(1i16), Some(2), Some(3)] {
             let mut bob = recipient();
@@ -1778,7 +1920,7 @@ mod tests {
             signed_prekey_public: bob.prekey_public.clone(),
         };
         assert!(decrypt_bootstrap(&keys, &message).is_err());
-        message.opk_secret = Some(SecretKey::random(&mut OsRng).to_bytes().to_vec());
+        message.opk_secret = Some(<SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec());
         assert!(decrypt_bootstrap(&keys, &message).is_err());
         message.opk_secret = Some(one_time.to_bytes().to_vec());
         assert_eq!(decrypt_bootstrap(&keys, &message).expect("decrypted"), plaintext);
@@ -1790,7 +1932,7 @@ mod tests {
         use crate::crypto::recipient_trust::OneTimePrekeyTarget;
 
         let account = owner("user");
-        let one_time = SecretKey::random(&mut OsRng);
+        let one_time = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let mut bob = recipient();
         bob.bundle.x3dh_max_version = Some(4);
         bob.bundle.ec_one_time_prekey = offered_one_time_prekey(41, &one_time);
@@ -1801,7 +1943,7 @@ mod tests {
             panic!("expected the ratchet route");
         };
         assert_eq!(target.x3dh_version(), 4);
-        let sender_secret = SecretKey::random(&mut OsRng).to_bytes().to_vec();
+        let sender_secret = <SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec();
 
         let bound = seal_for_recipient(&sender_secret, &target, "bound").expect("sealed");
         assert_eq!(bound.x3dh_version, Some(4));
@@ -1814,7 +1956,7 @@ mod tests {
             },
             OneTimePrekeyTarget {
                 key_id: 0,
-                public_key: one_time.public_key().to_encoded_point(false).as_bytes().to_vec(),
+                public_key: one_time.public_key().to_sec1_point(false).as_bytes().to_vec(),
             },
         ] {
             target.one_time_prekey = Some(unusable);
@@ -2602,7 +2744,7 @@ mod tests {
     }
 
     fn sending_session(account: &crate::crypto::recipient_trust::tests::Owner) -> Arc<RwLock<Session>> {
-        let prekey = SecretKey::random(&mut OsRng);
+        let prekey = <SecretKey as p256::elliptic_curve::Generate>::generate();
         Arc::new(RwLock::new(Session {
             data_kek: None,
             user_id: uuid::Uuid::new_v4(),
@@ -2614,9 +2756,9 @@ mod tests {
             identity_key: Some(account.keypair.to_armored().unwrap()),
             ratchet_identity_public: None,
             ratchet_keys: vec![crate::crypto::ratchet::RatchetReceiverKeys {
-                identity_secret_d: SecretKey::random(&mut OsRng).to_bytes().to_vec(),
+                identity_secret_d: <SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec(),
                 signed_prekey_secret_d: prekey.to_bytes().to_vec(),
-                signed_prekey_public: prekey.public_key().to_encoded_point(false).as_bytes().to_vec(),
+                signed_prekey_public: prekey.public_key().to_sec1_point(false).as_bytes().to_vec(),
             }],
             inbound_keys: Vec::new(),
             send_identities: Vec::new(),
@@ -2976,7 +3118,7 @@ mod tests {
         let account_identity = {
             let guard = session.read().await;
             let secret = SecretKey::from_slice(&guard.ratchet_keys[0].identity_secret_d).unwrap();
-            STANDARD.encode(secret.public_key().to_encoded_point(false).as_bytes())
+            STANDARD.encode(secret.public_key().to_sec1_point(false).as_bytes())
         };
 
         let amy = owner("amy");
@@ -3085,7 +3227,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_scoped_entry_is_used_for_an_alias_recipient_and_a_downgrade_is_refused() {
+    async fn a_first_send_without_a_one_time_prekey_records_the_grace_time() {
+        use crate::crypto::recipient_trust::tests::owner;
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let account_id = session.read().await.user_id.to_string();
+
+        let address = "olga@astermail.org";
+        let olga = owner("olga");
+        let mut olga_keys = recipient();
+        olga_keys.bundle.x3dh_max_version = Some(i16::from(crate::crypto::ratchet::X3DH_VERSION_KEY_BOUND));
+        sign_v2(&mut olga_keys.bundle, &olga);
+        directory.set_key(address, Some(json!({"public_key": olga.public_key, "internal": true})));
+        directory.set_bundle(address, Some(bundle_json(&olga_keys.bundle)));
+        db.recipient_pin_put(
+            &pin_id(&account_id, address),
+            &RecipientPin {
+                owner_fingerprint: crate::crypto::recipient_trust::key_fingerprint(Some(&olga.public_key)).unwrap(),
+                opk_seen: true,
+                ..RecipientPin::default()
+            },
+        )
+        .unwrap();
+
+        let mut payload = payload_with(vec![address]);
+        seal_internal_body_with(&mut payload, &session, &client, &db, "token", true, &AddressEntryDirectory::new())
+            .await
+            .unwrap();
+        assert_eq!(payload["is_e2e_encrypted"], json!(true));
+        let stored = crate::crypto::recipient_trust::read_recipient_pin(&db, &account_id, address)
+            .unwrap()
+            .pin
+            .expect("the recipient stays pinned");
+        assert!(stored.opk_seen);
+        assert!(stored.opk_grace_at > 0, "the first send without a one-time prekey starts the grace window");
+
+        let mut again = payload_with(vec![address]);
+        seal_internal_body_with(&mut again, &session, &client, &db, "token", true, &AddressEntryDirectory::new())
+            .await
+            .unwrap();
+        assert_eq!(again["is_e2e_encrypted"], json!(true));
+        let kept = crate::crypto::recipient_trust::read_recipient_pin(&db, &account_id, address)
+            .unwrap()
+            .pin
+            .unwrap();
+        assert_eq!(kept.opk_grace_at, stored.opk_grace_at);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_entry_is_used_for_an_alias_recipient_and_its_first_contact_pin_stays_unverified() {
         use crate::crypto::address_identity::tests::fixed_keyring;
         use crate::crypto::recipient_trust::tests::owner;
 
@@ -3114,16 +3308,30 @@ mod tests {
             })),
         );
 
-        let seal = || {
+        let seal_requiring = |require_post_quantum: bool| {
             let (session, client, db) = (&session, &client, &db);
             async move {
                 let mut payload = payload_with(vec![address]);
-                seal_internal_body_with(&mut payload, session, client, db, "token", true, &AddressEntryDirectory::new())
-                    .await
-                    .map(|_| payload)
+                seal_internal_body_with(
+                    &mut payload,
+                    session,
+                    client,
+                    db,
+                    "token",
+                    require_post_quantum,
+                    &AddressEntryDirectory::new(),
+                )
+                .await
+                .map(|_| payload)
             }
         };
+        let seal = || seal_requiring(false);
 
+        let refused = seal_requiring(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, BridgeError::RecipientKey(message) if message.starts_with(address) && message.contains("can't confirm")),
+            "a first-contact post-quantum key counted as confirmed protection: {refused:?}"
+        );
         let sealed = seal().await.unwrap();
         assert_eq!(sealed["is_e2e_encrypted"], json!(true));
         let account_id = session.read().await.user_id.to_string();
@@ -3131,23 +3339,118 @@ mod tests {
             .unwrap()
             .pin
             .expect("the entry is pinned");
-        assert!(stored.address_rooted);
+        assert!(!stored.address_rooted);
+        assert_eq!(stored.root_evidence, crate::crypto::recipient_trust::ROOT_EVIDENCE_FIRST_CONTACT);
 
         directory.set_scoped(address, None);
-        let refused = seal().await.unwrap_err();
-        assert!(
-            matches!(&refused, BridgeError::RecipientKey(message) if message.contains("recipient-key accept")),
-            "an unscoped answer for a rooted address asks to accept the changed key: {refused:?}"
-        );
-        let shown = crate::crypto::recipient_trust::key_fingerprint(Some(&amy.public_key)).unwrap();
-        crate::crypto::recipient_trust::accept_recipient_key(&db, &account_id, address, Some(&amy.public_key), &shown).unwrap();
-        let accepted = seal().await.unwrap();
-        assert_eq!(accepted["is_e2e_encrypted"], json!(true));
+        let fallback = seal().await.unwrap();
+        assert_eq!(fallback["is_e2e_encrypted"], json!(true));
         let stored = crate::crypto::recipient_trust::read_recipient_pin(&db, &account_id, address)
             .unwrap()
             .pin
             .unwrap();
         assert!(!stored.address_rooted && !stored.flagged);
+        assert_eq!(stored.root_evidence, crate::crypto::recipient_trust::ROOT_EVIDENCE_SIGNED_BUNDLE);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_pin_is_reviewed_once_against_signed_evidence_when_sending() {
+        use crate::crypto::address_identity::tests::fixed_keyring;
+        use crate::crypto::recipient_trust::tests::owner;
+        use crate::crypto::recipient_trust::{
+            key_fingerprint, read_recipient_pin, ROOT_EVIDENCE_FIRST_CONTACT, ROOT_EVIDENCE_SIGNED_BUNDLE,
+            ROOT_EVIDENCE_UNKNOWN, UNVERIFIED_NOTICE_NONE, UNVERIFIED_NOTICE_PENDING,
+        };
+        use sha2::{Digest, Sha256};
+
+        let (base, directory) = start_directory().await;
+        let client = ApiClient::new_with_base_url(&base);
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+        let session = sending_session(&owner("sender"));
+        let account_id = session.read().await.user_id.to_string();
+
+        let address = "amy.alias@astermail.org";
+        let amy = owner("amy");
+        let mut amy_keys = recipient();
+        sign_v2(&mut amy_keys.bundle, &amy);
+        directory.set_key(address, Some(json!({"public_key": amy.public_key, "internal": true})));
+        directory.set_bundle(address, Some(bundle_json(&amy_keys.bundle)));
+        let entry = fixed_keyring().sign_entry(address).unwrap();
+        directory.set_scoped(
+            address,
+            Some(json!({
+                "kem_identity_key": entry.kem_identity_key,
+                "signed_prekey": entry.signed_prekey,
+                "signed_prekey_signature": entry.signed_prekey_signature,
+                "pq_kem_public_key": entry.pq_kem_public_key,
+                "x3dh_max_version": 2,
+                "address_scoped": true,
+            })),
+        );
+        let fingerprint = |key: &str| {
+            Sha256::digest(STANDARD.decode(key).unwrap())
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
+        let pin_id = read_recipient_pin(&db, &account_id, address).unwrap().id;
+        let seal_requiring = |require_post_quantum: bool| {
+            let (session, client, db) = (&session, &client, &db);
+            async move {
+                let mut payload = payload_with(vec![address]);
+                seal_internal_body_with(
+                    &mut payload,
+                    session,
+                    client,
+                    db,
+                    "token",
+                    require_post_quantum,
+                    &AddressEntryDirectory::new(),
+                )
+                .await
+                .map(|_| payload)
+            }
+        };
+        let seal = || seal_requiring(false);
+
+        let server_minted = RecipientPin {
+            identity_fingerprint: fingerprint(&entry.kem_identity_key),
+            pq_seen: true,
+            address_rooted: true,
+            root_evidence: ROOT_EVIDENCE_UNKNOWN,
+            ..Default::default()
+        };
+        db.recipient_pin_put(&pin_id, &server_minted).unwrap();
+        assert_eq!(db.recipient_pin_unverified_notice_count().unwrap(), 0);
+        let sealed = seal().await.unwrap();
+        assert_eq!(sealed["is_e2e_encrypted"], json!(true));
+        let demoted = read_recipient_pin(&db, &account_id, address).unwrap().pin.unwrap();
+        assert!(!demoted.address_rooted && !demoted.flagged);
+        assert_eq!(demoted.root_evidence, ROOT_EVIDENCE_FIRST_CONTACT);
+        assert_eq!(demoted.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+        assert_eq!(db.recipient_pin_unverified_notice_count().unwrap(), 1);
+        seal().await.unwrap();
+        assert_eq!(read_recipient_pin(&db, &account_id, address).unwrap().pin.unwrap(), demoted);
+
+        let verified = RecipientPin {
+            identity_fingerprint: fingerprint(&amy_keys.bundle.kem_identity_key),
+            owner_fingerprint: key_fingerprint(Some(&amy.public_key)).unwrap(),
+            pq_seen: true,
+            address_rooted: true,
+            root_evidence: ROOT_EVIDENCE_UNKNOWN,
+            ..Default::default()
+        };
+        db.recipient_pin_put(&pin_id, &verified).unwrap();
+        let refused = seal_requiring(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, BridgeError::RecipientKey(message) if message.contains("recipient-key accept")),
+            "a verified pin still refuses an entry it never vouched for: {refused:?}"
+        );
+        let kept = read_recipient_pin(&db, &account_id, address).unwrap().pin.unwrap();
+        assert!(kept.address_rooted);
+        assert_eq!(kept.root_evidence, ROOT_EVIDENCE_SIGNED_BUNDLE);
+        assert_eq!(kept.unverified_notice, UNVERIFIED_NOTICE_NONE);
     }
 
     #[tokio::test]

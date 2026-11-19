@@ -682,6 +682,7 @@ where
 }
 
 const WIRE_SIZE_REVISION: i64 = 1;
+const PIN_EVIDENCE_REVISION: i64 = 3;
 const PENDING_CLEAR_MARKER: &str = "user_data_clear_pending";
 const CLEAR_ATTEMPTS: u32 = 5;
 const CLEAR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -977,6 +978,30 @@ impl Database {
             "ALTER TABLE recipient_key_pin ADD COLUMN address_rooted INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN signature_level INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN x3dh_floor INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN root_evidence INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN unverified_notice INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN opk_seen INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recipient_key_pin ADD COLUMN opk_grace_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_attachment (
@@ -1121,6 +1146,20 @@ impl Database {
                 WIRE_SIZE_REVISION
             ))
             .map_err(|e| format!("message size repair failed: {}", e))?;
+        }
+        if schema_revision < PIN_EVIDENCE_REVISION {
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 UPDATE recipient_key_pin SET root_evidence = {}
+                 WHERE root_evidence = 0
+                   AND identity_fingerprint != ''
+                   AND (address_rooted = 0 OR binding_epoch > 0);
+                 PRAGMA user_version = {};
+                 COMMIT;",
+                crate::crypto::recipient_trust::ROOT_EVIDENCE_SIGNED_BUNDLE,
+                PIN_EVIDENCE_REVISION
+            ))
+            .map_err(|e| format!("recipient pin update failed: {}", e))?;
         }
 
         verify_required_columns(conn)
@@ -2747,7 +2786,8 @@ impl Database {
             conn.query_row(
                 "SELECT identity_fingerprint, owner_fingerprint, pq_seen, flagged,
                         pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint,
-                        hosted, address_rooted
+                        hosted, address_rooted, signature_level, x3dh_floor,
+                        root_evidence, unverified_notice, opk_seen, opk_grace_at
                  FROM recipient_key_pin WHERE pin_id = ?1",
                 [pin_id],
                 |r| {
@@ -2762,6 +2802,12 @@ impl Database {
                         binding_fingerprint: r.get(7)?,
                         hosted: r.get::<_, i64>(8)? != 0,
                         address_rooted: r.get::<_, i64>(9)? != 0,
+                        signature_level: r.get(10)?,
+                        x3dh_floor: r.get(11)?,
+                        root_evidence: r.get(12)?,
+                        unverified_notice: r.get(13)?,
+                        opk_seen: r.get::<_, i64>(14)? != 0,
+                        opk_grace_at: r.get(15)?,
                     })
                 },
             )
@@ -2796,8 +2842,9 @@ impl Database {
                 "INSERT INTO recipient_key_pin
                     (pin_id, identity_fingerprint, owner_fingerprint, pq_seen, flagged, updated_at,
                      pq_fingerprint, transcript_bound, binding_epoch, binding_fingerprint, hosted,
-                     address_rooted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     address_rooted, signature_level, x3dh_floor, root_evidence, unverified_notice,
+                     opk_seen, opk_grace_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(pin_id) DO UPDATE SET
                     identity_fingerprint = excluded.identity_fingerprint,
                     owner_fingerprint = excluded.owner_fingerprint,
@@ -2809,7 +2856,13 @@ impl Database {
                     binding_epoch = excluded.binding_epoch,
                     binding_fingerprint = excluded.binding_fingerprint,
                     hosted = excluded.hosted,
-                    address_rooted = excluded.address_rooted",
+                    address_rooted = excluded.address_rooted,
+                    signature_level = excluded.signature_level,
+                    x3dh_floor = excluded.x3dh_floor,
+                    root_evidence = excluded.root_evidence,
+                    unverified_notice = excluded.unverified_notice,
+                    opk_seen = excluded.opk_seen,
+                    opk_grace_at = excluded.opk_grace_at",
                 rusqlite::params![
                     pin_id,
                     pin.identity_fingerprint,
@@ -2822,7 +2875,36 @@ impl Database {
                     pin.binding_epoch,
                     pin.binding_fingerprint,
                     pin.hosted as i64,
-                    pin.address_rooted as i64
+                    pin.address_rooted as i64,
+                    pin.signature_level,
+                    pin.x3dh_floor,
+                    pin.root_evidence,
+                    pin.unverified_notice,
+                    pin.opk_seen as i64,
+                    pin.opk_grace_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn recipient_pin_unverified_notice_count(&self) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM recipient_key_pin WHERE unverified_notice = ?1",
+                [crate::crypto::recipient_trust::UNVERIFIED_NOTICE_PENDING],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    pub fn recipient_pin_dismiss_unverified_notice(&self) -> Result<(), String> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE recipient_key_pin SET unverified_notice = ?1 WHERE unverified_notice = ?2",
+                [
+                    crate::crypto::recipient_trust::UNVERIFIED_NOTICE_SHOWN,
+                    crate::crypto::recipient_trust::UNVERIFIED_NOTICE_PENDING,
                 ],
             )?;
             Ok(())
@@ -5693,6 +5775,12 @@ mod db_tests {
             hosted: false,
             flagged: false,
             address_rooted: false,
+            signature_level: 0,
+            x3dh_floor: 0,
+            root_evidence: 0,
+            unverified_notice: 0,
+            opk_seen: false,
+            opk_grace_at: 0,
         };
         db.recipient_pin_put("pin", &first).unwrap();
         assert_eq!(db.recipient_pin_get("pin").unwrap(), Some(first.clone()));
@@ -5707,6 +5795,12 @@ mod db_tests {
             hosted: true,
             flagged: true,
             address_rooted: true,
+            signature_level: 3,
+            x3dh_floor: 4,
+            root_evidence: 2,
+            unverified_notice: 1,
+            opk_seen: true,
+            opk_grace_at: 1_790_000_000,
             ..first
         };
         db.recipient_pin_put("pin", &rotated).unwrap();
@@ -5819,7 +5913,87 @@ mod db_tests {
         let revision: i64 = db
             .with_conn(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .unwrap();
-        assert_eq!(revision, WIRE_SIZE_REVISION);
+        assert_eq!(revision, PIN_EVIDENCE_REVISION);
+    }
+
+    #[test]
+    fn reopening_keeps_signed_pins_verified_and_leaves_first_contact_pins_for_review() {
+        use crate::crypto::recipient_trust::{
+            needs_root_review, RecipientPin, ROOT_EVIDENCE_SIGNED_BUNDLE, ROOT_EVIDENCE_UNKNOWN,
+        };
+        let pin = |identity: &str, rooted: bool, epoch: i64| RecipientPin {
+            identity_fingerprint: identity.to_string(),
+            owner_fingerprint: "owner".to_string(),
+            address_rooted: rooted,
+            binding_epoch: epoch,
+            ..Default::default()
+        };
+        let rows = [
+            ("signed", pin("aa", false, 0), ROOT_EVIDENCE_SIGNED_BUNDLE),
+            ("bound_rooted", pin("bb", true, 4), ROOT_EVIDENCE_SIGNED_BUNDLE),
+            ("ambiguous_rooted", pin("cc", true, 0), ROOT_EVIDENCE_UNKNOWN),
+            ("owner_only", pin("", false, 0), ROOT_EVIDENCE_UNKNOWN),
+        ];
+        for revision in [0, 1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+                for (id, row, _) in &rows {
+                    db.recipient_pin_put(id, row).unwrap();
+                }
+                db.with_conn(|conn| conn.execute_batch(&format!("PRAGMA user_version = {};", revision)))
+                    .unwrap();
+            }
+            let db = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+            for (id, row, evidence) in &rows {
+                let stored = db.recipient_pin_get(id).unwrap().unwrap();
+                assert_eq!(
+                    stored,
+                    RecipientPin {
+                        root_evidence: *evidence,
+                        ..row.clone()
+                    },
+                    "{id} at revision {revision}"
+                );
+            }
+            assert!(db.recipient_pin_get("bound_rooted").unwrap().unwrap().address_rooted);
+            assert!(needs_root_review(&db.recipient_pin_get("ambiguous_rooted").unwrap().unwrap()));
+
+            let reopened = Database::open_with_key(dir.path(), &[7u8; 32]).unwrap();
+            for (id, _, evidence) in &rows {
+                assert_eq!(reopened.recipient_pin_get(id).unwrap().unwrap().root_evidence, *evidence);
+            }
+        }
+    }
+
+    #[test]
+    fn the_not_verified_notice_counts_pending_pins_and_is_shown_once() {
+        use crate::crypto::recipient_trust::{
+            RecipientPin, UNVERIFIED_NOTICE_NONE, UNVERIFIED_NOTICE_PENDING, UNVERIFIED_NOTICE_SHOWN,
+        };
+        let (_d, db) = open_db();
+        assert_eq!(db.recipient_pin_unverified_notice_count().unwrap(), 0);
+        for (id, notice) in [
+            ("a", UNVERIFIED_NOTICE_PENDING),
+            ("b", UNVERIFIED_NOTICE_PENDING),
+            ("c", UNVERIFIED_NOTICE_NONE),
+            ("d", UNVERIFIED_NOTICE_SHOWN),
+        ] {
+            db.recipient_pin_put(
+                id,
+                &RecipientPin {
+                    identity_fingerprint: id.to_string(),
+                    unverified_notice: notice,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(db.recipient_pin_unverified_notice_count().unwrap(), 2);
+        db.recipient_pin_dismiss_unverified_notice().unwrap();
+        assert_eq!(db.recipient_pin_unverified_notice_count().unwrap(), 0);
+        assert_eq!(db.recipient_pin_get("a").unwrap().unwrap().unverified_notice, UNVERIFIED_NOTICE_SHOWN);
+        assert_eq!(db.recipient_pin_get("c").unwrap().unwrap().unverified_notice, UNVERIFIED_NOTICE_NONE);
     }
 
     #[test]
