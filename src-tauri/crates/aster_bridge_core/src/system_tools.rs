@@ -85,45 +85,57 @@ fn current_account_sid() -> Option<&'static str> {
     .as_deref()
 }
 
-#[cfg(windows)]
-fn grant_only(path: &Path, trustee: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    let out = icacls_command()
+#[cfg(any(windows, test))]
+fn run_grant(mut command: std::process::Command, path: &Path, trustee: &str) -> Result<(), String> {
+    let out = command
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
         .arg(format!("{}:(F)", trustee))
-        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("icacls could not run: {}", e))?;
 
     if out.status.success() {
         return Ok(());
     }
-    Err(format!(
+    let detail = format!(
         "{} {}",
         String::from_utf8_lossy(&out.stdout).trim(),
         String::from_utf8_lossy(&out.stderr).trim()
     )
     .trim()
-    .to_string())
+    .to_string();
+    if detail.is_empty() {
+        return Err(format!("icacls exited with {}", out.status));
+    }
+    Err(detail)
 }
 
 #[cfg(windows)]
-fn restrict_to_current_account(path: &Path) -> Result<(), String> {
+fn grant_only(path: &Path, trustee: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut command = icacls_command();
+    command.creation_flags(CREATE_NO_WINDOW);
+    run_grant(command, path, trustee)
+}
+
+#[cfg(any(windows, test))]
+fn restrict_through<U, G>(path: &Path, sid: Option<&str>, user: U, grant: G) -> Result<(), String>
+where
+    U: FnOnce() -> String,
+    G: Fn(&Path, &str) -> Result<(), String>,
+{
     let mut failure = "the current account could not be resolved".to_string();
 
-    if let Some(sid) = current_account_sid() {
-        match grant_only(path, &format!("*{}", sid)) {
+    if let Some(sid) = sid {
+        match grant(path, &format!("*{}", sid)) {
             Ok(()) => return Ok(()),
             Err(e) => failure = e,
         }
     }
 
-    let user = whoami::fallible::username()
-        .unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default());
-
+    let user = user();
     if !user.is_empty() {
-        match grant_only(path, &user) {
+        match grant(path, &user) {
             Ok(()) => return Ok(()),
             Err(e) => failure = e,
         }
@@ -134,6 +146,16 @@ fn restrict_to_current_account(path: &Path) -> Result<(), String> {
         path.display(),
         failure
     ))
+}
+
+#[cfg(windows)]
+fn restrict_to_current_account(path: &Path) -> Result<(), String> {
+    restrict_through(
+        path,
+        current_account_sid(),
+        || whoami::fallible::username().unwrap_or_else(|_| std::env::var("USERNAME").unwrap_or_default()),
+        grant_only,
+    )
 }
 
 pub fn restrict_to_current_user(path: &Path) -> Result<(), String> {
@@ -150,9 +172,88 @@ pub fn restrict_to_current_user(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn limit_or_discard<F>(path: &Path, restrict: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    match restrict(path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(format!(
+                "{} was not saved because access to it could not be limited to your account: {}",
+                path.display(),
+                e
+            ))
+        }
+    }
+}
+
+pub fn write_limited_file<F>(path: &Path, bytes: &[u8], restrict: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(
+        options
+            .open(path)
+            .map_err(|e| format!("cannot create {}: {}", path.display(), e))?,
+    );
+    limit_or_discard(path, restrict)?;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("cannot write {}: {}", path.display(), e));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_whose_access_cannot_be_limited_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        let err = write_limited_file(&path, b"top secret", |_| {
+            Err("icacls exited with status 5".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("could not be limited to your account"), "{err}");
+        assert!(err.contains("icacls exited with status 5"), "{err}");
+        assert!(!path.exists(), "a file left behind after the restriction failed");
+    }
+
+    #[test]
+    fn a_file_is_restricted_before_its_contents_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        let mut seen = None;
+        write_limited_file(&path, b"top secret", |p| {
+            seen = Some(std::fs::read(p).unwrap());
+            restrict_to_current_user(p)
+        })
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some(&b""[..]));
+        assert_eq!(std::fs::read(&path).unwrap(), b"top secret");
+        assert!(write_limited_file(&path, b"again", restrict_to_current_user).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"top secret");
+    }
 
     #[test]
     fn reads_the_account_sid_from_the_last_field() {
@@ -178,6 +279,82 @@ mod tests {
         ] {
             assert!(parse_account_sid(bad).is_none(), "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_icacls(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("icacls");
+        std::fs::write(&script, format!("#!/bin/sh\n{}\n", body)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_or_missing_icacls_is_reported_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.bin");
+        std::fs::write(&target, b"x").unwrap();
+
+        let denied = fake_icacls(dir.path(), "echo 'Access is denied.' >&2\nexit 5");
+        let err = run_grant(std::process::Command::new(&denied), &target, "*S-1-5-21-1-2-3-1001").unwrap_err();
+        assert!(err.contains("Access is denied."), "{err}");
+
+        let silent = fake_icacls(dir.path(), "exit 5");
+        let err = run_grant(std::process::Command::new(&silent), &target, "*S-1-5-21-1-2-3-1001").unwrap_err();
+        assert!(err.contains("icacls exited with"), "{err}");
+
+        let missing = dir.path().join("no_such_icacls");
+        let err = run_grant(std::process::Command::new(&missing), &target, "sam").unwrap_err();
+        assert!(err.contains("icacls could not run"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_icacls_receives_the_grant_for_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.bin");
+        std::fs::write(&target, b"x").unwrap();
+        let record = dir.path().join("args.txt");
+        let ok = fake_icacls(dir.path(), &format!("printf '%s\n' \"$@\" > '{}'\nexit 0", record.display()));
+        run_grant(std::process::Command::new(&ok), &target, "*S-1-5-21-1-2-3-1001").unwrap();
+        let args = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec![
+                target.to_str().unwrap(),
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-21-1-2-3-1001:(F)"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_account_is_not_left_open_when_every_grant_fails() {
+        let path = Path::new("secret.bin");
+        let tried = std::cell::RefCell::new(Vec::new());
+        let failing = |_: &Path, trustee: &str| {
+            tried.borrow_mut().push(trustee.to_string());
+            Err("icacls exited with status 5".to_string())
+        };
+        let err = restrict_through(path, Some("S-1-5-21-1-2-3-1001"), || "sam".to_string(), failing).unwrap_err();
+        assert!(err.contains("could not restrict"), "{err}");
+        assert!(err.contains("status 5"), "{err}");
+        assert_eq!(*tried.borrow(), vec!["*S-1-5-21-1-2-3-1001".to_string(), "sam".to_string()]);
+
+        let err = restrict_through(path, None, String::new, |_: &Path, _: &str| Ok(())).unwrap_err();
+        assert!(err.contains("could not be resolved"), "{err}");
+
+        let by_name = restrict_through(path, Some("S-1-5-21-1-2-3-1001"), || "sam".to_string(), |_: &Path, trustee: &str| {
+            if trustee == "sam" {
+                Ok(())
+            } else {
+                Err("no mapping".to_string())
+            }
+        });
+        assert!(by_name.is_ok());
     }
 
     #[test]

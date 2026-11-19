@@ -165,6 +165,18 @@ pub async fn refresh_send_identities(
 
 // The account's chosen default sender. A failure here is non-fatal: the session
 // falls back to the primary address, which is what Bridge did before.
+pub async fn load_login_salts(client: &ApiClient, access_token: &str, user_id: &Uuid) {
+    let reported = match client.get_login_salts(access_token).await {
+        Ok(encoded) => crate::crypto::login_salt_guard::decode_reported_salts(&encoded),
+        Err(e) => {
+            tracing::warn!("failed to read the sign-in salts: {}", e);
+            Vec::new()
+        }
+    };
+    let dir = crate::crypto::mail_legacy_retirement::mail_legacy_pin_dir();
+    crate::crypto::login_salt_guard::remember_login_salts(dir.as_deref(), user_id, &reported);
+}
+
 pub async fn fetch_default_sender_id(client: &ApiClient, access_token: &str) -> Option<String> {
     match client.get_default_sender(access_token).await {
         Ok(id) => id,
@@ -334,6 +346,7 @@ pub struct VaultKeyMaterial {
     pub inbound_keys: Vec<crate::crypto::inbound::InboundKeyCandidate>,
     pub previous_keys: Zeroizing<Vec<String>>,
     pub ratchet_recovery: crate::crypto::ratchet_recovery::RecoveryMaterial,
+    pub mail_legacy_retired: bool,
 }
 
 pub fn decrypt_vault_key_material(
@@ -349,6 +362,7 @@ pub fn decrypt_vault_key_material(
         vault_kdf_iterations,
     )?;
     let ratchet_recovery = crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault(&v, passphrase);
+    crate::crypto::mail_legacy_retirement::note_vault_mail_legacy_marker(v.mail_legacy_retired);
     crate::crypto::envelope::remember_storage_envelope_keys(
         v.data_kek.as_deref(),
         &ratchet_recovery.storage_keys,
@@ -361,6 +375,7 @@ pub fn decrypt_vault_key_material(
         inbound_keys: crate::crypto::inbound::build_inbound_key_candidates(&v),
         previous_keys: Zeroizing::new(collect_previous_identity_keys(&v)),
         ratchet_recovery,
+        mail_legacy_retired: v.mail_legacy_retired,
     })
 }
 
@@ -432,7 +447,52 @@ pub async fn refresh_external_pgp_key(
     Ok(())
 }
 
-fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
+const EARLIER_VAULT: &str = "the server returned an earlier copy of this account's keys";
+
+fn vault_refusal(user_id: &Uuid, material: &VaultKeyMaterial) -> Option<String> {
+    match crate::auth::vault_floor::check_vault(user_id, material) {
+        Ok(true) => None,
+        Ok(false) => Some(EARLIER_VAULT.to_string()),
+        Err(e) => Some(format!(
+            "the saved record of this account's keys on this device could not be read ({})",
+            e
+        )),
+    }
+}
+
+fn admitted_vault(user_id: &Uuid, material: Result<VaultKeyMaterial>) -> Result<VaultKeyMaterial> {
+    let material = material?;
+    if let Some(reason) = vault_refusal(user_id, &material) {
+        return Err(BridgeError::Crypto(reason));
+    }
+    if let Err(e) = crate::auth::vault_floor::record_vault(user_id, &material) {
+        tracing::warn!("the record of this account's keys was not saved: {}", e);
+    }
+    Ok(material)
+}
+
+fn signed_in_vault(user_id: &Uuid, material: Result<VaultKeyMaterial>) -> Result<VaultKeyMaterial> {
+    let material = material?;
+    if let Some(reason) = vault_refusal(user_id, &material) {
+        return Err(BridgeError::Auth(format!(
+            "{}, so Aster Bridge did not sign in. To sign in with these keys, reset Aster Bridge and set it up again.",
+            reason
+        )));
+    }
+    if let Err(e) = crate::auth::vault_floor::record_vault(user_id, &material) {
+        tracing::warn!("the record of this account's keys was not saved: {}", e);
+    }
+    Ok(material)
+}
+
+fn record_mail_legacy_retirement(marked: bool, user_id: &Uuid) -> Result<()> {
+    crate::crypto::mail_legacy_retirement::sync_mail_legacy_retirement(marked, user_id)
+        .map(|_| ())
+        .map_err(|e| BridgeError::Auth(format!("{}, so Aster Bridge did not use these keys", e)))
+}
+
+fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) -> Result<()> {
+    record_mail_legacy_retirement(material.mail_legacy_retired, &session.user_id)?;
     if let Some(ref mut k) = session.identity_key {
         k.zeroize();
     }
@@ -451,6 +511,7 @@ fn apply_vault_key_material(session: &mut Session, material: VaultKeyMaterial) {
     crate::crypto::inbound::bind_inbound_owner(&mut session.inbound_keys, &session.user_id);
     session.previous_keys = material.previous_keys;
     session.ratchet_recovery = material.ratchet_recovery;
+    Ok(())
 }
 
 pub async fn restore_or_login(
@@ -465,7 +526,9 @@ pub async fn restore_or_login(
     let passphrase = device_identity::load_passphrase(&config.data_dir)
         .map_err(BridgeError::Auth)?
         .ok_or_else(|| BridgeError::Auth("no stored passphrase - first-time setup required".to_string()))?;
+    crate::crypto::mail_legacy_retirement::set_mail_legacy_pin_dir(&config.data_dir);
 
+    crate::auth::vault_floor::use_data_dir(&config.data_dir);
     login_with_passphrase(identity, device_id, passphrase, client).await
 }
 
@@ -491,23 +554,34 @@ pub async fn login_with_passphrase(
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token in login response".to_string()))?);
 
+    let decrypted = decrypt_vault_key_material(
+        &login_resp.encrypted_vault,
+        &login_resp.vault_nonce,
+        login_resp.vault_kdf_iterations,
+        &passphrase,
+    );
+    let vault_opened = decrypted.is_ok();
     let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys, ratchet_recovery) =
-        match decrypt_vault_key_material(
-            &login_resp.encrypted_vault,
-            &login_resp.vault_nonce,
-            login_resp.vault_kdf_iterations,
-            &passphrase,
-        ) {
-            Ok(m) => (
-                Some(m.identity_key),
-                m.data_kek,
-                m.ratchet_identity_public,
-                m.ratchet_keys,
-                bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
-                m.previous_keys,
-                m.ratchet_recovery,
-            ),
+        match signed_in_vault(&login_resp.user_id, decrypted) {
+            Err(e) if vault_opened => return Err(e),
+            Ok(m) => {
+                record_mail_legacy_retirement(m.mail_legacy_retired, &login_resp.user_id)?;
+                (
+                    Some(m.identity_key),
+                    m.data_kek,
+                    m.ratchet_identity_public,
+                    m.ratchet_keys,
+                    bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
+                    m.previous_keys,
+                    m.ratchet_recovery,
+                )
+            }
             Err(e) => {
+                if let Err(pin_error) =
+                    crate::crypto::mail_legacy_retirement::sync_mail_legacy_retirement(false, &login_resp.user_id)
+                {
+                    tracing::warn!("{}", pin_error);
+                }
                 tracing::error!(
                     "vault decrypt failed during sign-in: {}; encrypted mail cannot be decrypted until you sign in again",
                     e
@@ -515,6 +589,8 @@ pub async fn login_with_passphrase(
                 (None, None, None, Vec::new(), Vec::new(), Zeroizing::new(Vec::new()), Default::default())
             }
         };
+
+    load_login_salts(client, &access_token, &login_resp.user_id).await;
 
     let send_identities = build_send_identities(
         client,
@@ -669,12 +745,18 @@ async fn sign_in_and_reload_vault(
     let access_token = Zeroizing::new(login_resp
         .access_token
         .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
-    let passphrase = Zeroizing::new(session.read().await.vault_passphrase.clone());
-    let material = decrypt_vault_key_material(
-        &login_resp.encrypted_vault,
-        &login_resp.vault_nonce,
-        login_resp.vault_kdf_iterations,
-        &passphrase,
+    let (passphrase, session_user) = {
+        let s = session.read().await;
+        (Zeroizing::new(s.vault_passphrase.clone()), s.user_id)
+    };
+    let material = admitted_vault(
+        &session_user,
+        decrypt_vault_key_material(
+            &login_resp.encrypted_vault,
+            &login_resp.vault_nonce,
+            login_resp.vault_kdf_iterations,
+            &passphrase,
+        ),
     );
     let loaded_account_keys = match &material {
         Ok(m) => {
@@ -703,7 +785,14 @@ async fn sign_in_and_reload_vault(
         s.external_pgp_key = external_key;
     }
     match material {
-        Ok(m) => apply_vault_key_material(&mut s, m),
+        Ok(m) => {
+            if let Err(e) = apply_vault_key_material(&mut s, m) {
+                tracing::warn!(
+                    "vault refresh not applied during token refresh; keeping existing keys: {}",
+                    e
+                );
+            }
+        }
         Err(e) => tracing::warn!(
             "vault refresh failed during token refresh; keeping existing keys: {}",
             e
@@ -717,6 +806,7 @@ pub async fn first_time_setup(
     identity: &DeviceIdentity,
     client: &ApiClient,
 ) -> Result<Session> {
+    crate::crypto::mail_legacy_retirement::set_mail_legacy_pin_dir(&config.data_dir);
     let (ed25519_pk, mlkem_pk, x25519_pk) = device_identity::get_pubkeys(identity);
     let machine_name = whoami::devicename();
 
@@ -782,22 +872,35 @@ pub async fn first_time_setup(
                     .access_token
                     .ok_or_else(|| BridgeError::Auth("no access token".to_string()))?);
 
+                crate::auth::vault_floor::use_data_dir(&config.data_dir);
+                let decrypted = decrypt_vault_key_material(
+                    &login_resp.encrypted_vault,
+                    &login_resp.vault_nonce,
+                    login_resp.vault_kdf_iterations,
+                    &passphrase,
+                );
+                let vault_opened = decrypted.is_ok();
                 let (identity_key, data_kek, ratchet_identity_public, ratchet_keys, inbound_keys, previous_keys, ratchet_recovery) =
-                    match decrypt_vault_key_material(
-                        &login_resp.encrypted_vault,
-                        &login_resp.vault_nonce,
-                        login_resp.vault_kdf_iterations,
-                        &passphrase,
-                    ) {
-                        Ok(m) => (
-                            Some(m.identity_key),
-                            m.data_kek,
-                            m.ratchet_identity_public,
-                            m.ratchet_keys,
-                            bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
-                            m.previous_keys,
-                            m.ratchet_recovery,
-                        ),
+                    match signed_in_vault(&login_resp.user_id, decrypted) {
+                        Ok(m) => {
+                            if let Err(e) = record_mail_legacy_retirement(m.mail_legacy_retired, &login_resp.user_id) {
+                                passphrase.zeroize();
+                                return Err(e);
+                            }
+                            (
+                                Some(m.identity_key),
+                                m.data_kek,
+                                m.ratchet_identity_public,
+                                m.ratchet_keys,
+                                bound_inbound_keys(m.inbound_keys, &login_resp.user_id),
+                                m.previous_keys,
+                                m.ratchet_recovery,
+                            )
+                        }
+                        Err(e) if vault_opened => {
+                            passphrase.zeroize();
+                            return Err(e);
+                        }
                         Err(e) => {
                             passphrase.zeroize();
                             tracing::error!("vault decrypt failed during setup: {}", e);
@@ -814,6 +917,8 @@ pub async fn first_time_setup(
                     .map_err(BridgeError::Auth)?;
 
                 tracing::info!("Device enrolled successfully");
+
+                load_login_salts(client, &access_token, &login_resp.user_id).await;
 
                 let send_identities = build_send_identities(
                     client,
@@ -1006,6 +1111,10 @@ mod tests {
     use crate::crypto::vault::encrypt_vault_for_test;
 
     async fn spawn_device_login_server(encrypted_vault: String, vault_nonce: String) -> String {
+        spawn_device_login_server_for(Uuid::new_v4(), encrypted_vault, vault_nonce).await
+    }
+
+    async fn spawn_device_login_server_for(user_id: Uuid, encrypted_vault: String, vault_nonce: String) -> String {
         use axum::{routing::post, Json, Router};
         let challenge = serde_json::json!({
             "challenge_id": Uuid::new_v4(),
@@ -1013,7 +1122,7 @@ mod tests {
             "expires_in": 60
         });
         let login = serde_json::json!({
-            "user_id": Uuid::new_v4(),
+            "user_id": user_id,
             "username": "alice",
             "email": "alice@astermail.org",
             "access_token": "fresh-token",
@@ -1062,8 +1171,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_device_sign_in_after_a_rotation_keeps_the_rotated_identity() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let session = std::sync::Arc::new(tokio::sync::RwLock::new(sample_session()));
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let rotated_vault = serde_json::json!({
+            "identity_key": "rotated-ik",
+            "previous_keys": ["identity-key"],
+        })
+        .to_string();
+        let (ev, vn) = encrypt_vault_for_test(rotated_vault.as_bytes(), b"passphrase-bytes");
+        let rotated = ApiClient::new_with_base_url(&spawn_device_login_server(ev, vn).await);
+        refresh_access_token(&session, Uuid::new_v4(), &signing_key, &rotated)
+            .await
+            .unwrap();
+        assert_eq!(session.read().await.identity_key.as_deref(), Some("rotated-ik"));
+
+        let stale_vault = serde_json::json!({ "identity_key": "identity-key" }).to_string();
+        let (ev, vn) = encrypt_vault_for_test(stale_vault.as_bytes(), b"passphrase-bytes");
+        let stale = ApiClient::new_with_base_url(&spawn_device_login_server(ev, vn).await);
+        let _ = refresh_access_token(&session, Uuid::new_v4(), &signing_key, &stale).await;
+        assert_eq!(session.read().await.identity_key.as_deref(), Some("rotated-ik"));
+    }
+
+    #[tokio::test]
     async fn refresh_updates_inbound_keys_when_vault_carries_new_identity() {
-        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let sk = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let vault_json = serde_json::json!({
             "identity_key": "new-ik",
             "ratchet_identity_public": "pub-b64",
@@ -1090,7 +1224,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_vault_keys_loads_new_identity_even_with_a_refresh_token() {
-        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let sk = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let vault_json = serde_json::json!({
             "identity_key": "new-ik",
             "ratchet_identity_public": "pub-b64",
@@ -1127,6 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_keeps_old_keys_when_fresh_vault_does_not_decrypt() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let (ev, vn) = encrypt_vault_for_test(
             br#"{"identity_key":"unreachable"}"#,
             b"a-different-passphrase",
@@ -1151,6 +1287,89 @@ mod tests {
         assert_eq!(s.identity_key.as_deref(), Some("identity-key"));
         assert_eq!(s.inbound_keys.len(), 1);
         assert_eq!(s.inbound_keys[0].ecdh_secret_d, vec![9u8; 32]);
+    }
+
+    #[test]
+    fn a_sign_in_refuses_a_vault_the_floor_retired_and_records_an_admitted_one() {
+        use crate::auth::vault_floor::tests::material;
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let user = Uuid::new_v4();
+        let first = signed_in_vault(&user, Ok(material("first", &[], None))).unwrap();
+        assert_eq!(first.identity_key, "first");
+        signed_in_vault(&user, Ok(material("second", &["first"], None))).unwrap();
+        assert!(admitted_vault(&user, Ok(material("first", &[], None))).is_err());
+        assert!(signed_in_vault(&user, Ok(material("first", &[], None))).is_err());
+        assert!(admitted_vault(&user, Ok(material("second", &["first"], None))).is_ok());
+        assert!(signed_in_vault(&user, Ok(material("second", &["first"], None))).is_ok());
+        assert!(signed_in_vault(&user, Err(BridgeError::Crypto("bad".to_string()))).is_err());
+    }
+
+    #[test]
+    fn a_damaged_key_record_is_reported_as_unreadable_and_not_as_an_earlier_copy() {
+        use crate::auth::vault_floor::tests::material;
+        let (_serial, dir) = crate::auth::vault_floor::tests::isolated_root();
+        let user = Uuid::new_v4();
+        let floor_dir = dir.path().join("vault_floor");
+        std::fs::create_dir_all(&floor_dir).unwrap();
+        std::fs::write(floor_dir.join(format!("{}.json", user.simple())), b"{\"retired\": [").unwrap();
+        let signed_in = signed_in_vault(&user, Ok(material("any", &[], None)))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let refreshed = admitted_vault(&user, Ok(material("any", &[], None)))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        for message in [&signed_in, &refreshed] {
+            assert!(message.contains("could not be read"), "{message}");
+            assert!(!message.contains("earlier copy"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_device_sign_in_stops_when_the_server_returns_a_retired_vault() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let user = Uuid::new_v4();
+        let _ = crate::auth::vault_floor::record_vault(
+            &user,
+            &crate::auth::vault_floor::tests::material("identity-key", &["old-ik"], None),
+        );
+        let (ev, vn) = encrypt_vault_for_test(br#"{"identity_key":"old-ik"}"#, b"passphrase-bytes");
+        let base = spawn_device_login_server_for(user, ev, vn).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let identity = crate::auth::device_identity::tests::test_identity();
+
+        let result = login_with_passphrase(&identity, Uuid::new_v4(), b"passphrase-bytes".to_vec(), &client).await;
+
+        let refused = match &result {
+            Ok(_) => false,
+            Err(e) => e.to_string().contains("earlier copy"),
+        };
+        assert!(refused, "the sign-in went ahead with a retired vault");
+    }
+
+    #[tokio::test]
+    async fn a_forced_sign_in_keeps_the_keys_when_the_server_returns_a_retired_vault() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
+        let (ev, vn) = encrypt_vault_for_test(br#"{"identity_key":"old-ik"}"#, b"passphrase-bytes");
+        let base = spawn_device_login_server(ev, vn).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let initial = sample_session();
+        let user = initial.user_id;
+        let _ = crate::auth::vault_floor::record_vault(
+            &user,
+            &crate::auth::vault_floor::tests::material("identity-key", &["old-ik"], None),
+        );
+        let session = std::sync::Arc::new(tokio::sync::RwLock::new(initial));
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+
+        refresh_access_token(&session, Uuid::new_v4(), &signing_key, &client)
+            .await
+            .unwrap();
+
+        let s = session.read().await;
+        assert_eq!(s.access_token.as_str(), "fresh-token");
+        assert_eq!(s.identity_key.as_deref(), Some("identity-key"));
     }
 
     struct RefreshServerState {
@@ -1221,6 +1440,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_refreshes_rotate_once_without_replaying_the_spent_token() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         use std::sync::atomic::Ordering;
         let (base, state) = spawn_refresh_server(false).await;
         let client = ApiClient::new_with_base_url(&base);
@@ -1244,6 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rate_limited_refresh_waits_instead_of_signing_in_again() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         use std::sync::atomic::Ordering;
         let (base, state) = spawn_refresh_server(true).await;
         let client = ApiClient::new_with_base_url(&base);

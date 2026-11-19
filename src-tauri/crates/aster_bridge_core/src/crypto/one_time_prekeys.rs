@@ -22,13 +22,14 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use p256::SecretKey;
 use zeroize::Zeroizing;
 
 use crate::api_client::ApiClient;
-use crate::crypto::ratchet::{b64_decode, is_valid_one_time_prekey_id};
+use crate::crypto::ratchet::{b64_decode, hkdf_sha256, is_valid_one_time_prekey_id};
+use crate::crypto::vault::VaultContents;
 
 const MISSING_MEMO: Duration = Duration::from_secs(600);
 const WRAPPED_SECRET_LEN: usize = 48;
@@ -36,6 +37,76 @@ const WRAP_NONCE_LEN: usize = 12;
 const SECRET_LEN: usize = 32;
 const MAX_CACHED_SECRETS: usize = 256;
 const MAX_MISSING_MEMOS: usize = 1024;
+const PREKEY_SEAL_LABEL: &str = "aster-opk-seal-v1";
+const PREKEY_SEAL_KEY_LEN: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrekeySealKind {
+    Ec,
+    Pq,
+}
+
+impl PrekeySealKind {
+    fn label(self) -> &'static str {
+        match self {
+            PrekeySealKind::Ec => "ec",
+            PrekeySealKind::Pq => "pq",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct PrekeySeal {
+    key: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl PrekeySeal {
+    pub fn from_vault(vault: &VaultContents) -> Self {
+        let key = vault
+            .prekey_seal_key
+            .as_deref()
+            .and_then(|encoded| b64_decode(encoded).ok())
+            .map(Zeroizing::new)
+            .filter(|raw| raw.len() == PREKEY_SEAL_KEY_LEN)
+            .and_then(|raw| {
+                hkdf_sha256(raw.as_slice(), &[0u8; 32], PREKEY_SEAL_LABEL.as_bytes(), 32)
+                    .ok()
+                    .map(Zeroizing::new)
+            });
+        Self { key }
+    }
+
+    pub fn has_key(&self) -> bool {
+        self.key.is_some()
+    }
+
+    pub fn open(
+        &self,
+        kind: PrekeySealKind,
+        key_id: u32,
+        encrypted_secret_b64: &str,
+        secret_nonce_b64: &str,
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let key = self.key.as_ref()?;
+        let ciphertext = b64_decode(encrypted_secret_b64).ok()?;
+        let nonce = b64_decode(secret_nonce_b64).ok()?;
+        if nonce.len() != WRAP_NONCE_LEN {
+            return None;
+        }
+        let aad = format!("{}:{}:{}", PREKEY_SEAL_LABEL, kind.label(), key_id);
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).ok()?;
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ciphertext.as_slice(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .ok()
+            .map(Zeroizing::new)
+    }
+}
 
 type StoreKey = (String, u32);
 
@@ -100,6 +171,15 @@ fn with_store<T>(action: impl FnOnce(&mut OneTimeStore) -> T) -> T {
     action(&mut guard)
 }
 
+fn checked_one_time_scalar(secret: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>, String> {
+    if secret.len() != SECRET_LEN {
+        return Err("one-time prekey scalar has the wrong length".to_string());
+    }
+    SecretKey::from_slice(&secret)
+        .map_err(|_| "one-time prekey scalar is not a valid key".to_string())?;
+    Ok(secret)
+}
+
 pub fn unwrap_one_time_secret(
     sync_key: &[u8],
     encrypted_secret_b64: &str,
@@ -120,18 +200,34 @@ pub fn unwrap_one_time_secret(
             .decrypt(Nonce::from_slice(&nonce), wrapped.as_slice())
             .map_err(|_| "one-time prekey secret did not authenticate".to_string())?,
     );
-    if secret.len() != SECRET_LEN {
-        return Err("one-time prekey scalar has the wrong length".to_string());
+    checked_one_time_scalar(secret)
+}
+
+pub fn open_one_time_secret(
+    seal: &PrekeySeal,
+    sync_keys: &[Zeroizing<[u8; 32]>],
+    key_id: u32,
+    encrypted_secret_b64: &str,
+    secret_nonce_b64: &str,
+) -> Option<Zeroizing<Vec<u8>>> {
+    if let Some(secret) = seal.open(
+        PrekeySealKind::Ec,
+        key_id,
+        encrypted_secret_b64,
+        secret_nonce_b64,
+    ) {
+        return checked_one_time_scalar(secret).ok();
     }
-    SecretKey::from_slice(&secret)
-        .map_err(|_| "one-time prekey scalar is not a valid key".to_string())?;
-    Ok(secret)
+    sync_keys.iter().find_map(|sync_key| {
+        unwrap_one_time_secret(sync_key.as_slice(), encrypted_secret_b64, secret_nonce_b64).ok()
+    })
 }
 
 pub async fn load_one_time_secret(
     client: &ApiClient,
     access_token: &str,
     account: &str,
+    seal: &PrekeySeal,
     sync_keys: &[Zeroizing<[u8; 32]>],
     key_id: u32,
 ) -> Option<Zeroizing<Vec<u8>>> {
@@ -141,7 +237,7 @@ pub async fn load_one_time_secret(
     if let Some(secret) = with_store(|store| store.secret(account, key_id)) {
         return Some(secret);
     }
-    if sync_keys.is_empty() {
+    if !seal.has_key() && sync_keys.is_empty() {
         return None;
     }
     if with_store(|store| store.is_known_missing(account, key_id, Instant::now())) {
@@ -158,14 +254,13 @@ pub async fn load_one_time_secret(
             return None;
         }
     };
-    let secret = sync_keys.iter().find_map(|sync_key| {
-        unwrap_one_time_secret(
-            sync_key.as_slice(),
-            &wrapped.encrypted_secret,
-            &wrapped.secret_nonce,
-        )
-        .ok()
-    });
+    let secret = open_one_time_secret(
+        seal,
+        sync_keys,
+        key_id,
+        &wrapped.encrypted_secret,
+        &wrapped.secret_nonce,
+    );
     match secret {
         Some(secret) => {
             with_store(|store| store.remember_secret(account, key_id, secret.clone()));

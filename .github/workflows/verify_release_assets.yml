@@ -45,14 +45,13 @@ jobs:
             Aster-Bridge-arm64.deb
             Aster-Bridge-aarch64.rpm
             Aster-Bridge-x86_64.pkg.tar.zst
+          )
+
+          CLI_ARCHIVES=(
             aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz
-            aster-bridge-cli-x86_64-unknown-linux-gnu.tar.gz.sha256
             aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz
-            aster-bridge-cli-aarch64-unknown-linux-gnu.tar.gz.sha256
             aster-bridge-cli-universal-apple-darwin.tar.gz
-            aster-bridge-cli-universal-apple-darwin.tar.gz.sha256
             aster-bridge-cli-x86_64-pc-windows-msvc.zip
-            aster-bridge-cli-x86_64-pc-windows-msvc.zip.sha256
           )
 
           declare -A SRC=(
@@ -71,35 +70,81 @@ jobs:
           assets() { gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name'; }
           has() { assets | grep -qxF "$1"; }
 
+          FAILED=()
+
+          fail() {
+            echo "::error::$1"
+            FAILED+=("$1")
+          }
+
+          carry_over() {
+            local prev names name patterns releases
+            if ! releases="$(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName')"; then
+              fail "could not list earlier releases to carry over $*"
+              return 1
+            fi
+            for prev in $releases; do
+              [ "$prev" = "$TAG" ] && continue
+              if ! names="$(gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name')"; then
+                fail "could not read the assets of $prev while carrying over $*"
+                return 1
+              fi
+              patterns=()
+              for name in "$@"; do
+                grep -qxF "$name" <<<"$names" || continue 2
+                patterns+=(--pattern "$name")
+              done
+              if ! gh release download "$prev" --repo "$REPO" "${patterns[@]}" --dir "$TMP" --clobber; then
+                fail "could not download $* from $prev"
+                return 1
+              fi
+              if ! gh release upload "$TAG" "${@/#/$TMP/}" --repo "$REPO" --clobber; then
+                fail "could not upload $* to $TAG"
+                return 1
+              fi
+              echo "::warning::carried over $* from $prev - cut a fresh build to replace it"
+              return 0
+            done
+            echo "::warning::no earlier release has $*"
+          }
+
           for name in "${REQUIRED[@]}" "${OPTIONAL[@]}"; do
             if has "$name"; then echo "ok: $name"; continue; fi
 
             src="${SRC[$name]:-}"
             if [ -n "$src" ] && has "$src"; then
               echo "::notice::self-healing $name from $src on $TAG"
-              gh release download "$TAG" --repo "$REPO" --pattern "$src" --dir "$TMP" --clobber
-              mv "$TMP/$src" "$TMP/$name"
-              gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
+              if ! gh release download "$TAG" --repo "$REPO" --pattern "$src" --dir "$TMP" --clobber; then
+                fail "could not download $src from $TAG"
+              elif ! mv "$TMP/$src" "$TMP/$name"; then
+                fail "could not rename $src to $name"
+              elif ! gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber; then
+                fail "could not upload $name to $TAG"
+              fi
               continue
             fi
 
-            case "$name" in
-              Aster-Bridge-universal.dmg|aster-bridge-cli-*)
-                echo "::warning::$name is missing on $TAG; carrying it over from the most recent release that has it"
-                for prev in $(gh release list --repo "$REPO" --limit 40 --json tagName,isDraft -q '.[] | select(.isDraft==false) | .tagName'); do
-                  [ "$prev" = "$TAG" ] && continue
-                  if gh release view "$prev" --repo "$REPO" --json assets -q '.assets[].name' | grep -qxF "$name"; then
-                    gh release download "$prev" --repo "$REPO" --pattern "$name" --dir "$TMP" --clobber
-                    gh release upload "$TAG" "$TMP/$name" --repo "$REPO" --clobber
-                    echo "::warning::carried over $name from $prev - cut a fresh build to replace it"
-                    break
-                  fi
-                done
-                ;;
-            esac
+            if [ "$name" = Aster-Bridge-universal.dmg ]; then
+              echo "::warning::$name is missing on $TAG; carrying it over from the most recent release that has it"
+              carry_over "$name"
+            fi
+          done
+
+          for archive in "${CLI_ARCHIVES[@]}"; do
+            checksum="$archive.sha256"
+            if has "$archive" && has "$checksum"; then echo "ok: $archive and $checksum"; continue; fi
+            if has "$archive" || has "$checksum"; then
+              echo "::warning::$TAG has only one of $archive and $checksum; cut a fresh build to publish both"
+              continue
+            fi
+            echo "::warning::$archive and $checksum are missing on $TAG; carrying both over from the most recent release that has them"
+            carry_over "$archive" "$checksum"
           done
 
           ABSENT_OPTIONAL=()
+          for archive in "${CLI_ARCHIVES[@]}"; do
+            OPTIONAL+=("$archive" "$archive.sha256")
+          done
           for name in "${OPTIONAL[@]}"; do
             has "$name" || ABSENT_OPTIONAL+=("$name")
           done
@@ -115,6 +160,11 @@ jobs:
           if [ ${#MISSING[@]} -ne 0 ]; then
             echo "::error::Latest release $TAG is missing bridge download assets: ${MISSING[*]}"
             echo "The in-app Bridge downloads (/api/bridge/v1/download/<platform>) for these will 404. See the parent CLAUDE.md 'Website Download Assets'."
+            exit 1
+          fi
+
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "::error::$TAG has ${#FAILED[@]} asset step(s) that failed: ${FAILED[*]}"
             exit 1
           fi
 

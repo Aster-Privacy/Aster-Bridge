@@ -100,6 +100,8 @@ pub async fn poll_device_sign_in(
                 .ok_or_else(|| BridgeError::Auth("no sealed envelope in confirmation".to_string()))?;
             let passphrase = device_identity::unseal_vault_envelope(identity, &sealed_envelope)
                 .map_err(BridgeError::Crypto)?;
+            crate::auth::vault_floor::use_data_dir(data_dir);
+            crate::crypto::mail_legacy_retirement::set_mail_legacy_pin_dir(data_dir);
             let session =
                 session::login_with_passphrase(identity, device_id, passphrase, client).await?;
             if session.identity_key.is_none() {

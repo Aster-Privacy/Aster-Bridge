@@ -28,6 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::address_identity::AddressKeyring;
 use crate::crypto::inbound::decode_pq_decap_key;
+use crate::crypto::one_time_prekeys::PrekeySeal;
 use crate::crypto::ratchet::{
     b64_decode, ecdh_p256, hkdf_sha256, jwk_d_bytes, ml_kem768_decapsulate, serialize_header_ad,
 };
@@ -62,11 +63,15 @@ const PREVIOUS_KEY_CONTEXTS: [&str; 12] = [
     "astermail-subscriptions-v1",
     "astermail-recovery-email-v1",
 ];
+const PUBLIC_IDENTITY_MATERIALS: [&str; 3] = ["undefined", "null", ""];
 const SYNC_KEY_SALT: &[u8] = b"Aster Mail_Ratchet_State_Encryption";
 const SYNC_KEY_INFO: &[u8] = b"ratchet_state_key";
 const ESCROW_KEY_SALT: &[u8] = b"Aster_Mail_Plaintext_Escrow";
 const ESCROW_KEY_INFO: &[u8] = b"plaintext_escrow_key";
 const ESCROW_AAD_V2_PREFIX: &[u8] = b"aster.escrow.v2\0";
+const ESCROW_AAD_V3_PREFIX: &[u8] = b"aster.escrow.v3\0";
+const BOUND_ESCROW_KEY_PREFIX: &str = "v3:";
+const MAX_BOUND_ESCROW_HEADER_BYTES: usize = 4096;
 pub const MAX_ESCROW_PLAINTEXT_BYTES: usize = 100 * 1024;
 const GCM_TAG_LEN: usize = 16;
 const MAX_ALIAS_RECIPIENT_ATTEMPTS: usize = 8;
@@ -87,6 +92,7 @@ pub struct RecoveryMaterial {
     pub storage_keys: Vec<Zeroizing<[u8; 32]>>,
     pub lane_candidates: Vec<LaneCandidate>,
     pub address_keys: AddressKeyring,
+    pub prekey_seal: PrekeySeal,
 }
 
 impl Drop for RecoveryMaterial {
@@ -107,6 +113,7 @@ impl RecoveryMaterial {
             storage_keys: derive_storage_base_keys(vault, passphrase, iterations),
             lane_candidates: build_lane_candidates(vault),
             address_keys: AddressKeyring::from_vault(vault),
+            prekey_seal: PrekeySeal::from_vault(vault),
         }
     }
 
@@ -119,9 +126,23 @@ impl RecoveryMaterial {
     }
 }
 
+pub fn is_public_storage_key(key: &[u8; 32]) -> bool {
+    crate::crypto::mail_legacy_retirement::is_public_mail_key(key)
+        || PUBLIC_IDENTITY_MATERIALS.iter().any(|material| {
+            PREVIOUS_KEY_CONTEXTS.iter().any(|context| {
+                let mut hasher = Sha256::new();
+                hasher.update(material.as_bytes());
+                hasher.update(context.as_bytes());
+                let derived: [u8; 32] = hasher.finalize().into();
+                derived == *key
+            })
+        })
+}
+
 fn derive_sub_keys(bases: &[Zeroizing<[u8; 32]>], salt: &[u8], info: &[u8]) -> Vec<Zeroizing<[u8; 32]>> {
     bases
         .iter()
+        .filter(|base| !crate::crypto::ratchet_recovery::is_public_storage_key(base))
         .filter_map(|base| hkdf_sha256(base.as_slice(), salt, info, 32).ok())
         .filter_map(to_key)
         .collect()
@@ -429,6 +450,65 @@ pub fn escrow_aad_v2(dedupe_key: &str) -> Vec<u8> {
     let mut aad = ESCROW_AAD_V2_PREFIX.to_vec();
     aad.extend_from_slice(dedupe_key.as_bytes());
     aad
+}
+
+pub fn escrow_aad_v3(dedupe_key: &str) -> Vec<u8> {
+    let mut aad = ESCROW_AAD_V3_PREFIX.to_vec();
+    aad.extend_from_slice(dedupe_key.as_bytes());
+    aad
+}
+
+pub fn bound_escrow_key(dedupe_key: &str) -> String {
+    format!("{}{}", BOUND_ESCROW_KEY_PREFIX, dedupe_key)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundEscrow {
+    pub sender: String,
+    pub conversation_id: String,
+    pub plaintext: String,
+    pub unconfirmed_sender: bool,
+}
+
+fn bound_address(address: &str) -> String {
+    address.trim().to_lowercase()
+}
+
+impl BoundEscrow {
+    pub fn matches(&self, sender: &str, conversation_ids: &[String]) -> bool {
+        bound_address(&self.sender) == bound_address(sender)
+            && conversation_ids.contains(&self.conversation_id)
+    }
+}
+
+fn decode_bound_escrow(bytes: &[u8]) -> Option<BoundEscrow> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (header, plaintext) = text.split_once('\n')?;
+    let header: Value = serde_json::from_str(header).ok()?;
+    Some(BoundEscrow {
+        sender: json_str(&header, "s")?.to_string(),
+        conversation_id: json_str(&header, "c")?.to_string(),
+        plaintext: plaintext.to_string(),
+        unconfirmed_sender: header.get("u").and_then(Value::as_i64) == Some(1),
+    })
+}
+
+pub fn open_bound_escrow_entry(
+    escrow_keys: &[Zeroizing<[u8; 32]>],
+    dedupe_key: &str,
+    encrypted_plaintext_b64: &str,
+    nonce_b64: &str,
+) -> Option<BoundEscrow> {
+    let ciphertext = b64_decode(encrypted_plaintext_b64).ok()?;
+    let nonce = b64_decode(nonce_b64).ok()?;
+    if ciphertext.len() > MAX_ESCROW_PLAINTEXT_BYTES + MAX_BOUND_ESCROW_HEADER_BYTES + GCM_TAG_LEN {
+        return None;
+    }
+    let aad = escrow_aad_v3(dedupe_key);
+    escrow_keys
+        .iter()
+        .find_map(|key| aes_gcm_open(key.as_slice(), &nonce, &ciphertext, &aad))
+        .and_then(|plaintext| decode_bound_escrow(&plaintext))
 }
 
 pub fn decrypt_escrow_entry(
@@ -765,8 +845,7 @@ pub fn extract_subject_bundle(decrypted: &str) -> SubjectBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    use rand::rngs::OsRng;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use serde_json::json;
 
     const LANE_VECTORS: &str = include_str!("testdata/recovery_lane_vectors.json");
@@ -808,8 +887,8 @@ mod tests {
     }
 
     fn identity() -> TestIdentity {
-        let secret = p256::SecretKey::random(&mut OsRng);
-        let public_b64 = b64(secret.public_key().to_encoded_point(false).as_bytes());
+        let secret = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let public_b64 = b64(secret.public_key().to_sec1_point(false).as_bytes());
         TestIdentity { secret, public_b64 }
     }
 
@@ -823,8 +902,8 @@ mod tests {
     }
 
     fn seal_classical_lane(recipient: &TestIdentity, conversation: &str, sender: &str, plaintext: &str) -> Value {
-        let ephemeral = p256::SecretKey::random(&mut OsRng);
-        let epk = ephemeral.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let ephemeral = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let epk = ephemeral.public_key().to_sec1_point(false).as_bytes().to_vec();
         let recipient_public = STANDARD.decode(&recipient.public_b64).unwrap();
         let dh = ecdh_p256(&ephemeral.to_bytes(), &recipient_public).unwrap();
         let binding = lane_binding(conversation, sender, &recipient.public_b64, "");
@@ -1013,6 +1092,31 @@ mod tests {
     }
 
     #[test]
+    fn sync_and_escrow_keys_never_derive_from_a_public_storage_key() {
+        let public: Zeroizing<[u8; 32]> = Zeroizing::new(Sha256::digest(b"undefinedastermail-envelope-v1").into());
+        let private = Zeroizing::new([5u8; 32]);
+        let bases = [public.clone(), private.clone()];
+        for (salt, info) in [(SYNC_KEY_SALT, SYNC_KEY_INFO), (ESCROW_KEY_SALT, ESCROW_KEY_INFO)] {
+            let derived = derive_sub_keys(&bases, salt, info);
+            let only_private = derive_sub_keys(std::slice::from_ref(&private), salt, info);
+            assert_eq!(derived.len(), 1, "a public storage key produced a sync or escrow key");
+            assert_eq!(*derived[0], *only_private[0]);
+        }
+        let vault = vault_from(json!({
+            "identity_key": "undefined",
+            "previous_keys": ["null", ""],
+            "kdf_version": 2,
+            "data_kek": b64(public.as_slice())
+        }));
+        let material = RecoveryMaterial::from_vault_with_iterations(&vault, b"", 1);
+        assert!(!material.storage_keys.is_empty());
+        assert!(material.storage_keys.iter().all(|key| is_public_storage_key(key)));
+        assert!(material.escrow_keys().is_empty(), "public identity material produced an escrow key");
+        assert!(material.sync_keys().is_empty(), "public identity material produced a sync key");
+        assert!(!is_public_storage_key(&private));
+    }
+
+    #[test]
     fn escrow_opens_web_entries_with_and_without_aad() {
         let v: Value = serde_json::from_str(STORAGE_VECTORS).unwrap();
         let pass = v["passphrase"].as_str().unwrap().as_bytes();
@@ -1039,6 +1143,45 @@ mod tests {
         assert!(decrypt_escrow_entry(&keys, dedupe, &oversized, nonce).is_none());
         assert!(decrypt_escrow_entry(&keys, dedupe, "%%%", nonce).is_none());
         assert!(decrypt_escrow_entry(&[], dedupe, unbound, nonce).is_none());
+    }
+
+    #[test]
+    fn escrow_opens_sender_bound_entries_only_for_their_sender() {
+        let key = Zeroizing::new([7u8; 32]);
+        let keys = vec![key.clone()];
+        let dedupe = "mail-1:BAbc==:2";
+        let nonce = [9u8; 12];
+        let conversation = conversation_id("bob@astermail.org", "alice@astermail.org");
+        let body = format!("{{\"s\":\"alice@astermail.org\",\"c\":\"{}\"}}\nbound body\nsecond line", conversation);
+        let sealed = b64(&seal_gcm(key.as_slice(), &nonce, body.as_bytes(), &escrow_aad_v3(dedupe)));
+        let nonce_b64 = b64(&nonce);
+        let conversations = vec![conversation.clone()];
+        let open_for = |dedupe: &str, sealed: &str, sender: &str, conversations: &[String]| {
+            open_bound_escrow_entry(&keys, dedupe, sealed, &nonce_b64)
+                .filter(|bound| bound.matches(sender, conversations))
+                .map(|bound| bound.plaintext)
+        };
+        assert_eq!(bound_escrow_key(dedupe), "v3:mail-1:BAbc==:2");
+        assert_eq!(
+            open_for(dedupe, &sealed, " Alice@AsterMail.org ", &conversations)
+                .as_deref(),
+            Some("bound body\nsecond line")
+        );
+        assert!(open_for(dedupe, &sealed, "mallory@astermail.org", &conversations)
+            .is_none());
+        let other_conversation = vec![conversation_id("bob@astermail.org", "mallory@astermail.org")];
+        assert!(
+            open_for(dedupe, &sealed, "alice@astermail.org", &other_conversation)
+                .is_none()
+        );
+        assert!(
+            open_for("mail-2:BAbc==:2", &sealed, "alice@astermail.org", &conversations)
+                .is_none()
+        );
+        assert!(decrypt_escrow_entry(&keys, dedupe, &sealed, &nonce_b64).is_none());
+        let unbound = b64(&seal_gcm(key.as_slice(), &nonce, b"bound body", &escrow_aad_v3(dedupe)));
+        assert!(open_for(dedupe, &unbound, "alice@astermail.org", &conversations)
+            .is_none());
     }
 
     #[test]
@@ -1240,7 +1383,7 @@ mod tests {
         let current = identity();
         let previous = identity();
         let jwk = |id: &TestIdentity| {
-            let point = id.secret.public_key().to_encoded_point(false);
+            let point = id.secret.public_key().to_sec1_point(false);
             let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
             json!({
                 "kty": "EC",
@@ -1296,6 +1439,46 @@ mod tests {
         assert_eq!(capped.len(), MAX_ALIAS_RECIPIENT_ATTEMPTS);
         assert!(recipient_attempts(&json!({}), "me@x.org", "you@x.org").is_empty());
         assert_eq!(normalize_address_ignoring_dots(" J.O.E@Ex.Ample.org "), "joe@ex.ample.org");
+    }
+
+    #[test]
+    fn a_bound_escrow_entry_opens_only_under_its_own_key_and_reports_its_binding() {
+        let keys = vec![Zeroizing::new([5u8; 32])];
+        let dedupe = "mail-1:BAbc==:2";
+        let nonce = [3u8; 12];
+        let seal = |payload: &[u8], aad: &[u8]| {
+            let cipher = Aes256Gcm::new_from_slice(keys[0].as_slice()).unwrap();
+            STANDARD.encode(cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: payload, aad }).unwrap())
+        };
+        let nonce_b64 = STANDARD.encode(nonce);
+        let conversation = conversation_id("me@astermail.org", "Alice@astermail.org");
+        let header = json!({ "s": "alice@astermail.org", "c": conversation, "u": 1 });
+        let payload = format!("{}\nhello", header);
+        let sealed = seal(payload.as_bytes(), &escrow_aad_v3(dedupe));
+
+        let opened = open_bound_escrow_entry(&keys, dedupe, &sealed, &nonce_b64).unwrap();
+        assert_eq!(opened.plaintext, "hello");
+        assert!(opened.unconfirmed_sender);
+        let conversations = vec![conversation.clone()];
+        assert!(opened.matches(" Alice@astermail.org", &conversations));
+        assert!(!opened.matches("mallory@astermail.org", &conversations));
+        assert!(!opened.matches("alice@astermail.org", &["other".to_string()]));
+        assert!(opened.matches("alice@astermail.org", &["other".to_string(), conversation.clone()]));
+        let mixed_case = BoundEscrow {
+            sender: " Alice@AsterMail.org ".to_string(),
+            ..opened.clone()
+        };
+        assert!(mixed_case.matches("alice@astermail.org", &conversations));
+
+        assert!(open_bound_escrow_entry(&keys, "mail-2:BAbc==:2", &sealed, &nonce_b64).is_none());
+        let v2_sealed = seal(payload.as_bytes(), &escrow_aad_v2(dedupe));
+        assert!(open_bound_escrow_entry(&keys, dedupe, &v2_sealed, &nonce_b64).is_none());
+        let unbound = seal(payload.as_bytes(), &[]);
+        assert!(open_bound_escrow_entry(&keys, dedupe, &unbound, &nonce_b64).is_none());
+        let headerless = seal(b"hello", &escrow_aad_v3(dedupe));
+        assert!(open_bound_escrow_entry(&keys, dedupe, &headerless, &nonce_b64).is_none());
+        assert_eq!(bound_escrow_key(dedupe), "v3:mail-1:BAbc==:2");
+        assert_eq!(escrow_aad_v3("k"), b"aster.escrow.v3\0k".to_vec());
     }
 
     #[test]

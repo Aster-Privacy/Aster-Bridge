@@ -504,6 +504,26 @@ fn merge_attachment_meta(raw_headers: Option<&str>, entries: &[EnvelopeAttachmen
     serde_json::Value::Object(map).to_string()
 }
 
+pub(crate) fn trust_local_attachments(db: &Database, aster_id: &str) -> Result<(), String> {
+    let Some(cached) = db.get_cached_message(aster_id)? else {
+        return Ok(());
+    };
+    let Some(mut meta) = cached
+        .raw_headers
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+    else {
+        return Ok(());
+    };
+    let Some(map) = meta.as_object_mut() else {
+        return Ok(());
+    };
+    if map.remove(crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG).is_none() {
+        return Ok(());
+    }
+    db.set_cached_raw_headers(aster_id, &meta.to_string())
+}
+
 fn mark_attachments_unverified(raw_headers: Option<&str>) -> String {
     let mut map = raw_headers
         .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
@@ -1309,6 +1329,7 @@ struct PreparedMessage {
     unencrypted: bool,
     sender_unverified: bool,
     sealed_ratchet: bool,
+    attachments_unlisted: bool,
     external_key_allowed: bool,
     decrypted_parts: Vec<CachedAttachment>,
 }
@@ -1512,6 +1533,7 @@ fn prepare_mail_item(
         parse_envelope_attachments(&parsed)
     };
     let expected_attachments = expected_attachment_count(item, &attachments);
+    let attachments_unlisted = attachments_need_a_listing(origin_kind, &attachments, expected_attachments);
     const MAX_CACHED_BODY_BYTES: usize = 5 * 1024 * 1024;
     if let Some(b) = body_text.as_mut() {
         if b.len() > MAX_CACHED_BODY_BYTES {
@@ -1547,9 +1569,23 @@ fn prepare_mail_item(
         unencrypted,
         sender_unverified,
         sealed_ratchet: is_ratchet_envelope,
+        attachments_unlisted,
         external_key_allowed,
         decrypted_parts,
     })
+}
+
+fn attachments_need_a_listing(
+    origin: Option<crate::crypto::envelope::EnvelopeOrigin>,
+    listed: &[EnvelopeAttachment],
+    expected: usize,
+) -> bool {
+    origin == Some(crate::crypto::envelope::EnvelopeOrigin::SelfAuthored)
+        && (expected > listed.len() || !listed.iter().all(slot_bound_to_content))
+}
+
+fn slot_bound_to_content(listed: &EnvelopeAttachment) -> bool {
+    listed.seq.is_some() && (listed.sha256.is_some() || listed.key.is_some())
 }
 
 fn commit_mail_item(
@@ -1683,8 +1719,9 @@ fn commit_prepared(
         );
     }
     let mut raw_headers_meta = serde_json::Value::Object(raw_headers_map);
-    if prepared.sealed_ratchet
-        && (crate::message_render::has_listed_attachments(&raw_headers_meta) || prepared.expected_attachments > 0)
+    if prepared.attachments_unlisted
+        || (prepared.sealed_ratchet
+            && (crate::message_render::has_listed_attachments(&raw_headers_meta) || prepared.expected_attachments > 0))
     {
         raw_headers_meta[crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG] = serde_json::json!(true);
     }
@@ -1939,11 +1976,12 @@ struct InternalDecryptContext<'a> {
     escrow_keys: &'a [Zeroizing<[u8; 32]>],
     client: &'a ApiClient,
     access_token: &'a str,
+    db: &'a Database,
+    account_id: &'a str,
 }
 
-fn envelope_sender_address(parsed: &serde_json::Value) -> String {
-    let from = parsed.get("from");
-    let raw = match from {
+fn envelope_address(value: Option<&serde_json::Value>) -> String {
+    let raw = match value {
         Some(serde_json::Value::String(s)) => s.as_str(),
         Some(v) => v.get("email").and_then(|e| e.as_str()).unwrap_or(""),
         None => "",
@@ -1952,6 +1990,20 @@ fn envelope_sender_address(parsed: &serde_json::Value) -> String {
         (Some(open), Some(close)) if open < close => raw[open + 1..close].trim().to_string(),
         _ => raw.trim().to_string(),
     }
+}
+
+fn envelope_sender_address(parsed: &serde_json::Value) -> String {
+    envelope_address(parsed.get("from"))
+}
+
+fn envelope_recipient_addresses(parsed: &serde_json::Value) -> Vec<String> {
+    ["to", "cc", "bcc"]
+        .iter()
+        .filter_map(|field| parsed.get(*field).and_then(|v| v.as_array()))
+        .flatten()
+        .map(|v| envelope_address(Some(v)))
+        .filter(|address| !address.is_empty())
+        .collect()
 }
 
 async fn fetch_pq_secrets(
@@ -1969,20 +2021,34 @@ async fn fetch_pq_secrets(
         }
         return secrets;
     }
-    let Ok(key_id) = u32::try_from(key_id) else {
+    let Ok(wire_key_id) = u32::try_from(key_id) else {
         return Vec::new();
     };
-    if ctx.sync_keys.is_empty() {
+    let seal = &ctx.recovery.prekey_seal;
+    let legacy_keys: &[Zeroizing<[u8; 32]>] = ctx.sync_keys;
+    if !seal.has_key() && legacy_keys.is_empty() {
         return Vec::new();
     }
-    let resp = match ctx.client.get_pq_secret(ctx.access_token, key_id).await {
+    let resp = match ctx.client.get_pq_secret(ctx.access_token, wire_key_id).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!("ratchet pq secret {} unavailable: {}", key_id, e);
             return Vec::new();
         }
     };
-    for sync_key in ctx.sync_keys {
+    if resp.key_id != key_id {
+        tracing::warn!("ratchet pq secret came back for a different key id; ignored");
+        return Vec::new();
+    }
+    if let Some(secret) = seal.open(
+        crate::crypto::one_time_prekeys::PrekeySealKind::Pq,
+        wire_key_id,
+        &resp.encrypted_secret,
+        &resp.secret_nonce,
+    ) {
+        return vec![secret];
+    }
+    for sync_key in legacy_keys {
         if let Ok(secret) = crate::crypto::ratchet::decrypt_pq_secret(
             sync_key.as_slice(),
             &resp.encrypted_secret,
@@ -2021,6 +2087,7 @@ async fn try_bootstrap(
         ctx.client,
         ctx.access_token,
         ctx.our_email,
+        &ctx.recovery.prekey_seal,
         ctx.sync_keys,
         one_time_key_id,
     )
@@ -2079,9 +2146,59 @@ async fn open_bootstrap(
     opened
 }
 
-async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Option<String> {
+enum BoundEscrowLookup {
+    Absent,
+    Opened(crate::crypto::ratchet_recovery::BoundEscrow),
+    Refused,
+}
+
+async fn try_bound_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> BoundEscrowLookup {
+    let row_key = crate::crypto::ratchet_recovery::bound_escrow_key(dedupe_key);
+    let entry = match ctx.client.get_escrow_plaintext(ctx.access_token, &row_key).await {
+        Ok(Some(entry)) if entry.message_id == row_key => entry,
+        Ok(Some(_)) => {
+            tracing::warn!("bound ratchet escrow returned an entry for a different message; ignored");
+            return BoundEscrowLookup::Refused;
+        }
+        Ok(None) => return BoundEscrowLookup::Absent,
+        Err(e) => {
+            tracing::debug!("bound ratchet escrow lookup failed: {}", e);
+            return BoundEscrowLookup::Refused;
+        }
+    };
+    match crate::crypto::ratchet_recovery::open_bound_escrow_entry(
+        ctx.escrow_keys,
+        dedupe_key,
+        &entry.encrypted_plaintext,
+        &entry.plaintext_nonce,
+    ) {
+        Some(bound) => BoundEscrowLookup::Opened(bound),
+        None => {
+            tracing::warn!("bound ratchet escrow entry could not be opened; the older escrow copy is not used");
+            BoundEscrowLookup::Refused
+        }
+    }
+}
+
+async fn try_escrow(
+    ctx: &InternalDecryptContext<'_>,
+    dedupe_key: &str,
+    sender: &str,
+    conversation_ids: &[String],
+) -> Option<(String, bool)> {
     if ctx.escrow_keys.is_empty() {
         return None;
+    }
+    match try_bound_escrow(ctx, dedupe_key).await {
+        BoundEscrowLookup::Opened(bound) => {
+            if !bound.matches(sender, conversation_ids) {
+                tracing::warn!("ratchet escrow entry belongs to another conversation; ignored");
+                return None;
+            }
+            return Some((bound.plaintext, bound.unconfirmed_sender));
+        }
+        BoundEscrowLookup::Refused => return None,
+        BoundEscrowLookup::Absent => {}
     }
     let entry = match ctx.client.get_escrow_plaintext(ctx.access_token, dedupe_key).await {
         Ok(Some(entry)) => entry,
@@ -2101,6 +2218,16 @@ async fn try_escrow(ctx: &InternalDecryptContext<'_>, dedupe_key: &str) -> Optio
         &entry.encrypted_plaintext,
         &entry.plaintext_nonce,
     )
+    .map(|plaintext| (plaintext, true))
+}
+
+fn escrow_conversations(our_email: &str, attempt_address: &str, sender_email: &str) -> Vec<String> {
+    let mut ids = vec![crate::crypto::ratchet_recovery::conversation_id(attempt_address, sender_email)];
+    let ours = crate::crypto::ratchet_recovery::conversation_id(our_email, sender_email);
+    if !ids.contains(&ours) {
+        ids.push(ours);
+    }
+    ids
 }
 
 fn unsealed_bundle(plaintext: &str, sender_unverified: bool) -> crate::crypto::ratchet_recovery::SubjectBundle {
@@ -2118,6 +2245,27 @@ fn replay_marker(item: &MailItem) -> String {
     let digest = sha2::Sha256::digest(item.encrypted_envelope.as_bytes());
     let marker: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
     format!("sealed:{}", marker)
+}
+
+fn sender_pin(
+    ctx: &InternalDecryptContext<'_>,
+    sender_email: &str,
+) -> Option<crate::crypto::recipient_trust::RecipientPin> {
+    match crate::crypto::recipient_trust::read_recipient_pin(ctx.db, ctx.account_id, sender_email) {
+        Ok(read) => read.pin,
+        Err(e) => {
+            tracing::debug!("sender pin lookup failed: {}", e);
+            None
+        }
+    }
+}
+
+fn bootstrap_sender_verified(
+    pin: Option<&crate::crypto::recipient_trust::RecipientPin>,
+    sender_identity: &str,
+    published: bool,
+) -> bool {
+    published && crate::crypto::recipient_trust::pin_vouches_for_identity(pin, sender_identity)
 }
 
 async fn sender_identity_is_published(
@@ -2176,7 +2324,9 @@ async fn try_decrypt_internal_mail(
         if attempt.data.get("ephemeral_key").and_then(|v| v.as_str()).is_some() {
             opened = try_bootstrap(ctx, &ratchet_obj, &attempt.address).await;
             if opened.is_some() {
-                sender_unverified = !sender_identity_is_published(ctx, &sender_email, sender_identity).await;
+                let published = sender_identity_is_published(ctx, &sender_email, sender_identity).await;
+                let pin = sender_pin(ctx, &sender_email);
+                sender_unverified = !bootstrap_sender_verified(pin.as_ref(), sender_identity, published);
                 break;
             }
             failed_steps.push("bootstrap");
@@ -2210,17 +2360,24 @@ async fn try_decrypt_internal_mail(
             failed_steps.push("recovery_lane");
         }
         if let Some(dedupe_key) = crate::crypto::ratchet_recovery::escrow_dedupe_key(&item.id, attempt.data) {
-            opened = try_escrow(ctx, &dedupe_key).await;
-            if opened.is_some() {
-                sender_unverified = true;
+            let conversations = escrow_conversations(ctx.our_email, &attempt.address, &sender_email);
+            if let Some((plaintext, unverified)) = try_escrow(ctx, &dedupe_key, &sender_email, &conversations).await {
+                opened = Some(plaintext);
+                sender_unverified = unverified;
                 break;
             }
             failed_steps.push("escrow");
         }
     }
     if opened.is_none() && attempts.is_empty() {
-        opened = try_escrow(ctx, &item.id).await;
-        sender_unverified = opened.is_some();
+        let conversations: Vec<String> = std::iter::once(ctx.our_email.to_string())
+            .chain(envelope_recipient_addresses(&parsed))
+            .map(|address| crate::crypto::ratchet_recovery::conversation_id(&address, &sender_email))
+            .collect();
+        if let Some((plaintext, unverified)) = try_escrow(ctx, &item.id, &sender_email, &conversations).await {
+            opened = Some(plaintext);
+            sender_unverified = unverified;
+        }
         failed_steps.push("no_recipient_entry");
     }
     match opened {
@@ -3032,11 +3189,12 @@ async fn run_sync_pass(
     let indexing_history = history::is_enabled(db);
     let mut listing_totals: Vec<(String, usize)> = Vec::new();
 
-    let (access_token, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
+    let (access_token, account_id, passphrase, identity_key, previous_keys, our_email, ratchet_keys, inbound_keys, recovery) = {
         let s = session.read().await;
         crate::crypto::internal_send::note_aster_sender_scope(db, &s);
         (
             s.access_token.clone(),
+            s.user_id.to_string(),
             Zeroizing::new(s.vault_passphrase.clone()),
             s.identity_key.clone(),
             s.previous_keys.clone(),
@@ -3062,6 +3220,8 @@ async fn run_sync_pass(
         escrow_keys: &escrow_keys,
         client,
         access_token: &access_token,
+        db,
+        account_id: &account_id,
     };
 
     backfill_missing_message_ids(db);
@@ -4555,11 +4715,11 @@ mod tests {
         use aes_gcm::aead::Aead;
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use hkdf::Hkdf;
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         use sha2::Sha256;
-        let recipient_pub = recipient.public_key().to_encoded_point(false);
-        let ephemeral = p256::SecretKey::random(&mut rand_core::OsRng);
-        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let recipient_pub = recipient.public_key().to_sec1_point(false);
+        let ephemeral = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let eph_pub = ephemeral.public_key().to_sec1_point(false);
         let shared_x = crate::crypto::ratchet::ecdh_p256(
             ephemeral.to_bytes().as_slice(),
             recipient_pub.as_bytes(),
@@ -4618,8 +4778,8 @@ mod tests {
     #[test]
     fn failed_inbound_item_is_flagged_and_recovers_after_key_refresh() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
-        let wrong = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let wrong = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let json = serde_json::json!({"subject": "sealed", "body_text": "inbound body"});
         let item = inbound_item("msg-heal", &json, &recipient);
 
@@ -4643,7 +4803,7 @@ mod tests {
     #[test]
     fn a_healed_item_listed_before_an_append_does_not_refile_the_message() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let json = serde_json::json!({"subject": "sealed", "body_text": "inbound body"});
         let item = inbound_item("msg-appended", &json, &recipient);
         let keys = [inbound_candidate(&recipient)];
@@ -4680,8 +4840,8 @@ mod tests {
     #[test]
     fn unrecoverable_inbound_item_stays_uncached_after_retry() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
-        let wrong = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let wrong = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let json = serde_json::json!({"subject": "sealed"});
         let item = inbound_item("msg-unhealable", &json, &recipient);
 
@@ -4778,7 +4938,7 @@ mod tests {
     #[test]
     fn successful_decrypt_does_not_flag_inbound_failure() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let json = serde_json::json!({"subject": "ok", "body_text": "b"});
         let item = inbound_item("msg-inbound-ok", &json, &recipient);
         let keys = [inbound_candidate(&recipient)];
@@ -4795,7 +4955,7 @@ mod tests {
     #[test]
     fn inbound_mail_claiming_an_aster_sender_is_marked_unverified() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let keys = [inbound_candidate(&recipient)];
         let cases = [
             ("in-aster", serde_json::json!({"from": "Bob <bob@astermail.org>", "body_text": "b"}), true),
@@ -4822,7 +4982,7 @@ mod tests {
     #[test]
     fn inbound_sealed_ratchet_mail_is_judged_by_the_ratchet_layer() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let keys = [inbound_candidate(&recipient)];
         for (id, from) in [("r-aster", "bob@astermail.org"), ("r-outside", "carol@example.com")] {
             let item = inbound_item(id, &ratchet_envelope(from, "BDh=="), &recipient);
@@ -4845,7 +5005,7 @@ mod tests {
     #[test]
     fn sealed_fields_replace_every_server_supplied_field() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let keys = [inbound_candidate(&recipient)];
         let mut served = ratchet_envelope("Server Name <bob@astermail.org>", "BDh==");
         served["subject"] = serde_json::json!("Server subject");
@@ -4914,11 +5074,93 @@ mod tests {
         assert!(!flagged("sealed-bare"));
     }
 
+    #[test]
+    fn locally_stored_attachments_clear_only_the_unverified_flag() {
+        let (_dir, db) = temp_db();
+        let keys = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "invoice.pdf"}]);
+        let mut sealed = ratchet_envelope("bob@astermail.org", "BDh==");
+        sealed["attachment_keys"] = keys.clone();
+        let plain = serde_json::json!({"from": "bob@astermail.org", "body_text": "b"});
+        for (id, json) in [("local-att", &sealed), ("local-plain", &plain)] {
+            assert!(cache_mail_item(&db, "inbox", &item_with_envelope(id, json), b"pass", IK, &[], &[]).was_new);
+        }
+        let before = cached_meta(&db, "local-att");
+        assert!(crate::message_render::attachments_unverified(&before));
+        let plain_before = cached_meta(&db, "local-plain");
+
+        trust_local_attachments(&db, "local-att").unwrap();
+        trust_local_attachments(&db, "local-plain").unwrap();
+        trust_local_attachments(&db, "missing").unwrap();
+
+        let mut expected = before.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::message_render::ATTACHMENTS_UNVERIFIED_FLAG);
+        let after = cached_meta(&db, "local-att");
+        assert!(!crate::message_render::attachments_unverified(&after));
+        assert_eq!(after, expected);
+        assert_eq!(cached_meta(&db, "local-plain"), plain_before);
+        assert!(db.get_cached_message("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn server_declared_attachments_on_an_own_message_without_a_listing_are_flagged() {
+        let (_dir, db) = temp_db();
+        let bare = serde_json::json!({"from": "me@astermail.org", "body_text": "b"});
+        let mut declared = item_with_envelope("own-declared", &bare);
+        declared.has_attachments = Some(true);
+        declared.attachment_count = Some(1);
+        let keys = serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "notes.txt"}]);
+        let listed_json = serde_json::json!({"from": "me@astermail.org", "body_text": "b", "attachment_keys": keys});
+        let mut listed = item_with_envelope("own-listed", &listed_json);
+        listed.has_attachments = Some(true);
+        listed.attachment_count = Some(1);
+        let plain = item_with_envelope("own-plain", &bare);
+        for item in [&declared, &listed, &plain] {
+            assert!(cache_mail_item(&db, "sent", item, b"pass", IK, &[], &[]).was_new);
+        }
+        let flagged = |id: &str| crate::message_render::attachments_unverified(&cached_meta(&db, id));
+        assert!(flagged("own-declared"));
+        assert!(!flagged("own-listed"));
+        assert!(!flagged("own-plain"));
+    }
+
+    #[test]
+    fn an_own_message_whose_listed_attachment_is_not_bound_to_its_slot_is_flagged() {
+        let (_dir, db) = temp_db();
+        let cases = [
+            ("own-keyed", serde_json::json!([{"seq": 0, "key": "c2VydmVy", "filename": "notes.txt"}]), false),
+            ("own-unkeyed", serde_json::json!([{"seq": 0, "filename": "notes.txt"}]), true),
+            ("own-unplaced", serde_json::json!([{"key": "c2VydmVy", "filename": "notes.txt"}]), true),
+            (
+                "own-mixed",
+                serde_json::json!([
+                    {"seq": 0, "key": "c2VydmVy", "filename": "a.txt"},
+                    {"seq": 1, "filename": "b.txt"}
+                ]),
+                true,
+            ),
+        ];
+        for (id, keys, _) in &cases {
+            let count = keys.as_array().unwrap().len() as i16;
+            let envelope = serde_json::json!({"from": "me@astermail.org", "body_text": "b", "attachment_keys": keys});
+            let mut item = item_with_envelope(id, &envelope);
+            item.has_attachments = Some(true);
+            item.attachment_count = Some(count);
+            assert!(cache_mail_item(&db, "sent", &item, b"pass", IK, &[], &[]).was_new);
+        }
+        for (id, _, expected) in &cases {
+            let flagged = crate::message_render::attachments_unverified(&cached_meta(&db, id));
+            assert_eq!(flagged, *expected, "{id}");
+        }
+    }
+
     #[tokio::test]
     async fn an_escrow_opened_body_is_always_marked_sender_unverified() {
         use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-        use axum::{extract::Path, routing::get, Json, Router};
+        use axum::{extract::Path, response::IntoResponse, routing::get, Json, Router};
 
         let key = Zeroizing::new([7u8; 32]);
         let nonce = [1u8; 12];
@@ -4938,7 +5180,13 @@ mod tests {
                     "encrypted_plaintext": sealed_b64,
                     "plaintext_nonce": nonce_b64,
                 });
-                async move { Json(entry) }
+                async move {
+                    if k.starts_with("v3:") {
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    } else {
+                        Json(entry).into_response()
+                    }
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4949,7 +5197,7 @@ mod tests {
         let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
 
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let inbound_keys = [inbound_candidate(&recipient)];
         let forged = inbound_item("alice-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
         assert!(cache_mail_item(&db, "inbox", &forged, b"pass", IK, &[], &inbound_keys).was_new);
@@ -4958,8 +5206,10 @@ mod tests {
             storage_keys: Vec::new(),
             lane_candidates: Vec::new(),
             address_keys: Default::default(),
+            prekey_seal: Default::default(),
         };
         let escrow_keys = vec![key];
+        let (_pin_dir, pin_db) = temp_db();
         let ctx = InternalDecryptContext {
             our_email: "me@astermail.org",
             passphrase: b"pass",
@@ -4972,6 +5222,8 @@ mod tests {
             escrow_keys: &escrow_keys,
             client: &client,
             access_token: "tok",
+            db: &pin_db,
+            account_id: "account-1",
         };
         let bundle = try_decrypt_internal_mail(&forged, &ctx).await.unwrap();
         assert_eq!(bundle.body, "from alice");
@@ -4981,6 +5233,546 @@ mod tests {
 
         let moved = inbound_item("bob-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
         assert!(try_decrypt_internal_mail(&moved, &ctx).await.is_none());
+    }
+
+    async fn escrow_entries_client(entries: std::collections::HashMap<String, String>, nonce_b64: String) -> ApiClient {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{extract::Path, routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/crypto/v1/ratchet/plaintext/:key",
+            get(move |Path(k): Path<String>| {
+                let found = entries.get(&k).cloned();
+                let nonce_b64 = nonce_b64.clone();
+                async move {
+                    match found {
+                        Some(sealed) => Json(serde_json::json!({
+                            "message_id": k,
+                            "encrypted_plaintext": sealed,
+                            "plaintext_nonce": nonce_b64,
+                        }))
+                        .into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port))
+    }
+
+    #[tokio::test]
+    async fn a_conversation_bound_escrow_entry_opens_for_its_own_conversation_only() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+        let key = Zeroizing::new([11u8; 32]);
+        let nonce = [4u8; 12];
+        let nonce_b64 = STANDARD.encode(nonce);
+        let dedupe = "alice-item:BAli==:3";
+        let bound_row = format!("v3:{}", dedupe);
+        let mut bound_aad = b"aster.escrow.v3\0".to_vec();
+        bound_aad.extend_from_slice(dedupe.as_bytes());
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+        let seal = |payload: &[u8], aad: &[u8]| {
+            STANDARD.encode(cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: payload, aad }).unwrap())
+        };
+        let bound_payload = |sender: &str| {
+            let conversation = crate::crypto::ratchet_recovery::conversation_id("me@astermail.org", sender);
+            format!("{}\nbound body", serde_json::json!({"s": sender, "c": conversation}))
+        };
+
+        let own = std::collections::HashMap::from([(
+            bound_row.clone(),
+            seal(bound_payload("bob@astermail.org").as_bytes(), &bound_aad),
+        )]);
+        let other = std::collections::HashMap::from([
+            (bound_row.clone(), seal(bound_payload("mallory@astermail.org").as_bytes(), &bound_aad)),
+            (
+                dedupe.to_string(),
+                seal(b"swapped body", &crate::crypto::ratchet_recovery::escrow_aad_v2(dedupe)),
+            ),
+        ]);
+
+        let recipient = p256::SecretKey::from_slice(&[0x21u8; 32]).unwrap();
+        let inbound_keys = [inbound_candidate(&recipient)];
+        let item = inbound_item("alice-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
+        let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
+            storage_keys: Vec::new(),
+            lane_candidates: Vec::new(),
+            address_keys: Default::default(),
+            prekey_seal: Default::default(),
+        };
+        let escrow_keys = vec![key.clone()];
+        let mut outcomes = Vec::new();
+        for entries in [own, other] {
+            let client = escrow_entries_client(entries, nonce_b64.clone()).await;
+            let (_pin_dir, pin_db) = temp_db();
+            let ctx = InternalDecryptContext {
+                our_email: "me@astermail.org",
+                passphrase: b"pass",
+                identity_key: IK,
+                previous_keys: &[],
+                ratchet_keys: &[],
+                inbound_keys: &inbound_keys,
+                recovery: &recovery,
+                sync_keys: &[],
+                escrow_keys: &escrow_keys,
+                client: &client,
+                access_token: "tok",
+                db: &pin_db,
+                account_id: "account-1",
+            };
+            outcomes.push(try_decrypt_internal_mail(&item, &ctx).await.map(|bundle| bundle.body));
+        }
+
+        assert_eq!(outcomes[0].as_deref(), Some("bound body"), "an entry bound to this conversation must open");
+        assert_eq!(outcomes[1], None, "an entry bound to another conversation must not open, nor fall back");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_bound_escrow_row_is_refused_while_a_lone_legacy_row_still_opens() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+        let key = Zeroizing::new([13u8; 32]);
+        let nonce = [6u8; 12];
+        let nonce_b64 = STANDARD.encode(nonce);
+        let dedupe = "alice-item:BAli==:3";
+        let bound_row = format!("v3:{}", dedupe);
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+        let seal = |payload: &[u8], aad: &[u8]| {
+            STANDARD.encode(cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: payload, aad }).unwrap())
+        };
+        let legacy = seal(b"legacy body", &crate::crypto::ratchet_recovery::escrow_aad_v2(dedupe));
+        let damaged = seal(b"not a bound payload", &crate::crypto::ratchet_recovery::escrow_aad_v2(dedupe));
+
+        let invalid_bound = std::collections::HashMap::from([
+            (bound_row.clone(), damaged),
+            (dedupe.to_string(), legacy.clone()),
+        ]);
+        let legacy_only = std::collections::HashMap::from([(dedupe.to_string(), legacy)]);
+
+        let recipient = p256::SecretKey::from_slice(&[0x23u8; 32]).unwrap();
+        let inbound_keys = [inbound_candidate(&recipient)];
+        let item = inbound_item("alice-item", &ratchet_envelope("bob@astermail.org", "BAli=="), &recipient);
+        let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
+            storage_keys: Vec::new(),
+            lane_candidates: Vec::new(),
+            address_keys: Default::default(),
+            prekey_seal: Default::default(),
+        };
+        let escrow_keys = vec![key.clone()];
+        let mut outcomes = Vec::new();
+        for entries in [invalid_bound, legacy_only] {
+            let client = escrow_entries_client(entries, nonce_b64.clone()).await;
+            let (_pin_dir, pin_db) = temp_db();
+            let ctx = InternalDecryptContext {
+                our_email: "me@astermail.org",
+                passphrase: b"pass",
+                identity_key: IK,
+                previous_keys: &[],
+                ratchet_keys: &[],
+                inbound_keys: &inbound_keys,
+                recovery: &recovery,
+                sync_keys: &[],
+                escrow_keys: &escrow_keys,
+                client: &client,
+                access_token: "tok",
+                db: &pin_db,
+                account_id: "account-1",
+            };
+            outcomes.push(try_decrypt_internal_mail(&item, &ctx).await.map(|bundle| bundle.body));
+        }
+
+        assert_eq!(outcomes[0], None, "a bound row that does not open must not fall back to the older copy");
+        assert_eq!(outcomes[1].as_deref(), Some("legacy body"), "a message with only an older copy must still open");
+    }
+
+    async fn bound_escrow_outcome(bound_sender: &str, unconfirmed: bool) -> Option<bool> {
+        bound_escrow_case(
+            ratchet_envelope("bob@astermail.org", "BAli=="),
+            "alice-item:BAli==:3",
+            "me@astermail.org",
+            bound_sender,
+            unconfirmed,
+        )
+        .await
+    }
+
+    async fn bound_escrow_case(
+        envelope: serde_json::Value,
+        dedupe: &str,
+        bound_recipient: &str,
+        bound_sender: &str,
+        unconfirmed: bool,
+    ) -> Option<bool> {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use axum::{extract::Path, routing::get, Json, Router};
+
+        let key = Zeroizing::new([9u8; 32]);
+        let nonce = [2u8; 12];
+        let dedupe = dedupe.to_string();
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
+        let conversation = crate::crypto::ratchet_recovery::conversation_id(bound_recipient, "bob@astermail.org");
+        let mut header = serde_json::json!({"s": bound_sender, "c": conversation});
+        if unconfirmed {
+            header["u"] = serde_json::json!(1);
+        }
+        let bound_payload = format!("{}\nbound body", header);
+        let bound = STANDARD.encode(
+            cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: bound_payload.as_bytes(),
+                        aad: &crate::crypto::ratchet_recovery::escrow_aad_v3(&dedupe),
+                    },
+                )
+                .unwrap(),
+        );
+        let legacy = STANDARD.encode(
+            cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: b"legacy body".as_slice(),
+                        aad: &crate::crypto::ratchet_recovery::escrow_aad_v2(&dedupe),
+                    },
+                )
+                .unwrap(),
+        );
+        let nonce_b64 = STANDARD.encode(nonce);
+        let app = Router::new().route(
+            "/crypto/v1/ratchet/plaintext/:key",
+            get(move |Path(k): Path<String>| {
+                let sealed = if k.starts_with("v3:") { bound.clone() } else { legacy.clone() };
+                let entry = serde_json::json!({
+                    "message_id": k,
+                    "encrypted_plaintext": sealed,
+                    "plaintext_nonce": nonce_b64,
+                });
+                async move { Json(entry) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port));
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let inbound_keys = [inbound_candidate(&recipient)];
+        let item = inbound_item("alice-item", &envelope, &recipient);
+        let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
+            storage_keys: Vec::new(),
+            lane_candidates: Vec::new(),
+            address_keys: Default::default(),
+            prekey_seal: Default::default(),
+        };
+        let escrow_keys = vec![key];
+        let (_pin_dir, pin_db) = temp_db();
+        let ctx = InternalDecryptContext {
+            our_email: "me@astermail.org",
+            passphrase: b"pass",
+            identity_key: IK,
+            previous_keys: &[],
+            ratchet_keys: &[],
+            inbound_keys: &inbound_keys,
+            recovery: &recovery,
+            sync_keys: &[],
+            escrow_keys: &escrow_keys,
+            client: &client,
+            access_token: "tok",
+            db: &pin_db,
+            account_id: "account-1",
+        };
+        try_decrypt_internal_mail(&item, &ctx).await.map(|bundle| {
+            assert_eq!(bundle.body, "bound body");
+            bundle.sender_unverified
+        })
+    }
+
+    #[tokio::test]
+    async fn a_bound_escrow_entry_wins_over_the_legacy_row_only_for_its_own_conversation() {
+        assert_eq!(bound_escrow_outcome("bob@astermail.org", false).await, Some(false));
+        assert_eq!(bound_escrow_outcome("bob@astermail.org", true).await, Some(true));
+        assert_eq!(bound_escrow_outcome("carol@astermail.org", false).await, None);
+        assert_eq!(bound_escrow_outcome(" Bob@AsterMail.org", false).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_bound_escrow_entry_for_an_alias_opens_without_a_recipient_entry() {
+        let sealed = serde_json::json!({"type": "double_ratchet_v2"});
+        let envelope = |to: &str| {
+            serde_json::json!({
+                "from": "Bob <bob@astermail.org>",
+                "to": [{"email": to, "name": "Me"}],
+                "subject": "s",
+                "body_text": sealed.to_string(),
+            })
+        };
+        let opened = bound_escrow_case(
+            envelope("alias@astermail.org"),
+            "alice-item",
+            "alias@astermail.org",
+            "bob@astermail.org",
+            false,
+        )
+        .await;
+        assert_eq!(opened, Some(false));
+        let elsewhere = bound_escrow_case(
+            envelope("alias@astermail.org"),
+            "alice-item",
+            "other@astermail.org",
+            "bob@astermail.org",
+            false,
+        )
+        .await;
+        assert_eq!(elsewhere, None);
+    }
+
+    const PREKEY_SEAL_TEST_KEY: [u8; 32] = [0x5au8; 32];
+
+    fn prekey_seal_recovery(seal_key: Option<[u8; 32]>, migrated: bool) -> crate::crypto::ratchet_recovery::RecoveryMaterial {
+        let mut vault = serde_json::json!({ "identity_key": "ik" });
+        if let Some(key) = seal_key {
+            vault["prekey_seal_key"] = serde_json::json!(STANDARD.encode(key));
+        }
+        if migrated {
+            vault["prekey_seal_migrated"] = serde_json::json!(true);
+        }
+        let vault: crate::crypto::vault::VaultContents = serde_json::from_value(vault).unwrap();
+        crate::crypto::ratchet_recovery::RecoveryMaterial::from_vault_with_iterations(&vault, b"pass", 1)
+    }
+
+    fn wrap_under_sync_key(recovery: &crate::crypto::ratchet_recovery::RecoveryMaterial, secret: &[u8]) -> (String, String) {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        let sync_key = recovery.sync_keys().into_iter().next().expect("sync key");
+        let nonce: [u8; 12] = rand::random();
+        let cipher = Aes256Gcm::new_from_slice(sync_key.as_slice()).unwrap();
+        let wrapped = cipher.encrypt(Nonce::from_slice(&nonce), secret).unwrap();
+        (STANDARD.encode(wrapped), STANDARD.encode(nonce))
+    }
+
+    fn seal_under_vault_key(kind: &str, key_id: u32, secret: &[u8]) -> (String, String) {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        let key = crate::crypto::ratchet::hkdf_sha256(&PREKEY_SEAL_TEST_KEY, &[0u8; 32], b"aster-opk-seal-v1", 32).unwrap();
+        let aad = format!("aster-opk-seal-v1:{}:{}", kind, key_id);
+        let nonce: [u8; 12] = rand::random();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let sealed = cipher
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: secret, aad: aad.as_bytes() })
+            .unwrap();
+        (STANDARD.encode(sealed), STANDARD.encode(nonce))
+    }
+
+    async fn prekey_secret_server(echoed_key_id: i32, row: (String, String)) -> ApiClient {
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+
+        let pq_row = row.clone();
+        let app = Router::new()
+            .route(
+                "/crypto/v1/ratchet/pq-secret/:key_id",
+                get(move || {
+                    let (encrypted_secret, secret_nonce) = pq_row.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "key_id": echoed_key_id,
+                            "encrypted_secret": encrypted_secret,
+                            "secret_nonce": secret_nonce,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/crypto/v1/keys/ec-prekeys/secret/:key_id",
+                get(move || {
+                    let (encrypted_secret, secret_nonce) = row.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "key_id": echoed_key_id,
+                            "encrypted_secret": encrypted_secret,
+                            "secret_nonce": secret_nonce,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/crypto/v1/keys/ec-prekeys/:key_id",
+                delete(|| async { Json(serde_json::json!({ "success": true })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port))
+    }
+
+    async fn fetch_pq_secret_with(
+        recovery: &crate::crypto::ratchet_recovery::RecoveryMaterial,
+        client: &ApiClient,
+        key_id: i32,
+    ) -> Vec<Zeroizing<Vec<u8>>> {
+        let sync_keys = recovery.sync_keys();
+        let (_pin_dir, pin_db) = temp_db();
+        let ctx = InternalDecryptContext {
+            our_email: "pq-seal@astermail.org",
+            passphrase: b"pass",
+            identity_key: IK,
+            previous_keys: &[],
+            ratchet_keys: &[],
+            inbound_keys: &[],
+            recovery,
+            sync_keys: &sync_keys,
+            escrow_keys: &[],
+            client,
+            access_token: "tok",
+            db: &pin_db,
+            account_id: "account-1",
+        };
+        fetch_pq_secrets(&ctx, key_id).await
+    }
+
+    #[tokio::test]
+    async fn a_pq_prekey_secret_for_another_key_id_is_not_used() {
+        let recovery = prekey_seal_recovery(None, false);
+        let secret = vec![0x21u8; 2400];
+        let client = prekey_secret_server(4199, wrap_under_sync_key(&recovery, &secret)).await;
+
+        assert!(fetch_pq_secret_with(&recovery, &client, 4105).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pq_prekey_secret_sealed_under_the_vault_key_opens() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), false);
+        let secret = vec![0x22u8; 2400];
+        let client = prekey_secret_server(4105, seal_under_vault_key("pq", 4105, &secret)).await;
+
+        let opened = fetch_pq_secret_with(&recovery, &client, 4105).await;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].as_slice(), secret.as_slice());
+    }
+
+    #[tokio::test]
+    async fn a_pq_prekey_secret_in_the_older_format_still_opens_after_migration() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), true);
+        let secret = vec![0x23u8; 2400];
+        let client = prekey_secret_server(4105, wrap_under_sync_key(&recovery, &secret)).await;
+
+        let opened = fetch_pq_secret_with(&recovery, &client, 4105).await;
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].as_slice(), secret.as_slice());
+    }
+
+    async fn open_one_time_bound_with(
+        recovery: &crate::crypto::ratchet_recovery::RecoveryMaterial,
+        account: &str,
+        row: impl FnOnce(&[u8]) -> (String, String),
+    ) -> Option<String> {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+
+        let public = |key: &p256::SecretKey| key.public_key().to_sec1_point(false).as_bytes().to_vec();
+        let identity = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let prekey = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let one_time = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let sender = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let ratchet_keys = vec![crate::crypto::ratchet::RatchetReceiverKeys {
+            identity_secret_d: identity.to_bytes().to_vec(),
+            signed_prekey_secret_d: prekey.to_bytes().to_vec(),
+            signed_prekey_public: public(&prekey),
+        }];
+        let message = crate::crypto::ratchet::encrypt_bootstrap_one_time_bound(
+            sender.to_bytes().as_slice(),
+            &public(&identity),
+            &public(&prekey),
+            None,
+            None,
+            41,
+            &public(&one_time),
+            "hello one time",
+        )
+        .unwrap();
+        let envelope = crate::crypto::internal_send::build_envelope(
+            &STANDARD.encode(public(&sender)),
+            vec![(account.to_string(), crate::crypto::internal_send::recipient_entry(&message))],
+        );
+        let ratchet_obj: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        let client = prekey_secret_server(41, row(one_time.to_bytes().as_slice())).await;
+        let sync_keys = recovery.sync_keys();
+        let (_pin_dir, pin_db) = temp_db();
+        let ctx = InternalDecryptContext {
+            our_email: account,
+            passphrase: b"pass",
+            identity_key: IK,
+            previous_keys: &[],
+            ratchet_keys: &ratchet_keys,
+            inbound_keys: &[],
+            recovery,
+            sync_keys: &sync_keys,
+            escrow_keys: &[],
+            client: &client,
+            access_token: "tok",
+            db: &pin_db,
+            account_id: "account-1",
+        };
+        try_bootstrap(&ctx, &ratchet_obj, account).await
+    }
+
+    #[tokio::test]
+    async fn a_one_time_prekey_sealed_under_the_vault_key_opens_the_handshake() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), false);
+        let opened = open_one_time_bound_with(&recovery, "opk-sealed@astermail.org", |scalar| {
+            seal_under_vault_key("ec", 41, scalar)
+        })
+        .await;
+
+        assert_eq!(opened.as_deref(), Some("hello one time"));
+    }
+
+    #[tokio::test]
+    async fn a_one_time_prekey_sealed_for_another_key_id_is_refused() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), false);
+        let opened = open_one_time_bound_with(&recovery, "opk-other-id@astermail.org", |scalar| {
+            seal_under_vault_key("ec", 42, scalar)
+        })
+        .await;
+
+        assert!(opened.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_one_time_prekey_in_the_older_format_still_opens_after_migration() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), true);
+        let wrapping = prekey_seal_recovery(None, false);
+        let opened = open_one_time_bound_with(&recovery, "opk-retired@astermail.org", |scalar| {
+            wrap_under_sync_key(&wrapping, scalar)
+        })
+        .await;
+
+        assert_eq!(opened.as_deref(), Some("hello one time"));
+    }
+
+    #[tokio::test]
+    async fn a_one_time_prekey_in_the_older_format_still_opens_before_migration() {
+        let recovery = prekey_seal_recovery(Some(PREKEY_SEAL_TEST_KEY), false);
+        let wrapping = prekey_seal_recovery(None, false);
+        let opened = open_one_time_bound_with(&recovery, "opk-legacy@astermail.org", |scalar| {
+            wrap_under_sync_key(&wrapping, scalar)
+        })
+        .await;
+
+        assert_eq!(opened.as_deref(), Some("hello one time"));
     }
 
     async fn sender_directory(current: Option<String>, history: Vec<String>, failing: bool) -> ApiClient {
@@ -5027,21 +5819,69 @@ mod tests {
         ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port))
     }
 
+    fn identity_fingerprint(identity_b64: &str) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(STANDARD.decode(identity_b64).unwrap())
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect()
+    }
+
+    fn confirmed_pin(identity_b64: &str) -> crate::crypto::recipient_trust::RecipientPin {
+        crate::crypto::recipient_trust::RecipientPin {
+            identity_fingerprint: identity_fingerprint(identity_b64),
+            root_evidence: crate::crypto::recipient_trust::ROOT_EVIDENCE_USER_CONFIRMED,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bootstrap_sender_is_not_verified_by_the_directory_alone() {
+        let identity_b64 = STANDARD.encode([7u8; 65]);
+        let unproven = crate::crypto::recipient_trust::RecipientPin {
+            identity_fingerprint: identity_fingerprint(&identity_b64),
+            ..Default::default()
+        };
+        assert!(
+            !bootstrap_sender_verified(None, &identity_b64, true),
+            "a first-contact sender with no pin was marked verified"
+        );
+        assert!(
+            !bootstrap_sender_verified(Some(&unproven), &identity_b64, true),
+            "a pin without signed or confirmed evidence marked the sender verified"
+        );
+    }
+
+    #[test]
+    fn bootstrap_sender_is_verified_only_by_a_matching_vouching_pin() {
+        use crate::crypto::recipient_trust::{RecipientPin, ROOT_EVIDENCE_SIGNED_BUNDLE};
+        let identity_b64 = STANDARD.encode([7u8; 65]);
+        let other_b64 = STANDARD.encode([9u8; 65]);
+        let confirmed = confirmed_pin(&identity_b64);
+        let signed = RecipientPin { root_evidence: ROOT_EVIDENCE_SIGNED_BUNDLE, ..confirmed_pin(&identity_b64) };
+        let flagged = RecipientPin { flagged: true, ..confirmed_pin(&identity_b64) };
+        assert!(bootstrap_sender_verified(Some(&confirmed), &identity_b64, true));
+        assert!(bootstrap_sender_verified(Some(&signed), &identity_b64, true));
+        assert!(!bootstrap_sender_verified(Some(&confirmed), &identity_b64, false));
+        assert!(!bootstrap_sender_verified(Some(&flagged), &identity_b64, true));
+        assert!(!bootstrap_sender_verified(Some(&confirmed), &other_b64, true));
+    }
+
     #[tokio::test]
     async fn a_bootstrap_is_trusted_only_when_the_directory_publishes_the_sender_identity() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
 
-        let public = |key: &p256::SecretKey| key.public_key().to_encoded_point(false).as_bytes().to_vec();
-        let identity = p256::SecretKey::random(&mut rand_core::OsRng);
-        let prekey = p256::SecretKey::random(&mut rand_core::OsRng);
+        let public = |key: &p256::SecretKey| key.public_key().to_sec1_point(false).as_bytes().to_vec();
+        let identity = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
+        let prekey = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let ratchet_keys = vec![crate::crypto::ratchet::RatchetReceiverKeys {
             identity_secret_d: identity.to_bytes().to_vec(),
             signed_prekey_secret_d: prekey.to_bytes().to_vec(),
             signed_prekey_public: public(&prekey),
         }];
-        let sender = p256::SecretKey::random(&mut rand_core::OsRng);
+        let sender = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let sender_b64 = STANDARD.encode(public(&sender));
-        let other_b64 = STANDARD.encode(public(&p256::SecretKey::random(&mut rand_core::OsRng)));
+        let other_b64 = STANDARD.encode(public(&<p256::SecretKey as p256::elliptic_curve::Generate>::generate()));
         let message = crate::crypto::ratchet::encrypt_bootstrap(
             sender.to_bytes().as_slice(),
             &public(&identity),
@@ -5056,13 +5896,14 @@ mod tests {
             vec![("me@astermail.org".to_string(), crate::crypto::internal_send::recipient_entry(&message))],
         );
         let envelope = serde_json::json!({"from": "Bob <Bob@AsterMail.org>", "subject": "s", "body_text": sealed});
-        let inbound = p256::SecretKey::random(&mut rand_core::OsRng);
+        let inbound = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let inbound_keys = [inbound_candidate(&inbound)];
         let item = inbound_item("bootstrap-item", &envelope, &inbound);
         let recovery = crate::crypto::ratchet_recovery::RecoveryMaterial {
             storage_keys: Vec::new(),
             lane_candidates: Vec::new(),
             address_keys: Default::default(),
+            prekey_seal: Default::default(),
         };
 
         let cases = [
@@ -5072,6 +5913,13 @@ mod tests {
             ("current identity", Some(sender_b64.clone()), vec![], false, false),
             ("earlier identity", Some(other_b64.clone()), vec![other_b64.clone(), sender_b64.clone()], false, false),
         ];
+        let (_pin_dir, pin_db) = temp_db();
+        pin_db
+            .recipient_pin_put(
+                &crate::crypto::recipient_trust::pin_id("account-1", "bob@astermail.org"),
+                &confirmed_pin(&sender_b64),
+            )
+            .unwrap();
         for (label, current, history, failing, expect_unverified) in cases {
             let client = sender_directory(current, history, failing).await;
             let ctx = InternalDecryptContext {
@@ -5086,11 +5934,33 @@ mod tests {
                 escrow_keys: &[],
                 client: &client,
                 access_token: "tok",
+                db: &pin_db,
+                account_id: "account-1",
             };
             let bundle = try_decrypt_internal_mail(&item, &ctx).await.unwrap();
             assert_eq!(bundle.body, "hello bob", "{label}");
             assert_eq!(bundle.sender_unverified, expect_unverified, "{label}");
         }
+
+        let (_empty_dir, empty_db) = temp_db();
+        let client = sender_directory(Some(sender_b64.clone()), vec![], false).await;
+        let ctx = InternalDecryptContext {
+            our_email: "me@astermail.org",
+            passphrase: b"pass",
+            identity_key: IK,
+            previous_keys: &[],
+            ratchet_keys: &ratchet_keys,
+            inbound_keys: &inbound_keys,
+            recovery: &recovery,
+            sync_keys: &[],
+            escrow_keys: &[],
+            client: &client,
+            access_token: "tok",
+            db: &empty_db,
+            account_id: "account-1",
+        };
+        let bundle = try_decrypt_internal_mail(&item, &ctx).await.unwrap();
+        assert!(bundle.sender_unverified, "a first-contact sender with no pin was marked verified");
     }
 
     #[test]
@@ -5202,7 +6072,7 @@ mod tests {
     #[test]
     fn unauthenticated_mail_from_a_known_hosted_custom_domain_is_marked_unverified() {
         let (_dir, db) = temp_db();
-        let recipient = p256::SecretKey::random(&mut rand_core::OsRng);
+        let recipient = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let keys = [inbound_candidate(&recipient)];
         let send = |db: &Database, id: &str, from: &str| {
             let json = serde_json::json!({"from": from, "body_text": "b"});
