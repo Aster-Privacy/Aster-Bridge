@@ -193,6 +193,12 @@ impl From<rsa::errors::Error> for Error {
     }
 }
 
+impl From<signature_next::Error> for Error {
+    fn from(_: signature_next::Error) -> Error {
+        Error::SignatureError(SignatureError::new())
+    }
+}
+
 impl From<cipher::InvalidLength> for Error {
     fn from(_: cipher::InvalidLength) -> Error {
         Error::CfbInvalidKeyIvLength
