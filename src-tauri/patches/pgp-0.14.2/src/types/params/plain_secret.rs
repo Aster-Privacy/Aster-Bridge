@@ -5,7 +5,6 @@ use byteorder::{BigEndian, ByteOrder};
 use hkdf::Hkdf;
 use nom::combinator::map;
 use nom::sequence::tuple;
-use rsa::RsaPrivateKey;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -164,15 +163,14 @@ impl<'a> PlainSecretParamsRef<'a> {
         match self {
             PlainSecretParamsRef::RSA { d, p, q, .. } => match public_params {
                 PublicParams::RSA { ref n, ref e } => {
-                    let secret_key = RsaPrivateKey::from_components(
-                        n.into(),
-                        e.into(),
-                        d.into(),
-                        vec![p.into(), q.into()],
+                    let secret_key = crate::crypto::rsa::PrivateKey::from_components(
+                        n.as_bytes(),
+                        e.as_bytes(),
+                        d.as_bytes(),
+                        p.as_bytes(),
+                        q.as_bytes(),
                     )?;
-                    Ok(SecretKeyRepr::RSA(crate::crypto::rsa::PrivateKey::from(
-                        secret_key,
-                    )))
+                    Ok(SecretKeyRepr::RSA(secret_key))
                 }
                 _ => unreachable!("inconsistent key state"),
             },

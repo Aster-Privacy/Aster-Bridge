@@ -1,13 +1,12 @@
-use ecdsa::SigningKey;
-use elliptic_curve::sec1::ToEncodedPoint;
-use p521::NistP521;
+use elliptic_curve::sec1::ToSec1Point;
+use elliptic_curve::Generate;
 use rand::{CryptoRng, Rng};
-use signature::hazmat::{PrehashSigner, PrehashVerifier};
+use signature_next::hazmat::{PrehashSigner, PrehashVerifier};
 use zeroize::ZeroizeOnDrop;
 
 use crate::crypto::ecc_curve::ECCCurve;
 use crate::crypto::hash::HashAlgorithm;
-use crate::crypto::Signer;
+use crate::crypto::{RngNext, Signer};
 use crate::errors::Result;
 use crate::types::EcdsaPublicParams;
 use crate::types::{Mpi, PlainSecretParams, PublicParams};
@@ -70,8 +69,7 @@ impl Signer for SecretKey {
                 (r.to_vec(), s.to_vec())
             }
             Self::P521(secret_key) => {
-                let secret: SigningKey<NistP521> = secret_key.into();
-                let signing_key = p521::ecdsa::SigningKey::from(secret);
+                let signing_key = p521::ecdsa::SigningKey::from(secret_key);
                 let signature: p521::ecdsa::Signature = signing_key.sign_prehash(digest)?;
                 let (r, s) = signature.split_bytes();
                 (r.to_vec(), s.to_vec())
@@ -109,56 +107,56 @@ pub fn generate_key<R: Rng + CryptoRng>(
 ) -> Result<(PublicParams, PlainSecretParams)> {
     match curve {
         ECCCurve::P256 => {
-            let secret = p256::SecretKey::random(&mut rng);
+            let secret = p256::SecretKey::generate_from_rng(&mut RngNext(&mut rng));
             let public = secret.public_key();
             let secret = Mpi::from_slice(secret.to_bytes().as_slice());
 
             Ok((
                 PublicParams::ECDSA(EcdsaPublicParams::P256 {
                     key: public,
-                    p: Mpi::from_slice(public.to_encoded_point(false).as_bytes()),
+                    p: Mpi::from_slice(public.to_sec1_point(false).as_bytes()),
                 }),
                 PlainSecretParams::ECDSA(secret),
             ))
         }
 
         ECCCurve::P384 => {
-            let secret = p384::SecretKey::random(&mut rng);
+            let secret = p384::SecretKey::generate_from_rng(&mut RngNext(&mut rng));
             let public = secret.public_key();
             let secret = Mpi::from_slice(secret.to_bytes().as_slice());
 
             Ok((
                 PublicParams::ECDSA(EcdsaPublicParams::P384 {
                     key: public,
-                    p: Mpi::from_slice(public.to_encoded_point(false).as_bytes()),
+                    p: Mpi::from_slice(public.to_sec1_point(false).as_bytes()),
                 }),
                 PlainSecretParams::ECDSA(secret),
             ))
         }
 
         ECCCurve::P521 => {
-            let secret = p521::SecretKey::random(&mut rng);
+            let secret = p521::SecretKey::generate_from_rng(&mut RngNext(&mut rng));
             let public = secret.public_key();
             let secret = Mpi::from_slice(secret.to_bytes().as_slice());
 
             Ok((
                 PublicParams::ECDSA(EcdsaPublicParams::P521 {
                     key: public,
-                    p: Mpi::from_slice(public.to_encoded_point(false).as_bytes()),
+                    p: Mpi::from_slice(public.to_sec1_point(false).as_bytes()),
                 }),
                 PlainSecretParams::ECDSA(secret),
             ))
         }
 
         ECCCurve::Secp256k1 => {
-            let secret = k256::SecretKey::random(&mut rng);
+            let secret = k256::SecretKey::generate_from_rng(&mut RngNext(&mut rng));
             let public = secret.public_key();
             let secret = Mpi::from_slice(secret.to_bytes().as_slice());
 
             Ok((
                 PublicParams::ECDSA(EcdsaPublicParams::Secp256k1 {
                     key: public,
-                    p: Mpi::from_slice(public.to_encoded_point(false).as_bytes()),
+                    p: Mpi::from_slice(public.to_sec1_point(false).as_bytes()),
                 }),
                 PlainSecretParams::ECDSA(secret),
             ))

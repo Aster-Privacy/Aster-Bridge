@@ -39,3 +39,24 @@ pub trait KeyParams {
 
     fn key_params(&self) -> Self::KeyParams;
 }
+
+pub(crate) struct RngNext<'a, R: ?Sized>(pub(crate) &'a mut R);
+
+impl<R: rand::RngCore + rand::CryptoRng + ?Sized> rand_core_next::TryRng for RngNext<'_, R> {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.0.next_u32())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+impl<R: rand::RngCore + rand::CryptoRng + ?Sized> rand_core_next::TryCryptoRng for RngNext<'_, R> {}

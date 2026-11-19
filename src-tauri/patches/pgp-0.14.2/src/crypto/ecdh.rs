@@ -171,7 +171,7 @@ where
     C: elliptic_curve::CurveArithmetic,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
     elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+        elliptic_curve::sec1::FromSec1Point<C> + elliptic_curve::sec1::ToSec1Point<C>,
 {
     ensure_eq!(
         secret.len(),
@@ -183,7 +183,7 @@ where
     let ephemeral_public_key =
         elliptic_curve::PublicKey::<C>::from_sec1_bytes(public_point.as_bytes())?;
 
-    let our_secret = elliptic_curve::SecretKey::<C>::from_bytes(secret.into())?;
+    let our_secret = elliptic_curve::SecretKey::<C>::from_slice(secret)?;
 
     // derive shared secret
     let shared_secret = elliptic_curve::ecdh::diffie_hellman(
@@ -324,9 +324,9 @@ where
     C: elliptic_curve::CurveArithmetic + elliptic_curve::point::PointCompression,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
     elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+        elliptic_curve::sec1::FromSec1Point<C> + elliptic_curve::sec1::ToSec1Point<C>,
 {
-    let secret = elliptic_curve::SecretKey::<C>::random(&mut rng);
+    let secret = <elliptic_curve::SecretKey<C> as elliptic_curve::Generate>::generate_from_rng(&mut crate::crypto::RngNext(&mut rng));
     let public = secret.public_key();
 
     Ok((
@@ -507,17 +507,17 @@ where
     C: elliptic_curve::CurveArithmetic + elliptic_curve::point::PointCompression,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
     elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+        elliptic_curve::sec1::FromSec1Point<C> + elliptic_curve::sec1::ToSec1Point<C>,
 {
     let their_public = elliptic_curve::PublicKey::<C>::from_sec1_bytes(q)?;
-    let our_secret = elliptic_curve::ecdh::EphemeralSecret::<C>::random(&mut rng);
+    let our_secret = <elliptic_curve::ecdh::EphemeralSecret<C> as elliptic_curve::Generate>::generate_from_rng(&mut crate::crypto::RngNext(&mut rng));
 
     // derive shared secret
     let shared_secret = our_secret.diffie_hellman(&their_public);
 
     // encode our public key
     let our_public = elliptic_curve::PublicKey::<C>::from(&our_secret);
-    let our_public = elliptic_curve::sec1::EncodedPoint::<C>::from(our_public);
+    let our_public = elliptic_curve::sec1::Sec1Point::<C>::from(our_public);
 
     Ok((
         our_public.as_bytes().to_vec(),
