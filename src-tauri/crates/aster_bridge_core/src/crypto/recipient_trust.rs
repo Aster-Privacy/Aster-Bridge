@@ -53,6 +53,7 @@ pub enum BundleVerdict {
     Verified {
         covers_pq_identity: bool,
         signed: Option<SignedBinding>,
+        level: i64,
     },
     Tampered,
     Legacy,
@@ -71,7 +72,71 @@ pub struct RecipientPin {
     pub hosted: bool,
     pub flagged: bool,
     pub address_rooted: bool,
+    pub signature_level: i64,
+    pub x3dh_floor: i64,
+    pub root_evidence: i64,
+    pub unverified_notice: i64,
+    pub opk_seen: bool,
+    pub opk_grace_at: i64,
 }
+
+pub const ONE_TIME_PREKEY_GRACE_SECS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneTimePrekeyVerdict {
+    Offered,
+    NeverOffered,
+    Grace,
+    Withheld,
+}
+
+pub fn judge_one_time_prekey_offer(
+    opk_seen: bool,
+    grace_at: i64,
+    offered: bool,
+    now: i64,
+) -> OneTimePrekeyVerdict {
+    if offered {
+        OneTimePrekeyVerdict::Offered
+    } else if !opk_seen {
+        OneTimePrekeyVerdict::NeverOffered
+    } else if grace_at == 0 || grace_at > now || now - grace_at >= ONE_TIME_PREKEY_GRACE_SECS {
+        OneTimePrekeyVerdict::Grace
+    } else {
+        OneTimePrekeyVerdict::Withheld
+    }
+}
+
+fn one_time_prekey_verdict(base: &RecipientPin, target: &RatchetTarget, now: i64) -> OneTimePrekeyVerdict {
+    if !target.key_bound {
+        return OneTimePrekeyVerdict::NeverOffered;
+    }
+    judge_one_time_prekey_offer(base.opk_seen, base.opk_grace_at, target.one_time_prekey.is_some(), now)
+}
+
+fn watched_one_time_state(base: &RecipientPin, verdict: OneTimePrekeyVerdict, now: i64) -> (bool, i64) {
+    match verdict {
+        OneTimePrekeyVerdict::Offered => (true, base.opk_grace_at),
+        OneTimePrekeyVerdict::Grace => (base.opk_seen, now),
+        _ => (base.opk_seen, base.opk_grace_at),
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub const ROOT_EVIDENCE_UNKNOWN: i64 = 0;
+pub const ROOT_EVIDENCE_FIRST_CONTACT: i64 = 1;
+pub const ROOT_EVIDENCE_SIGNED_BUNDLE: i64 = 2;
+pub const ROOT_EVIDENCE_USER_CONFIRMED: i64 = 3;
+
+pub const UNVERIFIED_NOTICE_NONE: i64 = 0;
+pub const UNVERIFIED_NOTICE_PENDING: i64 = 1;
+pub const UNVERIFIED_NOTICE_SHOWN: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PqTarget {
@@ -120,6 +185,7 @@ pub enum SendRoute {
 pub struct Evaluation {
     pub pin: Option<RecipientPin>,
     pub outcome: Result<SendRoute, BridgeError>,
+    pub one_time_withheld: bool,
 }
 
 fn canonical_v1(bundle: &PrekeyBundle) -> String {
@@ -203,18 +269,21 @@ pub fn verify_bundle(bundle: &PrekeyBundle, owner_public_key: Option<&str>) -> B
         return BundleVerdict::Verified {
             covers_pq_identity: advertised_pq_identity_key(bundle).is_some(),
             signed: Some(signed),
+            level: 3,
         };
     }
     if canonical_v2(bundle).as_deref() == Some(signed_text) {
         return BundleVerdict::Verified {
             covers_pq_identity: true,
             signed: None,
+            level: 2,
         };
     }
     if signed_text == canonical_v1(bundle) {
         return BundleVerdict::Verified {
             covers_pq_identity: false,
             signed: None,
+            level: 1,
         };
     }
     BundleVerdict::Tampered
@@ -448,16 +517,25 @@ fn accepted_pin(existing: RecipientPin, fingerprint: &str) -> RecipientPin {
             pq_fingerprint: String::new(),
             binding_epoch,
             binding_fingerprint,
+            signature_level: 0,
             flagged: false,
             address_rooted: false,
+            root_evidence: ROOT_EVIDENCE_USER_CONFIRMED,
             ..existing
         };
     }
+    let root_evidence = if existing.identity_fingerprint.is_empty() {
+        ROOT_EVIDENCE_USER_CONFIRMED
+    } else {
+        existing.root_evidence
+    };
     RecipientPin {
         owner_fingerprint: fingerprint.to_string(),
         binding_epoch,
         binding_fingerprint,
+        signature_level: 0,
         flagged: false,
+        root_evidence,
         ..existing
     }
 }
@@ -513,6 +591,23 @@ fn stale_binding(address: &str) -> BridgeError {
         "The encryption keys that {} publishes now are older than the keys Aster Bridge already trusts for this recipient, so the message was not sent. This can mean that old keys are being replayed. Accepting the key does not fix this. Ask the recipient to sign in to an up-to-date Aster app so their current keys are published again.",
         address
     ))
+}
+
+fn weaker_signature_form(address: &str, level: i64, seen: i64) {
+    tracing::warn!(
+        "{} publishes keys in signature form {} after form {}; the keys are used but stay unverified",
+        address,
+        level,
+        seen
+    );
+}
+
+fn notice_after_weaker_form(notice: i64) -> i64 {
+    if notice == UNVERIFIED_NOTICE_NONE {
+        UNVERIFIED_NOTICE_PENDING
+    } else {
+        notice
+    }
 }
 
 fn binding_is_stale(base: &RecipientPin, signed: Option<&SignedBinding>) -> bool {
@@ -645,6 +740,16 @@ pub fn evaluate_recipient(
     owner_public_key: Option<&str>,
     existing: Option<&RecipientPin>,
 ) -> Evaluation {
+    evaluate_recipient_at(address, bundle, owner_public_key, existing, unix_now())
+}
+
+pub fn evaluate_recipient_at(
+    address: &str,
+    bundle: Option<&PrekeyBundle>,
+    owner_public_key: Option<&str>,
+    existing: Option<&RecipientPin>,
+    now: i64,
+) -> Evaluation {
     let base = existing.cloned().unwrap_or_default();
     let owner_fingerprint = owner_public_key
         .and_then(|key| aster_crypto::public_key_fingerprint_hex(key.as_bytes()));
@@ -658,6 +763,7 @@ pub fn evaluate_recipient(
 
     if verdict == Some(BundleVerdict::Tampered) || owner_changed || base.flagged || leaves_address_keys {
         return Evaluation {
+            one_time_withheld: false,
             pin: changed_pin(
                 existing,
                 RecipientPin {
@@ -675,6 +781,7 @@ pub fn evaluate_recipient(
 
     let (Some(_), Some(owner_fingerprint)) = (owner_public_key, owner_fingerprint) else {
         return Evaluation {
+            one_time_withheld: false,
             pin: None,
             outcome: Err(no_published_key(address)),
         };
@@ -685,19 +792,26 @@ pub fn evaluate_recipient(
         Some(BundleVerdict::Verified {
             covers_pq_identity,
             signed,
+            level,
         }),
     ) = (bundle, verdict)
     {
         if binding_is_stale(&base, signed.as_ref()) {
             return Evaluation {
+                one_time_withheld: false,
                 pin: None,
                 outcome: Err(stale_binding(address)),
             };
+        }
+        let weaker_form = level < base.signature_level;
+        if weaker_form {
+            weaker_signature_form(address, level, base.signature_level);
         }
         let advertises_pq = advertised_pq_identity_key(bundle).is_some();
         let pq_pinned = !base.pq_fingerprint.is_empty();
         if (pq_pinned && !covers_pq_identity) || (base.pq_seen && !advertises_pq) {
             return Evaluation {
+                one_time_withheld: false,
                 pin: None,
                 outcome: Err(downgraded(address)),
             };
@@ -706,14 +820,26 @@ pub fn evaluate_recipient(
             Ok(target) => target,
             Err(error) => {
                 return Evaluation {
+                    one_time_withheld: false,
                     pin: None,
                     outcome: Err(error),
                 }
             }
         };
-        if let Some(signed) = &signed {
-            target.key_bound = signed.x3dh_version >= i16::from(X3DH_VERSION_KEY_BOUND);
+        let key_bound_floor = i64::from(X3DH_VERSION_KEY_BOUND);
+        match &signed {
+            Some(signed) => {
+                target.key_bound = signed.x3dh_version >= i16::from(X3DH_VERSION_KEY_BOUND);
+                if signed.x3dh_version < i16::from(X3DH_VERSION_ONE_TIME_BOUND) {
+                    target.one_time_prekey = None;
+                }
+            }
+            None => target.key_bound = target.key_bound || base.x3dh_floor >= key_bound_floor,
         }
+        let x3dh_floor = match &signed {
+            Some(signed) => i64::from(signed.x3dh_version).min(key_bound_floor),
+            None => base.x3dh_floor,
+        };
         target.transcript_bound = match &signed {
             Some(signed) => signed.x3dh_version >= i16::from(X3DH_VERSION_TRANSCRIPT_BOUND),
             None => target.transcript_bound || base.transcript_bound,
@@ -722,6 +848,15 @@ pub fn evaluate_recipient(
             Some(signed) => (signed.epoch, signed.fingerprint),
             None => (base.binding_epoch, base.binding_fingerprint.clone()),
         };
+        let one_time_verdict = one_time_prekey_verdict(&base, &target, now);
+        if one_time_verdict == OneTimePrekeyVerdict::Withheld {
+            return Evaluation {
+                one_time_withheld: true,
+                pin: None,
+                outcome: Ok(SendRoute::Ratchet(target)),
+            };
+        }
+        let (opk_seen, opk_grace_at) = watched_one_time_state(&base, one_time_verdict, now);
         let identity_fingerprint = hex(&Sha256::digest(&target.identity_public));
         let pq_fingerprint = target
             .pq_target
@@ -740,8 +875,19 @@ pub fn evaluate_recipient(
             hosted: base.hosted,
             flagged: false,
             address_rooted: base.address_rooted,
+            signature_level: base.signature_level.max(level),
+            x3dh_floor,
+            root_evidence: base.root_evidence.max(ROOT_EVIDENCE_SIGNED_BUNDLE),
+            unverified_notice: if weaker_form {
+                notice_after_weaker_form(base.unverified_notice)
+            } else {
+                base.unverified_notice
+            },
+            opk_seen,
+            opk_grace_at,
         };
         return Evaluation {
+            one_time_withheld: false,
             pin: changed_pin(existing, pin),
             outcome: Ok(SendRoute::Ratchet(target)),
         };
@@ -749,23 +895,33 @@ pub fn evaluate_recipient(
 
     if base.binding_epoch > 0 {
         return Evaluation {
+            one_time_withheld: false,
             pin: None,
             outcome: Err(stale_binding(address)),
         };
     }
+    let unverified_notice = if base.signature_level > 0 {
+        weaker_signature_form(address, 0, base.signature_level);
+        notice_after_weaker_form(base.unverified_notice)
+    } else {
+        base.unverified_notice
+    };
 
     if base.pq_seen {
         return Evaluation {
+            one_time_withheld: false,
             pin: None,
             outcome: Err(downgraded(address)),
         };
     }
 
     Evaluation {
+        one_time_withheld: false,
         pin: changed_pin(
             existing,
             RecipientPin {
                 owner_fingerprint,
+                unverified_notice,
                 ..base
             },
         ),
@@ -778,6 +934,7 @@ pub enum DirectoryTrust {
     Account,
     Entry,
     Endorsed,
+    Unverified,
     Replaced,
     Invalid,
     Downgraded,
@@ -794,6 +951,20 @@ fn key_fingerprint_hex(public_key_b64: &str) -> Option<String> {
         .decode(public_key_b64.trim())
         .ok()
         .map(|bytes| hex(&Sha256::digest(bytes)))
+}
+
+pub fn pin_vouches_for_identity(pin: Option<&RecipientPin>, identity_public_key: &str) -> bool {
+    let Some(pin) = pin else {
+        return false;
+    };
+    if pin.flagged || pin.identity_fingerprint.is_empty() {
+        return false;
+    }
+    if !matches!(pin.root_evidence, ROOT_EVIDENCE_SIGNED_BUNDLE | ROOT_EVIDENCE_USER_CONFIRMED) {
+        return false;
+    }
+    key_fingerprint_hex(identity_public_key)
+        .is_some_and(|fingerprint| pin.identity_fingerprint.eq_ignore_ascii_case(&fingerprint))
 }
 
 pub fn is_address_scoped(bundle: &PrekeyBundle) -> bool {
@@ -832,7 +1003,7 @@ pub fn classify_scoped_entry(
         return if existing.is_some_and(|pin| !pin.owner_fingerprint.is_empty()) {
             DirectoryTrust::Account
         } else {
-            DirectoryTrust::Entry
+            DirectoryTrust::Unverified
         };
     };
     let pinned = |key: &str| {
@@ -858,10 +1029,25 @@ pub fn evaluate_address_entry(
     existing: Option<&RecipientPin>,
     owner_public_key: Option<&str>,
 ) -> Evaluation {
+    evaluate_address_entry_at(address, bundle, trust, existing, owner_public_key, unix_now())
+}
+
+pub fn evaluate_address_entry_at(
+    address: &str,
+    bundle: &PrekeyBundle,
+    trust: DirectoryTrust,
+    existing: Option<&RecipientPin>,
+    owner_public_key: Option<&str>,
+    now: i64,
+) -> Evaluation {
     let base = existing.cloned().unwrap_or_default();
-    let refused = !matches!(trust, DirectoryTrust::Entry | DirectoryTrust::Endorsed);
+    let refused = !matches!(
+        trust,
+        DirectoryTrust::Entry | DirectoryTrust::Endorsed | DirectoryTrust::Unverified
+    );
     if refused || base.flagged {
         return Evaluation {
+            one_time_withheld: false,
             pin: changed_pin(
                 existing,
                 RecipientPin {
@@ -872,13 +1058,22 @@ pub fn evaluate_address_entry(
             outcome: Err(untrusted(address, key_fingerprint(owner_public_key).as_deref())),
         };
     }
+    if trust == DirectoryTrust::Unverified {
+        tracing::warn!(
+            "first contact with {}: its address key is trusted on first use and stays unverified until it is compared with the recipient",
+            address
+        );
+    }
     let pq_key = advertised_pq_identity_key(bundle);
     if base.pq_seen && pq_key.is_none() {
         return Evaluation {
+            one_time_withheld: false,
             pin: None,
             outcome: Err(downgraded(address)),
         };
     }
+    let rooted_in_signed_evidence = trust != DirectoryTrust::Unverified
+        && existing.is_none_or(|pin| pin.root_evidence >= ROOT_EVIDENCE_SIGNED_BUNDLE);
     let decoded = (|| -> Result<RatchetTarget, BridgeError> {
         let pq_target = match pq_key {
             Some(key) => {
@@ -892,7 +1087,7 @@ pub fn evaluate_address_entry(
                 Some(PqTarget {
                     public_key,
                     key_id: PQ_IDENTITY_KEY_ID,
-                    signed: true,
+                    signed: rooted_in_signed_evidence,
                 })
             }
             None => None,
@@ -912,11 +1107,30 @@ pub fn evaluate_address_entry(
         Ok(target) => target,
         Err(error) => {
             return Evaluation {
+                one_time_withheld: false,
                 pin: None,
                 outcome: Err(error),
             }
         }
     };
+    let first_contact = trust == DirectoryTrust::Unverified;
+    let (address_rooted, root_evidence) = if first_contact {
+        (false, ROOT_EVIDENCE_FIRST_CONTACT)
+    } else {
+        (
+            base.address_rooted || base.root_evidence >= ROOT_EVIDENCE_SIGNED_BUNDLE,
+            base.root_evidence,
+        )
+    };
+    let one_time_verdict = one_time_prekey_verdict(&base, &target, now);
+    if one_time_verdict == OneTimePrekeyVerdict::Withheld {
+        return Evaluation {
+            one_time_withheld: true,
+            pin: None,
+            outcome: Ok(SendRoute::Ratchet(target)),
+        };
+    }
+    let (opk_seen, opk_grace_at) = watched_one_time_state(&base, one_time_verdict, now);
     let pin = RecipientPin {
         identity_fingerprint: hex(&Sha256::digest(&target.identity_public)),
         owner_fingerprint: base.owner_fingerprint.clone(),
@@ -931,12 +1145,97 @@ pub fn evaluate_address_entry(
         binding_fingerprint: base.binding_fingerprint.clone(),
         hosted: base.hosted,
         flagged: false,
-        address_rooted: true,
+        address_rooted,
+        signature_level: base.signature_level,
+        x3dh_floor: base.x3dh_floor,
+        root_evidence,
+        unverified_notice: if first_contact && base.unverified_notice == UNVERIFIED_NOTICE_NONE {
+            UNVERIFIED_NOTICE_PENDING
+        } else {
+            base.unverified_notice
+        },
+        opk_seen,
+        opk_grace_at,
     };
     Evaluation {
+        one_time_withheld: false,
         pin: changed_pin(existing, pin),
         outcome: Ok(SendRoute::Ratchet(target)),
     }
+}
+
+pub fn needs_root_review(pin: &RecipientPin) -> bool {
+    pin.address_rooted && pin.root_evidence == ROOT_EVIDENCE_UNKNOWN
+}
+
+pub fn review_legacy_root(
+    address: &str,
+    pin: &RecipientPin,
+    scoped: Option<&PrekeyBundle>,
+    account_bundle: Option<&PrekeyBundle>,
+    owner_public_key: Option<&str>,
+) -> RecipientPin {
+    if signed_root_evidence(address, pin, scoped, account_bundle, owner_public_key) {
+        return RecipientPin {
+            root_evidence: ROOT_EVIDENCE_SIGNED_BUNDLE,
+            ..pin.clone()
+        };
+    }
+    tracing::warn!("a saved recipient key was first seen in the directory, so it is now shown as not verified");
+    RecipientPin {
+        address_rooted: false,
+        root_evidence: ROOT_EVIDENCE_FIRST_CONTACT,
+        unverified_notice: UNVERIFIED_NOTICE_PENDING,
+        ..pin.clone()
+    }
+}
+
+fn signed_root_evidence(
+    address: &str,
+    pin: &RecipientPin,
+    scoped: Option<&PrekeyBundle>,
+    account_bundle: Option<&PrekeyBundle>,
+    owner_public_key: Option<&str>,
+) -> bool {
+    let Some(owner) = key_fingerprint(owner_public_key) else {
+        return false;
+    };
+    if pin.owner_fingerprint.is_empty() || normalize_fingerprint(&pin.owner_fingerprint) != normalize_fingerprint(&owner) {
+        return false;
+    }
+    let Some(account) = account_bundle.filter(|bundle| !is_address_scoped(bundle)) else {
+        return false;
+    };
+    if !matches!(verify_bundle(account, owner_public_key), BundleVerdict::Verified { .. }) {
+        return false;
+    }
+    let pinned = |key: &str| {
+        key_fingerprint_hex(key).is_some_and(|fingerprint| pin.identity_fingerprint.eq_ignore_ascii_case(&fingerprint))
+    };
+    if pinned(&account.kem_identity_key) {
+        return true;
+    }
+    let Some(entry) = scoped.filter(|bundle| is_address_scoped(bundle)) else {
+        return false;
+    };
+    if !pinned(&entry.kem_identity_key) {
+        return false;
+    }
+    let Some(account_identity) = key_fingerprint_hex(&account.kem_identity_key) else {
+        return false;
+    };
+    let verification = verify_address_entry(
+        address,
+        &entry.kem_identity_key,
+        &entry.signed_prekey,
+        advertised_pq_identity_key(entry),
+        entry.signed_prekey_signature.as_deref().unwrap_or(""),
+    );
+    verification.valid
+        && verification
+            .endorsers
+            .iter()
+            .any(|endorser| key_fingerprint_hex(endorser).as_deref() == Some(account_identity.as_str()))
 }
 
 #[cfg(test)]
@@ -1202,6 +1501,7 @@ X1OEWHpsCOAO
             BundleVerdict::Verified {
                 covers_pq_identity: false,
                 signed: None,
+                level: 1,
             }
         );
     }
@@ -1420,6 +1720,7 @@ X1OEWHpsCOAO
         let BundleVerdict::Verified {
             covers_pq_identity,
             signed: Some(signed),
+            level: 3,
         } = verify_bundle(&bundle, Some(&alice.public_key))
         else {
             panic!("a v3 binding must verify");
@@ -1437,6 +1738,7 @@ X1OEWHpsCOAO
             BundleVerdict::Verified {
                 covers_pq_identity: false,
                 signed: Some(_),
+                level: 3,
             }
         ));
     }
@@ -1523,6 +1825,140 @@ X1OEWHpsCOAO
     }
 
     #[test]
+    fn a_weaker_signature_form_is_used_and_keeps_the_strongest_form_seen() {
+        let alice = owner("alice");
+        let v1 = signed_v1_bundle(&alice, None);
+        let v1_pin = evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        assert_eq!(v1_pin.signature_level, 1);
+        let unsigned = unsigned_bundle(None);
+        let weaker = evaluate_recipient(BOB, Some(&unsigned), Some(&alice.public_key), Some(&v1_pin));
+        assert!(matches!(weaker.outcome, Ok(SendRoute::AccountKey)));
+        assert!(weaker.pin.is_some(), "a weaker signature form must record the unverified notice on the pin");
+        let weaker_pin = weaker.pin.unwrap();
+        assert_eq!(weaker_pin.signature_level, 1);
+        assert_eq!(weaker_pin.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+
+        let v2_pin = evaluate_recipient(BOB, Some(&signed_v2_bundle(&alice)), Some(&alice.public_key), Some(&v1_pin))
+            .pin
+            .unwrap();
+        assert_eq!(v2_pin.signature_level, 2);
+        let v1_with_pq = signed_v1_bundle(&alice, Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        let after_v2 = evaluate_recipient(BOB, Some(&v1_with_pq), Some(&alice.public_key), Some(&v2_pin));
+        assert!(after_v2.outcome.is_err(), "a pinned post-quantum key still refuses a form that drops it");
+
+        let other = owner("other");
+        let moved = accepted_pin(v2_pin.clone(), &key_fingerprint(Some(&other.public_key)).unwrap());
+        assert_eq!(moved.signature_level, 0);
+        let same = accepted_pin(v2_pin, &key_fingerprint(Some(&alice.public_key)).unwrap());
+        assert_eq!(same.signature_level, 0);
+    }
+
+    #[test]
+    fn a_weaker_signature_form_raises_the_unverified_notice_once() {
+        let alice = owner("alice");
+        let v1 = signed_v1_bundle(&alice, None);
+        let v1_pin = evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        assert_eq!(v1_pin.signature_level, 1);
+        let calm = RecipientPin {
+            unverified_notice: UNVERIFIED_NOTICE_NONE,
+            ..v1_pin
+        };
+        let same_form = evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), Some(&calm));
+        assert_eq!(
+            same_form.pin.map(|pin| pin.unverified_notice).unwrap_or(calm.unverified_notice),
+            UNVERIFIED_NOTICE_NONE
+        );
+
+        let unsigned = evaluate_recipient(BOB, Some(&unsigned_bundle(None)), Some(&alice.public_key), Some(&calm));
+        assert!(matches!(unsigned.outcome, Ok(SendRoute::AccountKey)));
+        assert_eq!(unsigned.pin.map(|pin| pin.unverified_notice), Some(UNVERIFIED_NOTICE_PENDING));
+
+        let stronger_seen = RecipientPin {
+            signature_level: 2,
+            ..calm.clone()
+        };
+        let older_form = evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), Some(&stronger_seen));
+        assert!(matches!(older_form.outcome, Ok(SendRoute::Ratchet(_))));
+        assert!(older_form.pin.is_some(), "an older signature form after a stronger one must record the unverified notice");
+        let older_pin = older_form.pin.unwrap();
+        assert_eq!(older_pin.signature_level, 2);
+        assert_eq!(older_pin.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+
+        let dismissed = RecipientPin {
+            unverified_notice: UNVERIFIED_NOTICE_SHOWN,
+            ..calm
+        };
+        let again = evaluate_recipient(BOB, Some(&unsigned_bundle(None)), Some(&alice.public_key), Some(&dismissed));
+        assert_eq!(
+            again.pin.map(|pin| pin.unverified_notice).unwrap_or(dismissed.unverified_notice),
+            UNVERIFIED_NOTICE_SHOWN
+        );
+    }
+
+    #[test]
+    fn a_recipient_whose_clients_publish_v1_or_unsigned_keys_is_not_refused() {
+        let alice = owner("alice");
+        let v1 = signed_v1_bundle(&alice, None);
+        let pin = evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), None)
+            .pin
+            .unwrap();
+        assert!(matches!(
+            evaluate_recipient(BOB, Some(&v1), Some(&alice.public_key), Some(&pin)).outcome,
+            Ok(SendRoute::Ratchet(_))
+        ));
+        assert!(matches!(
+            evaluate_recipient(BOB, Some(&unsigned_bundle(None)), Some(&alice.public_key), Some(&pin)).outcome,
+            Ok(SendRoute::AccountKey)
+        ));
+        assert!(matches!(
+            evaluate_recipient(BOB, None, Some(&alice.public_key), Some(&pin)).outcome,
+            Ok(SendRoute::AccountKey)
+        ));
+    }
+
+    #[test]
+    fn a_signed_handshake_version_overrides_the_advertised_one() {
+        let alice = owner("alice");
+        let mut bundle = signed_v3_bundle(&alice, 2, 1);
+        bundle.x3dh_max_version = Some(4);
+        bundle.ec_one_time_prekey = Some(serde_json::json!({
+            "key_id": 41,
+            "public_key": STANDARD.encode(p256_public()),
+        }));
+        let chosen = ratchet(evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None));
+        assert_eq!(chosen.one_time_prekey, None);
+        assert_eq!(chosen.x3dh_version(), 2);
+    }
+
+    #[test]
+    fn a_signed_key_bound_binding_is_not_raised_by_an_unsigned_one_time_prekey() {
+        let alice = owner("alice");
+        let mut bundle = signed_v3_bundle(&alice, 3, 1);
+        bundle.x3dh_max_version = Some(4);
+        bundle.ec_one_time_prekey = Some(serde_json::json!({
+            "key_id": 41,
+            "public_key": STANDARD.encode(p256_public()),
+        }));
+        let chosen = ratchet(evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None));
+        assert_eq!(chosen.one_time_prekey, None);
+        assert_eq!(chosen.x3dh_version(), 3);
+
+        let mut bundle = signed_v3_bundle(&alice, 4, 1);
+        bundle.x3dh_max_version = Some(4);
+        bundle.ec_one_time_prekey = Some(serde_json::json!({
+            "key_id": 41,
+            "public_key": STANDARD.encode(p256_public()),
+        }));
+        let chosen = ratchet(evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None));
+        assert!(chosen.one_time_prekey.is_some());
+        assert_eq!(chosen.x3dh_version(), 4);
+    }
+
+    #[test]
     fn bindings_without_an_epoch_keep_working_until_one_is_pinned() {
         let alice = owner("alice");
         let pin = evaluate_recipient(BOB, Some(&signed_v2_bundle(&alice)), Some(&alice.public_key), None)
@@ -1597,6 +2033,7 @@ X1OEWHpsCOAO
             accepted,
             RecipientPin {
                 flagged: false,
+                signature_level: 0,
                 ..pin.clone()
             }
         );
@@ -1901,6 +2338,7 @@ X1OEWHpsCOAO
         let evaluation = evaluate_recipient(BOB, Some(&bundle), Some(&alice.public_key), None);
         let pin = evaluation.pin.clone().unwrap();
         assert!(pin.transcript_bound);
+        assert_eq!(pin.x3dh_floor, 0);
 
         bundle.x3dh_max_version = Some(2);
         assert_eq!(version(&bundle, Some(&pin)), 2);
@@ -1910,16 +2348,17 @@ X1OEWHpsCOAO
 
         bundle.x3dh_max_version = None;
         assert_eq!(version(&bundle, Some(&pin)), 2);
+        assert_eq!(version(&bundle, None), 1);
 
         bundle.x3dh_max_version = Some(99);
         assert_eq!(version(&bundle, Some(&pin)), 3);
     }
 
     fn p256_public() -> Vec<u8> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        p256::SecretKey::random(&mut rand_core::OsRng)
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        <p256::SecretKey as p256::elliptic_curve::Generate>::generate()
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec()
     }
@@ -1968,6 +2407,57 @@ X1OEWHpsCOAO
     }
 
     #[test]
+    fn a_peer_that_published_one_time_prekeys_gets_one_send_without_them_per_window() {
+        let alice = owner("alice");
+        let address = "alice@astermail.org";
+        let mut offered = signed_v2_bundle(&alice);
+        offered.x3dh_max_version = Some(4);
+        offered.ec_one_time_prekey = advertised_one_time_prekey(41, &p256_public());
+        let mut stripped = signed_v2_bundle(&alice);
+        stripped.x3dh_max_version = Some(4);
+        stripped.ec_one_time_prekey = None;
+        let start = 1_800_000_000;
+        let ratchet_with = |evaluation: &Evaluation| match &evaluation.outcome {
+            Ok(SendRoute::Ratchet(target)) => Some(target.one_time_prekey.is_some()),
+            _ => None,
+        };
+
+        let never = evaluate_recipient_at(address, Some(&stripped), Some(&alice.public_key), None, start);
+        assert_eq!(ratchet_with(&never), Some(false));
+        assert!(!never.pin.expect("first pin").opk_seen);
+
+        let first = evaluate_recipient_at(address, Some(&offered), Some(&alice.public_key), None, start);
+        assert_eq!(ratchet_with(&first), Some(true));
+        let pin = first.pin.expect("first pin");
+        assert!(pin.opk_seen);
+        assert_eq!(pin.opk_grace_at, 0);
+
+        let grace = evaluate_recipient_at(address, Some(&stripped), Some(&alice.public_key), Some(&pin), start + 10);
+        assert_eq!(ratchet_with(&grace), Some(false));
+        let pin = grace.pin.expect("grace recorded");
+        assert!(pin.opk_seen);
+        assert_eq!(pin.opk_grace_at, start + 10);
+
+        let withheld = evaluate_recipient_at(address, Some(&stripped), Some(&alice.public_key), Some(&pin), start + 70);
+        assert_eq!(ratchet_with(&withheld), Some(false));
+        assert!(withheld.one_time_withheld);
+        assert!(withheld.pin.is_none());
+
+        let back = evaluate_recipient_at(address, Some(&offered), Some(&alice.public_key), Some(&pin), start + 80);
+        assert_eq!(ratchet_with(&back), Some(true));
+
+        let later = evaluate_recipient_at(
+            address,
+            Some(&stripped),
+            Some(&alice.public_key),
+            Some(&pin),
+            start + 10 + ONE_TIME_PREKEY_GRACE_SECS,
+        );
+        assert_eq!(ratchet_with(&later), Some(false));
+        assert_eq!(later.pin.expect("grace renewed").opk_grace_at, start + 10 + ONE_TIME_PREKEY_GRACE_SECS);
+    }
+
+    #[test]
     fn a_malformed_one_time_prekey_keeps_the_key_bound_handshake() {
         let alice = owner("alice");
         let mut bundle = signed_v2_bundle(&alice);
@@ -2010,7 +2500,7 @@ X1OEWHpsCOAO
     fn a_signed_statement_below_the_key_bound_handshake_blocks_the_one_time_bound_one() {
         let alice = owner("alice");
         let public = p256_public();
-        for (signed_version, expected) in [(1i16, 1u8), (2, 2), (3, 4), (4, 4)] {
+        for (signed_version, expected) in [(1i16, 1u8), (2, 2), (3, 3), (4, 4)] {
             let mut bundle = signed_v3_bundle(&alice, signed_version, 5);
             bundle.x3dh_max_version = Some(4);
             bundle.ec_one_time_prekey = advertised_one_time_prekey(41, &public);
@@ -2121,18 +2611,269 @@ X1OEWHpsCOAO
 
     const ALIAS: &str = "alias@example.org";
 
+    fn entry_endorser(bundle: &PrekeyBundle) -> String {
+        let verification = crate::crypto::address_identity::verify_address_entry(
+            ALIAS,
+            &bundle.kem_identity_key,
+            &bundle.signed_prekey,
+            bundle.pq_kem_public_key.as_deref(),
+            bundle.signed_prekey_signature.as_deref().unwrap(),
+        );
+        assert!(verification.valid);
+        verification.endorsers.first().expect("the fixed vault endorses its entries").clone()
+    }
+
+    fn account_bundle_with_identity(account: &Owner, identity_b64: &str) -> PrekeyBundle {
+        let mut bundle = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+        bundle.kem_identity_key = identity_b64.to_string();
+        let text = canonical_v2(&bundle).unwrap();
+        sign(&mut bundle, account, &text);
+        bundle
+    }
+
+    fn legacy_rooted(identity_b64: &str, owner_fingerprint: &str) -> RecipientPin {
+        RecipientPin {
+            owner_fingerprint: owner_fingerprint.to_string(),
+            pq_seen: true,
+            ..pinned_to(identity_b64, true)
+        }
+    }
+
     #[test]
-    fn a_valid_entry_on_first_contact_is_trusted_and_roots_the_pin() {
+    fn a_valid_entry_on_first_contact_is_used_but_stays_unverified() {
         let bundle = scoped_entry(ALIAS);
         assert!(is_address_scoped(&bundle));
-        assert_eq!(classify_scoped_entry(ALIAS, &bundle, None), DirectoryTrust::Entry);
-        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, None, None);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, None), DirectoryTrust::Unverified);
+        let evaluation = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Unverified, None, None);
         let pin = evaluation.pin.unwrap();
-        assert!(pin.address_rooted);
+        assert!(!pin.address_rooted);
+        assert_eq!(pin.root_evidence, ROOT_EVIDENCE_FIRST_CONTACT);
         assert_eq!(pin.identity_fingerprint, key_fingerprint_hex(&bundle.kem_identity_key).unwrap());
-        assert!(matches!(evaluation.outcome, Ok(SendRoute::Ratchet(_))));
-        let pinned = pinned_to(&bundle.kem_identity_key, true);
-        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pinned)), DirectoryTrust::Entry);
+        match evaluation.outcome {
+            Ok(SendRoute::Ratchet(target)) => assert!(target.pq_target.is_some_and(|pq| !pq.signed)),
+            other => panic!("expected a ratchet route: {other:?}"),
+        }
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pin)), DirectoryTrust::Entry);
+        let again = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, Some(&pin), None);
+        assert!(again.outcome.is_ok());
+        assert!(again.pin.is_none());
+        assert!(!needs_root_review(&pin));
+    }
+
+    #[test]
+    fn a_key_known_only_from_the_server_is_reported_unverified_and_not_signed() {
+        let bundle = scoped_entry(ALIAS);
+        let first = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Unverified, None, None);
+        let pin = first.pin.clone().expect("first contact is pinned");
+        assert_eq!(pin.root_evidence, ROOT_EVIDENCE_FIRST_CONTACT);
+        assert!(!pin.address_rooted);
+        assert_eq!(pin.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+        assert!(!pin_vouches_for_identity(Some(&pin), &bundle.kem_identity_key));
+        let first_pq = ratchet(first).pq_target.expect("the entry advertises a post-quantum key");
+        assert!(!first_pq.signed, "a first-contact post-quantum key was reported as signed");
+
+        for trust in [DirectoryTrust::Entry, DirectoryTrust::Endorsed] {
+            let later = evaluate_address_entry(ALIAS, &bundle, trust, Some(&pin), None);
+            assert!(
+                !ratchet(later).pq_target.unwrap().signed,
+                "a key pinned on first contact was reported as signed on a later send ({trust:?})"
+            );
+        }
+
+        let legacy = RecipientPin {
+            address_rooted: true,
+            root_evidence: ROOT_EVIDENCE_UNKNOWN,
+            ..pin.clone()
+        };
+        let later = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, Some(&legacy), None);
+        assert!(
+            !ratchet(later).pq_target.unwrap().signed,
+            "a legacy pin with no signed evidence was reported as signed"
+        );
+
+        for root_evidence in [ROOT_EVIDENCE_SIGNED_BUNDLE, ROOT_EVIDENCE_USER_CONFIRMED] {
+            let vouched = RecipientPin { root_evidence, ..pin.clone() };
+            let later = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Entry, Some(&vouched), None);
+            assert!(ratchet(later).pq_target.unwrap().signed);
+        }
+    }
+
+    #[test]
+    fn a_first_contact_entry_is_reported_to_the_user_as_unverified() {
+        let bundle = scoped_entry(ALIAS);
+        let pin = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Unverified, None, None)
+            .pin
+            .unwrap();
+        assert_eq!(pin.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+        let shown = RecipientPin {
+            unverified_notice: UNVERIFIED_NOTICE_SHOWN,
+            identity_fingerprint: String::new(),
+            ..pin.clone()
+        };
+        let kept = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Unverified, Some(&shown), None)
+            .pin
+            .unwrap();
+        assert_eq!(kept.unverified_notice, UNVERIFIED_NOTICE_SHOWN);
+        let verified = evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Endorsed, None, None)
+            .pin
+            .unwrap();
+        assert_eq!(verified.unverified_notice, UNVERIFIED_NOTICE_NONE);
+    }
+
+    #[test]
+    fn a_first_contact_pin_falls_back_to_the_account_key_when_the_entry_changes() {
+        let bundle = scoped_entry(ALIAS);
+        let trust = classify_scoped_entry(ALIAS, &bundle, None);
+        let pin = evaluate_address_entry(ALIAS, &bundle, trust, None, None).pin.unwrap();
+        assert_eq!(unscoped_trust(Some(&pin)), DirectoryTrust::Account);
+        let moved = RecipientPin {
+            identity_fingerprint: key_fingerprint_hex(&STANDARD.encode([0x04u8; 65])).unwrap(),
+            ..pin.clone()
+        };
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&moved)), DirectoryTrust::Account);
+        let account = owner("alias");
+        let next = evaluate_recipient(ALIAS, Some(&signed_v2_bundle(&account)), Some(&account.public_key), Some(&pin));
+        assert!(matches!(next.outcome, Ok(SendRoute::Ratchet(_))));
+        assert_eq!(next.pin.unwrap().root_evidence, ROOT_EVIDENCE_SIGNED_BUNDLE);
+    }
+
+    #[test]
+    fn an_address_entry_is_rooted_only_after_a_signed_bundle_vouches_for_it() {
+        let account = owner("alias");
+        let entry = scoped_entry(ALIAS);
+        let endorser = entry_endorser(&entry);
+        let account_bundle = account_bundle_with_identity(&account, &endorser);
+        let signed = evaluate_recipient(ALIAS, Some(&account_bundle), Some(&account.public_key), None)
+            .pin
+            .unwrap();
+        assert_eq!(signed.root_evidence, ROOT_EVIDENCE_SIGNED_BUNDLE);
+        assert!(!signed.address_rooted);
+        assert_eq!(classify_scoped_entry(ALIAS, &entry, Some(&signed)), DirectoryTrust::Endorsed);
+        let rooted = evaluate_address_entry(ALIAS, &entry, DirectoryTrust::Endorsed, Some(&signed), Some(&account.public_key))
+            .pin
+            .unwrap();
+        assert!(rooted.address_rooted);
+        assert_eq!(rooted.root_evidence, ROOT_EVIDENCE_SIGNED_BUNDLE);
+        assert!(!needs_root_review(&rooted));
+        assert_eq!(unscoped_trust(Some(&rooted)), DirectoryTrust::Downgraded);
+    }
+
+    #[test]
+    fn a_legacy_pin_verified_by_a_signed_bundle_stays_verified() {
+        let account = owner("alias");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let entry = scoped_entry(ALIAS);
+
+        let direct_bundle = signed_v2_bundle(&account);
+        let direct = legacy_rooted(&direct_bundle.kem_identity_key, &shown);
+        assert!(needs_root_review(&direct));
+        let reviewed = review_legacy_root(ALIAS, &direct, Some(&entry), Some(&direct_bundle), Some(&account.public_key));
+        assert_eq!(
+            reviewed,
+            RecipientPin {
+                root_evidence: ROOT_EVIDENCE_SIGNED_BUNDLE,
+                ..direct.clone()
+            }
+        );
+        assert_eq!(reviewed.unverified_notice, UNVERIFIED_NOTICE_NONE);
+        assert!(!needs_root_review(&reviewed));
+        assert_eq!(unscoped_trust(Some(&reviewed)), DirectoryTrust::Downgraded);
+
+        let endorsed_bundle = account_bundle_with_identity(&account, &entry_endorser(&entry));
+        let endorsed = legacy_rooted(&entry.kem_identity_key, &shown.to_uppercase());
+        let reviewed = review_legacy_root(ALIAS, &endorsed, Some(&entry), Some(&endorsed_bundle), Some(&account.public_key));
+        assert_eq!(
+            reviewed,
+            RecipientPin {
+                root_evidence: ROOT_EVIDENCE_SIGNED_BUNDLE,
+                ..endorsed.clone()
+            }
+        );
+        assert_eq!(classify_scoped_entry(ALIAS, &entry, Some(&reviewed)), DirectoryTrust::Entry);
+        let kept = evaluate_address_entry(ALIAS, &entry, DirectoryTrust::Entry, Some(&reviewed), None);
+        assert!(kept.outcome.is_ok());
+        let saved = kept.pin.unwrap_or_else(|| reviewed.clone());
+        assert_eq!(
+            (saved.identity_fingerprint.as_str(), saved.address_rooted, saved.root_evidence, saved.unverified_notice),
+            (reviewed.identity_fingerprint.as_str(), true, ROOT_EVIDENCE_SIGNED_BUNDLE, UNVERIFIED_NOTICE_NONE)
+        );
+        let mut replaced = scoped_entry(ALIAS);
+        replaced.kem_identity_key = STANDARD.encode([0x04u8; 65]);
+        assert_eq!(classify_scoped_entry(ALIAS, &replaced, Some(&reviewed)), DirectoryTrust::Invalid);
+    }
+
+    #[test]
+    fn a_legacy_pin_from_a_server_minted_entry_is_shown_as_not_verified() {
+        let account = owner("alias");
+        let mallory = owner("mallory");
+        let shown = key_fingerprint(Some(&account.public_key)).unwrap();
+        let entry = scoped_entry(ALIAS);
+        let signed_bundle = signed_v2_bundle(&account);
+        let endorsed_bundle = account_bundle_with_identity(&account, &entry_endorser(&entry));
+        let forged_bundle = account_bundle_with_identity(&mallory, &entry.kem_identity_key);
+        let unsigned = {
+            let mut bundle = unsigned_bundle(Some(vec![0x22; ML_KEM_768_PUBLIC_KEY_BYTES]));
+            bundle.kem_identity_key = entry.kem_identity_key.clone();
+            bundle
+        };
+
+        let first_contact = legacy_rooted(&entry.kem_identity_key, "");
+        let other_owner = legacy_rooted(&entry.kem_identity_key, &key_fingerprint(Some(&mallory.public_key)).unwrap());
+        let owned = legacy_rooted(&entry.kem_identity_key, &shown);
+        let cases: [(&RecipientPin, Option<&PrekeyBundle>, Option<&PrekeyBundle>, Option<&str>); 8] = [
+            (&first_contact, Some(&entry), Some(&endorsed_bundle), Some(&account.public_key)),
+            (&first_contact, Some(&entry), Some(&forged_bundle), Some(&mallory.public_key)),
+            (&other_owner, Some(&entry), Some(&endorsed_bundle), Some(&account.public_key)),
+            (&owned, Some(&entry), Some(&signed_bundle), Some(&account.public_key)),
+            (&owned, Some(&entry), Some(&unsigned), Some(&account.public_key)),
+            (&owned, Some(&entry), Some(&forged_bundle), Some(&account.public_key)),
+            (&owned, None, Some(&endorsed_bundle), Some(&account.public_key)),
+            (&owned, Some(&entry), None, Some(&account.public_key)),
+        ];
+        for (index, (pin, scoped, account_bundle, owner_key)) in cases.into_iter().enumerate() {
+            assert!(needs_root_review(pin));
+            let reviewed = review_legacy_root(ALIAS, pin, scoped, account_bundle, owner_key);
+            assert_eq!(
+                reviewed,
+                RecipientPin {
+                    address_rooted: false,
+                    root_evidence: ROOT_EVIDENCE_FIRST_CONTACT,
+                    unverified_notice: UNVERIFIED_NOTICE_PENDING,
+                    ..pin.clone()
+                },
+                "case {index}"
+            );
+            assert!(!needs_root_review(&reviewed));
+        }
+
+        let demoted = review_legacy_root(ALIAS, &owned, Some(&entry), Some(&signed_bundle), Some(&account.public_key));
+        assert_eq!(classify_scoped_entry(ALIAS, &entry, Some(&demoted)), DirectoryTrust::Entry);
+        let kept = evaluate_address_entry(ALIAS, &entry, DirectoryTrust::Entry, Some(&demoted), Some(&account.public_key));
+        assert!(kept.outcome.is_ok());
+        let saved = kept.pin.unwrap_or_else(|| demoted.clone());
+        assert_eq!(
+            (saved.identity_fingerprint.as_str(), saved.address_rooted, saved.root_evidence, saved.unverified_notice),
+            (demoted.identity_fingerprint.as_str(), false, ROOT_EVIDENCE_FIRST_CONTACT, UNVERIFIED_NOTICE_PENDING)
+        );
+        assert_eq!(unscoped_trust(Some(&demoted)), DirectoryTrust::Account);
+        let fallback = evaluate_recipient(ALIAS, Some(&signed_bundle), Some(&account.public_key), Some(&demoted));
+        assert!(matches!(fallback.outcome, Ok(SendRoute::Ratchet(_))));
+        let saved = fallback.pin.unwrap();
+        assert!(!saved.address_rooted && !saved.flagged);
+        assert_eq!(saved.unverified_notice, UNVERIFIED_NOTICE_PENDING);
+    }
+
+    #[test]
+    fn accepting_a_key_records_the_confirmation_as_evidence() {
+        let rooted = legacy_rooted(&STANDARD.encode([0x04u8; 65]), "old");
+        let accepted = accepted_pin(rooted, "new");
+        assert_eq!(accepted.root_evidence, ROOT_EVIDENCE_USER_CONFIRMED);
+        assert!(accepted.identity_fingerprint.is_empty() && !accepted.address_rooted);
+        let first_contact = RecipientPin {
+            root_evidence: ROOT_EVIDENCE_FIRST_CONTACT,
+            ..pinned_to(&STANDARD.encode([0x04u8; 65]), false)
+        };
+        assert_eq!(accepted_pin(first_contact, "new").root_evidence, ROOT_EVIDENCE_FIRST_CONTACT);
     }
 
     #[test]
@@ -2150,6 +2891,8 @@ X1OEWHpsCOAO
         let pinned = pinned_to(endorser, true);
         assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&pinned)), DirectoryTrust::Endorsed);
         assert!(evaluate_address_entry(ALIAS, &bundle, DirectoryTrust::Endorsed, Some(&pinned), None).outcome.is_ok());
+        let loose = pinned_to(endorser, false);
+        assert_eq!(classify_scoped_entry(ALIAS, &bundle, Some(&loose)), DirectoryTrust::Endorsed);
     }
 
     #[test]
@@ -2274,10 +3017,17 @@ X1OEWHpsCOAO
             hosted: true,
             flagged: true,
             address_rooted: false,
+            signature_level: 2,
+            x3dh_floor: 3,
+            root_evidence: ROOT_EVIDENCE_SIGNED_BUNDLE,
+            unverified_notice: UNVERIFIED_NOTICE_SHOWN,
+            opk_seen: true,
+            opk_grace_at: 5,
         };
         assert_eq!(
             accepted_pin(loose.clone(), "old"),
             RecipientPin {
+                signature_level: 0,
                 flagged: false,
                 ..loose.clone()
             }
@@ -2288,6 +3038,7 @@ X1OEWHpsCOAO
                 owner_fingerprint: "new".to_string(),
                 binding_epoch: 0,
                 binding_fingerprint: String::new(),
+                signature_level: 0,
                 flagged: false,
                 ..loose
             }

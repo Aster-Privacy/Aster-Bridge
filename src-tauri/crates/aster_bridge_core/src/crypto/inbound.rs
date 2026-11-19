@@ -319,7 +319,7 @@ mod tests {
     use super::*;
     use aes_gcm::aead::Aead;
     use ml_kem::kem::Encapsulate;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::SecretKey;
     use rand_core::OsRng;
 
@@ -332,9 +332,9 @@ mod tests {
     }
 
     fn encrypt_ecdh(plaintext: &[u8], recipient: &SecretKey, nonce_bytes: &[u8; 12]) -> Vec<u8> {
-        let recipient_pub = recipient.public_key().to_encoded_point(false);
-        let ephemeral = SecretKey::random(&mut OsRng);
-        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let recipient_pub = recipient.public_key().to_sec1_point(false);
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let eph_pub = ephemeral.public_key().to_sec1_point(false);
         let shared_x =
             ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
         let key = hkdf_aes_key(&shared_x, INFO_ECDH).unwrap();
@@ -355,9 +355,9 @@ mod tests {
         recipient_ek: &<MlKem768 as KemCore>::EncapsulationKey,
         nonce_bytes: &[u8; 12],
     ) -> Vec<u8> {
-        let recipient_pub = recipient.public_key().to_encoded_point(false);
-        let ephemeral = SecretKey::random(&mut OsRng);
-        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let recipient_pub = recipient.public_key().to_sec1_point(false);
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let eph_pub = ephemeral.public_key().to_sec1_point(false);
         let shared_x =
             ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
         let (kem_ct, kem_ss) = recipient_ek.encapsulate(&mut OsRng).unwrap();
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn ecdh_envelope_round_trips() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [7u8; 12];
         let json = r#"{"subject":"hello","body_text":"inbound"}"#;
         let payload = encrypt_ecdh(json.as_bytes(), &recipient, &nonce);
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn pq_envelope_round_trips() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [9u8; 12];
         let json = r#"{"subject":"pq","body_text":"hybrid"}"#;
@@ -402,8 +402,8 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_without_panic() {
-        let recipient = SecretKey::random(&mut OsRng);
-        let wrong = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let wrong = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [1u8; 12];
         let payload = encrypt_ecdh(b"{\"subject\":\"x\"}", &recipient, &nonce);
         let candidates = [candidate_from(&wrong, None)];
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn truncated_payloads_are_rejected_not_panicking() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let candidates = [candidate_from(&recipient, None)];
         let nonce = [2u8; 12];
         for len in [0usize, 1, 40, 65, 81] {
@@ -429,8 +429,8 @@ mod tests {
 
     #[test]
     fn pq_candidate_without_secret_is_skipped_not_fatal() {
-        let old = SecretKey::random(&mut OsRng);
-        let current = SecretKey::random(&mut OsRng);
+        let old = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let current = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [3u8; 12];
         let json = r#"{"subject":"skip"}"#;
@@ -445,8 +445,8 @@ mod tests {
 
     #[test]
     fn previous_key_fallback_succeeds_after_rotation() {
-        let rotated_away = SecretKey::random(&mut OsRng);
-        let current = SecretKey::random(&mut OsRng);
+        let rotated_away = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let current = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [4u8; 12];
         let json = r#"{"subject":"old mail"}"#;
         let payload = encrypt_ecdh(json.as_bytes(), &rotated_away, &nonce);
@@ -468,7 +468,7 @@ mod tests {
         let derived = decode_pq_decap_key(None, Some(&seed_b64)).unwrap();
         assert_eq!(derived, dk.as_bytes().to_vec());
 
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [5u8; 12];
         let json = r#"{"subject":"seed"}"#;
         let payload = encrypt_pq(json.as_bytes(), &recipient, &ek, &nonce);
@@ -479,8 +479,8 @@ mod tests {
 
     #[test]
     fn build_candidates_orders_current_before_previous() {
-        let current = SecretKey::random(&mut OsRng);
-        let previous = SecretKey::random(&mut OsRng);
+        let current = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let previous = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let jwk = |sk: &SecretKey| {
             serde_json::json!({
                 "kty": "EC",
@@ -548,9 +548,9 @@ mod tests {
         nonce_bytes: &[u8; 12],
         owner: &[u8; 16],
     ) -> Vec<u8> {
-        let recipient_pub = recipient.public_key().to_encoded_point(false);
-        let ephemeral = SecretKey::random(&mut OsRng);
-        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let recipient_pub = recipient.public_key().to_sec1_point(false);
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let eph_pub = ephemeral.public_key().to_sec1_point(false);
         let shared_x =
             ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
         let key = hkdf_aes_key(&shared_x, INFO_ECDH_BOUND).unwrap();
@@ -569,9 +569,9 @@ mod tests {
         nonce_bytes: &[u8; 12],
         owner: &[u8; 16],
     ) -> Vec<u8> {
-        let recipient_pub = recipient.public_key().to_encoded_point(false);
-        let ephemeral = SecretKey::random(&mut OsRng);
-        let eph_pub = ephemeral.public_key().to_encoded_point(false);
+        let recipient_pub = recipient.public_key().to_sec1_point(false);
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let eph_pub = ephemeral.public_key().to_sec1_point(false);
         let shared_x =
             ecdh_p256(ephemeral.to_bytes().as_slice(), recipient_pub.as_bytes()).unwrap();
         let (kem_ct, kem_ss) = recipient_ek.encapsulate(&mut OsRng).unwrap();
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn bound_ecdh_envelope_round_trips() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [3u8; 12];
         let json = r#"{"subject":"bound","body_text":"owner"}"#;
         let payload = encrypt_ecdh_bound(json.as_bytes(), &recipient, &nonce, &OWNER);
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn bound_pq_envelope_round_trips() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [4u8; 12];
         let json = r#"{"subject":"bound pq","body_text":"owner"}"#;
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn bound_envelope_fails_for_another_owner() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [5u8; 12];
         let ecdh = encrypt_ecdh_bound(b"{}", &recipient, &nonce, &OWNER);
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn bound_envelope_fails_without_an_owner() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [6u8; 12];
         let ecdh = encrypt_ecdh_bound(b"{}", &recipient, &nonce, &OWNER);
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn bound_and_unbound_envelopes_cannot_be_relabeled() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [8u8; 12];
         let candidates = [owned(
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn bound_envelope_fails_when_its_header_is_altered() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
         let nonce = [10u8; 12];
         let candidates = [owned(
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn unbound_envelopes_still_open_for_an_owned_candidate() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let nonce = [11u8; 12];
         let payload = encrypt_ecdh(b"{}", &recipient, &nonce);
         let candidates = [owned(candidate_from(&recipient, None), OWNER)];
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn binding_stamps_every_candidate_with_the_account_id() {
-        let recipient = SecretKey::random(&mut OsRng);
+        let recipient = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let mut candidates = vec![
             candidate_from(&recipient, None),
             candidate_from(&recipient, None),

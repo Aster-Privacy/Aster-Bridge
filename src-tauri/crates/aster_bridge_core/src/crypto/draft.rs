@@ -68,6 +68,10 @@ pub struct DraftKeys<'a> {
     pub passphrase: &'a [u8],
 }
 
+fn is_owner_draft_key(identity_key: &str) -> bool {
+    !crate::crypto::mail_legacy_retirement::is_public_identity_material(identity_key)
+}
+
 fn derive_draft_key(identity_key: &str) -> [u8; 32] {
     derive_versioned_draft_key(identity_key, DRAFT_KEY_VERSION)
 }
@@ -86,6 +90,11 @@ fn derive_versioned_draft_key(identity_key: &str, version: &str) -> [u8; 32] {
 pub fn encrypt_draft_content(content: &DraftContent, identity_key: &str) -> Result<(String, String)> {
     use rand_core::{OsRng, RngCore};
 
+    if !is_owner_draft_key(identity_key) {
+        return Err(BridgeError::Crypto(
+            "refusing to seal a draft without a private identity key".to_string(),
+        ));
+    }
     let plaintext = serde_json::to_string(content)
         .map_err(|e| BridgeError::Crypto(format!("draft serialize: {}", e)))?;
 
@@ -109,6 +118,9 @@ pub fn decrypt_draft_content(
     nonce_b64: &str,
     identity_key: &str,
 ) -> Result<DraftContent> {
+    if !is_owner_draft_key(identity_key) {
+        return Err(BridgeError::Crypto("draft key is not private".to_string()));
+    }
     let mut key = derive_draft_key(identity_key);
     let result = decrypt_draft_content_with_key(encrypted_b64, nonce_b64, &key);
     key.zeroize();
@@ -124,7 +136,7 @@ pub fn decrypt_draft_content_with_keys(
     if first.is_ok() {
         return first;
     }
-    for previous_key in keys.previous_keys.iter() {
+    for previous_key in keys.previous_keys.iter().filter(|k| is_owner_draft_key(k)) {
         for version in [DRAFT_KEY_VERSION, LEGACY_DRAFT_KEY_VERSION] {
             let mut key = derive_versioned_draft_key(previous_key, version);
             let result = decrypt_draft_content_with_key(encrypted_b64, nonce_b64, &key);
@@ -153,15 +165,51 @@ fn decrypt_draft_envelope(
     if nonce_b64.is_empty() && !is_armored_pgp_b64(encrypted_b64) {
         return Err(BridgeError::Crypto("draft envelope is not encrypted".to_string()));
     }
-    let plaintext = Zeroizing::new(crate::crypto::envelope::decrypt_envelope_with_previous_keys(
+    if crate::crypto::envelope::is_storage_key_envelope_nonce(nonce_b64) {
+        let storage_keys = crate::crypto::envelope::remembered_storage_envelope_keys();
+        return open_storage_key_draft(encrypted_b64, &storage_keys);
+    }
+    let identity_key = Some(keys.identity_key).filter(|k| is_owner_draft_key(k));
+    let previous_keys: Vec<String> = keys
+        .previous_keys
+        .iter()
+        .filter(|k| is_owner_draft_key(k))
+        .cloned()
+        .collect();
+    let previous_keys = Zeroizing::new(previous_keys);
+    let (plaintext, origin) = crate::crypto::envelope::decrypt_envelope_noting_origin(
         encrypted_b64,
         Some(nonce_b64),
         keys.passphrase,
-        Some(keys.identity_key),
-        keys.previous_keys,
+        identity_key,
+        &previous_keys,
         &[],
+    )?;
+    let plaintext = Zeroizing::new(plaintext);
+    if !origin.authenticated() {
+        return Err(BridgeError::Crypto("draft envelope is not signed by the owner".to_string()));
+    }
+    draft_content_from_json(&plaintext)
+}
+
+fn open_storage_key_draft(
+    encrypted_b64: &str,
+    storage_keys: &[Zeroizing<[u8; 32]>],
+) -> Result<DraftContent> {
+    let own_keys: Vec<Zeroizing<[u8; 32]>> = storage_keys
+        .iter()
+        .filter(|key| !crate::crypto::ratchet_recovery::is_public_storage_key(key))
+        .cloned()
+        .collect();
+    let plaintext = Zeroizing::new(crate::crypto::envelope::decrypt_storage_key_envelope(
+        encrypted_b64,
+        &own_keys,
     )?);
-    let value: serde_json::Value = serde_json::from_str(&plaintext)
+    draft_content_from_json(&plaintext)
+}
+
+fn draft_content_from_json(plaintext: &str) -> Result<DraftContent> {
+    let value: serde_json::Value = serde_json::from_str(plaintext)
         .map_err(|e| BridgeError::Crypto(format!("draft json parse: {}", e)))?;
     if !value.is_object() {
         return Err(BridgeError::Crypto("draft envelope is not an object".to_string()));
@@ -354,8 +402,13 @@ mod tests {
             "body_html": "<p>hi</p>",
         })
         .to_string();
-        let armored =
-            aster_crypto::encrypt_message(payload.as_bytes(), &[&owner.public_key()]).unwrap();
+        let armored = aster_crypto::encrypt_and_sign_with_passphrase(
+            payload.as_bytes(),
+            &[&owner.public_key()],
+            &owner,
+            PASS,
+        )
+        .unwrap();
         let enc = STANDARD.encode(armored);
 
         let out = decrypt_draft_content_with_keys(&enc, "", &keys(&owner_armored, &[])).unwrap();
@@ -369,6 +422,108 @@ mod tests {
             ..keys(&owner_armored, &[])
         };
         assert!(decrypt_draft_content_with_keys(&enc, "", &wrong).is_err());
+    }
+
+    #[test]
+    fn unsigned_pgp_draft_is_rejected() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(PASS);
+        let owner_armored = owner.to_armored().unwrap();
+        let payload = br#"{"to_recipients":["victim@example.com"],"bcc_recipients":["planted@example.com"],"subject":"planted"}"#;
+        let armored = aster_crypto::encrypt_message(payload, &[&owner.public_key()]).unwrap();
+        let enc = STANDARD.encode(armored);
+        assert!(decrypt_draft_content_with_keys(&enc, "", &keys(&owner_armored, &[])).is_err());
+    }
+
+    #[test]
+    fn pgp_draft_signed_by_another_key_is_rejected() {
+        let owner = crate::crypto::account_key::tests::protected_keypair(PASS);
+        let owner_armored = owner.to_armored().unwrap();
+        let stranger = aster_crypto::generate_keypair("Bob", "bob@astermail.org").unwrap();
+        let armored = aster_crypto::encrypt_and_sign_with_passphrase(
+            br#"{"bcc_recipients":["planted@example.com"],"subject":"planted"}"#,
+            &[&owner.public_key()],
+            &stranger,
+            "",
+        )
+        .unwrap();
+        let enc = STANDARD.encode(armored);
+        assert!(decrypt_draft_content_with_keys(&enc, "", &keys(&owner_armored, &[])).is_err());
+    }
+
+    #[test]
+    fn pgp_draft_signed_by_a_previous_owner_key_opens() {
+        let old = crate::crypto::account_key::tests::protected_keypair(PASS);
+        let current = crate::crypto::account_key::tests::protected_keypair(PASS);
+        let previous = vec![old.to_armored().unwrap()];
+        let armored = aster_crypto::encrypt_and_sign_with_passphrase(
+            br#"{"subject":"older draft"}"#,
+            &[&old.public_key()],
+            &old,
+            PASS,
+        )
+        .unwrap();
+        let enc = STANDARD.encode(armored);
+        let current_armored = current.to_armored().unwrap();
+        let out =
+            decrypt_draft_content_with_keys(&enc, "", &keys(&current_armored, &previous)).unwrap();
+        assert_eq!(out.subject, "older draft");
+    }
+
+    #[test]
+    fn drafts_sealed_under_public_key_material_are_rejected() {
+        let previous = vec!["undefined".to_string(), "null".to_string(), String::new()];
+        for public in ["undefined", "null", "", " "] {
+            for version in [DRAFT_KEY_VERSION, LEGACY_DRAFT_KEY_VERSION] {
+                let key = derive_versioned_draft_key(public, version);
+                let payload = serde_json::to_vec(&sample_content()).unwrap();
+                let (enc, nonce) = encrypt_with(&key, &payload);
+                assert!(decrypt_draft_content_with_keys(&enc, &nonce, &keys(public, &[])).is_err());
+                assert!(decrypt_draft_content_with_keys(&enc, &nonce, &keys("real-ik", &previous)).is_err());
+            }
+            let json = serde_json::to_string(&sample_content()).unwrap();
+            let mut ekey = crate::crypto::envelope::derive_envelope_key(
+                public.as_bytes(),
+                crate::crypto::envelope::ENVELOPE_VERSION_DEFAULT.as_bytes(),
+            )
+            .unwrap();
+            let (enc, nonce) = encrypt_with(&ekey, json.as_bytes());
+            ekey.zeroize();
+            assert!(decrypt_draft_content_with_keys(&enc, &nonce, &keys(public, &[])).is_err());
+            assert!(decrypt_draft_content_with_keys(&enc, &nonce, &keys("real-ik", &previous)).is_err());
+        }
+    }
+
+    #[test]
+    fn storage_key_drafts_open_only_under_private_storage_keys() {
+        let json = serde_json::to_string(&sample_content()).unwrap();
+        let salt = [7u8; 16];
+        let iv = [9u8; 12];
+        for (material, context) in [
+            ("undefined", "astermail-envelope-v1"),
+            ("undefined", "astermail-import-v1"),
+            ("undefined", "astermail-draft-v2"),
+            ("null", "astermail-draft-v2"),
+            ("", "astermail-draft-v1"),
+        ] {
+            let mut hasher = Sha256::new();
+            hasher.update(material.as_bytes());
+            hasher.update(context.as_bytes());
+            let public: [u8; 32] = hasher.finalize().into();
+            let enc = crate::crypto::envelope::seal_storage_key_envelope(&json, &public, &salt, &iv)
+                .unwrap();
+            assert!(open_storage_key_draft(&enc, &[Zeroizing::new(public)]).is_err());
+        }
+        let private = [42u8; 32];
+        let enc = crate::crypto::envelope::encrypt_storage_key_envelope(&json, &private).unwrap();
+        let opened = open_storage_key_draft(&enc, &[Zeroizing::new(private)]).unwrap();
+        assert_eq!(opened.subject, sample_content().subject);
+    }
+
+    #[test]
+    fn drafts_are_never_sealed_under_public_key_material() {
+        for public in ["undefined", "null", ""] {
+            assert!(encrypt_draft_content(&sample_content(), public).is_err());
+        }
     }
 
     #[test]

@@ -27,7 +27,6 @@ use hkdf::Hkdf;
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
-use rand::Rng;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -144,6 +143,10 @@ fn wrap_key_load_or_create() -> Result<[u8; 32], String> {
 
 fn wrap_key_delete() -> Result<(), String> {
     crate::secrets::delete(KEYRING_WRAP_USER)
+}
+
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    atomic_write(path, data)
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -624,7 +627,8 @@ pub fn seal_vault_envelope(
     let eph_public = XPublicKey::from(&eph_secret);
     let ss_cl = eph_secret.diffie_hellman(&XPublicKey::from(x25519_bytes));
 
-    let nonce_bytes: [u8; ENVELOPE_NONCE_LEN] = OsRng.gen();
+    let mut nonce_bytes = [0u8; ENVELOPE_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
 
     let transcript = if version == 2 {
         Some(envelope_v2_transcript(&recipient, eph_public.as_bytes(), ct.as_slice())?)
@@ -760,7 +764,7 @@ pub fn clear_identity(data_dir: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
 
@@ -898,7 +902,7 @@ mod tests {
         assert!(temp_leftovers(dir.path()).is_empty());
     }
 
-    fn test_identity() -> DeviceIdentity {
+    pub(crate) fn test_identity() -> DeviceIdentity {
         let ed25519_signing_key = SigningKey::generate(&mut OsRng);
         let (dk, ek): (MlKemDecapKey, MlKemEncapKey) = MlKem768::generate(&mut OsRng);
         let x25519_static_secret = StaticSecret::random_from_rng(OsRng);

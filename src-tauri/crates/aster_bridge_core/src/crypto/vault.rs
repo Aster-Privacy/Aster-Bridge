@@ -61,6 +61,14 @@ pub struct LegacyKek {
     pub k: String,
 }
 
+fn lenient_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_bool()))
+}
+
 fn lenient_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -111,6 +119,14 @@ where
     }))
 }
 
+fn lenient_retired_marker<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.is_some_and(|v| crate::crypto::mail_legacy_retirement::is_valid_retired_marker(&v)))
+}
+
 #[derive(Deserialize, ZeroizeOnDrop)]
 pub struct VaultContents {
     pub identity_key: String,
@@ -137,6 +153,13 @@ pub struct VaultContents {
     pub legacy_keks: Option<Vec<LegacyKek>>,
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub legacy_identity_keys: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub prekey_seal_key: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub prekey_seal_migrated: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_retired_marker")]
+    #[zeroize(skip)]
+    pub mail_legacy_retired: bool,
 }
 
 pub fn vault_kdf_iterations(stored: Option<u32>) -> Result<u32> {
@@ -275,6 +298,20 @@ mod tests {
         let vault = decrypt_vault(&data, &nonce_b64, pass).unwrap();
         assert_eq!(vault.identity_key, "only-ik");
         assert!(vault.signed_prekey.is_none());
+    }
+
+    #[test]
+    fn the_stored_mail_key_marker_parses_leniently() {
+        let parse = |extra: &str| -> VaultContents {
+            serde_json::from_str(&format!(r#"{{"identity_key":"ik"{}}}"#, extra)).unwrap()
+        };
+        assert!(!parse("").mail_legacy_retired);
+        assert!(parse(r#","mail_legacy_retired":{"v":1,"at":"2026-11-17T00:00:00Z"}"#).mail_legacy_retired);
+        assert!(parse(r#","mail_legacy_retired":{"v":2,"at":"t","extra":true}"#).mail_legacy_retired);
+        assert!(!parse(r#","mail_legacy_retired":{"v":0,"at":"t"}"#).mail_legacy_retired);
+        assert!(!parse(r#","mail_legacy_retired":{"v":1}"#).mail_legacy_retired);
+        assert!(!parse(r#","mail_legacy_retired":"yes""#).mail_legacy_retired);
+        assert!(!parse(r#","mail_legacy_retired":null"#).mail_legacy_retired);
     }
 
     #[test]

@@ -62,6 +62,7 @@ export interface BridgeState {
   import_progress: ImportProgress | null;
   port_conflict: PortConflict | null;
   insecure_sign_in: InsecureSignIn | null;
+  unverified_recipient_keys: number;
   update_required: boolean;
 }
 
@@ -91,6 +92,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     import_progress: ImportProgress | null;
     port_conflict: PortConflict | null;
     insecure_sign_in: InsecureSignIn | null;
+    unverified_recipient_keys?: number;
     update_required?: boolean;
   }>("get_bridge_status");
 
@@ -117,6 +119,7 @@ export async function get_bridge_state(): Promise<BridgeState> {
     import_progress: status.import_progress ?? null,
     port_conflict: status.port_conflict ?? null,
     insecure_sign_in: status.insecure_sign_in ?? null,
+    unverified_recipient_keys: status.unverified_recipient_keys ?? 0,
     update_required: status.update_required ?? false,
   };
 }
@@ -348,6 +351,10 @@ export async function open_url(url: string): Promise<void> {
 
 export async function dismiss_insecure_sign_in(seq: number): Promise<void> {
   return tauri_invoke("dismiss_insecure_sign_in", { seq });
+}
+
+export async function dismiss_unverified_recipient_keys(): Promise<void> {
+  return tauri_invoke("dismiss_unverified_recipient_keys");
 }
 
 export async function trigger_sync(): Promise<void> {

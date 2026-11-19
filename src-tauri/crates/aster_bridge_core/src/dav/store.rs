@@ -106,7 +106,10 @@ impl ContactsKeyring {
     fn new(current: ContactsKeys, previous: &[zeroize::Zeroizing<[u8; 32]>]) -> Self {
         let mut ring: Vec<ContactsKeys> = Vec::new();
         for key in previous {
-            if current.same_key(key) || ring.iter().any(|k| k.same_key(key)) {
+            if crate::crypto::ratchet_recovery::is_public_storage_key(key)
+                || current.same_key(key)
+                || ring.iter().any(|k| k.same_key(key))
+            {
                 continue;
             }
             ring.push(ContactsKeys::from_raw(key));
@@ -623,6 +626,24 @@ mod tests {
     }
 
     #[test]
+    fn contacts_never_open_under_a_public_storage_key() {
+        let public: zeroize::Zeroizing<[u8; 32]> =
+            zeroize::Zeroizing::new(Sha256::digest(b"undefinedastermail-envelope-v1").into());
+        let record = record_sealed_with(
+            &ContactsKeys::from_raw(&public),
+            &serde_json::json!({ "first_name": "Forged", "emails": ["forged@example.com"] }),
+        );
+        let keyring = ContactsKeyring::new(ContactsKeys::from_raw(&[3u8; 32]), std::slice::from_ref(&public));
+        assert!(keyring.previous.is_empty(), "a public storage key joined the contacts keyring");
+        assert!(decode_with_keyring(&keyring, &record).is_err());
+
+        let derived: zeroize::Zeroizing<[u8; 32]> =
+            zeroize::Zeroizing::new(Sha256::digest(b"nullastermail-tags-v1").into());
+        let keyring = ContactsKeyring::new(ContactsKeys::from_raw(&[3u8; 32]), std::slice::from_ref(&derived));
+        assert!(keyring.previous.is_empty(), "a key derived from public identity material joined the contacts keyring");
+    }
+
+    #[test]
     fn contacts_keyring_prefers_the_current_key_and_skips_duplicates() {
         let current_raw = zeroize::Zeroizing::new([3u8; 32]);
         let other = zeroize::Zeroizing::new([4u8; 32]);
@@ -678,6 +699,7 @@ mod tests {
                 storage_keys: storage_keys.into_iter().map(zeroize::Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
                 address_keys: Default::default(),
+                prekey_seal: Default::default(),
             },
             external_pgp_key: None,
         };
@@ -708,6 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn contact_writes_follow_a_storage_key_rotated_on_another_device() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         use crate::auth::vault_freshness::tests::{seal_vault, session_with, spawn, vault_json, FakeServer};
         use axum::routing::get;
 

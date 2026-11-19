@@ -44,6 +44,8 @@ static STORAGE_ENVELOPE_KEYS: std::sync::RwLock<Vec<Zeroizing<[u8; 32]>>> =
     std::sync::RwLock::new(Vec::new());
 static STORAGE_ENVELOPE_KEYS_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static CURRENT_STORAGE_KEYS: std::sync::RwLock<Vec<Zeroizing<[u8; 32]>>> =
+    std::sync::RwLock::new(Vec::new());
 
 fn decode_storage_key(key_b64: &str) -> Option<Zeroizing<[u8; 32]>> {
     let raw = Zeroizing::new(STANDARD.decode(key_b64.trim()).ok()?);
@@ -59,12 +61,15 @@ pub fn remember_storage_envelope_keys(
     data_kek_b64: Option<&str>,
     storage_keys: &[Zeroizing<[u8; 32]>],
 ) {
+    let current = data_kek_b64.and_then(decode_storage_key);
+    if let Some(key) = current.as_ref() {
+        remember_current_storage_key(key);
+    }
     let mut ring = STORAGE_ENVELOPE_KEYS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut merged: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(ring.len() + storage_keys.len() + 1);
-    for key in data_kek_b64
-        .and_then(decode_storage_key)
+    for key in current
         .into_iter()
         .chain(storage_keys.iter().cloned())
         .chain(ring.iter().cloned())
@@ -81,8 +86,38 @@ pub fn remember_storage_envelope_keys(
     }
 }
 
+pub fn remember_current_storage_key(key: &[u8; 32]) {
+    if crate::crypto::mail_legacy_retirement::is_public_mail_key(key) {
+        return;
+    }
+    let mut current = CURRENT_STORAGE_KEYS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !current.iter().any(|known| **known == *key) {
+        current.push(Zeroizing::new(*key));
+    }
+}
+
+pub(crate) fn mail_storage_envelope_keys() -> Vec<Zeroizing<[u8; 32]>> {
+    if !crate::crypto::mail_legacy_retirement::is_mail_legacy_retired() {
+        return remembered_storage_envelope_keys();
+    }
+    CURRENT_STORAGE_KEYS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|key| !crate::crypto::mail_legacy_retirement::is_public_mail_key(key))
+        .cloned()
+        .collect()
+}
+
 pub fn forget_storage_envelope_keys() {
     crate::crypto::envelope_v2::forget_envelope_v2_state();
+    crate::crypto::mail_legacy_retirement::reset_mail_legacy_retirement();
+    CURRENT_STORAGE_KEYS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     let mut ring = STORAGE_ENVELOPE_KEYS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -151,6 +186,12 @@ pub fn storage_key_envelope_nonce_marker() -> String {
 pub fn encrypt_storage_key_envelope(plaintext: &str, key: &[u8; 32]) -> Result<String> {
     use rand_core::{OsRng, RngCore};
 
+    if crate::crypto::mail_legacy_retirement::is_public_mail_key(key) {
+        return Err(BridgeError::Crypto(
+            "refusing to seal with a well-known storage key".to_string(),
+        ));
+    }
+
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     let mut iv = [0u8; NONCE_LEN];
@@ -158,7 +199,7 @@ pub fn encrypt_storage_key_envelope(plaintext: &str, key: &[u8; 32]) -> Result<S
     seal_storage_key_envelope(plaintext, key, &salt, &iv)
 }
 
-fn seal_storage_key_envelope(
+pub(crate) fn seal_storage_key_envelope(
     plaintext: &str,
     key: &[u8; 32],
     salt: &[u8; SALT_LEN],
@@ -246,6 +287,7 @@ pub enum EnvelopeOrigin {
     SelfAuthored,
     Inbound,
     UnsignedPgp,
+    UnprotectedKey,
 }
 
 impl EnvelopeOrigin {
@@ -295,13 +337,12 @@ pub fn decrypt_envelope_noting_origin_with_external_key(
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == 0x01 {
         return decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
-            .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored));
+            .map(|plaintext| (plaintext, passphrase_origin(passphrase)));
     }
 
     if nonce_bytes.len() == 1 && nonce_bytes[0] == STORAGE_KEY_ENVELOPE_MARKER {
-        let keys = remembered_storage_envelope_keys();
-        return decrypt_storage_key_envelope(encrypted_data_b64, &keys)
-            .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored));
+        let keys = mail_storage_envelope_keys();
+        return open_storage_key_envelope_noting_origin(encrypted_data_b64, &keys);
     }
 
     if nonce_bytes.len() == NONCE_LEN && !inbound_keys.is_empty() {
@@ -314,17 +355,66 @@ pub fn decrypt_envelope_noting_origin_with_external_key(
         }
     }
 
-    for ik in identity_key
+    let retired = crate::crypto::mail_legacy_retirement::is_mail_legacy_retired();
+    open_identity_or_passphrase_envelope(
+        encrypted_data_b64,
+        &nonce_bytes,
+        passphrase,
+        identity_key,
+        previous_keys,
+        retired,
+    )
+}
+
+fn passphrase_origin(passphrase: &[u8]) -> EnvelopeOrigin {
+    if passphrase.is_empty() {
+        EnvelopeOrigin::UnprotectedKey
+    } else {
+        EnvelopeOrigin::SelfAuthored
+    }
+}
+
+pub(crate) fn open_storage_key_envelope_noting_origin(
+    encrypted_data_b64: &str,
+    keys: &[Zeroizing<[u8; 32]>],
+) -> Result<(String, EnvelopeOrigin)> {
+    let (public_keys, private_keys): (Vec<Zeroizing<[u8; 32]>>, Vec<Zeroizing<[u8; 32]>>) = keys
+        .iter()
+        .cloned()
+        .partition(|key| crate::crypto::ratchet_recovery::is_public_storage_key(key));
+    if let Ok(plaintext) = decrypt_storage_key_envelope(encrypted_data_b64, &private_keys) {
+        return Ok((plaintext, EnvelopeOrigin::SelfAuthored));
+    }
+    decrypt_storage_key_envelope(encrypted_data_b64, &public_keys)
+        .map(|plaintext| (plaintext, EnvelopeOrigin::UnprotectedKey))
+}
+
+fn open_identity_or_passphrase_envelope(
+    encrypted_data_b64: &str,
+    nonce_bytes: &[u8],
+    passphrase: &[u8],
+    identity_key: Option<&str>,
+    previous_keys: &[String],
+    retired: bool,
+) -> Result<(String, EnvelopeOrigin)> {
+    let (public_keys, private_keys): (Vec<&str>, Vec<&str>) = identity_key
         .into_iter()
         .chain(previous_keys.iter().map(String::as_str))
-    {
-        if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, &nonce_bytes, ik) {
+        .partition(|ik| crate::crypto::mail_legacy_retirement::is_public_identity_material(ik));
+    for ik in private_keys {
+        if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, nonce_bytes, ik) {
             return Ok((result, EnvelopeOrigin::SelfAuthored));
         }
     }
-
+    if !retired {
+        for ik in public_keys {
+            if let Ok(result) = decrypt_identity_key_envelope(encrypted_data_b64, nonce_bytes, ik) {
+                return Ok((result, EnvelopeOrigin::UnprotectedKey));
+            }
+        }
+    }
     decrypt_pbkdf2_envelope(encrypted_data_b64, passphrase)
-        .map(|plaintext| (plaintext, EnvelopeOrigin::SelfAuthored))
+        .map(|plaintext| (plaintext, passphrase_origin(passphrase)))
 }
 
 pub(crate) fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8]) -> Result<String> {
@@ -337,6 +427,9 @@ pub(crate) fn decrypt_pbkdf2_envelope(encrypted_data_b64: &str, passphrase: &[u8
     }
 
     let salt = &data[..SALT_LEN];
+    if crate::crypto::login_salt_guard::is_known_login_salt(salt) {
+        return Err(BridgeError::Crypto("PBKDF2 envelope decrypt failed".to_string()));
+    }
     let nonce = &data[SALT_LEN..SALT_LEN + NONCE_LEN];
     let ciphertext = &data[SALT_LEN + NONCE_LEN..];
 
@@ -556,7 +649,7 @@ pub(crate) fn decrypt_own_pgp(
     Err(BridgeError::Crypto("PGP decrypt failed".to_string()))
 }
 
-fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> {
+pub(crate) fn derive_envelope_key(identity_key: &[u8], version: &[u8]) -> Result<[u8; 32]> {
     use sha2::Digest;
 
     let mut hasher = Sha256::new();
@@ -590,6 +683,11 @@ pub fn encrypt_identity_key_envelope_with_version(
 ) -> Result<(String, String)> {
     use rand_core::{OsRng, RngCore};
 
+    if crate::crypto::mail_legacy_retirement::is_public_identity_material(identity_key) {
+        return Err(BridgeError::Crypto(
+            "refusing to seal without a private identity key".to_string(),
+        ));
+    }
     let mut key = derive_envelope_key(identity_key.as_bytes(), version.as_bytes())?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| BridgeError::Crypto(format!("cipher init: {}", e)))?;
@@ -756,8 +854,7 @@ mod tests {
     }
 
     fn sample_inbound_candidates() -> Vec<InboundKeyCandidate> {
-        use rand_core::OsRng;
-        let sk = p256::SecretKey::random(&mut OsRng);
+        let sk = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         vec![InboundKeyCandidate {
             ecdh_secret_d: sk.to_bytes().to_vec(),
             pq_decap_key: None,
@@ -815,6 +912,45 @@ mod tests {
             return;
         }
         panic!("no probe produced an inbound marker first byte");
+    }
+
+    fn pbkdf2_envelope_with_salt(plaintext: &str, pass: &[u8], salt: &[u8; SALT_LEN]) -> String {
+        let nonce_bytes: [u8; NONCE_LEN] = rand::random();
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(pass, salt, PBKDF2_ITERATIONS, &mut key);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .unwrap();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(salt);
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        STANDARD.encode(&combined)
+    }
+
+    #[test]
+    fn pbkdf2_envelope_keyed_by_a_login_salt_is_refused() {
+        let pass = b"account-password";
+        let login_salt: [u8; SALT_LEN] = rand::random();
+        let other_salt: [u8; SALT_LEN] = rand::random();
+        let planted = pbkdf2_envelope_with_salt(r#"{"subject":"planted"}"#, pass, &login_salt);
+        let genuine = pbkdf2_envelope_with_salt(r#"{"subject":"genuine"}"#, pass, &other_salt);
+        let marker = pbkdf2_envelope_nonce_marker();
+
+        crate::crypto::login_salt_guard::remember_login_salts(
+            None,
+            &uuid::Uuid::new_v4(),
+            &[login_salt.to_vec()],
+        );
+
+        assert!(decrypt_envelope(&planted, Some(&marker), pass, None, &[]).is_err());
+        assert!(decrypt_envelope(&planted, Some(&STANDARD.encode([5u8; NONCE_LEN])), pass, None, &[]).is_err());
+        assert!(decrypt_pbkdf2_envelope(&planted, pass).is_err());
+        assert_eq!(
+            decrypt_envelope(&genuine, Some(&marker), pass, None, &[]).unwrap(),
+            r#"{"subject":"genuine"}"#
+        );
     }
 
     #[test]
@@ -1169,6 +1305,229 @@ mod tests {
         assert!(decrypt_storage_key_envelope(&first, &[v2_key(V2_LEGACY_KEK)]).is_err());
         assert_eq!(storage_key_envelope_nonce_marker(), "Ag==");
         assert!(is_storage_key_envelope_nonce(&storage_key_envelope_nonce_marker()));
+    }
+
+    const RETIRED_PASSPHRASE: &[u8] = b"retired-vault-pass";
+    const RETIRED_IDENTITY: &str = "retired-account-identity-key";
+
+    fn retired_vault_material(marker: serde_json::Value) -> crate::auth::session::VaultKeyMaterial {
+        let mut vault = serde_json::json!({
+            "identity_key": RETIRED_IDENTITY,
+            "data_kek": V2_DATA_KEK,
+            "vault_format": 2,
+            "legacy_keks": [{ "k": V2_LEGACY_KEK }],
+            "legacy_identity_keys": ["undefined"],
+        });
+        vault["mail_legacy_retired"] = marker;
+        let (sealed, nonce) = crate::crypto::vault::test_support::seal_vault_with_iterations(
+            vault.to_string().as_bytes(),
+            RETIRED_PASSPHRASE,
+            310_000,
+        );
+        crate::auth::session::decrypt_vault_key_material(&sealed, &nonce, Some(310_000), RETIRED_PASSPHRASE)
+            .unwrap()
+    }
+
+    fn public_identity_envelope() -> (String, String) {
+        build_identity_envelope(V2_PLAINTEXT.as_bytes(), "undefined", b"astermail-envelope-v1")
+    }
+
+    #[test]
+    fn a_retired_vault_opens_stored_mail_only_with_the_current_key() {
+        let material = retired_vault_material(serde_json::json!({ "v": 1, "at": "2026-11-17T00:00:00Z" }));
+        let previous: Vec<String> = material.previous_keys.to_vec();
+        let opened = decrypt_envelope_noting_origin(V2_CURRENT, Some("Ag=="), RETIRED_PASSPHRASE, None, &[], &[]);
+        assert_eq!(opened.unwrap().0, V2_PLAINTEXT);
+        assert!(
+            decrypt_envelope_noting_origin(V2_LEGACY_ONLY, Some("Ag=="), RETIRED_PASSPHRASE, None, &[], &[])
+                .is_err(),
+            "a retired vault must not open mail sealed under a legacy key"
+        );
+        let (public_ct, public_nonce) = public_identity_envelope();
+        assert!(
+            decrypt_envelope_noting_origin(
+                &public_ct,
+                Some(&public_nonce),
+                RETIRED_PASSPHRASE,
+                Some(RETIRED_IDENTITY),
+                &previous,
+                &[],
+            )
+            .is_err(),
+            "a retired vault must not open mail sealed under a well-known key"
+        );
+        let (own_ct, own_nonce) =
+            build_identity_envelope(V2_PLAINTEXT.as_bytes(), RETIRED_IDENTITY, b"astermail-envelope-v1");
+        let own = decrypt_envelope_noting_origin(
+            &own_ct,
+            Some(&own_nonce),
+            RETIRED_PASSPHRASE,
+            Some(RETIRED_IDENTITY),
+            &previous,
+            &[],
+        );
+        assert_eq!(own.unwrap().0, V2_PLAINTEXT);
+        crate::crypto::mail_legacy_retirement::reset_mail_legacy_retirement();
+    }
+
+    #[test]
+    fn an_unretired_vault_still_opens_legacy_mail() {
+        let material = retired_vault_material(serde_json::Value::Null);
+        assert!(!material.mail_legacy_retired);
+        crate::crypto::mail_legacy_retirement::reset_mail_legacy_retirement();
+        let previous: Vec<String> = material.previous_keys.to_vec();
+        for blob in [V2_CURRENT, V2_LEGACY_ONLY] {
+            let opened = decrypt_envelope_noting_origin(blob, Some("Ag=="), RETIRED_PASSPHRASE, None, &[], &[]);
+            assert_eq!(opened.unwrap().0, V2_PLAINTEXT);
+        }
+        let (public_ct, public_nonce) = public_identity_envelope();
+        let opened = decrypt_envelope_noting_origin(
+            &public_ct,
+            Some(&public_nonce),
+            RETIRED_PASSPHRASE,
+            Some(RETIRED_IDENTITY),
+            &previous,
+            &[],
+        );
+        assert_eq!(opened.unwrap().0, V2_PLAINTEXT);
+    }
+
+    #[test]
+    fn a_pinned_account_stays_retired_when_the_vault_drops_the_marker() {
+        let user = uuid::Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        crate::crypto::mail_legacy_retirement::sync_mail_legacy_retirement_in(Some(dir.path()), true, &user).unwrap();
+        let material = retired_vault_material(serde_json::Value::Null);
+        crate::crypto::mail_legacy_retirement::sync_mail_legacy_retirement_in(
+            Some(dir.path()),
+            material.mail_legacy_retired,
+            &user,
+        )
+        .unwrap();
+        assert!(
+            decrypt_envelope_noting_origin(V2_LEGACY_ONLY, Some("Ag=="), RETIRED_PASSPHRASE, None, &[], &[])
+                .is_err()
+        );
+        crate::crypto::mail_legacy_retirement::reset_mail_legacy_retirement();
+    }
+
+    #[test]
+    fn storage_key_envelopes_opened_by_a_public_key_are_not_authenticated() {
+        let public: Zeroizing<[u8; 32]> = Zeroizing::new({
+            use sha2::Digest;
+            Sha256::digest(b"undefinedastermail-envelope-v1").into()
+        });
+        let private = v2_key(V2_DATA_KEK);
+        let salt = [7u8; SALT_LEN];
+        let iv = [9u8; NONCE_LEN];
+        let forged = seal_storage_key_envelope(V2_PLAINTEXT, &public, &salt, &iv).unwrap();
+        let genuine = seal_storage_key_envelope(V2_PLAINTEXT, &private, &salt, &iv).unwrap();
+        let ring = [public.clone(), private.clone()];
+
+        let (plain, origin) = open_storage_key_envelope_noting_origin(&forged, &ring).unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+        assert!(!origin.authenticated(), "a public storage key opened a row as own mail");
+
+        let (plain, origin) = open_storage_key_envelope_noting_origin(&genuine, &ring).unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+
+        let (_, origin) = open_storage_key_envelope_noting_origin(V2_CURRENT, &[v2_key(V2_DATA_KEK)]).unwrap();
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+
+        for (material, context) in [("undefined", "astermail-tags-v1"), ("null", "astermail-envelope-v1"), ("", "astermail-draft-v2")] {
+            let derived: Zeroizing<[u8; 32]> = Zeroizing::new({
+                use sha2::Digest;
+                let mut hasher = Sha256::new();
+                hasher.update(material.as_bytes());
+                hasher.update(context.as_bytes());
+                hasher.finalize().into()
+            });
+            let forged = seal_storage_key_envelope(V2_PLAINTEXT, &derived, &salt, &iv).unwrap();
+            let (_, origin) = open_storage_key_envelope_noting_origin(&forged, &[derived.clone(), private.clone()]).unwrap();
+            assert!(!origin.authenticated(), "a key derived from public identity material opened a row as own mail");
+        }
+    }
+
+    #[test]
+    fn identity_envelopes_opened_by_public_material_are_not_authenticated() {
+        let (public_ct, public_nonce) = public_identity_envelope();
+        let nonce = STANDARD.decode(&public_nonce).unwrap();
+        let (plain, origin) = open_identity_or_passphrase_envelope(
+            &public_ct,
+            &nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(RETIRED_IDENTITY),
+            &["undefined".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+        assert!(!origin.authenticated(), "a previous public key opened a row as own mail");
+
+        let (plain, origin) = open_identity_or_passphrase_envelope(
+            &public_ct,
+            &nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some("undefined"),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain, V2_PLAINTEXT);
+        assert!(!origin.authenticated(), "a public identity key opened a row as own mail");
+
+        assert!(open_identity_or_passphrase_envelope(
+            &public_ct,
+            &nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some("undefined"),
+            &[],
+            true,
+        )
+        .is_err());
+
+        let (sealed, sealed_nonce) = encrypt_identity_key_envelope("own", RETIRED_IDENTITY).unwrap();
+        let sealed_nonce = STANDARD.decode(&sealed_nonce).unwrap();
+        let (plain, origin) = open_identity_or_passphrase_envelope(
+            &sealed,
+            &sealed_nonce,
+            VAULT_PASSPHRASE.as_bytes(),
+            Some(RETIRED_IDENTITY),
+            &["undefined".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain, "own");
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+    }
+
+    #[test]
+    fn passphrase_envelopes_need_a_private_passphrase_to_count_as_own() {
+        let nonce = [0u8; NONCE_LEN];
+        let sealed = encrypt_pbkdf2_envelope("own", VAULT_PASSPHRASE.as_bytes()).unwrap();
+        let (_, origin) =
+            open_identity_or_passphrase_envelope(&sealed, &nonce, VAULT_PASSPHRASE.as_bytes(), None, &[], false)
+                .unwrap();
+        assert_eq!(origin, EnvelopeOrigin::SelfAuthored);
+
+        let forged = encrypt_pbkdf2_envelope("forged", b"").unwrap();
+        let (plain, origin) = open_identity_or_passphrase_envelope(&forged, &nonce, b"", None, &[], false).unwrap();
+        assert_eq!(plain, "forged");
+        assert!(!origin.authenticated(), "an empty passphrase opened a row as own mail");
+    }
+
+    #[test]
+    fn mail_is_never_sealed_under_a_well_known_key() {
+        assert!(encrypt_identity_key_envelope("x", "undefined").is_err());
+        assert!(encrypt_identity_key_envelope("x", "").is_err());
+        assert!(encrypt_identity_key_envelope_with_version("x", "undefined", "astermail-import-v1").is_err());
+        let public: [u8; 32] = {
+            use sha2::Digest;
+            Sha256::digest(b"undefinedastermail-envelope-v1").into()
+        };
+        assert!(encrypt_storage_key_envelope("x", &public).is_err());
+        assert!(encrypt_identity_key_envelope("x", RETIRED_IDENTITY).is_ok());
     }
 
     fn open_with_external(
