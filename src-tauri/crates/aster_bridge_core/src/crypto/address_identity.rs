@@ -494,6 +494,9 @@ fn verify_digest(digest: &[u8; 32], signature: &[u8], public_key: &[u8]) -> bool
     let Ok(signature) = Signature::from_slice(signature) else {
         return false;
     };
+    if signature.normalize_s() != signature {
+        return false;
+    }
     key.verify_prehash(digest, &signature).is_ok()
 }
 
@@ -689,6 +692,30 @@ pub(crate) mod tests {
         let mut tampered = expected.clone();
         tampered.signed_prekey = tampered.kem_identity_key.clone();
         assert!(!verify_signed_entry(v["address"].as_str().unwrap(), &tampered).valid);
+    }
+
+    #[test]
+    fn a_high_s_entry_signature_is_refused() {
+        const ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+        ];
+        let scalar = fixed_bytes(91, 32);
+        let secret = SecretKey::from_slice(&scalar).unwrap();
+        let public_key = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+        let digest = [7u8; 32];
+        let low = sign_digest(&digest, &scalar).unwrap();
+        assert!(verify_digest(&digest, &low, &public_key));
+        let mut high = low.clone();
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let value = ORDER[i] as i16 - low[32 + i] as i16 - borrow;
+            borrow = if value < 0 { 1 } else { 0 };
+            high[32 + i] = (value + 256 * borrow) as u8;
+        }
+        assert_eq!(borrow, 0);
+        assert_ne!(high, low);
+        assert!(!verify_digest(&digest, &high, &public_key));
     }
 
     #[test]

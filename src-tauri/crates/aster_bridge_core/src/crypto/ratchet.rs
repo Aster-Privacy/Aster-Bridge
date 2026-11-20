@@ -396,6 +396,15 @@ pub fn decrypt_pq_secret(
     encrypted_secret_b64: &str,
     secret_nonce_b64: &str,
 ) -> Result<Vec<u8>, String> {
+    decrypt_pq_secret_for(None, sync_key, encrypted_secret_b64, secret_nonce_b64)
+}
+
+pub fn decrypt_pq_secret_for(
+    key_id: Option<u32>,
+    sync_key: &[u8],
+    encrypted_secret_b64: &str,
+    secret_nonce_b64: &str,
+) -> Result<Vec<u8>, String> {
     let ciphertext = b64_decode(encrypted_secret_b64)?;
     let nonce_bytes = b64_decode(secret_nonce_b64)?;
     if nonce_bytes.len() != 12 {
@@ -403,9 +412,24 @@ pub fn decrypt_pq_secret(
     }
     let cipher = Aes256Gcm::new_from_slice(sync_key).map_err(|e| format!("aes init: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|_| "pq secret decrypt failed".to_string())
+    let bound = key_id.and_then(|key_id| {
+        let binding = format!("aster-prekey-secret:pq:v1:{}", key_id);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: binding.as_bytes(),
+                },
+            )
+            .ok()
+    });
+    match bound {
+        Some(secret) => Ok(secret),
+        None => cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|_| "pq secret decrypt failed".to_string()),
+    }
 }
 
 fn push_key_set(
@@ -1639,6 +1663,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn a_pq_secret_sealed_to_its_key_id_opens_only_under_that_id() {
+        let sync_key = [3u8; 32];
+        let secret = vec![9u8; 2400];
+        let nonce_bytes = [0x56u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&sync_key).unwrap();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: secret.as_slice(),
+                    aad: b"aster-prekey-secret:pq:v1:77",
+                },
+            )
+            .unwrap();
+        let ct = STANDARD.encode(&ct);
+        let nonce = STANDARD.encode(nonce_bytes);
+        assert_eq!(decrypt_pq_secret_for(Some(77), &sync_key, &ct, &nonce).unwrap(), secret);
+        assert!(decrypt_pq_secret_for(Some(78), &sync_key, &ct, &nonce).is_err());
+        assert!(decrypt_pq_secret(&sync_key, &ct, &nonce).is_err());
     }
 
     const PQ_IDENTITY_INTEROP_VECTORS: &str = include_str!("pq_identity_interop_vectors.json");
