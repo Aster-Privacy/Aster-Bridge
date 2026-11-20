@@ -2049,7 +2049,8 @@ async fn fetch_pq_secrets(
         return vec![secret];
     }
     for sync_key in legacy_keys {
-        if let Ok(secret) = crate::crypto::ratchet::decrypt_pq_secret(
+        if let Ok(secret) = crate::crypto::ratchet::decrypt_pq_secret_for(
+            Some(wire_key_id),
             sync_key.as_slice(),
             &resp.encrypted_secret,
             &resp.secret_nonce,
@@ -2057,7 +2058,7 @@ async fn fetch_pq_secrets(
             return vec![Zeroizing::new(secret)];
         }
     }
-    tracing::debug!("ratchet pq secret {} did not open with any storage key", key_id);
+    tracing::warn!("ratchet pq secret {} did not open with any storage key", key_id);
     Vec::new()
 }
 
