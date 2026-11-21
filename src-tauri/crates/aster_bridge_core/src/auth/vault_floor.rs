@@ -56,7 +56,11 @@ fn floor_root() -> &'static Mutex<Option<PathBuf>> {
 
 pub fn use_data_dir(data_dir: &Path) {
     if let Ok(mut root) = floor_root().lock() {
-        *root = Some(data_dir.join(FLOOR_DIR));
+        let next = data_dir.join(FLOOR_DIR);
+        if root.as_ref() != Some(&next) {
+            floors().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        }
+        *root = Some(next);
     }
 }
 
@@ -279,6 +283,18 @@ pub(crate) mod tests {
         assert!(!admit_vault(&user, &material("any", &[], Some([4u8; 32]))));
         let saved = format!("{:?}", record_vault(&user, &material("any", &[], Some([4u8; 32]))));
         assert!(saved.starts_with("Err"), "{saved}");
+    }
+
+    #[test]
+    fn changing_the_data_dir_drops_the_cached_records() {
+        let (_serial, _dir) = isolated_root();
+        let user = Uuid::new_v4();
+        let _ = record_vault(&user, &material("first", &[], Some([1u8; 32])));
+        let _ = record_vault(&user, &material("second", &["first"], Some([2u8; 32])));
+        assert!(!admit_vault(&user, &material("first", &[], Some([1u8; 32]))));
+        let other = tempfile::tempdir().unwrap();
+        use_data_dir(other.path());
+        assert!(admit_vault(&user, &material("first", &[], Some([1u8; 32]))));
     }
 
     #[test]

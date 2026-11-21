@@ -215,6 +215,19 @@ fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
 }
 
+pub fn guard_pending_wait(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> Duration {
+    #[cfg(feature = "test-support")]
+    if let Some(ms) = env_u64("ASTER_BRIDGE_TEST_GUARD_WAIT_MS") {
+        return Duration::from_millis(ms);
+    }
+    let now = chrono::Utc::now();
+    aster_bridge_core::runtime::guard_pending_wait(
+        activates_at.unwrap_or(now),
+        now,
+        aster_bridge_core::guard::error::retry_wait(),
+    )
+}
+
 pub fn api_client() -> ApiClient {
     #[cfg(feature = "test-support")]
     if let Some(base) = std::env::var("ASTER_BRIDGE_TEST_API_BASE")

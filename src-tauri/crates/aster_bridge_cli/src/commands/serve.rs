@@ -23,7 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aster_bridge_core::account_state::AccountState;
+use aster_bridge_core::account_state::{self, AccountState};
+use aster_bridge_core::guard::pending as held_device;
 use aster_bridge_core::api_client::ApiClient;
 use aster_bridge_core::auth::app_passwords::AppPasswords;
 use aster_bridge_core::auth::device_identity;
@@ -42,12 +43,13 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use zeroize::Zeroizing;
 
 use super::common::{self, VERSION};
+use super::guard_text;
 use crate::context::{self, Context};
 use crate::control;
 use crate::events::{self, CliEvents, SinkGuard};
 use crate::exit::{
     CliError, CliResult, CODE_CACHE_REBUILD, CODE_CONTROL_UNREACHABLE, CODE_NOT_SIGNED_IN, CODE_OUTBOX_ALREADY_SENT,
-    CODE_CODE_EXPIRED, CODE_LOCKED, CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
+    CODE_CODE_EXPIRED, CODE_GUARD_PENDING, CODE_LOCKED, CODE_OUTBOX_NOT_FOUND, CODE_OUTBOX_READ, CODE_OUTBOX_RETRY, CODE_PLAN_CHECK, CODE_PORT_UNAVAILABLE,
     CODE_SERVER_START, CODE_SERVER_STOPPED, CODE_SYNC, CODE_TLS_CERTIFICATE, EXIT_ERROR,
     EXIT_NOT_READY, EXIT_OK,
 };
@@ -217,9 +219,37 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
     let _log = context::init_logging(ctx, true);
     let base_delay = context::service_retry_delay();
     let mut delay = base_delay;
+    let mut announced = false;
     loop {
         let attempt_started = std::time::Instant::now();
         match serve(ctx, ndjson, &network).await {
+            Err(error) if error.code == CODE_GUARD_PENDING => {
+                let activates_at = held_device::load(&ctx.data_dir)
+                    .map(|held| held.activates_at)
+                    .or_else(account_state::activates_at);
+                let wait = context::guard_pending_wait(activates_at);
+                if ndjson {
+                    events::emit_line(
+                        "guard_pending",
+                        json!({
+                            "activates_at": activates_at.map(|at| at.to_rfc3339()),
+                            "retry_in_secs": wait.as_secs(),
+                        }),
+                    );
+                } else if !announced {
+                    announce_pending(ctx, activates_at);
+                }
+                announced = true;
+                tracing::info!(
+                    "this device is waiting for activation; trying again in {} seconds",
+                    wait.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = signals::shutdown() => return Ok(EXIT_OK),
+                }
+                delay = base_delay;
+            }
             Err(error) if service && error.code == CODE_NOT_SIGNED_IN && !is_signed_in(&ctx.data_dir) => {
                 tracing::warn!("aster-bridge is waiting for you to sign in");
                 let waiting = crate::lock::WaitingLock::hold(&ctx.data_dir);
@@ -273,8 +303,25 @@ pub async fn run(ctx: &Context, json_events: bool, service: bool, network: Serve
     }
 }
 
+fn announce_pending(ctx: &Context, activates_at: Option<chrono::DateTime<chrono::Utc>>) {
+    let out = &ctx.out;
+    out.banner(Tone::Warn, guard_text::PENDING_LABEL);
+    out.blank();
+    out.line(guard_text::PENDING_MESSAGE);
+    out.line(guard_text::GUARD_REASON);
+    out.line(guard_text::activation_line(activates_at));
+    out.line(out.dim(guard_text::SERVE_PENDING_NEXT));
+    out.blank();
+}
+
+fn is_held(dir: &std::path::Path) -> bool {
+    state::load(dir).account.is_none()
+        && held_device::load(dir).is_some()
+        && secret_backend::has_record(dir)
+}
+
 fn is_signed_in(dir: &std::path::Path) -> bool {
-    state::load(dir).account.is_some() && secret_backend::has_record(dir)
+    (state::load(dir).account.is_some() && secret_backend::has_record(dir)) || is_held(dir)
 }
 
 fn ready_to_start(dir: &std::path::Path) -> bool {
@@ -394,7 +441,12 @@ async fn serve(ctx: &Context, ndjson: bool, network: &ResolvedNetwork) -> CliRes
     let dir = ctx.data_dir.clone();
     let _lock = InstanceLock::acquire(&dir)?;
     let cached = state::load(&dir);
-    if cached.account.is_none() {
+    let held = if cached.account.is_none() {
+        held_device::load(&dir)
+    } else {
+        None
+    };
+    if cached.account.is_none() && held.is_none() {
         return Err(CliError::not_signed_in());
     }
     if secret_backend::activate_existing(&dir, ctx.global.secret_backend)?.is_none() {
@@ -408,6 +460,10 @@ async fn serve(ctx: &Context, ndjson: bool, network: &ResolvedNetwork) -> CliRes
     let Some(device_id) = identity.device_id else {
         return Err(CliError::not_signed_in());
     };
+    if held.as_ref().is_some_and(|held| held.device_id != device_id) {
+        held_device::clear(&dir);
+        return Err(CliError::not_signed_in());
+    }
     let db = Arc::new(
         Database::open(&dir).map_err(|e| map_store_error("Couldn't open the mail cache", e))?,
     );
@@ -422,6 +478,19 @@ async fn serve(ctx: &Context, ndjson: bool, network: &ResolvedNetwork) -> CliRes
     )
     .await
     .map_err(|e| common::map_login_error(&dir, e))?;
+    account_state::clear_guard_state();
+    if held.is_some() {
+        let user_id = session.user_id.to_string();
+        if cached.cache_user_id.as_deref().is_some_and(|owner| owner != user_id) {
+            db.clear_all_user_data().map_err(|e| {
+                CliError::coded(
+                    CODE_CACHE_REBUILD,
+                    format!("Couldn't clear the previous account's cache: {}", e),
+                )
+            })?;
+        }
+        common::save_state(&dir, |s| s.cache_user_id = Some(user_id));
+    }
     let email = session.default_sender_address();
     let account = AccountInfo {
         user_id: session.user_id.to_string(),

@@ -636,6 +636,12 @@ where
                     let mut pw_match = passwords
                         .verify_and_id_cached(login_name.as_deref().unwrap_or(""), &password)
                         .await;
+                    if pw_match.is_some() {
+                        if let Some(text) = crate::sign_in_notice::pending_reply() {
+                            writer.write_all(format!("454 4.7.0 {}\r\n", text).as_bytes()).await?;
+                            continue;
+                        }
+                    }
                     if let (Some(_), Some(name)) = (&pw_match, &login_name) {
                         if !session.read().await.accepts_login_name(name) {
                             if !refreshed_identities {
@@ -1565,6 +1571,51 @@ mod tests {
         )
         .await;
         assert!(out.contains("\r\n235 "), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn auth_while_the_device_is_held_is_a_temporary_failure() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending, PENDING_LINE, APP_PASSWORD};
+        let b64 = |s: &str| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s);
+        set_pending(Some(Some(pending_at())));
+        let out = smtp_transcript(
+            &format!(
+                "EHLO client\r\nAUTH PLAIN {}\r\nAUTH LOGIN\r\n{}\r\n{}\r\nQUIT\r\n",
+                b64(&format!("\0tester@aster.test\0{}", APP_PASSWORD)),
+                b64("tester@aster.test"),
+                b64(APP_PASSWORD)
+            ),
+            false,
+        )
+        .await;
+        set_pending(None);
+        assert_eq!(
+            out.matches(&format!("\r\n454 4.7.0 {}\r\n", PENDING_LINE)).count(),
+            2,
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("\r\n235 "), "{:?}", out);
+        assert!(!out.contains("\r\n535 "), "{:?}", out);
+        assert!(out.contains("\r\n221"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB3cm9uZw==\r\nQUIT\r\n", false).await;
+        set_pending(None);
+        assert!(out.contains("\r\n535 5.7.8 "), "{:?}", out);
+        assert!(!out.contains("454 4.7.0"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn without_a_hold_a_wrong_password_still_fails_permanently() {
+        crate::sign_in_notice::test_support::set_pending(None);
+        let out = smtp_transcript("EHLO client\r\nAUTH PLAIN AHRlc3RlcgB3cm9uZw==\r\nQUIT\r\n", false).await;
+        assert!(out.contains("\r\n535 5.7.8 "), "{:?}", out);
+        assert!(!out.contains("454 4.7.0"), "{:?}", out);
     }
 
     #[tokio::test]

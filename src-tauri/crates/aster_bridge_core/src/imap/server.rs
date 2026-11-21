@@ -1581,6 +1581,10 @@ where
                             };
                             if username_ok {
                                 if let Some(pw_id) = passwords.verify_and_id_cached(&authcid, &password).await {
+                                    if let Some(text) = crate::sign_in_notice::pending_reply() {
+                                        write_no(&mut writer, &tag, &format!("[UNAVAILABLE] {}", text)).await?;
+                                        continue;
+                                    }
                                     conn.state = ImapState::Authenticated;
                                     passwords.record_use(&pw_id, Some("imap"));
                                     crate::sign_in_notice::record_signed_in("imap");
@@ -3184,6 +3188,10 @@ async fn handle_login(
     }
 
     if let Some(pw_id) = passwords.verify_and_id_cached(username, password).await {
+        if let Some(text) = crate::sign_in_notice::pending_reply() {
+            write_no(writer, tag, &format!("[UNAVAILABLE] {}", text)).await?;
+            return Ok(true);
+        }
         conn.state = ImapState::Authenticated;
         passwords.record_use(&pw_id, Some("imap"));
         crate::sign_in_notice::record_signed_in("imap");
@@ -5009,6 +5017,98 @@ mod tests {
             crate::sign_in_notice::last_insecure().map(|l| l.protocol),
             Some("imap")
         );
+    }
+
+    #[tokio::test]
+    async fn sign_in_while_the_device_is_held_explains_the_wait() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending, PENDING_LINE};
+        set_pending(Some(Some(pending_at())));
+        let out = imap_transcript(
+            "a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\na2 AUTHENTICATE PLAIN AHRlc3RlckBhc3Rlci50ZXN0AGFiY2QtZWZnaC1pamtsLW1ub3A=\r\na3 AUTHENTICATE PLAIN\r\nAHRlc3RlckBhc3Rlci50ZXN0AGFiY2QtZWZnaC1pamtsLW1ub3A=\r\na4 NOOP\r\na5 SELECT INBOX\r\na6 LOGOUT\r\n",
+            false,
+        )
+        .await;
+        set_pending(None);
+        for tag in ["a1", "a2", "a3"] {
+            assert!(
+                out.contains(&format!("{} NO [UNAVAILABLE] {}\r\n", tag, PENDING_LINE)),
+                "{:?}",
+                out
+            );
+        }
+        assert!(out.contains("a4 OK"), "{:?}", out);
+        assert!(!out.contains("a5 OK"), "{:?}", out);
+        assert!(out.contains("a6 OK"), "{:?}", out);
+        assert!(!out.contains("AUTHENTICATIONFAILED"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = imap_transcript(
+            "a1 LOGIN tester@aster.test wrong-password\r\na2 AUTHENTICATE PLAIN AHRlc3RlcgB4\r\na3 LOGOUT\r\n",
+            false,
+        )
+        .await;
+        set_pending(None);
+        assert!(out.contains("a1 NO [AUTHENTICATIONFAILED]"), "{:?}", out);
+        assert!(out.contains("a2 NO [AUTHENTICATIONFAILED]"), "{:?}", out);
+        assert!(!out.contains("UNAVAILABLE"), "{:?}", out);
+        assert!(!out.contains("activation"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn without_a_hold_the_credential_check_runs_as_before() {
+        crate::sign_in_notice::test_support::set_pending(None);
+        let out = imap_transcript("a1 LOGIN tester@aster.test wrong-password\r\na2 LOGOUT\r\n", false).await;
+        assert!(out.contains("a1 NO [AUTHENTICATIONFAILED]"), "{:?}", out);
+        assert!(!out.contains("waiting for activation"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_signed_in_session_keeps_working_when_a_hold_starts() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(None);
+        let crate::sign_in_notice::test_support::Fixture { session, db, client, passwords, dir, .. } =
+            crate::sign_in_notice::test_support::fixture();
+        let (tx, _rx) = broadcast::channel(16);
+        let (client_side, server_side) = tokio::io::duplex(16 * 1024);
+        let handle = tokio::spawn(run_session(server_side, session, db, client, passwords, tx, None));
+        let (reader, mut writer) = tokio::io::split(client_side);
+        let mut reader = tokio::io::BufReader::new(reader);
+        async fn read_tagged<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, tag: &str) -> String {
+            use tokio::io::AsyncBufReadExt;
+            let mut seen = String::new();
+            loop {
+                let mut line = String::new();
+                let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                    .await
+                    .expect("the server stopped answering")
+                    .unwrap();
+                assert!(n > 0, "the connection closed: {:?}", seen);
+                seen.push_str(&line);
+                if line.starts_with(&format!("{} ", tag)) {
+                    return seen;
+                }
+            }
+        }
+        writer
+            .write_all(b"a1 LOGIN tester@aster.test abcd-efgh-ijkl-mnop\r\n")
+            .await
+            .unwrap();
+        let out = read_tagged(&mut reader, "a1").await;
+        assert!(out.contains("a1 OK"), "{:?}", out);
+        set_pending(Some(Some(pending_at())));
+        writer.write_all(b"a2 NOOP\r\n").await.unwrap();
+        let out = read_tagged(&mut reader, "a2").await;
+        assert!(out.contains("a2 OK"), "{:?}", out);
+        writer.write_all(b"a3 SELECT INBOX\r\n").await.unwrap();
+        let out = read_tagged(&mut reader, "a3").await;
+        assert!(out.contains("a3 OK"), "{:?}", out);
+        set_pending(None);
+        handle.abort();
+        drop(dir);
     }
 
     #[test]

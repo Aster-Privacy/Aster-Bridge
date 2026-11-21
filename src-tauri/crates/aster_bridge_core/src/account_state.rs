@@ -18,7 +18,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+
+use chrono::{DateTime, Utc};
+
+use crate::error::BridgeError;
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -31,6 +35,8 @@ pub enum AccountState {
     DeletionScheduled,
     FamilyPolicy,
     UpdateRequired,
+    GuardPending,
+    SignInAgain,
 }
 
 impl AccountState {
@@ -41,6 +47,8 @@ impl AccountState {
             AccountState::DeletionScheduled => "deletion_scheduled",
             AccountState::FamilyPolicy => "family_policy",
             AccountState::UpdateRequired => "update_required",
+            AccountState::GuardPending => "guard_pending",
+            AccountState::SignInAgain => "sign_in_again",
         }
     }
 
@@ -51,6 +59,8 @@ impl AccountState {
             AccountState::DeletionScheduled => 2,
             AccountState::FamilyPolicy => 3,
             AccountState::UpdateRequired => 4,
+            AccountState::GuardPending => 5,
+            AccountState::SignInAgain => 6,
         }
     }
 
@@ -60,12 +70,32 @@ impl AccountState {
             2 => AccountState::DeletionScheduled,
             3 => AccountState::FamilyPolicy,
             4 => AccountState::UpdateRequired,
+            5 => AccountState::GuardPending,
+            6 => AccountState::SignInAgain,
             _ => AccountState::Active,
         }
     }
 }
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
+static ACTIVATES_AT: AtomicI64 = AtomicI64::new(0);
+
+fn error_code(error: &str) -> Option<&str> {
+    if let Some(start) = error.find("\"code\"") {
+        let rest = error[start + 6..].trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        return rest.find('"').map(|end| &rest[..end]);
+    }
+    error.split_once(':').map(|(label, _)| label.trim())
+}
+
+fn guard_state(error: &str) -> Option<AccountState> {
+    match error_code(error)? {
+        "GUARD_DEVICE_PENDING" | "guard_device_pending" => Some(AccountState::GuardPending),
+        "GUARD_REQUIRED" | "guard_required" => Some(AccountState::SignInAgain),
+        _ => None,
+    }
+}
 
 pub fn classify(error: &str) -> Option<AccountState> {
     if error.contains("ACCOUNT_SUSPENDED") {
@@ -77,7 +107,50 @@ pub fn classify(error: &str) -> Option<AccountState> {
     } else if error.contains("CLIENT_UPGRADE_REQUIRED") || error.contains("client_upgrade_required") {
         Some(AccountState::UpdateRequired)
     } else {
-        None
+        guard_state(error)
+    }
+}
+
+pub fn classify_error(error: &BridgeError) -> Option<AccountState> {
+    match error {
+        BridgeError::GuardPending { .. } => Some(AccountState::GuardPending),
+        BridgeError::GuardRequired(_) => Some(AccountState::SignInAgain),
+        BridgeError::ClientUpgradeRequired(_) => Some(AccountState::UpdateRequired),
+        other => classify(&other.to_string()),
+    }
+}
+
+pub fn activates_at() -> Option<DateTime<Utc>> {
+    if current() != AccountState::GuardPending {
+        return None;
+    }
+    DateTime::from_timestamp(ACTIVATES_AT.load(Ordering::SeqCst), 0)
+        .filter(|time| time.timestamp() > 0)
+}
+
+pub fn record_pending(activates_at: DateTime<Utc>) -> bool {
+    let previous = ACTIVATES_AT.swap(activates_at.timestamp(), Ordering::SeqCst);
+    let changed = record(AccountState::GuardPending);
+    if !changed && previous != activates_at.timestamp() {
+        crate::events::emit(|sink| sink.account_state_changed(AccountState::GuardPending));
+        return true;
+    }
+    changed
+}
+
+pub fn record_error(error: &BridgeError) -> Option<AccountState> {
+    if let BridgeError::GuardPending { activates_at, .. } = error {
+        record_pending(*activates_at);
+        return Some(AccountState::GuardPending);
+    }
+    let state = classify_error(error)?;
+    record(state);
+    Some(state)
+}
+
+pub fn clear_guard_state() {
+    if matches!(current(), AccountState::GuardPending | AccountState::SignInAgain) {
+        record(AccountState::Active);
     }
 }
 
@@ -89,8 +162,17 @@ pub fn record(state: AccountState) -> bool {
     let previous = CURRENT.swap(state.to_u8(), Ordering::SeqCst);
     let changed = previous != state.to_u8();
     if changed {
+        if state != AccountState::GuardPending {
+            ACTIVATES_AT.store(0, Ordering::SeqCst);
+        }
         match state {
             AccountState::Active => tracing::info!("account state is active again"),
+            AccountState::GuardPending => {
+                tracing::info!("this device is waiting for activation")
+            }
+            AccountState::SignInAgain => {
+                tracing::warn!("this device needs to sign in again")
+            }
             other => tracing::error!(
                 "the server refused requests for this account ({})",
                 other.as_str()
@@ -122,8 +204,113 @@ pub fn observe<T>(result: &Result<T, String>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn state_lock() -> std::sync::MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn classify_reads_guard_codes_in_both_forms() {
+        assert_eq!(
+            classify(r#"403 Forbidden: {"code":"GUARD_DEVICE_PENDING"}"#),
+            Some(AccountState::GuardPending)
+        );
+        assert_eq!(
+            classify("guard_device_pending: activates at 2026-11-15 11:00:00 UTC"),
+            Some(AccountState::GuardPending)
+        );
+        assert_eq!(
+            classify(r#"403 Forbidden: {"code":"GUARD_REQUIRED"}"#),
+            Some(AccountState::SignInAgain)
+        );
+        assert_eq!(
+            classify("guard_required: Aster Guard needs to approve this sign-in."),
+            Some(AccountState::SignInAgain)
+        );
+    }
+
+    #[test]
+    fn classify_needs_the_exact_guard_code() {
+        assert_eq!(
+            classify(r#"403 Forbidden: {"error":"x", "code": "GUARD_REQUIRED"}"#),
+            Some(AccountState::SignInAgain)
+        );
+        assert_eq!(classify(r#"403 Forbidden: {"code":"NOT_GUARD_REQUIRED"}"#), None);
+        assert_eq!(classify(r#"403 Forbidden: {"code":"GUARD_REQUIRED_SOON"}"#), None);
+        assert_eq!(
+            classify(r#"400 Bad Request: {"error":"guard_required is not a field"}"#),
+            None
+        );
+        assert_eq!(classify("sync failed: the server said guard_required"), None);
+    }
+
+    #[test]
+    fn classify_error_maps_guard_variants() {
+        let pending = BridgeError::GuardPending {
+            device_id: uuid::Uuid::nil(),
+            activates_at: at("2026-11-15T11:00:00Z"),
+            change_id: None,
+        };
+        assert_eq!(classify_error(&pending), Some(AccountState::GuardPending));
+        assert_eq!(
+            classify_error(&BridgeError::GuardRequired("x".to_string())),
+            Some(AccountState::SignInAgain)
+        );
+        assert_eq!(classify_error(&BridgeError::Api("500 boom".to_string())), None);
+    }
+
+    #[test]
+    fn pending_state_keeps_the_activation_time_until_cleared() {
+        let _lock = state_lock();
+        record(AccountState::Active);
+        assert_eq!(activates_at(), None);
+        let pending = BridgeError::GuardPending {
+            device_id: uuid::Uuid::nil(),
+            activates_at: at("2026-11-15T11:00:00Z"),
+            change_id: None,
+        };
+        assert_eq!(record_error(&pending), Some(AccountState::GuardPending));
+        assert_eq!(current(), AccountState::GuardPending);
+        assert_eq!(activates_at(), Some(at("2026-11-15T11:00:00Z")));
+        assert!(record_pending(at("2026-11-15T11:30:00Z")));
+        assert_eq!(activates_at(), Some(at("2026-11-15T11:30:00Z")));
+        clear_guard_state();
+        assert_eq!(current(), AccountState::Active);
+        assert_eq!(activates_at(), None);
+    }
+
+    #[test]
+    fn sign_in_again_clears_on_success_but_update_required_stays() {
+        let _lock = state_lock();
+        record(AccountState::Active);
+        record_error(&BridgeError::GuardRequired("x".to_string()));
+        assert_eq!(current(), AccountState::SignInAgain);
+        observe(&Ok(()));
+        assert_eq!(current(), AccountState::Active);
+        record(AccountState::UpdateRequired);
+        clear_guard_state();
+        assert_eq!(current(), AccountState::UpdateRequired);
+        record(AccountState::Active);
+    }
+
+    #[test]
+    fn guard_states_round_trip_and_serialize() {
+        for state in [AccountState::GuardPending, AccountState::SignInAgain] {
+            assert_eq!(AccountState::from_u8(state.to_u8()), state);
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
+    }
 
     #[test]
     fn classify_reads_backend_error_bodies() {
@@ -153,6 +340,7 @@ mod tests {
 
     #[test]
     fn observe_tracks_transitions_and_ignores_transient_errors() {
+        let _lock = state_lock();
         record(AccountState::Active);
         observe::<()>(&Err("403 Forbidden: {\"code\":\"ACCOUNT_SUSPENDED\"}".to_string()));
         assert_eq!(current(), AccountState::Suspended);

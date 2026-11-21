@@ -431,6 +431,10 @@ where
                         }
                     }
                     if let Some(pw_id) = pw_match {
+                        if let Some(text) = crate::sign_in_notice::pending_reply() {
+                            writer.write_all(format!("-ERR [SYS/TEMP] {}\r\n", text).as_bytes()).await?;
+                            continue;
+                        }
                         if POP3_SESSION_ACTIVE.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
                             writer.write_all(b"-ERR [IN-USE] Maildrop already locked by another session\r\n").await?;
                             break;
@@ -708,6 +712,49 @@ mod tests {
             crate::sign_in_notice::last_insecure().map(|l| l.protocol),
             Some("pop3")
         );
+    }
+
+    #[tokio::test]
+    async fn pass_while_the_device_is_held_is_a_temporary_failure() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending, PENDING_LINE};
+        set_pending(Some(Some(pending_at())));
+        let out = pop3_transcript(
+            "USER tester@aster.test\r\nPASS abcd-efgh-ijkl-mnop\r\nPASS abcd-efgh-ijkl-mnop\r\nQUIT\r\n",
+            false,
+        )
+        .await;
+        set_pending(None);
+        assert_eq!(
+            out.matches(&format!("-ERR [SYS/TEMP] {}\r\n", PENDING_LINE)).count(),
+            2,
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("maildrop ready"), "{:?}", out);
+        assert!(out.contains("+OK"), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_while_held_reveals_nothing_about_the_hold() {
+        use crate::sign_in_notice::test_support::{pending_at, set_pending};
+        set_pending(Some(Some(pending_at())));
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS wrong\r\nQUIT\r\n", false).await;
+        set_pending(None);
+        assert!(!out.contains("SYS/TEMP"), "{:?}", out);
+        assert!(!out.contains("waiting for activation"), "{:?}", out);
+        assert!(out.contains("-ERR Sign-in failed."), "{:?}", out);
+    }
+
+    #[tokio::test]
+    async fn without_a_hold_a_wrong_password_is_refused_as_before() {
+        crate::sign_in_notice::test_support::set_pending(None);
+        let out = pop3_transcript("USER tester@aster.test\r\nPASS wrong\r\nQUIT\r\n", false).await;
+        assert!(
+            out.contains("-ERR Sign-in failed. Use the username and app password shown in Aster Bridge\r\n"),
+            "{:?}",
+            out
+        );
+        assert!(!out.contains("SYS/TEMP"), "{:?}", out);
     }
 
     #[tokio::test]

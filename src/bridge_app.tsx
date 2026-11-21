@@ -26,7 +26,7 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
+import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -49,7 +49,8 @@ import {
 import { UpdateCard } from "./update_card";
 import { use_update_installer } from "./use_update_installer";
 import { writeText as clipboard_write_text, readText as clipboard_read_text } from "@tauri-apps/plugin-clipboard-manager";
-import { notify_native } from "@/notify";
+import { notify_native, should_notify_activation } from "@/notify";
+import { GuardPendingPanel } from "./guard_pending_panel";
 import { listen_tauri } from "@/lib/tauri_events";
 import { parse_provision_link, request_provision_bundle } from "@/lib/provision_flow";
 import { DEFAULT_PROFILE_COLOR, HEX_COLOR, profile_gradient_background } from "@/lib/profile_palette";
@@ -171,12 +172,14 @@ type SetupState =
   | "requesting_code"
   | "showing_code"
   | "expired"
+  | "denied"
   | "error";
 
 const UPGRADE_URL = "https://app.astermail.org/settings/billing";
 
 
-type View = "loading" | "setup" | "dashboard";
+type View = "loading" | "setup" | "guard_pending" | "dashboard";
+type SignInEnding = "denied" | "expired";
 type Tab = "status" | "passwords" | "settings";
 type ToastType = "success" | "error" | "info" | "warning";
 
@@ -399,7 +402,7 @@ function toast_layout(position: string) {
 }
 
 function ToastContainer() {
-  const [toasts, set_toasts] = useState<ToastState[]>([]);
+  const [toasts, set_toasts] = useState<ToastState[]>(() => [...toast_stack]);
   const [position, set_position] = useState<string>(() => get_toast_position());
   const reduce_motion =
     (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) ||
@@ -807,15 +810,19 @@ const DEFAULT_CODE_LIFETIME = 600;
 
 function SetupView({
   on_enrolled,
+  on_activation_pending,
   can_go_back,
   on_back,
+  initial_state,
 }: {
   on_enrolled: () => void;
+  on_activation_pending: () => void;
   can_go_back: boolean;
   on_back: () => void;
+  initial_state?: SignInEnding;
 }) {
   const { t } = useTranslation();
-  const [state, set_state] = useState<SetupState>("idle");
+  const [state, set_state] = useState<SetupState>(initial_state ?? "idle");
   const [code, set_code] = useState<string | null>(null);
   const [device_fingerprint, set_device_fingerprint] = useState("");
   const [time_left, set_time_left] = useState(0);
@@ -870,6 +877,8 @@ function SetupView({
           try {
             const status = await api.check_setup_confirmation();
             if (status === "confirmed") { stop_polling(); on_enrolled(); return; }
+            if (status === "activation_pending") { stop_polling(); set_code(null); on_activation_pending(); return; }
+            if (status === "denied") { stop_polling(); set_code(null); set_state("denied"); return; }
             if (status === "expired") { stop_polling(); set_state("expired"); return; }
           } catch {
             /* keep polling on transient errors */
@@ -882,7 +891,7 @@ function SetupView({
     } catch {
       set_state("error");
     }
-  }, [stop_polling, on_enrolled]);
+  }, [stop_polling, on_enrolled, on_activation_pending]);
 
   const handle_copy_code = async () => {
     if (!code) return;
@@ -982,6 +991,15 @@ function SetupView({
             <>
               <h1 className="text-xl font-semibold mt-6 text-txt-primary text-center">{t("setup_expired_title")}</h1>
               <p className="text-sm mt-2 leading-relaxed text-txt-tertiary text-center">{t("setup_expired_subtitle")}</p>
+              <Button className="w-full mt-6" size="xl" variant="depth" onClick={start_code_flow}>{t("setup_get_new_code")}</Button>
+              {can_go_back && <button className="mt-3 text-sm text-txt-muted hover:text-txt-tertiary transition-colors" onClick={handle_back}>{t("setup_back_to_dashboard")}</button>}
+            </>
+          )}
+
+          {state === "denied" && (
+            <>
+              <h1 className="text-xl font-semibold mt-6 text-txt-primary text-center">{t("guard_denied_title")}</h1>
+              <p role="status" className="text-sm mt-2 leading-relaxed text-txt-tertiary text-center">{t("guard_denied")}</p>
               <Button className="w-full mt-6" size="xl" variant="depth" onClick={start_code_flow}>{t("setup_get_new_code")}</Button>
               {can_go_back && <button className="mt-3 text-sm text-txt-muted hover:text-txt-tertiary transition-colors" onClick={handle_back}>{t("setup_back_to_dashboard")}</button>}
             </>
@@ -2919,6 +2937,10 @@ export function BridgeApp() {
   const [unverified_recipient_keys, set_unverified_recipient_keys] = useState(0);
   const unverified_keys_dismissed = useRef(false);
   const update_required_shown = useRef(false);
+  const sign_in_again_shown = useRef(false);
+  const was_guard_pending = useRef(false);
+  const [guard_pending, set_guard_pending] = useState<GuardPending | null>(null);
+  const [sign_in_ending, set_sign_in_ending] = useState<SignInEnding | null>(null);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
   const [provision_armed, set_provision_armed] = useState(false);
@@ -2970,6 +2992,21 @@ export function BridgeApp() {
         update_required_shown.current = true;
         show_toast(i18next.t("toast_bridge_update_required"), "error", 10000);
       }
+      if (state.sign_in_again && !sign_in_again_shown.current) {
+        sign_in_again_shown.current = true;
+        show_toast(i18next.t("guard_sign_in_again"), "warning", 10000);
+      } else if (!state.sign_in_again) {
+        sign_in_again_shown.current = false;
+      }
+      if (should_notify_activation(was_guard_pending.current, state.guard_pending !== null, state.enrolled)) {
+        notify_native(i18next.t("guard_activated_title"), i18next.t("guard_activated"));
+        show_toast(i18next.t("guard_activated"), "success", 6000);
+      }
+      was_guard_pending.current = state.guard_pending !== null;
+      set_guard_pending(state.guard_pending);
+      if (state.enrolled || state.guard_pending) {
+        set_sign_in_ending(null);
+      }
       if (state.enrolled) {
         set_view("dashboard");
         set_email(state.email);
@@ -2991,6 +3028,8 @@ export function BridgeApp() {
         apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();
+      } else if (state.guard_pending) {
+        set_view("guard_pending");
       } else {
         set_view("setup");
       }
@@ -3188,6 +3227,19 @@ export function BridgeApp() {
   }, []);
 
   useEffect(() => {
+    const sub = listen_tauri<string>("sign_in_ended", async (event) => {
+      if (event.payload !== "denied" && event.payload !== "expired") return;
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().show().catch(() => {});
+      was_guard_pending.current = false;
+      set_guard_pending(null);
+      set_sign_in_ending(event.payload);
+      force_link_device();
+    });
+    return sub.unlisten;
+  }, [force_link_device]);
+
+  useEffect(() => {
     const sub = listen_tauri("session_expired", async () => {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().show();
@@ -3275,6 +3327,13 @@ export function BridgeApp() {
 
   const handle_back_to_dashboard = () => { set_view("dashboard"); };
 
+  const handle_cancel_activation = async () => {
+    try { await api.sign_out(); } catch { show_toast(i18next.t("toast_signed_out_data_kept"), "error"); }
+    was_guard_pending.current = false;
+    set_guard_pending(null);
+    force_link_device();
+  };
+
   if (view === "loading") {
     return (
       <>
@@ -3286,10 +3345,19 @@ export function BridgeApp() {
     );
   }
 
+  if (view === "guard_pending") {
+    return (
+      <>
+        <GuardPendingPanel activates_at={guard_pending?.activates_at ?? null} on_cancel={handle_cancel_activation} />
+        <ToastContainer />
+      </>
+    );
+  }
+
   if (view === "setup") {
     return (
       <>
-        <SetupView on_enrolled={handle_enrolled} can_go_back={was_enrolled} on_back={handle_back_to_dashboard} />
+        <SetupView key={sign_in_ending ?? "setup"} initial_state={sign_in_ending ?? undefined} on_enrolled={handle_enrolled} on_activation_pending={load_state} can_go_back={was_enrolled} on_back={handle_back_to_dashboard} />
         <ToastContainer />
       </>
     );

@@ -383,6 +383,25 @@ pub fn restrict_permissions(path: &Path, is_dir: bool) {
 }
 
 #[cfg(test)]
+pub(crate) async fn test_backend_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let guard = LOCK.lock().await;
+    let round = ROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "aster-bridge-test-secrets-{}-{}",
+        std::process::id(),
+        round
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    install_backend(SecretBackend::File { dir, key });
+    guard
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
