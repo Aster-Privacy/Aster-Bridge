@@ -251,6 +251,9 @@ impl AppPasswords {
     }
 
     pub async fn verify_and_id_cached(&self, username: &str, password: &str) -> Option<String> {
+        if !crate::auth::session::listeners_may_sign_in() {
+            return None;
+        }
         let key = verify_cache_key(username, password);
         if let Some(id) = self.cached_match(&key) {
             return Some(id);
@@ -535,6 +538,19 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&verify_cache_key("u@aster.test", "wrong-wrong-wrong-x")));
+    }
+
+    #[tokio::test]
+    async fn listeners_refuse_a_valid_password_while_the_sign_in_is_rejected() {
+        let (_dir, db) = test_db();
+        let ap = AppPasswords::new(db);
+        let pw = generate_app_password();
+        let id = ap.store("held", &pw).unwrap();
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id.clone()));
+        crate::auth::session::FORCE_REJECTED.with(|forced| forced.set(true));
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, None);
+        crate::auth::session::FORCE_REJECTED.with(|forced| forced.set(false));
+        assert_eq!(ap.verify_and_id_cached("u@aster.test", &pw).await, Some(id));
     }
 
     #[tokio::test]

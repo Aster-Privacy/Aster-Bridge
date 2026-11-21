@@ -1072,6 +1072,7 @@ mod tests {
     #[test]
     fn guard_required_on_refresh_keeps_the_device_and_retries() {
         let _state = crate::account_state::tests::state_lock();
+        let _rejection = crate::auth::session::rejection_lock();
         crate::account_state::record(crate::account_state::AccountState::Active);
         note_guard_required();
         assert_eq!(

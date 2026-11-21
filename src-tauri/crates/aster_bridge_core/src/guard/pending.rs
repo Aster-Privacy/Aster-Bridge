@@ -70,7 +70,7 @@ fn write_record(data_dir: &Path, pending: &PendingActivation) -> Result<(), Stri
         }
     }
     let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-    crate::atomic_file::write(&pending_path(data_dir), &bytes)
+    crate::auth::device_identity::write_private_file(&pending_path(data_dir), &bytes)
 }
 
 fn move_plain_code(data_dir: &Path, record: &PendingActivation, code: &str) {

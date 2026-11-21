@@ -533,7 +533,16 @@ pub async fn restore_or_login(
     crate::crypto::mail_legacy_retirement::set_mail_legacy_pin_dir(&config.data_dir);
 
     crate::auth::vault_floor::use_data_dir(&config.data_dir);
+    let was_held = crate::guard::pending::load(&config.data_dir).is_some();
     match login_with_passphrase(identity, device_id, passphrase, client).await {
+        Ok(session) if was_held && session.identity_key.is_none() => {
+            crate::guard::pending::clear(&config.data_dir);
+            device_identity::clear_passphrase(&config.data_dir);
+            let _ = device_identity::clear_device_id(&config.data_dir);
+            Err(BridgeError::Auth(
+                "the sign-in did not unlock this account".to_string(),
+            ))
+        }
         Ok(session) => {
             crate::guard::pending::clear(&config.data_dir);
             Ok(session)
@@ -696,6 +705,32 @@ pub fn set_session_rejected(rejected: bool) {
 
 pub fn session_rejected() -> bool {
     SESSION_REJECTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn rejection_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn listeners_may_sign_in() -> bool {
+    #[cfg(test)]
+    {
+        if FORCE_REJECTED.with(|forced| forced.get()) {
+            return false;
+        }
+        let _serial = rejection_lock();
+        !session_rejected()
+    }
+    #[cfg(not(test))]
+    {
+        !session_rejected()
+    }
 }
 
 fn is_transient_refresh_error(error: &BridgeError) -> bool {

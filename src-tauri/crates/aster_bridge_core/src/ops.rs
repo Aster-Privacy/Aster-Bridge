@@ -169,6 +169,9 @@ fn hold_code(
 
 fn end_held_attempt(identity: &mut DeviceIdentity, data_dir: &Path, normalized_code: &str) {
     let Some(held) = pending::load(data_dir) else {
+        if identity.device_id.is_none() {
+            device_identity::clear_passphrase(data_dir);
+        }
         return;
     };
     if held.code.as_deref() != Some(normalized_code) {
@@ -177,7 +180,10 @@ fn end_held_attempt(identity: &mut DeviceIdentity, data_dir: &Path, normalized_c
     pending::clear(data_dir);
     let _ = match held.replaced_device_id {
         Some(previous) => device_identity::set_device_id(data_dir, previous),
-        None => device_identity::clear_device_id(data_dir),
+        None => {
+            device_identity::clear_passphrase(data_dir);
+            device_identity::clear_device_id(data_dir)
+        }
     };
     if identity.device_id == Some(held.device_id) {
         identity.device_id = held.replaced_device_id;
@@ -608,6 +614,21 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_denied_hold_removes_a_stored_passphrase() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let (mock, client, _device_id) = hold(&mut identity, dir.path()).await;
+            device_identity::store_passphrase(dir.path(), PASSPHRASE).unwrap();
+            *mock.status.lock().unwrap() = serde_json::json!({"status": "denied"});
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::Denied));
+            assert_eq!(device_identity::load_passphrase(dir.path()).unwrap(), None);
+        }
+
+        #[tokio::test]
         async fn a_hold_keeps_the_earlier_sign_in_and_gives_it_back_when_it_ends() {
             let _secrets = crate::secrets::test_backend_lock().await;
             for ending in ["denied", "expired"] {
@@ -691,6 +712,38 @@ mod tests {
             assert_eq!(
                 device_identity::load_passphrase(dir.path()).unwrap().as_deref(),
                 Some(PASSPHRASE)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hold_that_ends_without_an_unlocked_vault_signs_nobody_in() {
+            let _secrets = crate::secrets::test_backend_lock().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identity = device_identity::get_or_create_identity(dir.path()).unwrap();
+            let device_id = Uuid::new_v4();
+            let (ed, mlkem, x) = device_identity::get_pubkeys(&identity);
+            let wrong = device_identity::seal_vault_envelope(&ed, &mlkem, &x, b"some other passphrase", 2).unwrap();
+            let mock = mock_with(serde_json::json!({
+                "status": "confirmed",
+                "device_id": device_id,
+                "sealed_envelope": wrong,
+            }));
+            let client = ApiClient::new_with_base_url(&spawn(mock.clone()).await);
+            let result = poll_device_sign_in(&client, &mut identity, dir.path(), "ABCD1234")
+                .await
+                .unwrap();
+            assert!(matches!(result, SignInPoll::ActivationPending { .. }));
+            mock.login_pending.store(false, Ordering::SeqCst);
+            let err = session::restore_or_login(&config_for(dir.path()), &identity, &client)
+                .await
+                .err()
+                .expect("the vault does not open");
+            assert!(matches!(err, BridgeError::Auth(_)));
+            assert_eq!(pending::load(dir.path()), None);
+            assert_eq!(device_identity::load_passphrase(dir.path()).unwrap(), None);
+            assert_eq!(
+                device_identity::get_or_create_identity(dir.path()).unwrap().device_id,
+                None
             );
         }
 
