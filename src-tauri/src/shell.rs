@@ -41,6 +41,8 @@ pub struct TrayMenuState(pub Mutex<Option<TrayItems>>);
 
 pub struct QuitState(pub std::sync::atomic::AtomicBool);
 
+pub struct CloseToTrayState(pub std::sync::atomic::AtomicBool);
+
 pub fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -297,6 +299,15 @@ async fn outbox_pending(state: &SharedBridgeState) -> usize {
         guard.db.clone()
     };
     db.outbox_pending_count().unwrap_or(0)
+}
+
+pub fn handle_close_request(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    let keep_running = app.state::<CloseToTrayState>().0.load(Ordering::SeqCst);
+    hide_main_window(app);
+    if !keep_running {
+        request_quit(app);
+    }
 }
 
 pub fn request_quit(app: &AppHandle) {
