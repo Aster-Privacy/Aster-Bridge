@@ -1995,6 +1995,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   const { t } = useTranslation();
   const [autostart, set_autostart] = useState(false);
   const [autostart_loading, set_autostart_loading] = useState(true);
+  const [close_to_tray, set_close_to_tray] = useState(true);
   const [service_mode, set_service_mode] = useState(false);
   const [service_mode_loading, set_service_mode_loading] = useState(true);
   const [full_history, set_full_history] = useState(true);
@@ -2183,6 +2184,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   useEffect(() => {
     api.get_service_settings().then((s) => {
       set_autostart(s.autostart);
+      set_close_to_tray(s.close_to_tray);
       set_service_mode(s.service_mode);
       set_require_post_quantum(s.require_post_quantum);
       set_autostart_loading(false);
@@ -2252,6 +2254,18 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_autostart(!new_value);
       show_toast(t("toast_autolaunch_failed"), "error");
+    }
+  };
+
+  const handle_toggle_close_to_tray = async () => {
+    const new_value = !close_to_tray;
+    set_close_to_tray(new_value);
+    try {
+      await api.set_close_to_tray(new_value);
+      show_toast(new_value ? t("toast_close_to_tray_on") : t("toast_close_to_tray_off"), "success");
+    } catch {
+      set_close_to_tray(!new_value);
+      show_toast(t("toast_close_to_tray_failed"), "error");
     }
   };
 
@@ -2332,6 +2346,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       <SettingsGroup title={t("section_general")} icon={<Cog6ToothIcon />}>
         <SettingRow label={t("launch_on_startup")} sublabel={t("launch_on_startup_hint")}>
           <Toggle checked={autostart} disabled={autostart_loading} on_click={handle_toggle_autostart} />
+        </SettingRow>
+        <SettingRow label={t("close_to_tray")} sublabel={t("close_to_tray_hint")}>
+          <Toggle checked={close_to_tray} disabled={autostart_loading} on_click={handle_toggle_close_to_tray} />
         </SettingRow>
         <SettingRow label={t("run_in_background")} sublabel={t("run_in_background_hint")}>
           <Toggle checked={service_mode} disabled={service_mode_loading} on_click={handle_toggle_service_mode} />
