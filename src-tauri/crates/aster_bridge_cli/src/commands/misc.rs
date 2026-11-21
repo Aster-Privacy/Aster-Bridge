@@ -31,7 +31,7 @@ use crate::exit::{self, CliError, CliResult, EXIT_OK};
 use crate::output::{Output, Tone};
 use crate::spinner;
 
-const HIDDEN_KEYS: [&str; 2] = ["service_mode", "autostart"];
+const HIDDEN_KEYS: [&str; 3] = ["service_mode", "autostart", "close_to_tray"];
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 86_400;
 
@@ -407,6 +407,7 @@ mod tests {
         let map = visible_settings(&BridgeConfig::default()).unwrap();
         assert!(!map.contains_key("service_mode"));
         assert!(!map.contains_key("autostart"));
+        assert!(!map.contains_key("close_to_tray"));
         assert!(!map.contains_key("data_dir"));
         assert!(map.contains_key("imap_port"));
     }

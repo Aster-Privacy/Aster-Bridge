@@ -33,6 +33,8 @@ pub struct BridgeConfig {
     pub service_mode: bool,
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
     #[serde(default = "default_tls_enabled")]
     pub tls_enabled: bool,
     #[serde(default = "default_imap_implicit_tls_port")]
@@ -62,6 +64,10 @@ pub struct BridgeConfig {
 
 fn default_jmap_port() -> u16 {
     1080
+}
+
+fn default_close_to_tray() -> bool {
+    true
 }
 
 fn default_jmap_enabled() -> bool {
@@ -117,6 +123,7 @@ impl Default for BridgeConfig {
             jmap_enabled: default_jmap_enabled(),
             service_mode: false,
             autostart: false,
+            close_to_tray: default_close_to_tray(),
             tls_enabled: default_tls_enabled(),
             imap_implicit_tls_port: default_imap_implicit_tls_port(),
             smtp_implicit_tls_port: default_smtp_implicit_tls_port(),
@@ -392,6 +399,7 @@ mod tests {
         assert!(parsed.jmap_enabled);
         assert_eq!(parsed.pop3_port, default_pop3_port());
         assert!(!parsed.service_mode);
+        assert!(parsed.close_to_tray);
     }
 
     #[test]

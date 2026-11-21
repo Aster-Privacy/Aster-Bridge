@@ -1476,6 +1476,7 @@ async fn provision_bundle(
 struct ServiceSettingsResponse {
     service_mode: bool,
     autostart: bool,
+    close_to_tray: bool,
     require_post_quantum: bool,
 }
 
@@ -1487,6 +1488,7 @@ async fn get_service_settings(
     Ok(ServiceSettingsResponse {
         service_mode: guard.config.service_mode,
         autostart: guard.config.autostart,
+        close_to_tray: guard.config.close_to_tray,
         require_post_quantum: guard.config.require_post_quantum,
     })
 }
@@ -1534,6 +1536,25 @@ async fn set_autostart(
     let mut guard = state.0.lock().await;
     guard.config.autostart = enabled;
     config::save_config(&guard.config)
+}
+
+#[tauri::command]
+async fn set_close_to_tray(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    let previous = guard.config.close_to_tray;
+    guard.config.close_to_tray = enabled;
+    if let Err(error) = config::save_config(&guard.config) {
+        guard.config.close_to_tray = previous;
+        return Err(error);
+    }
+    app.state::<shell::CloseToTrayState>()
+        .0
+        .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1940,6 +1961,7 @@ fn main() {
         .manage(TrayState(std::sync::Mutex::new(None)))
         .manage(shell::TrayMenuState(std::sync::Mutex::new(None)))
         .manage(shell::QuitState(std::sync::atomic::AtomicBool::new(false)))
+        .manage(shell::CloseToTrayState(std::sync::atomic::AtomicBool::new(true)))
         .manage(PendingDeepLink(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_bridge_status,
@@ -1972,6 +1994,7 @@ fn main() {
             set_service_mode,
             set_require_post_quantum,
             set_autostart,
+            set_close_to_tray,
             provision_bundle,
             webkit_sandbox::webkit_sandbox_status,
             take_pending_deep_link,
@@ -2003,6 +2026,10 @@ fn main() {
             cfg.service_mode = true;
         }
         let service_mode = cfg.service_mode;
+        app.state::<shell::CloseToTrayState>().0.store(
+            service_mode || cfg.close_to_tray,
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
         let db = match db::Database::open(&cfg.data_dir) {
             Ok(d) => d,
@@ -2183,7 +2210,7 @@ fn main() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                shell::hide_main_window(window.app_handle());
+                shell::handle_close_request(window.app_handle());
             }
             #[cfg(target_os = "macos")]
             if let WindowEvent::ThemeChanged(theme) = event {

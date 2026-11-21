@@ -290,6 +290,7 @@ export async function open_data_directory(): Promise<void> {
 export interface ServiceSettings {
   service_mode: boolean;
   autostart: boolean;
+  close_to_tray: boolean;
   require_post_quantum: boolean;
 }
 
@@ -326,6 +327,10 @@ export async function get_autostart_enabled(): Promise<boolean> {
 
 export async function set_autostart_enabled(enabled: boolean): Promise<void> {
   return tauri_invoke("set_autostart", { enabled });
+}
+
+export async function set_close_to_tray(enabled: boolean): Promise<void> {
+  return tauri_invoke("set_close_to_tray", { enabled });
 }
 
 export interface WebkitSandboxStatus {
