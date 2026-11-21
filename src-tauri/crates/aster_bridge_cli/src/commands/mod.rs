@@ -20,6 +20,7 @@
 //
 pub mod app_password;
 pub mod common;
+pub mod guard_text;
 pub mod login;
 pub mod logout;
 pub mod misc;

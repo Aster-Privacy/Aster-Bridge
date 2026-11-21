@@ -152,7 +152,10 @@ impl BridgeEvents for CliEvents {
         self.persist(|s| s.account_state = account_state);
         self.emit(
             "account_state_changed",
-            json!({ "account_state": account_state.as_str() }),
+            json!({
+                "account_state": account_state.as_str(),
+                "activates_at": aster_bridge_core::account_state::activates_at().map(|at| at.to_rfc3339()),
+            }),
         );
     }
 }

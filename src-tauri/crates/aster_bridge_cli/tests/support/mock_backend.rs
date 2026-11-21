@@ -42,8 +42,10 @@ const VAULT_PASSPHRASE: &[u8] = b"mock-vault-passphrase";
 pub enum CodeStatus {
     Confirm,
     ConfirmForeignPassphrase,
+    ActivationPending,
     Pending,
     Expired,
+    Denied,
     Gone,
 }
 
@@ -73,6 +75,9 @@ struct Inner {
     plan: Mutex<Plan>,
     sync: Mutex<SyncMode>,
     login_status: AtomicU16,
+    held_until: Mutex<Option<String>>,
+    login_calls: AtomicUsize,
+    status_calls: AtomicUsize,
     expires_in: AtomicU64,
     plan_calls: AtomicUsize,
     sync_calls: AtomicUsize,
@@ -94,6 +99,9 @@ impl Mock {
             plan: Mutex::new(Plan::Allow),
             sync: Mutex::new(SyncMode::Empty),
             login_status: AtomicU16::new(200),
+            held_until: Mutex::new(None),
+            login_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
             expires_in: AtomicU64::new(600),
             plan_calls: AtomicUsize::new(0),
             sync_calls: AtomicUsize::new(0),
@@ -134,6 +142,18 @@ impl Mock {
 
     pub fn set_login_status(&self, status: u16) {
         self.inner.login_status.store(status, Ordering::SeqCst);
+    }
+
+    pub fn hold_device_until(&self, activates_at: Option<&str>) {
+        *self.inner.held_until.lock().unwrap() = activates_at.map(str::to_string);
+    }
+
+    pub fn login_calls(&self) -> usize {
+        self.inner.login_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn status_calls(&self) -> usize {
+        self.inner.status_calls.load(Ordering::SeqCst)
     }
 
     pub fn set_expires_in(&self, secs: u64) {
@@ -200,13 +220,23 @@ async fn device_code(
 }
 
 async fn device_code_status(State(inner): State<Arc<Inner>>) -> Response {
+    inner.status_calls.fetch_add(1, Ordering::SeqCst);
     let status = *inner.code_status.lock().unwrap();
     match status {
+        CodeStatus::ActivationPending => Json(json!({
+            "status": "activation_pending",
+            "device_id": inner.device_id,
+            "sealed_envelope": null,
+            "code_secret_sealed": null,
+            "activates_at": inner.held_until.lock().unwrap().clone(),
+        }))
+        .into_response(),
         CodeStatus::Pending => Json(json!({ "status": "pending" })).into_response(),
         CodeStatus::Expired => Json(json!({ "status": "expired" })).into_response(),
+        CodeStatus::Denied => Json(json!({ "status": "denied" })).into_response(),
         CodeStatus::Gone => (StatusCode::GONE, Json(json!({ "error": "gone" }))).into_response(),
         CodeStatus::Confirm | CodeStatus::ConfirmForeignPassphrase => {
-            let passphrase: &[u8] = if status == CodeStatus::Confirm {
+            let passphrase: &[u8] = if status != CodeStatus::ConfirmForeignPassphrase {
                 VAULT_PASSPHRASE
             } else {
                 b"passphrase-chosen-by-someone-else"
@@ -247,6 +277,22 @@ async fn device_challenge() -> Json<Value> {
 }
 
 async fn device_login(State(inner): State<Arc<Inner>>) -> Response {
+    inner.login_calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(activates_at) = inner.held_until.lock().unwrap().clone() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "This device is waiting for activation.",
+                "code": "GUARD_DEVICE_PENDING",
+                "details": {
+                    "device_id": inner.device_id,
+                    "activates_at": activates_at,
+                    "change_id": null,
+                },
+            })),
+        )
+            .into_response();
+    }
     let status = inner.login_status.load(Ordering::SeqCst);
     if status != 200 {
         let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

@@ -130,6 +130,7 @@ impl Env {
             .env("ASTER_BRIDGE_TEST_DRAIN_MS", "500")
             .env("ASTER_BRIDGE_TEST_SERVICE_DELAY_MS", "50")
             .env("ASTER_BRIDGE_TEST_SERVICE_RETRY_MS", "100")
+            .env("ASTER_BRIDGE_TEST_GUARD_WAIT_MS", "200")
             .stdin(Stdio::null());
         command
     }

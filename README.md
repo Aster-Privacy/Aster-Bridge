@@ -171,9 +171,12 @@ Add `--json` to any command for machine-readable output. Every command exits wit
 | 2 | The command or its options aren't valid. |
 | 3 | You aren't signed in, or the servers aren't running. |
 | 4 | Your plan doesn't include Aster Bridge, or the plan check failed. |
-| 5 | The session expired or this device was signed out. |
+| 5 | The session expired, this device was signed out, or someone declined the sign-in on another Aster device. |
 | 6 | The keychain or key file isn't available. |
 | 7 | Another Aster Bridge process is using the data folder. |
+| 8 | This device is waiting for activation after a new sign-in. Mail apps can connect after the time that the tool shows. |
+
+While the device waits for activation, `aster-bridge status --json` reports `account_state` as `guard_pending`, and `aster-bridge healthcheck --json` reports `healthy` as `true` and `ready` as `false`. When Aster asks this device to sign in again, `account_state` is `sign_in_again`.
 
 ## Run Aster Bridge in Docker
 

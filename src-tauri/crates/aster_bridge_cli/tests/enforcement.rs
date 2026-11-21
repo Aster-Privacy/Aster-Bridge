@@ -600,3 +600,235 @@ fn logout_keeping_the_cache_still_deletes_old_copies() {
         ]
     );
 }
+
+const HELD_UNTIL: &str = "2030-01-01T10:00:00Z";
+const HELD_UNTIL_RFC3339: &str = "2030-01-01T10:00:00+00:00";
+
+fn hold_new_sign_in(env: &Env) {
+    env.mock.hold_device_until(Some(HELD_UNTIL));
+    env.mock.set_code_status(CodeStatus::ActivationPending);
+}
+
+fn confirm_held_sign_in(env: &Env) {
+    env.mock.set_code_status(CodeStatus::Confirm);
+    env.mock.hold_device_until(None);
+}
+
+#[test]
+fn login_reports_the_activation_wait_and_finishes_after_it() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let run = env.json(&["login"]);
+    run.expect(8);
+    let body = run.json();
+    assert_eq!(body["status"], "activation_pending");
+    assert_eq!(body["activates_at"], HELD_UNTIL_RFC3339);
+    assert!(body["next"].as_str().unwrap().contains("aster-bridge login again"));
+    assert!(!run.stdout.contains("mock-access-token"));
+    assert!(!run.stdout.contains("mock-refresh-token"));
+
+    let status = env.json(&["status"]);
+    status.expect(8);
+    assert_eq!(status.json()["account_state"], "guard_pending");
+    assert_eq!(status.json()["activates_at"], HELD_UNTIL_RFC3339);
+    assert_eq!(status.json()["signed_in"], false);
+
+    let health = env.json(&["healthcheck"]);
+    health.expect(0);
+    assert_eq!(health.json()["healthy"], true);
+    assert_eq!(health.json()["ready"], false);
+
+    let codes = env.mock.code_requests().len();
+    let polls = env.mock.status_calls();
+    env.json(&["login"]).expect(8);
+    assert_eq!(env.mock.code_requests().len(), codes);
+    assert_eq!(env.mock.status_calls(), polls + 1);
+    assert_eq!(env.mock.login_calls(), 0);
+
+    confirm_held_sign_in(&env);
+    let done = env.json(&["login"]);
+    done.expect(0);
+    assert_eq!(done.json()["status"], "signed_in");
+    assert_eq!(env.mock.code_requests().len(), codes);
+    let status = env.json(&["status"]);
+    assert_eq!(status.json()["signed_in"], true);
+    assert_eq!(status.json()["account_state"], "active");
+    assert!(status.json()["activates_at"].is_null());
+}
+
+#[test]
+fn login_names_the_activation_time_in_plain_text() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let run = env.run(&["login"]);
+    run.expect(8);
+    assert!(run.stdout.contains("Waiting for activation"), "{}", run.stdout);
+    assert!(run.stdout.contains("2030-01-01 10:00 UTC"), "{}", run.stdout);
+    assert!(run.stdout.contains("aster-bridge serve"), "{}", run.stdout);
+    assert!(run.stdout.contains("aster-bridge login again"), "{}", run.stdout);
+    let status = env.run(&["status"]);
+    status.expect(8);
+    assert!(status.stdout.contains("Waiting for activation"), "{}", status.stdout);
+}
+
+#[test]
+fn held_sign_in_explains_that_aster_guard_sets_the_wait() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    let reason = "Aster Guard is on for your account, so new sign-ins wait one hour.";
+    let run = env.run(&["login"]);
+    run.expect(8);
+    assert!(run.stdout.contains(reason), "{}", run.stdout);
+    let status = env.run(&["status"]);
+    status.expect(8);
+    assert!(status.stdout.contains(reason), "{}", status.stdout);
+    let json = env.json(&["status"]);
+    assert!(!json.stdout.contains("Aster Guard is on"), "{}", json.stdout);
+}
+
+#[test]
+fn serve_waits_for_activation_and_then_starts() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    let imap = env.config_port("imap_port");
+    let mut serve = env.serve(&[]);
+    let first = serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert_eq!(first["activates_at"], HELD_UNTIL_RFC3339);
+    let polls = env.mock.status_calls();
+    serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert!(env.mock.status_calls() > polls);
+    assert_eq!(env.mock.login_calls(), 0);
+    assert!(serve.is_running());
+    assert!(!port_open(imap));
+
+    confirm_held_sign_in(&env);
+    let ready = serve.wait_event("ready", READY_TIMEOUT);
+    assert_eq!(ready["account"], TEST_EMAIL);
+    assert!(port_open(imap));
+    let status = env.json(&["status"]);
+    status.expect(0);
+    assert_eq!(status.json()["account_state"], "active");
+}
+
+#[test]
+fn logout_forgets_a_held_sign_in() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    env.json(&["logout"]).expect(0);
+    assert!(!env.data.join("guard_pending.json").exists());
+}
+
+#[test]
+fn a_sign_in_without_guard_works_as_before() {
+    let env = Env::new();
+    let run = env.json(&["login"]);
+    run.expect(0);
+    assert_eq!(run.json()["status"], "signed_in");
+    assert!(!env.data.join("guard_pending.json").exists());
+    let status = env.json(&["status"]);
+    status.expect(EXIT_NOT_RUNNING);
+    assert_eq!(status.json()["signed_in"], true);
+    assert_eq!(status.json()["account_state"], "active");
+    assert!(status.json()["activates_at"].is_null());
+}
+
+const EXIT_NOT_RUNNING: i32 = 3;
+
+#[test]
+fn declined_sign_in_stops_waiting_and_stores_nothing() {
+    let env = Env::new();
+    env.mock.set_code_status(CodeStatus::Denied);
+    let run = env.json(&["login"]);
+    run.expect(5);
+    assert_eq!(run.error_code(), "sign_in_declined");
+    assert!(!env.data.join("guard_pending.json").exists());
+    let status = env.json(&["status"]);
+    status.expect(3);
+    assert_eq!(status.json()["signed_in"], false);
+    assert_eq!(env.mock.login_calls(), 0);
+}
+
+#[test]
+fn declined_sign_in_reads_as_plain_text() {
+    let env = Env::new();
+    env.mock.set_code_status(CodeStatus::Denied);
+    let run = env.run(&["login"]);
+    run.expect(5);
+    let text = format!("{}{}", run.stdout, run.stderr);
+    assert!(text.contains("Someone declined this sign-in"), "{}", text);
+}
+
+#[test]
+fn serve_follows_an_earlier_activation_time_from_the_server() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    let mut serve = env.serve(&[]);
+    let first = serve.wait_event("guard_pending", READY_TIMEOUT);
+    assert_eq!(first["activates_at"], HELD_UNTIL_RFC3339);
+    env.mock.hold_device_until(Some("2029-06-01T08:00:00Z"));
+    let mut seen = false;
+    for _ in 0..5 {
+        let event = serve.wait_event("guard_pending", READY_TIMEOUT);
+        if event["activates_at"] == "2029-06-01T08:00:00+00:00" {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen);
+    confirm_held_sign_in(&env);
+    serve.wait_event("ready", READY_TIMEOUT);
+}
+
+#[test]
+fn a_held_sign_in_that_is_declined_forgets_the_device() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    assert!(env.data.join("guard_pending.json").exists());
+    env.mock.set_code_status(CodeStatus::Denied);
+    let run = env.json(&["login"]);
+    run.expect(5);
+    assert_eq!(run.error_code(), "sign_in_declined");
+    assert!(!env.data.join("guard_pending.json").exists());
+    assert_eq!(env.mock.login_calls(), 0);
+    let status = env.json(&["status"]);
+    status.expect(3);
+    assert_eq!(status.json()["signed_in"], false);
+    assert_eq!(status.json()["account_state"], "active");
+
+    let codes = env.mock.code_requests().len();
+    confirm_held_sign_in(&env);
+    env.json(&["login"]).expect(0);
+    assert_eq!(env.mock.code_requests().len(), codes + 1);
+}
+
+#[test]
+fn a_held_sign_in_whose_code_ran_out_reports_it_expired() {
+    for ending in [CodeStatus::Expired, CodeStatus::Gone] {
+        let env = Env::new();
+        hold_new_sign_in(&env);
+        env.json(&["login"]).expect(8);
+        env.mock.set_code_status(ending);
+        let run = env.json(&["login"]);
+        run.expect(5);
+        assert_eq!(run.error_code(), "code_expired");
+        assert!(!env.data.join("guard_pending.json").exists());
+        assert_eq!(env.json(&["status"]).json()["signed_in"], false);
+    }
+}
+
+#[test]
+fn serve_stops_waiting_when_a_held_sign_in_is_declined() {
+    let env = Env::new();
+    hold_new_sign_in(&env);
+    env.json(&["login"]).expect(8);
+    let mut serve = env.serve(&[]);
+    serve.wait_event("guard_pending", READY_TIMEOUT);
+    env.mock.set_code_status(CodeStatus::Denied);
+    serve.expect_exit(5, Some("sign_in_declined"));
+    assert!(!env.data.join("guard_pending.json").exists());
+    assert_eq!(env.mock.login_calls(), 0);
+}

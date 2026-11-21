@@ -27,6 +27,40 @@ pub const TLS_REQUIRED_TEXT: &str =
 pub const BAD_CREDENTIALS_TEXT: &str =
     "Sign-in failed. Use the username and app password shown in Aster Bridge";
 
+pub const PENDING_TEXT: &str = "Your Aster Bridge sign-in is waiting for activation.";
+
+pub fn pending_text(activates_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    match activates_at {
+        Some(at) => format!(
+            "{} Try again after {} UTC.",
+            PENDING_TEXT,
+            at.format("%Y-%m-%d %H:%M")
+        ),
+        None => format!("{} Try again in a few minutes.", PENDING_TEXT),
+    }
+}
+
+pub fn pending_reply() -> Option<String> {
+    pending_activation().map(pending_text)
+}
+
+#[cfg(not(test))]
+fn pending_activation() -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+    (crate::account_state::current() == crate::account_state::AccountState::GuardPending)
+        .then(crate::account_state::activates_at)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PENDING: std::cell::Cell<Option<Option<chrono::DateTime<chrono::Utc>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn pending_activation() -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+    TEST_PENDING.with(|pending| pending.get())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct InsecureSignIn {
     pub protocol: &'static str,
@@ -85,6 +119,19 @@ pub(crate) mod test_support {
     use crate::db::Database;
 
     pub(crate) const APP_PASSWORD: &str = "abcd-efgh-ijkl-mnop";
+
+    pub(crate) fn set_pending(activates_at: Option<Option<chrono::DateTime<chrono::Utc>>>) {
+        super::TEST_PENDING.with(|pending| pending.set(activates_at));
+    }
+
+    pub(crate) fn pending_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-15T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    pub(crate) const PENDING_LINE: &str =
+        "Your Aster Bridge sign-in is waiting for activation. Try again after 2026-11-15 11:00 UTC.";
 
     pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -158,6 +205,29 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_text_names_the_time_in_utc() {
+        assert_eq!(
+            super::pending_text(Some(super::test_support::pending_at())),
+            super::test_support::PENDING_LINE
+        );
+        assert_eq!(
+            super::pending_text(None),
+            "Your Aster Bridge sign-in is waiting for activation. Try again in a few minutes."
+        );
+    }
+
+    #[test]
+    fn no_pending_reply_unless_the_device_is_held() {
+        super::test_support::set_pending(None);
+        assert_eq!(super::pending_reply(), None);
+        super::test_support::set_pending(Some(Some(super::test_support::pending_at())));
+        assert_eq!(
+            super::pending_reply().as_deref(),
+            Some(super::test_support::PENDING_LINE)
+        );
+        super::test_support::set_pending(None);
+    }
     use super::test_support::test_lock;
     use super::*;
 
@@ -210,7 +280,17 @@ mod tests {
 
     #[test]
     fn user_texts_are_single_line_and_plain() {
-        for text in [TLS_REQUIRED_TEXT, BAD_CREDENTIALS_TEXT] {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let texts = [
+            TLS_REQUIRED_TEXT.to_string(),
+            BAD_CREDENTIALS_TEXT.to_string(),
+            pending_text(Some(at)),
+            pending_text(None),
+        ];
+        for text in texts {
+            assert!(text.is_ascii());
             assert!(!text.chars().any(char::is_control));
             assert!(!text.contains('\u{2014}'));
         }

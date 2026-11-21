@@ -34,13 +34,14 @@ use aster_bridge_core::runtime;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use super::guard_text;
 use crate::context::{self, Context};
 use crate::exit::{
     CliError, CliResult, CODE_APP_PASSWORD_REVOKE, CODE_APP_PASSWORD_SAVE, CODE_INTERNAL,
     CODE_NETWORK, CODE_OUTBOX_READ, CODE_PLAN_CHECK, CODE_RECIPIENT_KEY, CODE_RECIPIENT_KEY_LOOKUP,
     CODE_RECIPIENT_KEY_MISMATCH, CODE_SETTINGS_READ,
-    CODE_SIGN_IN,
-    EXIT_ACCESS, EXIT_ERROR, UPGRADE_URL,
+    CODE_CODE_EXPIRED, CODE_SIGN_IN, CODE_SIGN_IN_DECLINED,
+    EXIT_ACCESS, EXIT_DEVICE, EXIT_ERROR, EXIT_PENDING, UPGRADE_URL,
 };
 use crate::lock::InstanceLock;
 use crate::output::title_case;
@@ -78,6 +79,7 @@ pub fn forget_device(data_dir: &Path) {
     let _ = device_identity::clear_device_id(data_dir);
     device_identity::clear_passphrase(data_dir);
     state::clear_pending(data_dir);
+    aster_bridge_core::guard::pending::clear(data_dir);
     save_state(data_dir, |s| {
         s.account = None;
         s.plan = None;
@@ -138,6 +140,8 @@ pub fn account_state_label(account_state: AccountState) -> &'static str {
         AccountState::DeletionScheduled => "Scheduled for deletion",
         AccountState::FamilyPolicy => "Needs two-factor authentication",
         AccountState::UpdateRequired => "Update required",
+        AccountState::GuardPending => guard_text::PENDING_LABEL,
+        AccountState::SignInAgain => guard_text::SIGN_IN_AGAIN_LABEL,
     }
 }
 
@@ -159,11 +163,24 @@ pub fn account_state_error(account_state: AccountState) -> CliError {
             "This version of Aster Bridge can't connect to your account.",
             "To continue, install the latest version of Aster Bridge, then start it again. You stay signed in.".to_string(),
         ),
+        AccountState::GuardPending => (
+            guard_text::PENDING_MESSAGE,
+            guard_text::pending_hint(account_state::activates_at()),
+        ),
+        AccountState::SignInAgain => (
+            guard_text::SIGN_IN_AGAIN_MESSAGE,
+            guard_text::SIGN_IN_AGAIN_HINT.to_string(),
+        ),
         AccountState::Active => {
             return CliError::coded(CODE_SIGN_IN, "Aster Mail refused the sign-in.");
         }
     };
-    CliError::new(EXIT_ACCESS, account_state.as_str(), message).with_hint(hint)
+    let exit_code = if account_state == AccountState::GuardPending {
+        EXIT_PENDING
+    } else {
+        EXIT_ACCESS
+    };
+    CliError::new(exit_code, account_state.as_str(), message).with_hint(hint)
 }
 
 pub fn network_error(detail: &str) -> CliError {
@@ -173,9 +190,18 @@ pub fn network_error(detail: &str) -> CliError {
     ))
 }
 
+pub fn code_expired() -> CliError {
+    CliError::new(EXIT_DEVICE, CODE_CODE_EXPIRED, "The sign-in code expired.")
+        .with_hint("To get a new code, run: aster-bridge login")
+}
+
+pub fn sign_in_declined() -> CliError {
+    CliError::new(EXIT_DEVICE, CODE_SIGN_IN_DECLINED, guard_text::DECLINED_MESSAGE)
+        .with_hint(guard_text::DECLINED_HINT)
+}
+
 pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
-    let text = error.to_string();
-    if let Some(account_state) = account_state::classify(&text) {
+    if let Some(account_state) = account_state::record_error(&error) {
         save_state(data_dir, |s| s.account_state = account_state);
         return account_state_error(account_state);
     }
@@ -183,7 +209,14 @@ pub fn map_login_error(data_dir: &Path, error: BridgeError) -> CliError {
         forget_device(data_dir);
         return CliError::device_revoked();
     }
+    if matches!(error, BridgeError::SignInDenied | BridgeError::SignInExpired) {
+        state::clear_pending(data_dir);
+        account_state::clear_guard_state();
+        save_state(data_dir, |s| s.account_state = AccountState::Active);
+    }
     match error {
+        BridgeError::SignInDenied => sign_in_declined(),
+        BridgeError::SignInExpired => code_expired(),
         BridgeError::PlanUpgradeRequired(_) => access_denied(None),
         BridgeError::Auth(message) if message.contains("first-time setup required") => {
             CliError::not_signed_in()
