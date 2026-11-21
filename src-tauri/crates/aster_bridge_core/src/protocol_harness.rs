@@ -77,11 +77,15 @@ async fn resolve_pq_secret(
         return inbound_keys.iter().find_map(|c| c.pq_decap_key.clone());
     }
     let sk = sync_key?;
-    let resp = client
-        .get_pq_secret(token, u32::try_from(key_id).ok()?)
-        .await
-        .ok()?;
-    crate::crypto::ratchet::decrypt_pq_secret(sk, &resp.encrypted_secret, &resp.secret_nonce).ok()
+    let wire_key_id = u32::try_from(key_id).ok()?;
+    let resp = client.get_pq_secret(token, wire_key_id).await.ok()?;
+    crate::crypto::ratchet::decrypt_pq_secret_for(
+        Some(wire_key_id),
+        sk,
+        &resp.encrypted_secret,
+        &resp.secret_nonce,
+    )
+    .ok()
 }
 const EMAIL: &str = "tester@aster.test";
 

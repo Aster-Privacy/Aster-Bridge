@@ -192,12 +192,18 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
                 continue;
             }
         };
-        let result = (|mut file: std::fs::File| -> std::io::Result<()> {
+        drop(file);
+        aster_bridge_core::system_tools::limit_or_discard(
+            &tmp,
+            aster_bridge_core::system_tools::restrict_to_current_user,
+        )?;
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).truncate(true).open(&tmp)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp, path)
-        })(file);
+        })();
         match result {
             Ok(()) => return Ok(()),
             Err(e) => {

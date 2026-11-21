@@ -1,15 +1,15 @@
 {
   "name": "aster-bridge",
   "private": true,
-  "version": "1.0.17",
+  "version": "1.0.18",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "node --experimental-strip-types --test tests/*.test.ts && vitest run --dir src",
     "tauri": "tauri",
     "tauri:dev": "tauri dev -- --no-default-features",
-    "tauri:build": "tauri build",
-    "test": "vitest run"
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "@aster/ui": "file:../aster-ui",

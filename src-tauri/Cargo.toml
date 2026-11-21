@@ -22,7 +22,7 @@ members = [".", "crates/aster_bridge_core", "crates/aster_bridge_cli"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.17"
+version = "1.0.18"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
@@ -97,6 +97,7 @@ winreg = "0.52"
 
 [patch.crates-io]
 glib = { path = "patches/glib-0.18.5" }
+pgp = { path = "patches/pgp-0.14.2" }
 
 [profile.release]
 panic = "abort"

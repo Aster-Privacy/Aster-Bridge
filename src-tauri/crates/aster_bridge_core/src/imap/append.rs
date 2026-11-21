@@ -854,7 +854,7 @@ async fn upload_attachments(
             let passphrase = passphrase.to_vec();
             let own_key = own_key.map(str::to_string);
             tokio::task::spawn_blocking(move || {
-                crate::crypto::attachment::seal_attachment_for_slot(
+                crate::crypto::attachment::seal_attachment_with_own_key(
                     &attachment,
                     &passphrase,
                     own_key.as_deref(),
@@ -1179,6 +1179,8 @@ async fn import_message(
             if !local_attachments.is_empty() {
                 cache_db
                     .replace_message_attachments(&cache_id, &local_attachments)
+                    .map_err(|e| format!("could not store attachments locally: {}", e))?;
+                crate::sync::poller::trust_local_attachments(&cache_db, &cache_id)
                     .map_err(|e| format!("could not store attachments locally: {}", e))?;
             }
 

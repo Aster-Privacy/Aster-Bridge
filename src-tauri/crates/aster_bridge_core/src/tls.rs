@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
@@ -122,20 +123,26 @@ fn load_existing(
     let cert_bytes = std::fs::read(cert_path).map_err(|e| e.to_string())?;
     let key_bytes = std::fs::read(key_path).map_err(|e| e.to_string())?;
 
-    let mut cert_reader = std::io::BufReader::new(&cert_bytes[..]);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
+    let certs = read_pem_certs(&cert_bytes)?;
     if certs.is_empty() {
         return Err("no certificates parsed from tls.crt".to_string());
     }
 
-    let mut key_reader = std::io::BufReader::new(&key_bytes[..]);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no private key parsed from tls.key".to_string())?;
+    let key = match PrivateKeyDer::from_pem_slice(&key_bytes) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => {
+            return Err("no private key parsed from tls.key".to_string())
+        }
+        Err(e) => return Err(e.to_string()),
+    };
 
     Ok((certs, key))
+}
+
+fn read_pem_certs(bytes: &[u8]) -> TlsResult<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_slice_iter(bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn generate_and_persist(
@@ -230,69 +237,8 @@ fn persist_pair(cert_path: &Path, cert_pem: &[u8], key_path: &Path, key_pem: &[u
     Ok(())
 }
 
-#[cfg(unix)]
 fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    f.write_all(bytes).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
-    use std::io::Write;
-    use std::os::windows::process::CommandExt;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-
-    let p = path.to_string_lossy();
-    let user = whoami::fallible::username().unwrap_or_else(|_| {
-        std::env::var("USERNAME").unwrap_or_else(|_| "SYSTEM".to_string())
-    });
-    let acl_ok = match crate::system_tools::icacls_command()
-        .args([p.as_ref(), "/inheritance:r", "/grant:r", &format!("{}:(F)", user)])
-        .creation_flags(0x0800_0000)
-        .output()
-    {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            tracing::warn!(
-                "icacls failed to restrict TLS key permissions: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!("icacls invocation failed for TLS key: {}", e);
-            false
-        }
-    };
-    if !acl_ok {
-        tracing::warn!("TLS private key {} may be readable under inherited ACLs", p);
-    }
-
-    f.write_all(bytes).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn write_key_restricted(path: &Path, bytes: &[u8]) -> TlsResult<()> {
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    crate::system_tools::write_limited_file(path, bytes, crate::system_tools::restrict_to_current_user)
 }
 
 pub fn server_config(
@@ -397,10 +343,7 @@ fn cert_extended_key_usages(cert_der: &[u8]) -> Option<Vec<String>> {
 pub fn cert_fingerprint_sha256(data_dir: &Path) -> Option<String> {
     let path = cert_pem_path(data_dir);
     let bytes = std::fs::read(&path).ok()?;
-    let mut reader = std::io::BufReader::new(&bytes[..]);
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut reader).collect::<std::io::Result<Vec<_>>>().ok()?;
-    let first = certs.into_iter().next()?;
+    let first = read_pem_certs(&bytes).ok()?.into_iter().next()?;
     Some(fingerprint_hex_colon(first.as_ref()))
 }
 
@@ -482,6 +425,51 @@ mod tests {
         assert_eq!(named[0].as_ref(), kept[0].as_ref());
         let (kept_plain, _) = ensure_cert(dir.path()).unwrap();
         assert_eq!(named[0].as_ref(), kept_plain[0].as_ref());
+    }
+
+    #[test]
+    fn stored_pem_files_load_with_surrounding_text_and_extra_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let der = write_cert_valid_for(dir.path(), 100);
+        let cert_pem = std::fs::read_to_string(cert_pem_path(dir.path())).unwrap();
+        let key_pem = std::fs::read_to_string(key_pem_path(dir.path())).unwrap();
+        let other = rcgen::CertificateParams::new(vec!["other.local".to_string()])
+            .unwrap()
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let cert_file = format!("written by an older build\r\n{}\r\n{}", cert_pem.replace('\n', "\r\n"), other.pem());
+        std::fs::write(cert_pem_path(dir.path()), &cert_file).unwrap();
+        std::fs::write(key_pem_path(dir.path()), format!("{}{}", cert_pem, key_pem)).unwrap();
+
+        let (certs, key) =
+            load_existing(&cert_pem_path(dir.path()), &key_pem_path(dir.path())).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), &der[..]);
+        assert_eq!(certs[1].as_ref(), other.der().as_ref());
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+        assert_eq!(cert_fingerprint_sha256(dir.path()), Some(fingerprint_hex_colon(&der)));
+
+        let (kept, _) = ensure_cert(dir.path()).unwrap();
+        assert_eq!(kept[0].as_ref(), &der[..]);
+    }
+
+    #[test]
+    fn missing_pem_items_report_the_same_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cert_valid_for(dir.path(), 100);
+        let cert_pem = std::fs::read_to_string(cert_pem_path(dir.path())).unwrap();
+        std::fs::write(key_pem_path(dir.path()), &cert_pem).unwrap();
+        assert_eq!(
+            load_existing(&cert_pem_path(dir.path()), &key_pem_path(dir.path())).unwrap_err(),
+            "no private key parsed from tls.key"
+        );
+
+        std::fs::write(cert_pem_path(dir.path()), "no pem here\n").unwrap();
+        assert_eq!(
+            load_existing(&cert_pem_path(dir.path()), &key_pem_path(dir.path())).unwrap_err(),
+            "no certificates parsed from tls.crt"
+        );
+        assert_eq!(cert_fingerprint_sha256(dir.path()), None);
     }
 
     #[test]

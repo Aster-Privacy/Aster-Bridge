@@ -128,9 +128,10 @@ async fn refresh(
     session: &RwLock<Session>,
     state: &mut FreshnessState,
 ) -> Result<FreshnessOutcome> {
-    let (token, passphrase, session_identity, session_previous) = {
+    let (user_id, token, passphrase, session_identity, session_previous) = {
         let s = session.read().await;
         (
+            s.user_id,
             Zeroizing::new(s.access_token.to_string()),
             Zeroizing::new(s.vault_passphrase.clone()),
             s.identity_key.clone().map(Zeroizing::new),
@@ -157,6 +158,22 @@ async fn refresh(
     })
     .await
     .map_err(|e| BridgeError::Crypto(format!("vault decrypt task: {}", e)))??;
+    let admitted = match crate::auth::vault_floor::check_vault(&user_id, &material) {
+        Ok(admitted) => {
+            if !admitted {
+                tracing::warn!("server holds an earlier copy of the vault, keeping the current keys");
+            }
+            admitted
+        }
+        Err(e) => {
+            tracing::warn!("the saved record of this account's keys could not be read, keeping the current keys: {}", e);
+            false
+        }
+    };
+    if !admitted {
+        state.vault_sha = Some(sha);
+        return Ok(FreshnessOutcome::Unchanged);
+    }
 
     let vault_kek = material.data_kek.as_deref().and_then(|k| raw_key(k));
 
@@ -181,6 +198,11 @@ async fn refresh(
         }
     };
 
+    crate::crypto::mail_legacy_retirement::sync_mail_legacy_retirement(
+        material.mail_legacy_retired,
+        &user_id,
+    )
+    .map_err(BridgeError::Crypto)?;
     state.vault_sha = Some(sha);
 
     let mut s = session.write().await;
@@ -190,6 +212,13 @@ async fn refresh(
         wrap_kek,
         &material.ratchet_recovery.storage_keys,
     );
+    let session_kek = s.data_kek.as_deref().and_then(|k| raw_key(k));
+    let material_kek = material.data_kek.as_deref().and_then(|k| raw_key(k));
+    if material_kek.is_none() || session_kek.as_deref() == material_kek.as_deref() {
+        if let Err(e) = crate::auth::vault_floor::record_vault(&user_id, &material) {
+            tracing::warn!("the record of this account's keys was not saved: {}", e);
+        }
+    }
     Ok(if updated {
         FreshnessOutcome::Updated
     } else {
@@ -323,6 +352,7 @@ fn apply_storage_keys(
 
     if changed {
         if let Some(t) = target {
+            crate::crypto::envelope::remember_current_storage_key(&t);
             session.data_kek = Some(Zeroizing::new(STANDARD.encode(*t)));
             crate::crypto::envelope_v2::update_envelope_v2_write_key(
                 session.data_kek.as_deref().map(|k| k.as_str()),
@@ -375,6 +405,7 @@ pub(crate) mod tests {
                 storage_keys: data_kek.into_iter().map(Zeroizing::new).collect(),
                 lane_candidates: Vec::new(),
                 address_keys: Default::default(),
+                prekey_seal: Default::default(),
             },
             external_pgp_key: None,
         }
@@ -515,6 +546,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn vault_is_checked_once_per_interval_unless_marked_stale() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let a = [3u8; 32];
         let server = FakeServer::new(
             seal_vault(&vault_json("", a, &[])),
@@ -537,6 +569,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn rotated_vault_moves_writes_to_the_new_key_and_keeps_the_old_one_readable() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let a = [3u8; 32];
         let b = [4u8; 32];
         let server = FakeServer::new(seal_vault(&vault_json("", b, &[a])), None);
@@ -563,6 +596,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn newest_side_copy_wins_over_a_stale_vault_and_the_vault_is_never_written() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let identity = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
         let armored = identity.to_armored().unwrap();
         let a = [3u8; 32];
@@ -629,6 +663,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_side_copy_the_server_encrypts_to_the_public_key_is_never_adopted() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let identity = aster_crypto::generate_keypair("tester", "tester@aster.test").unwrap();
         let armored = identity.to_armored().unwrap();
         let a = [3u8; 32];
@@ -694,6 +729,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unreachable_server_keeps_the_current_key_and_waits_for_the_interval() {
+        let (_serial, _dir) = crate::auth::vault_floor::tests::isolated_root();
         let a = [3u8; 32];
         let client = ApiClient::new_with_base_url("http://127.0.0.1:9");
         let session = RwLock::new(session_with(Some(a), None));

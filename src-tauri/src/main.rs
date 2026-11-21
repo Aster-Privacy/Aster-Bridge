@@ -137,6 +137,7 @@ struct BridgeStatusResponse {
     import_progress: Option<imap::append::ImportProgress>,
     port_conflict: Option<PortConflict>,
     insecure_sign_in: Option<sign_in_notice::InsecureSignIn>,
+    unverified_recipient_keys: i64,
     update_required: bool,
     activates_at: Option<String>,
     activation_pending: bool,
@@ -255,6 +256,7 @@ async fn get_bridge_status(state: State<'_, AppState>) -> Result<BridgeStatusRes
         import_progress: imap::append::current_import_progress(),
         port_conflict: guard.port_conflict.clone(),
         insecure_sign_in: sign_in_notice::last_insecure(),
+        unverified_recipient_keys: guard.db.recipient_pin_unverified_notice_count().unwrap_or(0),
         update_required: aster_bridge_core::account_state::current()
             == aster_bridge_core::account_state::AccountState::UpdateRequired,
         activates_at: guard_status::held_activation(&guard.config.data_dir, connected),
@@ -486,6 +488,9 @@ async fn reset_bridge_data(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().await;
     guard.stop_runtime_and_wait(runtime::StopReason::UserRequested).await;
     guard.db.clear_all_user_data().map_err(|e| e.to_string())?;
+    if let Err(e) = auth::vault_floor::forget_all(&guard.config.data_dir) {
+        tracing::warn!("the saved record of account keys was not removed: {}", e);
+    }
     tracing::info!("bridge data reset");
     Ok(())
 }
@@ -1537,6 +1542,12 @@ fn dismiss_insecure_sign_in(seq: u64) {
 }
 
 #[tauri::command]
+async fn dismiss_unverified_recipient_keys(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.0.lock().await.db.clone();
+    db.recipient_pin_dismiss_unverified_notice()
+}
+
+#[tauri::command]
 async fn trigger_sync(state: State<'_, AppState>) -> Result<(), String> {
     let trigger = {
         let guard = state.0.lock().await;
@@ -1966,6 +1977,7 @@ fn main() {
             take_pending_deep_link,
             trigger_sync,
             dismiss_insecure_sign_in,
+            dismiss_unverified_recipient_keys,
             repair_cache,
             accept_recipient_key,
             recipient_key_fingerprint,

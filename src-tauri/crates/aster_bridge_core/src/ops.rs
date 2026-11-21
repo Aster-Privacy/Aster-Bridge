@@ -253,6 +253,8 @@ pub async fn poll_device_sign_in(
                     .map_err(BridgeError::Crypto)?,
             );
             check_unsealed_passphrase(&passphrase)?;
+            crate::auth::vault_floor::use_data_dir(data_dir);
+            crate::crypto::mail_legacy_retirement::set_mail_legacy_pin_dir(data_dir);
             let session = match session::login_with_passphrase(
                 identity,
                 device_id,

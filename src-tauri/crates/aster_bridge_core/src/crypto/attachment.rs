@@ -344,7 +344,7 @@ pub fn decrypt_attachment_with_external_key(
     previous_keys: &[String],
     external_key: Option<&ExternalPgpKey>,
 ) -> Result<DecryptedAttachment> {
-    let storage_keys = crate::crypto::envelope::remembered_storage_envelope_keys();
+    let storage_keys = crate::crypto::envelope::mail_storage_envelope_keys();
     decrypt_attachment_with_storage_keys(
         row,
         entry,
@@ -529,28 +529,22 @@ pub fn mime_attachments(parsed: &mail_parser::Message<'_>, max_bytes: usize) -> 
     out
 }
 
-pub fn seal_attachment(attachment: &OutgoingAttachment, passphrase: &[u8]) -> Result<SealedAttachment> {
-    seal_attachment_with_own_key(attachment, passphrase, None)
+pub fn seal_attachment(
+    attachment: &OutgoingAttachment,
+    passphrase: &[u8],
+    slot: usize,
+) -> Result<SealedAttachment> {
+    seal_attachment_with_own_key(attachment, passphrase, None, slot)
 }
 
 pub fn seal_attachment_with_own_key(
     attachment: &OutgoingAttachment,
     passphrase: &[u8],
     own_key: Option<&str>,
-) -> Result<SealedAttachment> {
-    let v2_key = crate::crypto::envelope_v2::envelope_v2_write_key();
-    seal_attachment_with_keys(attachment, passphrase, own_key, v2_key.as_deref())
-}
-
-pub fn seal_attachment_for_slot(
-    attachment: &OutgoingAttachment,
-    passphrase: &[u8],
-    own_key: Option<&str>,
     slot: usize,
 ) -> Result<SealedAttachment> {
     let v2_key = crate::crypto::envelope_v2::envelope_v2_write_key();
-    let bound_slot = crate::crypto::sent_copy::bound_attachment_writes().then_some(slot);
-    seal_attachment_in_form(attachment, passphrase, own_key, v2_key.as_deref(), bound_slot)
+    seal_attachment_in_form(attachment, passphrase, own_key, v2_key.as_deref(), slot)
 }
 
 fn v2_meta_nonce() -> [u8; DATA_NONCE_LEN] {
@@ -559,21 +553,12 @@ fn v2_meta_nonce() -> [u8; DATA_NONCE_LEN] {
     nonce
 }
 
-fn seal_attachment_with_keys(
-    attachment: &OutgoingAttachment,
-    passphrase: &[u8],
-    own_key: Option<&str>,
-    v2_key: Option<&[u8; 32]>,
-) -> Result<SealedAttachment> {
-    seal_attachment_in_form(attachment, passphrase, own_key, v2_key, None)
-}
-
 fn seal_attachment_in_form(
     attachment: &OutgoingAttachment,
     passphrase: &[u8],
     own_key: Option<&str>,
     v2_key: Option<&[u8; 32]>,
-    bound_slot: Option<usize>,
+    slot: usize,
 ) -> Result<SealedAttachment> {
     use rand_core::{OsRng, RngCore};
 
@@ -583,14 +568,9 @@ fn seal_attachment_in_form(
         .map_err(|e| BridgeError::Crypto(format!("attachment cipher init: {}", e)))?;
     let mut data_nonce = [0u8; DATA_NONCE_LEN];
     OsRng.fill_bytes(&mut data_nonce);
-    let aad = match bound_slot {
-        Some(slot) => {
-            let seq = i64::try_from(slot)
-                .map_err(|_| BridgeError::Crypto("attachment slot out of range".to_string()))?;
-            attachment_data_aad(seq)
-        }
-        None => Vec::new(),
-    };
+    let seq = i64::try_from(slot)
+        .map_err(|_| BridgeError::Crypto("attachment slot out of range".to_string()))?;
+    let aad = attachment_data_aad(seq);
     let encrypted_data = cipher
         .encrypt(
             Nonce::from_slice(&data_nonce),
@@ -669,7 +649,7 @@ pub fn seal_send_attachments_with_own_key(
         .iter()
         .enumerate()
         .map(|(slot, a)| {
-            seal_attachment_for_slot(a, passphrase, own_key, slot).map(|s| send_attachment_value(&s))
+            seal_attachment_with_own_key(a, passphrase, own_key, slot).map(|s| send_attachment_value(&s))
         })
         .collect()
 }
@@ -685,21 +665,37 @@ mod tests {
     }
 
     #[test]
-    fn an_attachment_is_written_unbound_unless_a_slot_is_given() {
+    fn a_slot_write_is_bound_without_a_server_switch() {
         let att = outgoing("a.txt", "text/plain", None, b"file body");
-        let sealed = seal_attachment_in_form(&att, b"vault-pass", None, None, None).unwrap();
-        let key = decode_session_key(&sealed_session_key(&sealed)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, b"vault-pass", None, 3).unwrap();
+        let key_b64 = sealed_session_key(&sealed);
+        let key = decode_session_key(&key_b64).unwrap();
         let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
-        let plain = cipher
+        assert!(cipher
             .decrypt(Nonce::from_slice(&sealed.data_nonce), sealed.encrypted_data.as_ref())
-            .unwrap();
-        assert_eq!(plain, b"file body");
+            .is_err());
+        assert_eq!(
+            decrypt_data(3, &sealed.encrypted_data, &sealed.data_nonce, &key_b64).ok(),
+            Some(b"file body".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_single_seal_is_bound_to_the_slot_it_is_given() {
+        let att = outgoing("a.txt", "text/plain", None, b"file body");
+        let sealed = seal_attachment(&att, b"vault-pass", 4).unwrap();
+        let key_b64 = sealed_session_key(&sealed);
+        assert_eq!(
+            decrypt_data(4, &sealed.encrypted_data, &sealed.data_nonce, &key_b64).ok(),
+            Some(b"file body".to_vec())
+        );
+        assert!(decrypt_data(0, &sealed.encrypted_data, &sealed.data_nonce, &key_b64).is_err());
     }
 
     #[test]
     fn a_bound_attachment_opens_only_at_its_own_slot() {
         let att = outgoing("a.txt", "text/plain", None, b"file body");
-        let sealed = seal_attachment_in_form(&att, b"vault-pass", None, None, Some(2)).unwrap();
+        let sealed = seal_attachment_in_form(&att, b"vault-pass", None, None, 2).unwrap();
         let key_b64 = sealed_session_key(&sealed);
         let key = decode_session_key(&key_b64).unwrap();
         let cipher = Aes256Gcm::new_from_slice(key.as_slice()).unwrap();
@@ -718,8 +714,8 @@ mod tests {
         let first = outgoing("a.txt", "text/plain", None, b"first");
         let second = outgoing("b.txt", "text/plain", None, b"second body");
         let list = vec![
-            send_attachment_value(&seal_attachment_in_form(&first, b"p", None, None, Some(0)).unwrap()),
-            send_attachment_value(&seal_attachment_in_form(&second, b"p", None, None, Some(1)).unwrap()),
+            send_attachment_value(&seal_attachment_in_form(&first, b"p", None, None, 0).unwrap()),
+            send_attachment_value(&seal_attachment_in_form(&second, b"p", None, None, 1).unwrap()),
         ];
         let manifest = send_attachment_manifest(&serde_json::json!({ "attachments": list }));
         assert_eq!(manifest.len(), 2);
@@ -748,14 +744,17 @@ mod tests {
         assert_eq!(nonce.len(), 12);
         let ct = STANDARD.decode(value["encrypted_data"].as_str().unwrap()).unwrap();
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let plain = cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).unwrap();
+        let aad = attachment_data_aad(0);
+        let plain = cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct.as_ref(), aad: &aad })
+            .unwrap();
         (plain, meta)
     }
 
     #[test]
     fn sealed_send_attachment_is_readable_by_the_server_delivery_path() {
         let att = outgoing("report.pdf", "application/pdf", None, b"hello pdf");
-        let value = send_attachment_value(&seal_attachment(&att, b"pass").unwrap());
+        let value = send_attachment_value(&seal_attachment(&att, b"pass", 0).unwrap());
         let (plain, meta) = server_decrypt(&value);
         assert_eq!(plain, b"hello pdf");
         assert_eq!(meta["filename"], "report.pdf");
@@ -771,7 +770,7 @@ mod tests {
     #[test]
     fn sealed_send_attachment_sender_copy_opens_with_the_passphrase() {
         let att = outgoing("logo.png", "image/png", Some("logo@aster"), b"\x89PNG");
-        let sealed = seal_attachment(&att, b"vault-pass").unwrap();
+        let sealed = seal_attachment(&att, b"vault-pass", 0).unwrap();
         let (plain, meta) = server_decrypt(&send_attachment_value(&sealed));
         assert_eq!(plain, b"\x89PNG");
         assert_eq!(meta["content_id"], "logo@aster");
@@ -796,9 +795,9 @@ mod tests {
     #[test]
     fn sealed_send_attachment_received_copy_opens_from_plain_meta() {
         let att = outgoing("notes.txt", "text/plain", None, b"plain notes");
-        let sealed = seal_attachment(&att, b"vault-pass").unwrap();
+        let sealed = seal_attachment(&att, b"vault-pass", 0).unwrap();
         let received_row = row(
-            3,
+            0,
             &sealed.encrypted_data,
             &sealed.data_nonce,
             sealed.plain_meta.as_bytes(),
@@ -812,8 +811,8 @@ mod tests {
     #[test]
     fn every_seal_uses_a_fresh_key_and_nonce() {
         let att = outgoing("a.bin", "application/octet-stream", None, b"same bytes");
-        let one = seal_attachment(&att, b"p").unwrap();
-        let two = seal_attachment(&att, b"p").unwrap();
+        let one = seal_attachment(&att, b"p", 0).unwrap();
+        let two = seal_attachment(&att, b"p", 0).unwrap();
         assert_ne!(one.encrypted_data, two.encrypted_data);
         assert_ne!(one.data_nonce, two.data_nonce);
         assert_ne!(one.sender_meta_nonce, two.sender_meta_nonce);
@@ -1477,7 +1476,7 @@ mod tests {
     fn own_key_seal_writes_armored_meta_with_a_zero_nonce() {
         let key = own_key();
         let att = outgoing("report.pdf", "application/pdf", None, b"pdf bytes");
-        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key), 0).unwrap();
         let armored = String::from_utf8(STANDARD.decode(&sealed.sender_meta).unwrap()).unwrap();
         assert!(armored.starts_with("-----BEGIN PGP MESSAGE-----"));
         assert!(!armored.contains("report.pdf"));
@@ -1496,7 +1495,7 @@ mod tests {
     fn own_key_sealed_meta_opens_through_the_reader() {
         let key = own_key();
         let att = outgoing("logo.png", "image/png", Some("logo@aster"), b"logo bytes");
-        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key), 0).unwrap();
         let opened =
             decrypt_attachment(&sender_row(&sealed), None, OWN_PASS.as_bytes(), Some(&key), &[])
                 .unwrap();
@@ -1511,7 +1510,7 @@ mod tests {
         let key = own_key();
         let current = own_key();
         let att = outgoing("a.txt", "text/plain", None, b"moved key");
-        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key), 0).unwrap();
         let opened = decrypt_attachment(
             &sender_row(&sealed),
             None,
@@ -1529,7 +1528,7 @@ mod tests {
         let key = own_key();
         let other = own_key();
         let att = outgoing("secret.txt", "text/plain", None, b"secret");
-        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, OWN_PASS.as_bytes(), Some(&key), 0).unwrap();
         let opened =
             decrypt_attachment(&sender_row(&sealed), None, OWN_PASS.as_bytes(), Some(&other), &[]);
         assert!(opened.map(|a| a.data != b"secret").unwrap_or(true));
@@ -1539,7 +1538,7 @@ mod tests {
     fn own_key_seal_falls_back_to_the_passphrase_envelope() {
         let att = outgoing("b.txt", "text/plain", None, b"fallback");
         for key in [Some(r#"{"kty":"EC"}"#), None] {
-            let sealed = seal_attachment_with_own_key(&att, b"vault-pass", key).unwrap();
+            let sealed = seal_attachment_with_own_key(&att, b"vault-pass", key, 0).unwrap();
             let raw = STANDARD.decode(&sealed.sender_meta).unwrap();
             assert!(!String::from_utf8_lossy(&raw).contains("BEGIN PGP"));
             assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
@@ -1554,7 +1553,7 @@ mod tests {
     fn own_key_seal_falls_back_for_a_wrong_passphrase() {
         let key = own_key();
         let att = outgoing("c.txt", "text/plain", None, b"wrong pass");
-        let sealed = seal_attachment_with_own_key(&att, b"not the key pass", Some(&key)).unwrap();
+        let sealed = seal_attachment_with_own_key(&att, b"not the key pass", Some(&key), 0).unwrap();
         assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
         let opened =
             decrypt_attachment(&sender_row(&sealed), None, b"not the key pass", None, &[]).unwrap();
@@ -1566,7 +1565,7 @@ mod tests {
         let att = outgoing("v2.txt", "text/plain", Some("v2@aster"), b"v2 bytes");
         for key in [None, Some(r#"{"kty":"EC"}"#)] {
             let sealed =
-                seal_attachment_with_keys(&att, b"vault-pass", key, Some(&VECTOR_DATA_KEK)).unwrap();
+                seal_attachment_in_form(&att, b"vault-pass", key, Some(&VECTOR_DATA_KEK), 0).unwrap();
             assert_eq!(sealed.sender_meta_nonce, V2_META_NONCE);
             let value = send_attachment_value(&sealed);
             assert_eq!(value["sender_meta_nonce"], "AgAAAAAAAAAAAAAA");
@@ -1596,11 +1595,12 @@ mod tests {
     fn admitted_session_keeps_the_identity_key_seal_first() {
         let key = own_key();
         let att = outgoing("pgp.txt", "text/plain", None, b"pgp first");
-        let sealed = seal_attachment_with_keys(
+        let sealed = seal_attachment_in_form(
             &att,
             OWN_PASS.as_bytes(),
             Some(&key),
             Some(&VECTOR_DATA_KEK),
+            0,
         )
         .unwrap();
         assert_eq!(sealed.sender_meta_nonce, [0u8; DATA_NONCE_LEN]);
@@ -1612,7 +1612,7 @@ mod tests {
     fn unadmitted_session_keeps_the_passphrase_envelope() {
         let att = outgoing("old.txt", "text/plain", None, b"old bytes");
         for key in [None, Some(r#"{"kty":"EC"}"#)] {
-            let sealed = seal_attachment_with_keys(&att, b"vault-pass", key, None).unwrap();
+            let sealed = seal_attachment_in_form(&att, b"vault-pass", key, None, 0).unwrap();
             assert_ne!(sealed.sender_meta_nonce, V2_META_NONCE);
             assert!(sealed.sender_meta_nonce.iter().any(|b| *b != 0));
             let plain = decrypt_pbkdf2_envelope(&sealed.sender_meta, b"vault-pass").unwrap();

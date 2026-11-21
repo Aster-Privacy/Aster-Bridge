@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.18 - 2026-11-19
+
+### What's new
+- Contacts keep their relations and custom social profile labels when they sync to your contacts app.
+- The Docker image reads secrets from mounted files, reports its health, and accepts PUID and PGID settings.
+- Your first run of Aster Bridge in Docker shows the sign-in steps in the container logs.
+
+### Fixed
+- Attachments in encrypted multipart messages now appear in your mail app.
+- Sent mail that you archive stays in your Sent folder.
+- Account keys, drafts, and prekeys stay consistent across your devices.
+- Messages that can't sync on the first attempt sync on the next pass instead of being skipped.
+- Attachment notes, message previews, and line endings display correctly.
+
 ## 1.0.17 - 2026-11-12
 
 ### What's new

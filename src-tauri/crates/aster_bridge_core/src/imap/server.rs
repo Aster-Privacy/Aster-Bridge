@@ -129,6 +129,7 @@ fn gmail_labels_for_message(msg: &CachedMessage) -> Vec<String> {
 const MAX_LINE_LENGTH: usize = 8192;
 const IDLE_LINE_LIMIT: u64 = 256;
 const MAX_FAILED_AUTH: u32 = 5;
+const INVALID_SEQUENCE_SET: &str = "Invalid sequence set";
 const MAX_SEARCH_LITERALS: usize = 16;
 const SEARCH_LITERAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -237,8 +238,12 @@ fn sequence_set_contains(set: &str, n: u32, largest: u32) -> bool {
 }
 
 fn is_sequence_set(token: &str) -> bool {
+    has_sequence_set_syntax(token, 1)
+}
+
+fn has_sequence_set_syntax(token: &str, lowest: u32) -> bool {
     let is_number = |v: &str| {
-        v == "*" || (v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u32>().is_ok_and(|n| n > 0))
+        v == "*" || (v.bytes().all(|b| b.is_ascii_digit()) && v.parse::<u32>().is_ok_and(|n| n >= lowest))
     };
     !token.is_empty()
         && token.split(',').all(|part| match part.split_once(':') {
@@ -931,6 +936,20 @@ async fn store_append_keywords(
 
 const MAX_APPEND_BYTES: usize = 40 * 1024 * 1024;
 const MAX_DRAINABLE_APPEND_BYTES: usize = 256 * 1024 * 1024;
+const APPEND_INITIAL_CAPACITY: usize = 64 * 1024;
+
+async fn read_append_literal<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    literal_len: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(literal_len.min(APPEND_INITIAL_CAPACITY));
+    let read = reader.take(literal_len as u64).read_to_end(&mut buf).await?;
+    if read < literal_len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(buf)
+}
 
 fn mailbox_directory(db: &Database) -> crate::folders::Directory {
     crate::folders::Directory::build(&db.list_custom_folders().unwrap_or_default())
@@ -1723,13 +1742,17 @@ where
                         }
                         let set_end = subargs.find(' ').unwrap_or(subargs.len());
                         let uid_set_spec = &subargs[..set_end];
+                        if !has_sequence_set_syntax(uid_set_spec, 0) {
+                            write_bad(&mut writer, &tag, INVALID_SEQUENCE_SET).await?;
+                            continue;
+                        }
                         let op_and_flags = subargs[set_end..].trim();
                         let folder = conn.selected_folder.as_deref().unwrap_or("inbox").to_string();
                         let messages = synced_meta
                             .take()
                             .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
-                        let uids = parse_set(uid_set_spec, view.max_uid);
+                        let uids = parse_uid_set(uid_set_spec, &conn.uids);
                         // Routed like STORE: an X-GM-LABELS item fell through
                         // to the flag code, which cleared every flag of the
                         // message and pushed "unread" to the server.
@@ -1910,6 +1933,10 @@ where
                 let store_args = parts.get(2).copied().unwrap_or("");
                 let set_end = store_args.find(' ').unwrap_or(store_args.len());
                 let set_part = &store_args[..set_end];
+                if !has_sequence_set_syntax(set_part, 0) {
+                    write_bad(&mut writer, &tag, INVALID_SEQUENCE_SET).await?;
+                    continue;
+                }
                 let op_and_flags = store_args[set_end..].trim();
                 let upper_store = op_and_flags.to_ascii_uppercase();
                 let is_gm_labels = upper_store.contains("X-GM-LABELS");
@@ -2248,12 +2275,14 @@ where
                             writer.write_all(b"+ Ready for literal data\r\n").await?;
                             writer.flush().await?;
                         }
-                        let mut buf = vec![0u8; cmd.literal_len];
-                        if let Err(e) = reader.read_exact(&mut buf).await {
-                            tracing::warn!("APPEND read failed: {}", e);
-                            write_bad(&mut writer, &tag, "APPEND read failed").await?;
-                            continue;
-                        }
+                        let mut buf = match read_append_literal(&mut reader, cmd.literal_len).await {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                tracing::warn!("APPEND read failed: {}", e);
+                                write_bad(&mut writer, &tag, "APPEND read failed").await?;
+                                continue;
+                            }
+                        };
                         let mut trailer = [0u8; 2];
                         let _ = reader.read_exact(&mut trailer).await;
                         match target_folder.as_deref() {
@@ -4267,42 +4296,76 @@ fn parse_set(spec: &str, max: u32) -> Vec<u32> {
     if max == 0 {
         return Vec::new();
     }
+    let bound = |v: &str| if v == "*" { Some(max) } else { v.parse::<u32>().ok() };
+    let mut covered: Vec<(u32, u32)> = Vec::new();
     let mut out = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((a, b)) = part.split_once(':') {
-            let lo: u32 = if a == "*" {
-                max
-            } else if let Ok(v) = a.parse() {
-                v
-            } else {
-                continue;
-            };
-            let hi: u32 = if b == "*" {
-                max
-            } else if let Ok(v) = b.parse() {
-                v
-            } else {
-                continue;
-            };
-            let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-            for i in lo..=hi.min(max) {
-                if i >= 1 {
-                    out.push(i);
-                }
+        let (lo, hi) = match part.split_once(':') {
+            Some((a, b)) => {
+                let (Some(a), Some(b)) = (bound(a), bound(b)) else { continue };
+                (a.min(b), a.max(b))
             }
-        } else if part == "*" {
-            out.push(max);
-        } else if let Ok(n) = part.parse::<u32>() {
-            if n >= 1 && n <= max {
-                out.push(n);
+            None => {
+                let Some(n) = bound(part) else { continue };
+                (n, n)
             }
+        };
+        let (lo, hi) = (lo.max(1), hi.min(max));
+        if lo <= hi {
+            take_uncovered(&mut covered, &mut out, lo, hi);
         }
     }
     out
+}
+
+fn parse_uid_set(spec: &str, uids: &[u32]) -> Vec<u32> {
+    let mut known: Vec<u32> = uids.to_vec();
+    known.sort_unstable();
+    known.dedup();
+    let Some(&max) = known.last() else { return Vec::new() };
+    let bound = |v: &str| if v == "*" { Some(max) } else { v.parse::<u32>().ok() };
+    let mut covered: Vec<(u32, u32)> = Vec::new();
+    let mut positions = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        let (lo, hi) = match part.split_once(':') {
+            Some((a, b)) => {
+                let (Some(a), Some(b)) = (bound(a), bound(b)) else { continue };
+                (a.min(b), a.max(b))
+            }
+            None => {
+                let Some(n) = bound(part) else { continue };
+                (n, n)
+            }
+        };
+        let first = known.partition_point(|&uid| uid < lo);
+        let end = known.partition_point(|&uid| uid <= hi);
+        if first < end {
+            take_uncovered(&mut covered, &mut positions, first as u32 + 1, end as u32);
+        }
+    }
+    positions.into_iter().map(|position| known[position as usize - 1]).collect()
+}
+
+fn take_uncovered(covered: &mut Vec<(u32, u32)>, out: &mut Vec<u32>, lo: u32, hi: u32) {
+    let start = covered.partition_point(|&(_, c_hi)| c_hi < lo);
+    let mut end = start;
+    let mut next = u64::from(lo);
+    let (mut merged_lo, mut merged_hi) = (lo, hi);
+    while let Some(&(c_lo, c_hi)) = covered.get(end).filter(|(c_lo, _)| *c_lo <= hi) {
+        if u64::from(c_lo) > next {
+            out.extend(next as u32..c_lo);
+        }
+        next = next.max(u64::from(c_hi) + 1);
+        merged_lo = merged_lo.min(c_lo);
+        merged_hi = merged_hi.max(c_hi);
+        end += 1;
+    }
+    if next <= u64::from(hi) {
+        out.extend(next as u32..=hi);
+    }
+    covered.splice(start..end, [(merged_lo, merged_hi)]);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4417,10 +4480,10 @@ async fn handle_fetch(
     let folder = conn.selected_folder.as_deref().unwrap_or("inbox");
     let mut fetch_seen_pushes: Vec<String> = Vec::new();
 
-    let (range_spec, fetch_parts) = args
-        .split_once(' ')
-        .map(|(r, rest)| (r, rest))
-        .unwrap_or((args, "(FLAGS)"));
+    let (range_spec, fetch_parts) = args.split_once(' ').unwrap_or((args, "(FLAGS)"));
+    if !has_sequence_set_syntax(range_spec, 0) {
+        return write_bad(writer, tag, INVALID_SEQUENCE_SET).await;
+    }
 
     let upper_parts = fetch_parts.to_ascii_uppercase();
     let is_all  = contains_word(&upper_parts, "ALL");
@@ -4464,15 +4527,13 @@ async fn handle_fetch(
         || wants_bodystructure
         || header_fields.is_some();
     let needs_body = needs_content || needs_layout;
-    let range_cap = if uid_command {
-        conn.uids.iter().copied().max().unwrap_or(0)
+    let selected: Vec<u32> = if uid_command {
+        parse_uid_set(range_spec, &conn.uids)
     } else {
-        conn.uids.len() as u32
+        parse_set(range_spec, conn.uids.len() as u32)
     };
-    let selected = parse_set(range_spec, range_cap);
     let wanted: Vec<u32> = if uid_command {
-        let known: std::collections::HashSet<u32> = conn.uids.iter().copied().collect();
-        selected.iter().copied().filter(|uid| known.contains(uid)).collect()
+        selected.clone()
     } else {
         selected
             .iter()
@@ -4811,6 +4872,38 @@ mod tests {
     #[test]
     fn quoted_strings_drop_line_breaks() {
         assert_eq!(quote_imap_string("a\"b\\c\r\n* BYE"), "\"a\\\"b\\\\c  * BYE\"");
+    }
+
+    struct OfferProbe {
+        max_offered: usize,
+        sent: bool,
+    }
+
+    impl tokio::io::AsyncRead for OfferProbe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.max_offered = self.max_offered.max(buf.remaining());
+            if !self.sent {
+                self.sent = true;
+                let n = buf.remaining().min(5);
+                buf.put_slice(&b"hello"[..n]);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_announced_append_size_is_not_reserved_up_front() {
+        let mut probe = OfferProbe { max_offered: 0, sent: false };
+        assert!(read_append_literal(&mut probe, MAX_APPEND_BYTES).await.is_err());
+        assert!(
+            probe.max_offered <= 1 << 20,
+            "offered {} bytes before any data arrived",
+            probe.max_offered
+        );
     }
 
     #[tokio::test]
@@ -7595,6 +7688,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uid_commands_with_wide_sparse_sets_stay_bounded() {
+        let (addr, db, _tx, _calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed_copy_source(&db, "wide-a", "first", &[]);
+        seed_copy_source(&db, "wide-b", "second", &[]);
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let wide = format!("{}4294967295", "1:4294967295,4000000000:*,".repeat(200));
+        let timed = |label: &str, started: std::time::Instant| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{label} took {:?} for a wide UID set",
+                started.elapsed()
+            );
+        };
+
+        let started = std::time::Instant::now();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "w1", &format!("UID SEARCH UID {}", wide)).await;
+        timed("UID SEARCH", started);
+        assert!(resp.contains("* SEARCH 1 2"), "{}", resp);
+        assert!(resp.contains("w1 OK"), "{}", resp);
+
+        let started = std::time::Instant::now();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "w2", &format!("UID COPY {} Archive", wide)).await;
+        timed("UID COPY", started);
+        assert!(resp.contains("w2 OK [COPYUID "), "{}", resp);
+        assert_eq!(copyuid(&resp).0, vec![1, 2]);
+
+        let started = std::time::Instant::now();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "w3", &format!("UID MOVE {} Archive", wide)).await;
+        timed("UID MOVE", started);
+        assert!(resp.contains("w3 OK"), "{}", resp);
+        assert_eq!(resp.matches(" EXPUNGE").count(), 2, "{}", resp);
+        assert!(db.list_cached_messages("inbox").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn uid_expunge_with_a_wide_sparse_set_stays_bounded() {
+        let (addr, db, _tx, _calls, _dir) = start_test_server_with_backend(false).await;
+        seed(&db, "wide-x1", "inbox", "one");
+        seed(&db, "wide-x2", "inbox", "two");
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        imap_cmd_lines(&mut reader, &mut writer, "x1", "STORE 1:2 +FLAGS (\\Deleted)").await;
+        let wide = format!("{}4294967295", "1:4294967295,4000000000:*,".repeat(200));
+
+        let started = std::time::Instant::now();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "x2", &format!("UID EXPUNGE {}", wide)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "UID EXPUNGE took {:?} for a wide UID set",
+            started.elapsed()
+        );
+        assert!(resp.contains("x2 OK"), "{}", resp);
+        assert!(db.get_cached_message("wide-x1").unwrap().is_none());
+        assert!(db.get_cached_message("wide-x2").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn move_still_moves_the_message_and_expunges_it() {
         let (addr, db, _tx, calls, _dir) =
             start_test_server_with_backend_opts(false, Some("test-ik")).await;
@@ -7632,6 +7782,45 @@ mod tests {
         assert!(!resp.contains("COPYUID"), "a COPYUID with an unassigned UID: {}", resp);
         assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
         assert!(resp.contains("m1 OK"), "{}", resp);
+    }
+
+    #[tokio::test]
+    async fn append_literal_reads_exactly_the_announced_bytes() {
+        let mut src: &[u8] = b"hello\r\nrest";
+        let buf = read_append_literal(&mut src, 5).await.unwrap();
+        assert_eq!(buf, b"hello");
+        assert_eq!(src, b"\r\nrest");
+    }
+
+    #[tokio::test]
+    async fn append_literal_grows_with_the_data_not_the_announcement() {
+        struct OfferedSpace<'a> {
+            data: &'a [u8],
+            largest: usize,
+        }
+        impl tokio::io::AsyncRead for OfferedSpace<'_> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let data = self.data;
+                self.largest = self.largest.max(buf.remaining());
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                self.data = &data[n..];
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut src = OfferedSpace { data: b"short", largest: 0 };
+        let err = read_append_literal(&mut src, MAX_APPEND_BYTES).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(src.largest > 0);
+        assert!(src.largest <= APPEND_INITIAL_CAPACITY, "offered {} bytes up front", src.largest);
+        let data = vec![b'x'; APPEND_INITIAL_CAPACITY * 3];
+        let mut src: &[u8] = &data;
+        let buf = read_append_literal(&mut src, data.len()).await.unwrap();
+        assert_eq!(buf.len(), data.len());
     }
 
     #[tokio::test]
@@ -8151,6 +8340,81 @@ mod tests {
         let mut unsupported = None;
         assert!(search_matches_noting(m, position, &[], "1:5 UNDELETED", &mut unsupported).unwrap());
         assert_eq!(unsupported, None);
+    }
+
+    #[test]
+    fn parse_uid_set_is_bounded_by_the_message_count() {
+        let uids = [1u32, 5, 4_000_000_000];
+        let started = std::time::Instant::now();
+        let wanted = parse_uid_set("1:*", &uids);
+        assert_eq!(wanted, vec![1, 5, 4_000_000_000]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(parse_uid_set("4000000000:6,1,1:*", &uids), vec![4_000_000_000, 1, 5]);
+        assert_eq!(parse_uid_set(&"1:*,".repeat(1000), &uids), vec![1, 5, 4_000_000_000]);
+        assert_eq!(parse_uid_set("2:4,9:10", &uids), Vec::<u32>::new());
+        assert!(parse_uid_set("1:*", &[]).is_empty());
+    }
+
+    #[test]
+    fn parse_set_lists_each_message_once_in_request_order() {
+        assert_eq!(parse_set(&"1:*,".repeat(100), 10), (1..=10).collect::<Vec<u32>>());
+        assert_eq!(parse_set("1,1,1,1", 5), vec![1]);
+        assert_eq!(parse_set("194,97:100,98,99:101", 200), vec![194, 97, 98, 99, 100, 101]);
+        assert_eq!(parse_set("3:5,*:1,4", 6), vec![3, 4, 5, 1, 2, 6]);
+        assert_eq!(parse_set("7:*,2,*", 4), vec![4, 2]);
+        assert_eq!(parse_set("0,9,2:3,0:1", 5), vec![2, 3, 1]);
+        assert_eq!(parse_set("4294967295,4294967294:*", u32::MAX), vec![u32::MAX, u32::MAX - 1]);
+        assert!(parse_set("1:*", 0).is_empty());
+    }
+
+    #[test]
+    fn fetch_and_store_sets_accept_zero_but_not_other_junk() {
+        for set in ["1", "*", "1:*", "0:*", "5,1:3,*:9"] {
+            assert!(has_sequence_set_syntax(set, 0), "{}", set);
+        }
+        for set in ["", "1,", ",1", "1:", "x", "1:x", "1;2", "4294967296", "1::2"] {
+            assert!(!has_sequence_set_syntax(set, 0), "{}", set);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_answers_each_message_once_for_repeated_ranges() {
+        let (addr, db, _tx, _dir) = start_test_server().await;
+        for n in 1..=3 {
+            seed(&db, &format!("dup-{}", n), "inbox", "s");
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "FETCH 1:*,1:*,2 (FLAGS)").await;
+        assert_eq!(resp.matches(" FETCH (").count(), 3, "{}", resp);
+        assert!(resp.ends_with("f1 OK FETCH completed"), "{}", resp);
+
+        let repeated = vec!["1:*"; 50].join(",");
+        let resp =
+            imap_cmd_lines(&mut reader, &mut writer, "f2", &format!("UID FETCH {} (FLAGS)", repeated)).await;
+        assert_eq!(resp.matches(" FETCH (").count(), 3, "{}", resp);
+
+        for cmd in ["FETCH 1:x (FLAGS)", "UID FETCH 1,,2 (FLAGS)", "STORE 1: +FLAGS (\\Seen)", "UID STORE abc +FLAGS (\\Seen)"] {
+            let resp = imap_cmd_lines(&mut reader, &mut writer, "b1", cmd).await;
+            assert_eq!(resp, "b1 BAD Invalid sequence set", "{}", cmd);
+        }
+    }
+
+    #[tokio::test]
+    async fn store_sends_each_message_once_for_repeated_numbers() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_with_backend_opts(false, Some("test-ik")).await;
+        seed(&db, "rep-1", "inbox", "first");
+        seed(&db, "rep-2", "inbox", "second");
+        db.replace_custom_tags(&[work_label()]).unwrap();
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "s1", "STORE 1,1,1,1 +FLAGS (\\Seen Work)").await;
+        assert_eq!(resp.matches("* 1 FETCH").count(), 1, "{}", resp);
+        assert!(resp.ends_with("s1 OK STORE completed"), "{}", resp);
+        let log = calls.lock().await.clone();
+        let adds: Vec<&str> = log.iter().filter(|(m, _)| m == "ADD_TAG").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(adds, vec!["tok-work|1"], "{:?}", log);
     }
 
     #[test]

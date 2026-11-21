@@ -26,7 +26,7 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
-import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict } from "@/api";
+import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
 import {
   apply_preferences,
   normalize_preferences,
@@ -52,6 +52,7 @@ import { writeText as clipboard_write_text, readText as clipboard_read_text } fr
 import { notify_native, should_notify_activation } from "@/notify";
 import { GuardPendingPanel } from "./guard_pending_panel";
 import { listen_tauri } from "@/lib/tauri_events";
+import { parse_provision_link, request_provision_bundle } from "@/lib/provision_flow";
 import { DEFAULT_PROFILE_COLOR, HEX_COLOR, profile_gradient_background } from "@/lib/profile_palette";
 import {
   Button,
@@ -209,7 +210,8 @@ function SandboxBanner() {
   );
 }
 
-const HIDDEN_LABEL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const PROVISION_ARM_DELAY_MS = 1_000;
+const PROVISION_RESULT_TTL_MS = 120_000;
 
 // Write to the clipboard via the native pasteboard (Tauri plugin), falling back
 // to the web clipboard API. The plugin path does not depend on webview
@@ -556,11 +558,16 @@ function CopyIcon() {
   );
 }
 
-function CopyValue({ value, mono = true }: { value: string; mono?: boolean }) {
+async function copy_secret(value: string): Promise<void> {
+  await copy_text(value);
+  clear_clipboard_if_unchanged(value);
+}
+
+function CopyValue({ value, mono = true, secret = false }: { value: string; mono?: boolean; secret?: boolean }) {
   const { t } = useTranslation();
   const on_copy = async () => {
     try {
-      await copy_text(value);
+      await (secret ? copy_secret(value) : copy_text(value));
       show_toast(t("copied_to_clipboard"), "success");
     } catch {
       show_toast(t("failed_to_copy"), "error");
@@ -666,13 +673,28 @@ function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: 
   );
 }
 
-function InfoRow({ label, value, copy = true, mono = true }: { label: string; value: string; copy?: boolean; mono?: boolean }) {
+function InfoRow({ label, value, copy = true, mono = true, secret = false }: { label: string; value: string; copy?: boolean; mono?: boolean; secret?: boolean }) {
   return (
     <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
       <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
       {copy
-        ? <CopyValue value={value} mono={mono} />
+        ? <CopyValue value={value} mono={mono} secret={secret} />
         : <span className={`text-[13px] text-right text-txt-primary truncate ${mono ? "font-mono" : ""}`} title={value}>{value}</span>}
+    </div>
+  );
+}
+
+function ProvisionSettingsRows({ settings }: { settings: ProvisionBundle }) {
+  const { t } = useTranslation();
+  return (
+    <div className="mt-3">
+      <InfoRow label={t("field_username")} value={settings.email} />
+      <InfoRow label={t("field_password")} value={settings.app_password} secret />
+      <InfoRow label={t("field_hostname")} value={settings.imap_host} />
+      <InfoRow label={t("imap_port")} value={String(settings.imap_port)} />
+      <InfoRow label={t("smtp_port")} value={String(settings.smtp_port)} />
+      {settings.jmap_enabled && <InfoRow label={t("field_session_url")} value={settings.jmap_url} />}
+      {settings.carddav_enabled && <InfoRow label={t("field_carddav_url")} value={settings.carddav_url} />}
     </div>
   );
 }
@@ -1309,6 +1331,31 @@ function InsecureSignInNotice({
   );
 }
 
+function UnverifiedKeysNotice({
+  count,
+  on_dismiss,
+}: {
+  count: number;
+  on_dismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div
+      role="status"
+      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+    >
+      <InformationCircleIcon className="w-5 h-5 flex-shrink-0 mt-0.5 text-txt-muted" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold text-txt-primary leading-tight">{t("unverified_keys_title")}</p>
+        <p className="text-[12px] text-txt-muted mt-1">{t("unverified_keys_body", { count })}</p>
+      </div>
+      <button type="button" onClick={on_dismiss} className="flex-shrink-0 text-txt-muted hover:text-txt-primary" aria-label={t("dismiss")}>
+        <XMarkIcon className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
+
 function ConfigPanel({
   email,
   display_name,
@@ -1325,6 +1372,8 @@ function ConfigPanel({
   on_use_alternate_ports,
   insecure_sign_in,
   on_dismiss_insecure_sign_in,
+  unverified_recipient_keys,
+  on_dismiss_unverified_recipient_keys,
 }: {
   email: string | null;
   display_name: string | null;
@@ -1341,6 +1390,8 @@ function ConfigPanel({
   on_use_alternate_ports: () => Promise<void>;
   insecure_sign_in: InsecureSignIn | null;
   on_dismiss_insecure_sign_in: () => void;
+  unverified_recipient_keys: number;
+  on_dismiss_unverified_recipient_keys: () => void;
 }) {
   const { t } = useTranslation();
   const imap_host = conn_info?.imap_host || "127.0.0.1";
@@ -1426,6 +1477,9 @@ function ConfigPanel({
 
       {insecure_sign_in && (
         <InsecureSignInNotice attempt={insecure_sign_in} on_dismiss={on_dismiss_insecure_sign_in} />
+      )}
+      {unverified_recipient_keys > 0 && (
+        <UnverifiedKeysNotice count={unverified_recipient_keys} on_dismiss={on_dismiss_unverified_recipient_keys} />
       )}
 
       {bridge_running && sync_progress && (
@@ -1587,9 +1641,8 @@ function PasswordsPanel({
 
   const handle_copy = async (value: string) => {
     try {
-      await navigator.clipboard.writeText(value);
+      await copy_secret(value);
       show_toast(t("copied_to_clipboard"), "success");
-      clear_clipboard_if_unchanged(value);
     } catch {
       show_toast(t("failed_to_copy"), "error");
     }
@@ -2742,6 +2795,7 @@ function DashboardView({
   has_bridge_access, plan_info_loaded, outbox_count, connected_since, sync_progress, is_online,
   import_progress, on_dismiss_import, port_conflict, on_use_alternate_ports,
   insecure_sign_in, on_dismiss_insecure_sign_in,
+  unverified_recipient_keys, on_dismiss_unverified_recipient_keys,
 }: {
   email: string | null; display_name: string | null; profile_picture: string | null;
   profile_color: string | null; bridge_running: boolean; conn_info: ConnectionInfo | null;
@@ -2764,6 +2818,8 @@ function DashboardView({
   on_use_alternate_ports: () => Promise<void>;
   insecure_sign_in: InsecureSignIn | null;
   on_dismiss_insecure_sign_in: () => void;
+  unverified_recipient_keys: number;
+  on_dismiss_unverified_recipient_keys: () => void;
 }) {
   const { t } = useTranslation();
   const show_upgrade_banner = plan_info_loaded && !has_bridge_access;
@@ -2823,7 +2879,7 @@ function DashboardView({
             ) : (
               <>
                 {active_tab === "status" && (
-                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} port_conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} insecure_sign_in={insecure_sign_in} on_dismiss_insecure_sign_in={on_dismiss_insecure_sign_in} />
+                  <ConfigPanel email={email} display_name={display_name} profile_picture={profile_picture} profile_color={profile_color} conn_info={conn_info} bridge_running={bridge_running} on_toggle_bridge={on_toggle_bridge} connected_since={connected_since} sync_progress={sync_progress} import_progress={import_progress} on_dismiss_import={on_dismiss_import} port_conflict={port_conflict} on_use_alternate_ports={on_use_alternate_ports} insecure_sign_in={insecure_sign_in} on_dismiss_insecure_sign_in={on_dismiss_insecure_sign_in} unverified_recipient_keys={unverified_recipient_keys} on_dismiss_unverified_recipient_keys={on_dismiss_unverified_recipient_keys} />
                 )}
                 {active_tab === "passwords" && !plan_info_loaded && (
                   <div className="p-5 text-sm text-txt-muted text-center">{t("loading")}</div>
@@ -2861,6 +2917,8 @@ export function BridgeApp() {
   const [port_conflict, set_port_conflict] = useState<PortConflict | null>(null);
   const [insecure_sign_in, set_insecure_sign_in] = useState<InsecureSignIn | null>(null);
   const dismissed_insecure_seq = useRef(0);
+  const [unverified_recipient_keys, set_unverified_recipient_keys] = useState(0);
+  const unverified_keys_dismissed = useRef(false);
   const update_required_shown = useRef(false);
   const sign_in_again_shown = useRef(false);
   const was_guard_pending = useRef(false);
@@ -2868,6 +2926,10 @@ export function BridgeApp() {
   const [sign_in_ending, set_sign_in_ending] = useState<SignInEnding | null>(null);
   const [provision_label, set_provision_label] = useState<string | null>(null);
   const provision_display = use_frozen(provision_label);
+  const [provision_armed, set_provision_armed] = useState(false);
+  const [provision_result, set_provision_result] = useState<ProvisionBundle | null>(null);
+  const provision_result_display = use_frozen(provision_result);
+  const provision_busy = useRef(false);
   const [outbox_count, set_outbox_count] = useState(0);
   const [connected_since, set_connected_since] = useState<number | null>(null);
   const [sync_progress, set_sync_progress] = useState<SyncProgress | null>(null);
@@ -2885,6 +2947,11 @@ export function BridgeApp() {
     }
     set_insecure_sign_in(null);
   }, [insecure_sign_in]);
+  const handle_dismiss_unverified_recipient_keys = useCallback(() => {
+    unverified_keys_dismissed.current = true;
+    set_unverified_recipient_keys(0);
+    api.dismiss_unverified_recipient_keys().catch(() => {});
+  }, []);
   const handle_dismiss_import = useCallback(() => {
     set_import_progress(prev => {
       if (prev) import_dismissed.current = prev.started_at_ms;
@@ -2939,6 +3006,8 @@ export function BridgeApp() {
             ? state.insecure_sign_in
             : null,
         );
+        if (state.unverified_recipient_keys === 0) unverified_keys_dismissed.current = false;
+        set_unverified_recipient_keys(unverified_keys_dismissed.current ? 0 : state.unverified_recipient_keys);
         apply_import_progress(state.import_progress);
         set_was_enrolled(true);
         sync_theme();
@@ -3188,18 +3257,11 @@ export function BridgeApp() {
 
   useEffect(() => {
     const apply_deep_link = (payload: string) => {
-      try {
-        const url = new URL(payload);
-        if (url.protocol !== "aster-mail:") return;
-        if (url.hostname !== "provision" && url.pathname !== "//provision" && url.pathname !== "/provision") return;
-        const raw_label = url.searchParams.get("label") || i18next.t("provision_default_label");
-        // Deep links arrive from arbitrary local apps; the label is untrusted.
-        // Strip control chars and cap length before it is shown in the confirm modal.
-        const label = [...raw_label].filter((ch) => !HIDDEN_LABEL_CHARACTER.test(ch)).join("").trim().slice(0, 64).trim() || i18next.t("provision_default_label");
-        set_provision_label(label);
-      } catch {
-        /* ignore malformed deep link */
-      }
+      const label = parse_provision_link(payload, i18next.t("provision_default_label"));
+      if (label === null) return;
+      if (provision_busy.current) return;
+      provision_busy.current = true;
+      set_provision_label(label);
     };
     const sub = listen_tauri<string>("deep_link", (event) => {
       apply_deep_link(event.payload);
@@ -3211,22 +3273,37 @@ export function BridgeApp() {
     return sub.unlisten;
   }, []);
 
-  const handle_provision_confirm = async () => {
+  useEffect(() => {
+    set_provision_armed(false);
     if (!provision_label) return;
+    const timer = window.setTimeout(() => set_provision_armed(true), PROVISION_ARM_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [provision_label]);
+
+  const cancel_provision = () => {
+    set_provision_label(null);
+    provision_busy.current = false;
+  };
+
+  const close_provision_result = () => {
+    set_provision_result(null);
+    provision_busy.current = false;
+  };
+
+  useEffect(() => {
+    if (!provision_result) return;
+    const timer = window.setTimeout(close_provision_result, PROVISION_RESULT_TTL_MS);
+    return () => window.clearTimeout(timer);
+  }, [provision_result]);
+
+  const handle_provision_confirm = async () => {
+    if (!provision_label || !provision_armed) return;
     const label = provision_label;
     set_provision_label(null);
     try {
-      const { password_id, ...settings } = await api.provision_bundle(label);
-      const payload = JSON.stringify(settings, null, 2);
-      try {
-        await copy_text(payload);
-      } catch (copy_error) {
-        await api.delete_app_password(password_id).catch(() => {});
-        throw copy_error;
-      }
-      clear_clipboard_if_unchanged(payload);
-      show_toast(i18next.t("toast_provisioned", { label: settings.label }), "success");
+      set_provision_result(await request_provision_bundle(label, api));
     } catch {
+      provision_busy.current = false;
       show_toast(i18next.t("toast_provision_failed"), "error");
     }
   };
@@ -3283,13 +3360,22 @@ export function BridgeApp() {
         import_progress={import_progress} on_dismiss_import={handle_dismiss_import}
         port_conflict={port_conflict} on_use_alternate_ports={handle_use_alternate_ports}
         insecure_sign_in={insecure_sign_in} on_dismiss_insecure_sign_in={handle_dismiss_insecure_sign_in}
+        unverified_recipient_keys={unverified_recipient_keys} on_dismiss_unverified_recipient_keys={handle_dismiss_unverified_recipient_keys}
       />
-      <Modal open={!!provision_label} on_close={() => set_provision_label(null)}>
+      <Modal open={!!provision_label} on_close={cancel_provision}>
         <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_title")}</p>
         <ModalBody>{i18next.t("provision_confirm", { label: provision_display ?? "" })}</ModalBody>
         <ModalActions>
-          <Button variant="ghost" size="md" onClick={() => set_provision_label(null)}>{i18next.t("cancel")}</Button>
-          <Button variant="depth" size="md" onClick={handle_provision_confirm}>{i18next.t("provision_allow")}</Button>
+          <Button variant="ghost" size="md" onClick={cancel_provision}>{i18next.t("cancel")}</Button>
+          <Button variant="depth" size="md" disabled={!provision_armed} onClick={handle_provision_confirm}>{i18next.t("provision_allow")}</Button>
+        </ModalActions>
+      </Modal>
+      <Modal open={!!provision_result} on_close={close_provision_result}>
+        <p className="text-base font-semibold text-txt-primary">{i18next.t("provision_result_title", { label: provision_result_display?.label ?? "" })}</p>
+        <ModalBody>{i18next.t("provision_result_hint")}</ModalBody>
+        {provision_result_display && <ProvisionSettingsRows settings={provision_result_display} />}
+        <ModalActions>
+          <Button variant="depth" size="md" onClick={close_provision_result}>{i18next.t("done")}</Button>
         </ModalActions>
       </Modal>
       <UpdateBanner />

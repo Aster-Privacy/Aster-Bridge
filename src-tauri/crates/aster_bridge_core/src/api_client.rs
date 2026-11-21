@@ -867,6 +867,14 @@ pub struct DomainAddressListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LoginSaltsResponse {
+    #[serde(default)]
+    pub login_salt: Option<String>,
+    #[serde(default)]
+    pub retired_salts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct DefaultSenderResponse {
     #[serde(default)]
@@ -1122,10 +1130,7 @@ impl ApiClient {
         };
 
         match resp.bytes().await {
-            Ok(body) => {
-                crate::crypto::sent_copy::record_bound_attachment_writes(&body);
-                crate::crypto::sent_copy::parse_format_writes(&body)
-            }
+            Ok(body) => crate::crypto::sent_copy::parse_format_writes(&body),
             Err(_) => false,
         }
     }
@@ -1177,6 +1182,21 @@ impl ApiClient {
         } else {
             Level2Admission::Unknown
         }
+    }
+
+    pub async fn get_login_salts(&self, access_token: &str) -> Result<Vec<String>> {
+        let resp = self.client
+            .get(format!("{}/core/v1/auth/me/login-salt", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        let body: LoginSaltsResponse = resp.json().await.map_err(BridgeError::from)?;
+        Ok(body.login_salt.into_iter().chain(body.retired_salts).collect())
     }
 
     pub async fn get_default_sender(&self, access_token: &str) -> Result<Option<String>> {

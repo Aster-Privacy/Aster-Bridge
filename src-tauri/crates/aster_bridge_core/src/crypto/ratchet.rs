@@ -27,7 +27,7 @@ use ml_kem::array::Array;
 use ml_kem::kem::Decapsulate;
 use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use serde_json::Value;
 use sha2::Sha256;
@@ -146,7 +146,7 @@ pub(crate) fn serialize_header_ad(version: u8, dh_public: &[u8], previous_chain_
 
 fn identity_public_sec1(secret_d: &[u8]) -> Result<Vec<u8>, String> {
     let sk = SecretKey::from_slice(secret_d).map_err(|e| format!("p256 secret: {}", e))?;
-    Ok(sk.public_key().to_encoded_point(false).as_bytes().to_vec())
+    Ok(sk.public_key().to_sec1_point(false).as_bytes().to_vec())
 }
 
 struct PqContribution<'a> {
@@ -396,6 +396,15 @@ pub fn decrypt_pq_secret(
     encrypted_secret_b64: &str,
     secret_nonce_b64: &str,
 ) -> Result<Vec<u8>, String> {
+    decrypt_pq_secret_for(None, sync_key, encrypted_secret_b64, secret_nonce_b64)
+}
+
+pub fn decrypt_pq_secret_for(
+    key_id: Option<u32>,
+    sync_key: &[u8],
+    encrypted_secret_b64: &str,
+    secret_nonce_b64: &str,
+) -> Result<Vec<u8>, String> {
     let ciphertext = b64_decode(encrypted_secret_b64)?;
     let nonce_bytes = b64_decode(secret_nonce_b64)?;
     if nonce_bytes.len() != 12 {
@@ -403,9 +412,24 @@ pub fn decrypt_pq_secret(
     }
     let cipher = Aes256Gcm::new_from_slice(sync_key).map_err(|e| format!("aes init: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|_| "pq secret decrypt failed".to_string())
+    let bound = key_id.and_then(|key_id| {
+        let binding = format!("aster-prekey-secret:pq:v1:{}", key_id);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: binding.as_bytes(),
+                },
+            )
+            .ok()
+    });
+    match bound {
+        Some(secret) => Ok(secret),
+        None => cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|_| "pq secret decrypt failed".to_string()),
+    }
 }
 
 fn push_key_set(
@@ -671,7 +695,7 @@ fn seal_bootstrap(
     plaintext: &str,
 ) -> Result<RatchetMessage, String> {
     use ml_kem::kem::Encapsulate;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use rand_core::{OsRng, RngCore};
     type EncapKey = <MlKem768 as KemCore>::EncapsulationKey;
 
@@ -679,15 +703,15 @@ fn seal_bootstrap(
         .map_err(|e| format!("sender identity: {}", e))?;
     let sender_identity_public = sender_identity
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
 
-    let ephemeral = SecretKey::random(&mut OsRng);
+    let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
     let ephemeral_d = ephemeral.to_bytes();
     let ephemeral_public = ephemeral
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
 
@@ -743,11 +767,11 @@ fn seal_bootstrap(
     }
     let shared_secret = shared_secret?;
 
-    let sender_ratchet = SecretKey::random(&mut OsRng);
+    let sender_ratchet = <SecretKey as p256::elliptic_curve::Generate>::generate();
     let sender_ratchet_d = sender_ratchet.to_bytes();
     let sender_ratchet_public = sender_ratchet
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
     let dh_root = ecdh_p256(sender_ratchet_d.as_slice(), recipient_signed_prekey_public)?;
@@ -788,17 +812,17 @@ mod tests {
     use crate::protocol_harness::derive_sync_key;
     use ml_kem::kem::Encapsulate;
     use sha2::Digest;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use rand_core::OsRng;
     use serde_json::json;
 
 
     fn pub_sec1(sk: &SecretKey) -> Vec<u8> {
-        sk.public_key().to_encoded_point(false).as_bytes().to_vec()
+        sk.public_key().to_sec1_point(false).as_bytes().to_vec()
     }
 
     fn p256_jwk(sk: &SecretKey) -> String {
-        let point = sk.public_key().to_encoded_point(false);
+        let point = sk.public_key().to_sec1_point(false);
         json!({
             "kty": "EC",
             "crv": "P-256",
@@ -825,13 +849,13 @@ mod tests {
         header_version: Option<u8>,
         header_bound: bool,
     ) -> Built {
-        let recv_identity = SecretKey::random(&mut OsRng);
-        let recv_spk = SecretKey::random(&mut OsRng);
+        let recv_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let recv_spk = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recv_spk_pub = pub_sec1(&recv_spk);
         let (dk, ek) = MlKem768::generate(&mut OsRng);
 
-        let sender_identity = SecretKey::random(&mut OsRng);
-        let ephemeral = SecretKey::random(&mut OsRng);
+        let sender_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
 
         let dh1 = ecdh_p256(sender_identity.to_bytes().as_slice(), &recv_spk_pub).unwrap();
         let dh2 = ecdh_p256(ephemeral.to_bytes().as_slice(), &pub_sec1(&recv_identity)).unwrap();
@@ -852,7 +876,7 @@ mod tests {
 
         let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, info, 32).unwrap();
 
-        let sender_ratchet = SecretKey::random(&mut OsRng);
+        let sender_ratchet = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let sender_ratchet_pub = pub_sec1(&sender_ratchet);
         let dh_root = ecdh_p256(sender_ratchet.to_bytes().as_slice(), &recv_spk_pub).unwrap();
         let root_out = hkdf_sha256(&dh_root, &shared_secret, KDF_INFO_ROOT, 64).unwrap();
@@ -1152,10 +1176,10 @@ mod tests {
 
     #[test]
     fn a_one_time_bound_bootstrap_round_trips_on_every_lane() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         for pq_key_id in [None, Some(7), Some(PQ_IDENTITY_KEY_ID)] {
             let recipient = peer();
-            let one_time = SecretKey::random(&mut OsRng);
+            let one_time = <SecretKey as p256::elliptic_curve::Generate>::generate();
             let mut message = encrypt_bootstrap_one_time_bound(
                 sender.to_bytes().as_slice(),
                 &recipient.identity_public,
@@ -1180,7 +1204,7 @@ mod tests {
 
             assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
 
-            message.opk_secret = Some(SecretKey::random(&mut OsRng).to_bytes().to_vec());
+            message.opk_secret = Some(<SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec());
             assert!(decrypt_bootstrap(&recipient.keys, &message).is_err());
 
             message.opk_secret = Some(one_time.to_bytes().to_vec());
@@ -1204,9 +1228,9 @@ mod tests {
 
     #[test]
     fn the_one_time_bound_sender_refuses_an_unusable_one_time_prekey() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recipient = peer();
-        let one_time = pub_sec1(&SecretKey::random(&mut OsRng));
+        let one_time = pub_sec1(&<SecretKey as p256::elliptic_curve::Generate>::generate());
         let seal = |key_id: u32, public: &[u8]| {
             encrypt_bootstrap_one_time_bound(
                 sender.to_bytes().as_slice(),
@@ -1235,7 +1259,7 @@ mod tests {
 
     #[test]
     fn the_versioned_sender_never_writes_the_one_time_bound_version() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recipient = peer();
         for version in [1, 2, 3, X3DH_VERSION_ONE_TIME_BOUND, 5] {
             let message = encrypt_bootstrap_versioned(
@@ -1333,12 +1357,12 @@ mod tests {
     }
 
     fn peer() -> Peer {
-        let identity = SecretKey::random(&mut OsRng);
-        let prekey = SecretKey::random(&mut OsRng);
+        let identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let prekey = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let (dk, ek) = MlKem768::generate(&mut OsRng);
-        let prekey_public = prekey.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let prekey_public = prekey.public_key().to_sec1_point(false).as_bytes().to_vec();
         Peer {
-            identity_public: identity.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            identity_public: identity.public_key().to_sec1_point(false).as_bytes().to_vec(),
             keys: RatchetReceiverKeys {
                 identity_secret_d: identity.to_bytes().to_vec(),
                 signed_prekey_secret_d: prekey.to_bytes().to_vec(),
@@ -1351,7 +1375,7 @@ mod tests {
 
     #[test]
     fn a_bound_bootstrap_round_trips_on_every_lane() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let lanes = [None, Some(7), Some(PQ_IDENTITY_KEY_ID)];
         let versions = [
             (X3DH_VERSION_TRANSCRIPT_BOUND, X3DH_VERSION_KEY_BOUND),
@@ -1388,7 +1412,7 @@ mod tests {
 
     #[test]
     fn a_key_bound_bootstrap_does_not_open_under_another_signed_prekey() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recipient = peer();
         let message = encrypt_bootstrap_versioned(
             sender.to_bytes().as_slice(),
@@ -1400,11 +1424,11 @@ mod tests {
             "bound",
         )
         .unwrap();
-        let other_prekey = SecretKey::random(&mut OsRng);
+        let other_prekey = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let other_keys = RatchetReceiverKeys {
             identity_secret_d: recipient.keys.identity_secret_d.clone(),
             signed_prekey_secret_d: other_prekey.to_bytes().to_vec(),
-            signed_prekey_public: other_prekey.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            signed_prekey_public: other_prekey.public_key().to_sec1_point(false).as_bytes().to_vec(),
         };
 
         assert!(decrypt_bootstrap(&other_keys, &message).is_err());
@@ -1413,7 +1437,7 @@ mod tests {
 
     #[test]
     fn an_unknown_sender_version_falls_back_to_the_first_handshake() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recipient = peer();
         let message = encrypt_bootstrap_versioned(
             sender.to_bytes().as_slice(),
@@ -1432,7 +1456,7 @@ mod tests {
 
     #[test]
     fn an_unbound_bootstrap_stays_on_the_first_handshake_version() {
-        let sender = SecretKey::random(&mut OsRng);
+        let sender = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recipient = peer();
         let mut message = encrypt_bootstrap(
             sender.to_bytes().as_slice(),
@@ -1515,7 +1539,7 @@ mod tests {
     fn wrong_receiver_identity_key_fails() {
         let b = build_message("secret", true, Some(2));
         let wrong = RatchetReceiverKeys {
-            identity_secret_d: SecretKey::random(&mut OsRng).to_bytes().to_vec(),
+            identity_secret_d: <SecretKey as p256::elliptic_curve::Generate>::generate().to_bytes().to_vec(),
             signed_prekey_secret_d: b.keys.signed_prekey_secret_d.clone(),
             signed_prekey_public: b.keys.signed_prekey_public.clone(),
         };
@@ -1541,13 +1565,13 @@ mod tests {
     fn full_wiring_decrypts_nested_envelope_via_vault() {
         let pt = "Internal message body, sign-in code 992210.";
 
-        let recv_identity = SecretKey::random(&mut OsRng);
-        let recv_spk = SecretKey::random(&mut OsRng);
+        let recv_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let recv_spk = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let recv_spk_pub = pub_sec1(&recv_spk);
         let (dk, ek) = MlKem768::generate(&mut OsRng);
 
-        let sender_identity = SecretKey::random(&mut OsRng);
-        let ephemeral = SecretKey::random(&mut OsRng);
+        let sender_identity = <SecretKey as p256::elliptic_curve::Generate>::generate();
+        let ephemeral = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let dh1 = ecdh_p256(sender_identity.to_bytes().as_slice(), &recv_spk_pub).unwrap();
         let dh2 = ecdh_p256(ephemeral.to_bytes().as_slice(), &pub_sec1(&recv_identity)).unwrap();
         let dh3 = ecdh_p256(ephemeral.to_bytes().as_slice(), &recv_spk_pub).unwrap();
@@ -1560,7 +1584,7 @@ mod tests {
         ikm.extend_from_slice(pq_ss.as_slice());
         let shared_secret = hkdf_sha256(&ikm, &ZERO_SALT_32, X3DH_INFO_PQ, 32).unwrap();
 
-        let sender_ratchet = SecretKey::random(&mut OsRng);
+        let sender_ratchet = <SecretKey as p256::elliptic_curve::Generate>::generate();
         let sender_ratchet_pub = pub_sec1(&sender_ratchet);
         let dh_root = ecdh_p256(sender_ratchet.to_bytes().as_slice(), &recv_spk_pub).unwrap();
         let root_out = hkdf_sha256(&dh_root, &shared_secret, KDF_INFO_ROOT, 64).unwrap();
@@ -1639,6 +1663,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn a_pq_secret_sealed_to_its_key_id_opens_only_under_that_id() {
+        let sync_key = [3u8; 32];
+        let secret = vec![9u8; 2400];
+        let nonce_bytes = [0x56u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&sync_key).unwrap();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: secret.as_slice(),
+                    aad: b"aster-prekey-secret:pq:v1:77",
+                },
+            )
+            .unwrap();
+        let ct = STANDARD.encode(&ct);
+        let nonce = STANDARD.encode(nonce_bytes);
+        assert_eq!(decrypt_pq_secret_for(Some(77), &sync_key, &ct, &nonce).unwrap(), secret);
+        assert!(decrypt_pq_secret_for(Some(78), &sync_key, &ct, &nonce).is_err());
+        assert!(decrypt_pq_secret(&sync_key, &ct, &nonce).is_err());
     }
 
     const PQ_IDENTITY_INTEROP_VECTORS: &str = include_str!("pq_identity_interop_vectors.json");

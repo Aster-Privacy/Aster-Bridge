@@ -166,20 +166,27 @@ pub fn create_key_file(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|e| {
+    let file = options.open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             format!("{} already exists, so it was left unchanged", path.display())
         } else {
             format!("cannot create secret key file {}: {}", path.display(), e)
         }
     })?;
-    let written = file.write_all(text.as_bytes()).and_then(|_| file.sync_all());
     drop(file);
+    crate::system_tools::limit_or_discard(path, crate::system_tools::restrict_to_current_user)?;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        });
     if let Err(e) = written {
         let _ = std::fs::remove_file(path);
         return Err(format!("cannot write secret key file {}: {}", path.display(), e));
     }
-    restrict_permissions(path, false);
     Ok(())
 }
 
@@ -330,14 +337,13 @@ fn file_set(dir: &Path, key: &[u8; 32], user: &str, value: &str) -> Result<(), S
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     let tmp = path.with_extension("sealed.tmp");
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("secret write: {}", e))?;
-        restrict_permissions(&tmp, false);
-        f.write_all(&out).map_err(|e| format!("secret write: {}", e))?;
-        f.sync_all().map_err(|e| format!("secret write: {}", e))?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("secret write: {}", e))?;
+    let _ = std::fs::remove_file(&tmp);
+    crate::system_tools::write_limited_file(&tmp, &out, crate::system_tools::restrict_to_current_user)
+        .map_err(|e| format!("secret write: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("secret write: {}", e)
+    })?;
     Ok(())
 }
 

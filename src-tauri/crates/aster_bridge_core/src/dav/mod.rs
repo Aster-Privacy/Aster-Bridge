@@ -8,4 +8,5 @@
 pub mod server;
 pub mod store;
 pub mod vcard;
+pub mod vcard_links;
 pub mod xml;

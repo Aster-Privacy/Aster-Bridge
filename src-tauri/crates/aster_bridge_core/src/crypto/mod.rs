@@ -28,17 +28,22 @@ pub mod draft;
 pub mod envelope;
 pub mod envelope_capability;
 pub mod envelope_v2;
+pub mod login_salt_guard;
 pub mod external_pgp_key;
 pub mod folder;
 pub mod inbound;
 pub mod internal_send;
-#[allow(dead_code)]
-pub mod metadata;
+pub mod mail_legacy_retirement;
 pub mod one_time_prekeys;
+pub mod pgp_mime;
 pub mod preferences;
 pub mod ratchet;
 pub mod ratchet_recovery;
 pub mod recipient_trust;
+#[cfg(test)]
+mod ecc_interop_tests;
+#[cfg(test)]
+mod rsa_interop_tests;
 pub mod sealed_details;
 pub mod sent_copy;
 #[cfg(test)]
