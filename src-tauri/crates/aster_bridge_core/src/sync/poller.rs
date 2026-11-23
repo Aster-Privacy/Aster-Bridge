@@ -3615,10 +3615,11 @@ async fn run_sync_pass(
     }
 
     let account_keys = session.read().await.account_keys.clone();
-    let mut drafts_listed = false;
+    let mut unlisted_web_drafts: Vec<String> = Vec::new();
     match identity_key.as_deref().filter(|_| !rate_limited) {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
+            let mut drafts_listed = false;
             let mut cursor: Option<String> = None;
             let mut fetched = 0usize;
             let mut new_ids: Vec<String> = Vec::new();
@@ -3688,6 +3689,12 @@ async fn run_sync_pass(
                 let id_refs: Vec<&str> = new_ids.iter().map(|s| s.as_str()).collect();
                 let _ = db.jmap_record_sync_batch("Email", &id_refs);
             }
+            if drafts_listed {
+                unlisted_web_drafts = existing_versions
+                    .into_keys()
+                    .filter(|id| !seen_ids.contains(id))
+                    .collect();
+            }
         }
         None => {
             for id in cached_draft_versions(db).keys() {
@@ -3722,18 +3729,13 @@ async fn run_sync_pass(
             }
         }
     }
-    if deep && drafts_listed && !full_prune {
-        if let Ok(local) = db.list_all_cached_id_folder_dates() {
-            for (id, folder, _) in local {
-                if folder == "drafts"
-                    && !seen_ids.contains(&id)
-                    && db.unless_appended_since(&id, pass_started, || {
-                        db.delete_message_by_aster_id(&id).is_ok()
-                    }) == Some(true)
-                {
-                    tracing::info!("sync: pruned draft {} (gone on server)", id);
-                    destroyed_ids.push(id);
-                }
+    if deep && !full_prune {
+        for id in unlisted_web_drafts {
+            if db.unless_appended_since(&id, pass_started, || db.delete_message_by_aster_id(&id).is_ok())
+                == Some(true)
+            {
+                tracing::info!("sync: pruned draft {} (gone on server)", id);
+                destroyed_ids.push(id);
             }
         }
     }
@@ -7019,6 +7021,25 @@ mod tests {
         let _ = run_sync_pass(&session, &client, &db, None, true).await;
 
         assert!(db.get_cached_message("web-draft-kept").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn web_draft_prune_keeps_drafts_from_the_message_listing() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let item = item_with_envelope(
+            "mail-draft",
+            &serde_json::json!({"subject": "mail draft", "body_text": "b", "date": "2026-07-01T00:00:00Z"}),
+        );
+        assert!(cache_mail_item(&db, "drafts", &item, b"pass", IK, &[], &[]).was_new);
+
+        let base = spawn_capped_mock_server(false).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("mail-draft").unwrap().is_some());
     }
 
     #[tokio::test]
