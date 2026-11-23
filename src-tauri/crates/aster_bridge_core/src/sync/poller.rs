@@ -3173,7 +3173,8 @@ async fn run_sync_pass(
     jmap_broadcaster: Option<&broadcast::Sender<StateChange>>,
     deep: bool,
 ) -> Result<(), String> {
-    let pass_started = std::time::Instant::now();
+    let sync_pass = db.begin_sync_pass();
+    let pass_started = sync_pass.started();
     crate::imap::server::retry_pending_flag_pushes(db, client, session).await;
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
