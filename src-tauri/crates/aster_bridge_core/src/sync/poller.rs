@@ -6789,6 +6789,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sync_pass_stays_registered_while_it_runs() {
+        use axum::{routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let seen_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (probe_db, probe) = (db.clone(), seen_running.clone());
+        let app = with_empty_drafts(Router::new()).route(
+            "/bridge/v1/messages",
+            get(move || {
+                let (db, probe) = (probe_db.clone(), probe.clone());
+                async move {
+                    if db.oldest_sync_pass().is_some() {
+                        probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+
+        run_sync_pass(&mock_session(), &client, &db, None, true).await.unwrap();
+
+        assert!(seen_running.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(db.oldest_sync_pass(), None);
+    }
+
+    #[tokio::test]
     async fn deep_sync_prunes_web_draft_deleted_on_server() {
         let (_dir, db) = temp_db();
         let db = Arc::new(db);

@@ -730,6 +730,7 @@ struct AppendPin {
 
 const APPEND_PIN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const APPEND_PIN_SWEEP_LEN: usize = 512;
+const APPEND_PIN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 fn sweep_append_pins(
     pins: &mut HashMap<String, AppendPin>,
@@ -737,7 +738,9 @@ fn sweep_append_pins(
     oldest_sync_pass: Option<std::time::Instant>,
 ) {
     pins.retain(|_, pin| {
-        now.duration_since(pin.at) < APPEND_PIN_TTL || oldest_sync_pass.is_some_and(|started| pin.at >= started)
+        let age = now.duration_since(pin.at);
+        age < APPEND_PIN_TTL
+            || (age < APPEND_PIN_MAX_AGE && oldest_sync_pass.is_some_and(|started| pin.at >= started))
     });
 }
 
@@ -5289,6 +5292,10 @@ mod db_tests {
         let mut pins = fresh();
         sweep_append_pins(&mut pins, swept_at, Some(start + std::time::Duration::from_secs(1)));
         assert_eq!(pins.keys().collect::<Vec<_>>(), vec!["during-pass"]);
+
+        let mut pins = fresh();
+        sweep_append_pins(&mut pins, later + APPEND_PIN_MAX_AGE, Some(start));
+        assert!(pins.is_empty(), "a pass that never ends must not keep pins forever");
     }
 
     #[test]
