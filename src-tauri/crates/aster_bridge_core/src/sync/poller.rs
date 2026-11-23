@@ -3615,6 +3615,7 @@ async fn run_sync_pass(
     }
 
     let account_keys = session.read().await.account_keys.clone();
+    let mut drafts_listed = false;
     match identity_key.as_deref().filter(|_| !rate_limited) {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
@@ -3665,6 +3666,7 @@ async fn run_sync_pass(
                                 all_folders_complete = false;
                                 capped_only = false;
                             }
+                            drafts_listed = reached_end;
                             break;
                         }
                         cursor = resp.next_cursor;
@@ -3695,7 +3697,8 @@ async fn run_sync_pass(
     }
 
     let mut destroyed_ids: Vec<String> = Vec::new();
-    if deep && all_folders_complete && last_err.is_none() {
+    let full_prune = deep && all_folders_complete && last_err.is_none();
+    if full_prune {
         if let Ok(local) = db.list_all_cached_id_folder_dates() {
             for (id, folder, _) in local {
                 if !seen_ids.contains(&id)
@@ -3714,6 +3717,21 @@ async fn run_sync_pass(
             for id in confirm_gone_on_server(client, &access_token, &candidates).await {
                 if db.delete_message_by_aster_id(&id).is_ok() {
                     tracing::info!("sync: pruned {} (gone on server)", id);
+                    destroyed_ids.push(id);
+                }
+            }
+        }
+    }
+    if deep && drafts_listed && !full_prune {
+        if let Ok(local) = db.list_all_cached_id_folder_dates() {
+            for (id, folder, _) in local {
+                if folder == "drafts"
+                    && !seen_ids.contains(&id)
+                    && db.unless_appended_since(&id, pass_started, || {
+                        db.delete_message_by_aster_id(&id).is_ok()
+                    }) == Some(true)
+                {
+                    tracing::info!("sync: pruned draft {} (gone on server)", id);
                     destroyed_ids.push(id);
                 }
             }
@@ -6939,6 +6957,68 @@ mod tests {
             "a message older than the listed range must be kept"
         );
         assert!(db.get_cached_message("listed-0").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn deep_sync_of_a_capped_folder_prunes_web_draft_deleted_on_server() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let content = crate::crypto::draft::DraftContent {
+            subject: "stale".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-gone", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
+
+        let base = spawn_capped_mock_server(false).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("web-draft-gone").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_draft_listing_prunes_no_drafts() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let content = crate::crypto::draft::DraftContent {
+            subject: "kept".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-kept", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
+
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }),
+            )
+            .route("/mail/v1/drafts", get(|| async { StatusCode::BAD_GATEWAY }))
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+        let session = mock_session();
+
+        let _ = run_sync_pass(&session, &client, &db, None, true).await;
+
+        assert!(db.get_cached_message("web-draft-kept").unwrap().is_some());
     }
 
     #[tokio::test]
