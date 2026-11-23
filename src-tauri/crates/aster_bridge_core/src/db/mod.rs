@@ -1956,6 +1956,11 @@ impl Database {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let dropped = sweep_append_pins(pins, now, &sync_passes);
+        if dropped.is_some_and(|at| sync_passes.iter().any(|started| *started <= at)) {
+            tracing::warn!(
+                "sync: a pass running for over an hour lost its append pins; its remaining prunes and listing writes wait for the next pass"
+            );
+        }
         let mut dropped_until = self
             .append_pins_dropped_until
             .lock()
