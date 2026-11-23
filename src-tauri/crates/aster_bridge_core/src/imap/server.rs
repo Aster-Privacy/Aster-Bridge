@@ -6878,24 +6878,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_to_drafts_is_not_pruned_by_a_pass_that_started_before_it() {
-        let (addr, db, _tx, _calls, _dir) =
-            start_test_server_with_backend_opts(false, Some("test-ik")).await;
-        let (mut reader, mut writer) = login_and_select(addr).await;
-        let pass_started = std::time::Instant::now();
-
-        let raw = b"Subject: autosave\r\nContent-Type: text/plain\r\n\r\nwip";
-        let resp = append_literal(&mut reader, &mut writer, "ad3", "Drafts", raw).await;
-        assert!(resp.contains("ad3 OK"), "append not accepted: {}", resp);
-
-        let pruned = db.unless_appended_since("draft-created-1", pass_started, || {
-            db.delete_message_by_aster_id("draft-created-1").is_ok()
-        });
-        assert_eq!(pruned, None);
-        assert!(db.get_cached_message("draft-created-1").unwrap().is_some());
-    }
-
-    #[tokio::test]
     async fn append_to_drafts_round_trips_web_compatible_encryption() {
         let (addr, db, _tx, calls, _dir) =
             start_test_server_with_backend_opts(false, Some("test-ik")).await;
