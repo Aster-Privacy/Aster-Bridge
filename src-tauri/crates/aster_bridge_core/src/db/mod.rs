@@ -4064,12 +4064,12 @@ impl Database {
             tx.commit()
         });
         self.app_password_cache.clear();
-        self.append_pins
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.append_pin_sweep_len
-            .store(APPEND_PIN_SWEEP_LEN, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+            pins.clear();
+            self.append_pin_sweep_len
+                .store(APPEND_PIN_SWEEP_LEN, std::sync::atomic::Ordering::Relaxed);
+        }
         *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = None;
         result?;
         self.scrub_free_space()?;
