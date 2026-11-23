@@ -719,6 +719,7 @@ pub struct Database {
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
     pub(crate) tag_writes: std::sync::atomic::AtomicU64,
     append_pins: Mutex<HashMap<String, AppendPin>>,
+    append_pin_sweep_len: std::sync::atomic::AtomicUsize,
     sync_passes: Mutex<Vec<std::time::Instant>>,
     aster_sender_scope: Mutex<Option<crate::crypto::internal_send::AsterSenderScope>>,
 }
@@ -730,7 +731,6 @@ struct AppendPin {
 
 const APPEND_PIN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const APPEND_PIN_SWEEP_LEN: usize = 512;
-const APPEND_PIN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 fn sweep_append_pins(
     pins: &mut HashMap<String, AppendPin>,
@@ -738,9 +738,7 @@ fn sweep_append_pins(
     oldest_sync_pass: Option<std::time::Instant>,
 ) {
     pins.retain(|_, pin| {
-        let age = now.duration_since(pin.at);
-        age < APPEND_PIN_TTL
-            || (age < APPEND_PIN_MAX_AGE && oldest_sync_pass.is_some_and(|started| pin.at >= started))
+        now.duration_since(pin.at) < APPEND_PIN_TTL || oldest_sync_pass.is_some_and(|started| pin.at >= started)
     });
 }
 
@@ -795,6 +793,7 @@ impl Database {
             tag_lock: tokio::sync::Mutex::new(()),
             tag_writes: std::sync::atomic::AtomicU64::new(0),
             append_pins: Mutex::new(HashMap::new()),
+            append_pin_sweep_len: std::sync::atomic::AtomicUsize::new(APPEND_PIN_SWEEP_LEN),
             sync_passes: Mutex::new(Vec::new()),
             aster_sender_scope: Mutex::new(None),
         })
@@ -1923,8 +1922,12 @@ impl Database {
     pub(crate) fn pin_appended(&self, aster_id: &str, folder: &str) {
         let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
-        if pins.len() >= APPEND_PIN_SWEEP_LEN {
+        if pins.len() >= self.append_pin_sweep_len() {
             sweep_append_pins(&mut pins, now, self.oldest_sync_pass());
+            self.append_pin_sweep_len.store(
+                (2 * pins.len()).max(APPEND_PIN_SWEEP_LEN),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         pins.insert(
             aster_id.to_string(),
@@ -1933,6 +1936,10 @@ impl Database {
                 at: now,
             },
         );
+    }
+
+    fn append_pin_sweep_len(&self) -> usize {
+        self.append_pin_sweep_len.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn begin_sync_pass(&self) -> SyncPassGuard<'_> {
@@ -4061,6 +4068,8 @@ impl Database {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.append_pin_sweep_len
+            .store(APPEND_PIN_SWEEP_LEN, std::sync::atomic::Ordering::Relaxed);
         *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = None;
         result?;
         self.scrub_free_space()?;
@@ -5294,8 +5303,19 @@ mod db_tests {
         assert_eq!(pins.keys().collect::<Vec<_>>(), vec!["during-pass"]);
 
         let mut pins = fresh();
-        sweep_append_pins(&mut pins, later + APPEND_PIN_MAX_AGE, Some(start));
-        assert!(pins.is_empty(), "a pass that never ends must not keep pins forever");
+        let days_later = later + std::time::Duration::from_secs(3 * 24 * 60 * 60);
+        sweep_append_pins(&mut pins, days_later, Some(start + std::time::Duration::from_secs(1)));
+        assert_eq!(pins.keys().collect::<Vec<_>>(), vec!["during-pass"]);
+    }
+
+    #[test]
+    fn pins_kept_by_a_sweep_wait_for_the_map_to_double() {
+        let (_d, db) = open_db();
+        let _pass = db.begin_sync_pass();
+        for i in 0..=APPEND_PIN_SWEEP_LEN {
+            db.pin_appended(&format!("a{}", i), "inbox");
+        }
+        assert_eq!(db.append_pin_sweep_len(), 2 * APPEND_PIN_SWEEP_LEN);
     }
 
     #[test]
