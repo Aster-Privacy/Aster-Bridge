@@ -2874,10 +2874,36 @@ async fn confirm_gone_on_server(
     access_token: &str,
     candidates: &[String],
 ) -> Vec<String> {
+    confirm_gone(candidates, |id| async move {
+        client.fetch_mail_item(access_token, &id).await.map(|_| ())
+    })
+    .await
+}
+
+async fn confirm_drafts_gone(
+    client: &ApiClient,
+    access_token: &str,
+    candidates: &[String],
+) -> Vec<String> {
+    confirm_gone(candidates, |id| async move {
+        client.check_draft_exists(access_token, &id).await
+    })
+    .await
+}
+
+async fn confirm_gone<F, Fut>(candidates: &[String], check: F) -> Vec<String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BridgeError>>,
+{
     let mut gone = Vec::new();
-    for id in candidates.iter().take(CAPPED_PRUNE_CHECKS_PER_PASS) {
-        match client.fetch_mail_item(access_token, id).await {
-            Ok(_) => {}
+    for id in candidates
+        .iter()
+        .filter(|id| is_valid_item_id(id))
+        .take(CAPPED_PRUNE_CHECKS_PER_PASS)
+    {
+        match check(id.clone()).await {
+            Ok(()) => {}
             Err(BridgeError::Api(ref msg))
                 if api_status_code(msg).is_some_and(is_permanent_status) =>
             {
@@ -3616,9 +3642,12 @@ async fn run_sync_pass(
     }
 
     let account_keys = session.read().await.account_keys.clone();
+    let mut unlisted_web_drafts: Vec<String> = Vec::new();
+    let mut drafts_paged = false;
     match identity_key.as_deref().filter(|_| !rate_limited) {
         Some(ik) => {
             let existing_versions = cached_draft_versions(db);
+            let mut drafts_listed = false;
             let mut cursor: Option<String> = None;
             let mut fetched = 0usize;
             let mut new_ids: Vec<String> = Vec::new();
@@ -3666,9 +3695,11 @@ async fn run_sync_pass(
                                 all_folders_complete = false;
                                 capped_only = false;
                             }
+                            drafts_listed = reached_end;
                             break;
                         }
                         cursor = resp.next_cursor;
+                        drafts_paged = true;
                     }
                     Err(e) => {
                         let msg = format!("failed to sync web drafts: {}", e);
@@ -3687,6 +3718,12 @@ async fn run_sync_pass(
                 let id_refs: Vec<&str> = new_ids.iter().map(|s| s.as_str()).collect();
                 let _ = db.jmap_record_sync_batch("Email", &id_refs);
             }
+            if drafts_listed {
+                unlisted_web_drafts = existing_versions
+                    .into_keys()
+                    .filter(|id| !seen_ids.contains(id))
+                    .collect();
+            }
         }
         None => {
             for id in cached_draft_versions(db).keys() {
@@ -3695,11 +3732,21 @@ async fn run_sync_pass(
         }
     }
 
+    let web_drafts_gone = if !deep || unlisted_web_drafts.is_empty() {
+        Vec::new()
+    } else if drafts_paged {
+        confirm_drafts_gone(client, &access_token, &unlisted_web_drafts).await
+    } else {
+        unlisted_web_drafts.clone()
+    };
+    let unlisted_web_drafts: HashSet<String> = unlisted_web_drafts.into_iter().collect();
+
     let mut destroyed_ids: Vec<String> = Vec::new();
     if deep && all_folders_complete && last_err.is_none() {
         if let Ok(local) = db.list_all_cached_id_folder_dates() {
             for (id, folder, _) in local {
                 if !seen_ids.contains(&id)
+                    && !unlisted_web_drafts.contains(&id)
                     && db.unless_appended_since(&id, pass_started, || {
                         db.delete_message_by_aster_id(&id).is_ok()
                     }) == Some(true)
@@ -3718,6 +3765,14 @@ async fn run_sync_pass(
                     destroyed_ids.push(id);
                 }
             }
+        }
+    }
+    for id in web_drafts_gone {
+        if db.unless_appended_since(&id, pass_started, || db.delete_message_by_aster_id(&id).is_ok())
+            == Some(true)
+        {
+            tracing::info!("sync: pruned draft {} (gone on server)", id);
+            destroyed_ids.push(id);
         }
     }
     if !destroyed_ids.is_empty() {
@@ -6826,6 +6881,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deep_sync_keeps_a_draft_saved_over_imap_during_the_pass() {
+        use axum::{routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let session = mock_session();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+
+        let (save_db, save_client, save_session) = (db.clone(), client.clone(), session.clone());
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                get(move || {
+                    let (db, client, session) = (save_db.clone(), save_client.clone(), save_session.clone());
+                    async move {
+                        let raw = b"Subject: autosave\r\nContent-Type: text/plain\r\n\r\nwip";
+                        crate::imap::server::append_draft(&db, &client, &session, raw)
+                            .await
+                            .unwrap();
+                        Json(serde_json::json!({
+                            "items": [],
+                            "has_more": false,
+                            "next_cursor": serde_json::Value::Null
+                        }))
+                    }
+                })
+                .post(|| async { Json(serde_json::json!({"id": "imap-draft", "version": 1, "success": true})) }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("imap-draft").unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn deep_sync_prunes_web_draft_deleted_on_server() {
         let (_dir, db) = temp_db();
         let db = Arc::new(db);
@@ -6977,6 +7086,352 @@ mod tests {
             "a message older than the listed range must be kept"
         );
         assert!(db.get_cached_message("listed-0").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn deep_sync_of_a_capped_folder_prunes_web_draft_deleted_on_server() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let content = crate::crypto::draft::DraftContent {
+            subject: "stale".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-gone", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
+
+        let base = spawn_capped_mock_server(false).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("web-draft-gone").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_draft_listing_prunes_no_drafts() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let content = crate::crypto::draft::DraftContent {
+            subject: "kept".to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(&db, "web-draft-kept", &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
+
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }),
+            )
+            .route("/mail/v1/drafts", get(|| async { StatusCode::BAD_GATEWAY }))
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+        let session = mock_session();
+
+        let _ = run_sync_pass(&session, &client, &db, None, true).await;
+
+        assert!(db.get_cached_message("web-draft-kept").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn web_draft_prune_keeps_drafts_from_the_message_listing() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let item = item_with_envelope(
+            "mail-draft",
+            &serde_json::json!({"subject": "mail draft", "body_text": "b", "date": "2026-07-01T00:00:00Z"}),
+        );
+        assert!(cache_mail_item(&db, "drafts", &item, b"pass", IK, &[], &[]).was_new);
+
+        let base = spawn_capped_mock_server(false).await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+        let session = mock_session();
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("mail-draft").unwrap().is_some());
+    }
+
+    fn listed_draft_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "draft_type": "new",
+            "encrypted_content": "",
+            "content_nonce": "",
+            "version": 1,
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-01T00:00:00Z"
+        })
+    }
+
+    fn drafts_test_messages_router(capped: bool) -> axum::Router {
+        use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+        let body = if capped {
+            let items: Vec<serde_json::Value> = (0..SYSTEM_FOLDER_MAX_ITEMS)
+                .map(|i| {
+                    let mut item = server_item_json(&format!("listed-{}", i), "listed");
+                    item["created_at"] = serde_json::json!("2026-06-14T00:00:00Z");
+                    item
+                })
+                .collect();
+            serde_json::json!({
+                "items": items,
+                "total": SYSTEM_FOLDER_MAX_ITEMS + 500,
+                "has_more": true,
+                "next_cursor": "more"
+            })
+        } else {
+            serde_json::json!({
+                "items": [],
+                "total": 0,
+                "has_more": false,
+                "next_cursor": serde_json::Value::Null
+            })
+        };
+        Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/bridge/v1/messages/:id",
+                get(|Path(_id): Path<String>| async move { StatusCode::NOT_FOUND.into_response() }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            )
+    }
+
+    async fn spawn_paged_drafts_server(
+        capped: bool,
+        pages: Vec<Vec<&'static str>>,
+        draft_status: fn(&str) -> axum::http::StatusCode,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        use axum::{
+            extract::{Path, Query},
+            routing::get,
+            Json,
+        };
+        let pages = Arc::new(pages);
+        let app = drafts_test_messages_router(capped)
+            .route(
+                "/mail/v1/drafts",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let pages = pages.clone();
+                    async move {
+                        let page = q
+                            .get("cursor")
+                            .and_then(|c| c.strip_prefix('p'))
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let items: Vec<serde_json::Value> =
+                            pages[page].iter().map(|id| listed_draft_json(id)).collect();
+                        let has_more = page + 1 < pages.len();
+                        let next_cursor = if has_more {
+                            serde_json::json!(format!("p{}", page + 1))
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        Json(serde_json::json!({
+                            "items": items,
+                            "has_more": has_more,
+                            "next_cursor": next_cursor
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/mail/v1/drafts/:id",
+                get(move |Path(id): Path<String>| {
+                    let checks = checks.clone();
+                    async move {
+                        checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        draft_status(&id)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn cache_test_draft(db: &Database, id: &str) {
+        let content = crate::crypto::draft::DraftContent {
+            subject: id.to_string(),
+            message: "x".to_string(),
+            ..Default::default()
+        };
+        cache_web_draft(db, id, &content, "tester@aster.test", "2026-08-01T00:00:00Z", 1, None);
+    }
+
+    #[tokio::test]
+    async fn a_draft_edited_while_the_drafts_are_paged_is_kept() {
+        use axum::http::StatusCode;
+        for capped in [false, true] {
+            let (_dir, db) = temp_db();
+            let db = Arc::new(db);
+            cache_test_draft(&db, "draft-edited");
+            cache_test_draft(&db, "draft-deleted");
+            let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let base = spawn_paged_drafts_server(
+                capped,
+                vec![vec!["draft-listed"], vec![]],
+                |id| {
+                    if id == "draft-edited" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                },
+                checks.clone(),
+            )
+            .await;
+            let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+            run_sync_pass(&mock_session(), &client, &db, None, true).await.unwrap();
+
+            assert!(
+                db.get_cached_message("draft-edited").unwrap().is_some(),
+                "a draft the paged listing skipped but the server still has must be kept (capped: {})",
+                capped
+            );
+            assert!(
+                db.get_cached_message("draft-deleted").unwrap().is_none(),
+                "a draft the server no longer has must be pruned (capped: {})",
+                capped
+            );
+            assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_draft_check_keeps_the_draft() {
+        for capped in [false, true] {
+            let (_dir, db) = temp_db();
+            let db = Arc::new(db);
+            cache_test_draft(&db, "draft-unchecked");
+            let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let base = spawn_paged_drafts_server(
+                capped,
+                vec![vec!["draft-listed"], vec![]],
+                |_| axum::http::StatusCode::BAD_GATEWAY,
+                checks.clone(),
+            )
+            .await;
+            let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+            run_sync_pass(&mock_session(), &client, &db, None, true).await.unwrap();
+
+            assert!(db.get_cached_message("draft-unchecked").unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_page_draft_listing_prunes_without_checks() {
+        for capped in [false, true] {
+            let (_dir, db) = temp_db();
+            let db = Arc::new(db);
+            cache_test_draft(&db, "draft-deleted");
+            cache_test_draft(&db, "draft-listed");
+            let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let base = spawn_paged_drafts_server(
+                capped,
+                vec![vec!["draft-listed"]],
+                |_| axum::http::StatusCode::OK,
+                checks.clone(),
+            )
+            .await;
+            let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+            run_sync_pass(&mock_session(), &client, &db, None, true).await.unwrap();
+
+            assert!(db.get_cached_message("draft-deleted").unwrap().is_none());
+            assert!(db.get_cached_message("draft-listed").unwrap().is_some());
+            assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shallow_sync_prunes_no_drafts() {
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        cache_test_draft(&db, "draft-deleted");
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = spawn_paged_drafts_server(
+            false,
+            vec![vec![]],
+            |_| axum::http::StatusCode::NOT_FOUND,
+            checks.clone(),
+        )
+        .await;
+        let client = Arc::new(ApiClient::new_with_base_url(&base));
+
+        run_sync_pass(&mock_session(), &client, &db, None, false).await.unwrap();
+
+        assert!(db.get_cached_message("draft-deleted").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn capped_deep_sync_keeps_a_draft_saved_over_imap_during_the_pass() {
+        use axum::{routing::get, Json};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let session = mock_session();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+
+        let (save_db, save_client, save_session) = (db.clone(), client.clone(), session.clone());
+        let app = drafts_test_messages_router(true).route(
+            "/mail/v1/drafts",
+            get(move || {
+                let (db, client, session) = (save_db.clone(), save_client.clone(), save_session.clone());
+                async move {
+                    let raw = b"Subject: autosave\r\nContent-Type: text/plain\r\n\r\nwip";
+                    crate::imap::server::append_draft(&db, &client, &session, raw)
+                        .await
+                        .unwrap();
+                    Json(serde_json::json!({
+                        "items": [],
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }
+            })
+            .post(|| async { Json(serde_json::json!({"id": "imap-draft", "version": 1, "success": true})) }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("imap-draft").unwrap().is_some());
     }
 
     #[tokio::test]
