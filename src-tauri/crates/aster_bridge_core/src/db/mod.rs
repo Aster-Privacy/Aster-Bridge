@@ -719,6 +719,9 @@ pub struct Database {
     pub(crate) tag_lock: tokio::sync::Mutex<()>,
     pub(crate) tag_writes: std::sync::atomic::AtomicU64,
     append_pins: Mutex<HashMap<String, AppendPin>>,
+    append_pin_sweep_len: std::sync::atomic::AtomicUsize,
+    sync_passes: Mutex<Vec<std::time::Instant>>,
+    append_pins_dropped_until: Mutex<Option<std::time::Instant>>,
     aster_sender_scope: Mutex<Option<crate::crypto::internal_send::AsterSenderScope>>,
 }
 
@@ -729,6 +732,49 @@ struct AppendPin {
 
 const APPEND_PIN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const APPEND_PIN_SWEEP_LEN: usize = 512;
+const STUCK_SYNC_PASS_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn sweep_append_pins(
+    pins: &mut HashMap<String, AppendPin>,
+    now: std::time::Instant,
+    sync_passes: &[std::time::Instant],
+) -> Option<std::time::Instant> {
+    let oldest_live_pass = sync_passes
+        .iter()
+        .filter(|started| now.saturating_duration_since(**started) < STUCK_SYNC_PASS_AFTER)
+        .min()
+        .copied();
+    let mut dropped_until = None;
+    pins.retain(|_, pin| {
+        let keep = now.duration_since(pin.at) < APPEND_PIN_TTL
+            || oldest_live_pass.is_some_and(|started| pin.at >= started);
+        if !keep {
+            dropped_until = dropped_until.max(Some(pin.at));
+        }
+        keep
+    });
+    dropped_until
+}
+
+pub(crate) struct SyncPassGuard<'a> {
+    db: &'a Database,
+    started: std::time::Instant,
+}
+
+impl SyncPassGuard<'_> {
+    pub(crate) fn started(&self) -> std::time::Instant {
+        self.started
+    }
+}
+
+impl Drop for SyncPassGuard<'_> {
+    fn drop(&mut self) {
+        let mut passes = self.db.sync_passes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = passes.iter().position(|started| *started == self.started) {
+            passes.swap_remove(i);
+        }
+    }
+}
 
 impl Database {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
@@ -761,6 +807,9 @@ impl Database {
             tag_lock: tokio::sync::Mutex::new(()),
             tag_writes: std::sync::atomic::AtomicU64::new(0),
             append_pins: Mutex::new(HashMap::new()),
+            append_pin_sweep_len: std::sync::atomic::AtomicUsize::new(APPEND_PIN_SWEEP_LEN),
+            sync_passes: Mutex::new(Vec::new()),
+            append_pins_dropped_until: Mutex::new(None),
             aster_sender_scope: Mutex::new(None),
         })
     }
@@ -1888,8 +1937,8 @@ impl Database {
     pub(crate) fn pin_appended(&self, aster_id: &str, folder: &str) {
         let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
-        if pins.len() >= APPEND_PIN_SWEEP_LEN {
-            pins.retain(|_, pin| now.duration_since(pin.at) < APPEND_PIN_TTL);
+        if pins.len() >= self.append_pin_sweep_len() {
+            self.sweep_append_pins(&mut pins, now);
         }
         pins.insert(
             aster_id.to_string(),
@@ -1900,6 +1949,59 @@ impl Database {
         );
     }
 
+    fn sweep_append_pins(&self, pins: &mut HashMap<String, AppendPin>, now: std::time::Instant) {
+        let sync_passes = self
+            .sync_passes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let dropped = sweep_append_pins(pins, now, &sync_passes);
+        if dropped.is_some_and(|at| sync_passes.iter().any(|started| *started <= at)) {
+            tracing::warn!(
+                "sync: a pass running for over an hour lost its append pins; its remaining prunes and listing writes wait for the next pass"
+            );
+        }
+        let mut dropped_until = self
+            .append_pins_dropped_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *dropped_until = (*dropped_until).max(dropped);
+        self.append_pin_sweep_len.store(
+            (2 * pins.len()).max(APPEND_PIN_SWEEP_LEN),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn pins_dropped_since(&self, since: std::time::Instant) -> bool {
+        self.append_pins_dropped_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| until >= since)
+    }
+
+    fn append_pin_sweep_len(&self) -> usize {
+        self.append_pin_sweep_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn begin_sync_pass(&self) -> SyncPassGuard<'_> {
+        let started = std::time::Instant::now();
+        self.sync_passes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(started);
+        SyncPassGuard { db: self, started }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oldest_sync_pass(&self) -> Option<std::time::Instant> {
+        self.sync_passes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .min()
+            .copied()
+    }
+
     pub(crate) fn unless_listing_predates_append<T>(
         &self,
         aster_id: &str,
@@ -1908,9 +2010,10 @@ impl Database {
         write: impl FnOnce() -> T,
     ) -> Option<T> {
         let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
-        if pins
-            .get(aster_id)
-            .is_some_and(|pin| pin.folder != folder && pin.at >= listed_at)
+        if self.pins_dropped_since(listed_at)
+            || pins
+                .get(aster_id)
+                .is_some_and(|pin| pin.folder != folder && pin.at >= listed_at)
         {
             return None;
         }
@@ -1924,7 +2027,7 @@ impl Database {
         write: impl FnOnce() -> T,
     ) -> Option<T> {
         let pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
-        if pins.get(aster_id).is_some_and(|pin| pin.at >= since) {
+        if self.pins_dropped_since(since) || pins.get(aster_id).is_some_and(|pin| pin.at >= since) {
             return None;
         }
         Some(write())
@@ -4004,10 +4107,12 @@ impl Database {
             tx.commit()
         });
         self.app_password_cache.clear();
-        self.append_pins
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        {
+            let mut pins = self.append_pins.lock().unwrap_or_else(|e| e.into_inner());
+            pins.clear();
+            self.append_pin_sweep_len
+                .store(APPEND_PIN_SWEEP_LEN, std::sync::atomic::Ordering::Relaxed);
+        }
         *self.aster_sender_scope.lock().unwrap_or_else(|e| e.into_inner()) = None;
         result?;
         self.scrub_free_space()?;
@@ -5217,6 +5322,89 @@ mod db_tests {
         let after = std::time::Instant::now();
         assert_eq!(db.unless_listing_predates_append("a1", "inbox", after, || 1), Some(1));
         assert_eq!(db.unless_appended_since("a1", after, || 1), Some(1));
+    }
+
+    #[test]
+    fn a_sweep_keeps_pins_a_running_sync_pass_still_needs() {
+        let start = std::time::Instant::now();
+        let pin = |at| AppendPin { folder: "drafts".to_string(), at };
+        let later = start + std::time::Duration::from_secs(5);
+        let swept_at = later + APPEND_PIN_TTL + std::time::Duration::from_secs(1);
+        let fresh = || {
+            HashMap::from([
+                ("before-pass".to_string(), pin(start)),
+                ("during-pass".to_string(), pin(later)),
+            ])
+        };
+
+        let mut pins = fresh();
+        sweep_append_pins(&mut pins, swept_at, &[]);
+        assert!(pins.is_empty());
+
+        let mut pins = fresh();
+        sweep_append_pins(&mut pins, swept_at, &[start + std::time::Duration::from_secs(1)]);
+        assert_eq!(pins.keys().collect::<Vec<_>>(), vec!["during-pass"]);
+    }
+
+    #[test]
+    fn a_stuck_sync_pass_gives_up_its_pins() {
+        let start = std::time::Instant::now();
+        let pin = |at| AppendPin { folder: "drafts".to_string(), at };
+        let stuck_pass = start + std::time::Duration::from_secs(1);
+        let later = start + std::time::Duration::from_secs(5);
+        let stuck_at = stuck_pass + STUCK_SYNC_PASS_AFTER;
+        let live_pass = stuck_at - std::time::Duration::from_secs(60);
+        let mut pins = HashMap::from([
+            ("before-pass".to_string(), pin(start)),
+            ("during-pass".to_string(), pin(later)),
+            ("during-live-pass".to_string(), pin(live_pass)),
+        ]);
+
+        let dropped = sweep_append_pins(&mut pins, stuck_at + APPEND_PIN_TTL, &[stuck_pass, live_pass]);
+
+        assert_eq!(pins.keys().collect::<Vec<_>>(), vec!["during-live-pass"]);
+        assert_eq!(dropped, Some(later));
+    }
+
+    #[test]
+    fn writes_a_dropped_pin_guarded_are_skipped() {
+        let (_d, db) = open_db();
+        let start = std::time::Instant::now();
+        let pass = db.begin_sync_pass();
+        db.pin_appended("a1", "drafts");
+        let swept_at = pass.started() + STUCK_SYNC_PASS_AFTER + APPEND_PIN_TTL;
+        db.sweep_append_pins(&mut db.append_pins.lock().unwrap(), swept_at);
+
+        assert_eq!(db.unless_appended_since("a1", pass.started(), || 1), None);
+        assert_eq!(db.unless_appended_since("other", pass.started(), || 1), None);
+        assert_eq!(db.unless_listing_predates_append("other", "inbox", start, || 1), None);
+        let after = std::time::Instant::now();
+        assert_eq!(db.unless_appended_since("other", after, || 1), Some(1));
+        assert_eq!(db.unless_listing_predates_append("other", "inbox", after, || 1), Some(1));
+    }
+
+    #[test]
+    fn pins_kept_by_a_sweep_wait_for_the_map_to_double() {
+        let (_d, db) = open_db();
+        let _pass = db.begin_sync_pass();
+        for i in 0..=APPEND_PIN_SWEEP_LEN {
+            db.pin_appended(&format!("a{}", i), "inbox");
+        }
+        assert_eq!(db.append_pin_sweep_len(), 2 * APPEND_PIN_SWEEP_LEN);
+    }
+
+    #[test]
+    fn a_sync_pass_is_tracked_until_its_guard_drops() {
+        let (_d, db) = open_db();
+        assert_eq!(db.oldest_sync_pass(), None);
+        let first = db.begin_sync_pass();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = db.begin_sync_pass();
+        assert_eq!(db.oldest_sync_pass(), Some(first.started()));
+        drop(first);
+        assert_eq!(db.oldest_sync_pass(), Some(second.started()));
+        drop(second);
+        assert_eq!(db.oldest_sync_pass(), None);
     }
 
     #[test]

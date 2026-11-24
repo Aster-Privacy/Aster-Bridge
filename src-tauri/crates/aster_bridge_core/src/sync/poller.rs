@@ -3199,7 +3199,8 @@ async fn run_sync_pass(
     jmap_broadcaster: Option<&broadcast::Sender<StateChange>>,
     deep: bool,
 ) -> Result<(), String> {
-    let pass_started = std::time::Instant::now();
+    let sync_pass = db.begin_sync_pass();
+    let pass_started = sync_pass.started();
     crate::imap::server::retry_pending_flag_pushes(db, client, session).await;
     let mut any_inserted = false;
     let mut last_err: Option<String> = None;
@@ -6840,6 +6841,43 @@ mod tests {
         let cached = db.get_cached_message("web-draft-att").unwrap().unwrap();
         assert_eq!(cached.attachments_state, ATTACHMENTS_NONE);
         assert!(db.get_message_attachments("web-draft-att").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sync_pass_stays_registered_while_it_runs() {
+        use axum::{routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let seen_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (probe_db, probe) = (db.clone(), seen_running.clone());
+        let app = with_empty_drafts(Router::new()).route(
+            "/bridge/v1/messages",
+            get(move || {
+                let (db, probe) = (probe_db.clone(), probe.clone());
+                async move {
+                    if db.oldest_sync_pass().is_some() {
+                        probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+
+        run_sync_pass(&mock_session(), &client, &db, None, true).await.unwrap();
+
+        assert!(seen_running.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(db.oldest_sync_pass(), None);
     }
 
     #[tokio::test]
