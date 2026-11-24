@@ -1671,6 +1671,20 @@ impl ApiClient {
         resp.json().await.map_err(BridgeError::from)
     }
 
+    pub async fn check_draft_exists(&self, access_token: &str, draft_id: &str) -> Result<()> {
+        let resp = self.client
+            .get(format!("{}/mail/v1/drafts/{}", self.base_url, draft_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        Ok(())
+    }
+
     pub async fn delete_draft(&self, access_token: &str, draft_id: &str) -> Result<()> {
         let resp = self.client
             .delete(format!("{}/mail/v1/drafts/{}", self.base_url, draft_id))
