@@ -3035,6 +3035,7 @@ pub(crate) async fn append_draft(
         .await
         .map_err(|e| e.to_string())?;
 
+    db.pin_appended(&created.id, "drafts");
     let now = chrono::Utc::now().to_rfc3339();
     crate::sync::poller::cache_web_draft(db, &created.id, &content, &our_email, &now, created.version, reply_to_id.as_deref());
     let uid = db.assign_uid_if_missing("drafts", &created.id)?;
