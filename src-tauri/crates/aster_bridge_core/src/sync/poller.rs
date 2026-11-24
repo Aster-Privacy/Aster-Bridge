@@ -6808,6 +6808,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deep_sync_keeps_a_draft_saved_over_imap_during_the_pass() {
+        use axum::{routing::get, Json, Router};
+        let (_dir, db) = temp_db();
+        let db = Arc::new(db);
+        let session = mock_session();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)));
+
+        let (save_db, save_client, save_session) = (db.clone(), client.clone(), session.clone());
+        let app = Router::new()
+            .route(
+                "/bridge/v1/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "items": [],
+                        "total": 0,
+                        "has_more": false,
+                        "next_cursor": serde_json::Value::Null
+                    }))
+                }),
+            )
+            .route(
+                "/mail/v1/labels",
+                get(|| async { Json(serde_json::json!({"labels": [], "has_more": false})) }),
+            )
+            .route(
+                "/mail/v1/drafts",
+                get(move || {
+                    let (db, client, session) = (save_db.clone(), save_client.clone(), save_session.clone());
+                    async move {
+                        let raw = b"Subject: autosave\r\nContent-Type: text/plain\r\n\r\nwip";
+                        crate::imap::server::append_draft(&db, &client, &session, raw)
+                            .await
+                            .unwrap();
+                        Json(serde_json::json!({
+                            "items": [],
+                            "has_more": false,
+                            "next_cursor": serde_json::Value::Null
+                        }))
+                    }
+                })
+                .post(|| async { Json(serde_json::json!({"id": "imap-draft", "version": 1, "success": true})) }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        run_sync_pass(&session, &client, &db, None, true).await.unwrap();
+
+        assert!(db.get_cached_message("imap-draft").unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn deep_sync_prunes_web_draft_deleted_on_server() {
         let (_dir, db) = temp_db();
         let db = Arc::new(db);
