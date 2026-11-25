@@ -41,9 +41,9 @@ import {
 } from "@/lib/theme_sync";
 import {
   check_for_update,
-  is_desktop_runtime,
   get_last_notified_version,
   mark_version_notified,
+  updates_supported,
   type UpdateInfo,
 } from "./updater";
 import { UpdateCard } from "./update_card";
@@ -471,7 +471,7 @@ function UpdateBanner() {
   const reduce_motion = useReducedMotion();
 
   useEffect(() => {
-    if (!is_desktop_runtime()) return;
+    if (!updates_supported()) return;
     let cancelled = false;
     const run = async () => {
       try {
@@ -2345,6 +2345,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
   };
 
   const handle_check_updates = async () => {
+    if (!updates_supported()) return;
     set_update_checking(true);
     try {
       const info = await check_for_update();
@@ -2543,7 +2544,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       </SettingsGroup>
 
       <SettingsGroup title={t("section_updates")} icon={<ArrowDownTrayIcon />}>
-        {update_info && (
+        {update_info && updates_supported() && (
           <div className="py-3">
             <div className="rounded-[var(--aster-radius-item,12px)] bg-brand/[0.07] p-3.5">
               <UpdateCard
@@ -2557,9 +2558,11 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </div>
         )}
         <SettingRow label={t("updates_app_row")} sublabel={app_version ? `${t("app_version")} ${app_version}` : undefined}>
-          <Button variant="outline" size="sm" disabled={update_installing} is_loading={update_checking} onClick={handle_check_updates}>
-            {t("update_check_now")}
-          </Button>
+          {updates_supported() && (
+            <Button variant="outline" size="sm" disabled={update_installing} is_loading={update_checking} onClick={handle_check_updates}>
+              {t("update_check_now")}
+            </Button>
+          )}
         </SettingRow>
       </SettingsGroup>
 

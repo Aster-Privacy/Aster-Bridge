@@ -25,6 +25,7 @@ mod a11y_bus;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod guard_status;
+mod package_managed;
 mod shell;
 mod webkit_sandbox;
 
@@ -1524,19 +1525,34 @@ async fn set_service_mode(state: State<'_, AppState>, enabled: bool) -> Result<(
     config::save_config(&guard.config)
 }
 
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(command) = package_managed::launch_command() {
+        let launcher = package_managed::launcher(&app.package_info().name, &command)?;
+        let result = if enabled {
+            launcher.enable()
+        } else {
+            launcher.disable()
+        };
+        return result.map_err(|e| e.to_string());
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn set_autostart(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    use tauri_plugin_autostart::ManagerExt;
-    let manager = app.autolaunch();
-    if enabled {
-        manager.enable().map_err(|e| e.to_string())?;
-    } else {
-        manager.disable().map_err(|e| e.to_string())?;
-    }
+    apply_autostart(&app, enabled)?;
     let mut guard = state.0.lock().await;
     guard.config.autostart = enabled;
     config::save_config(&guard.config)
@@ -1941,7 +1957,14 @@ fn main() {
         std::process::id()
     );
 
-    tauri::Builder::default()
+    let updates_managed = package_managed::updater_disabled();
+    if updates_managed {
+        tracing::info!(
+            "{} is set; updates come from the system package manager",
+            package_managed::DISABLE_UPDATER_VAR
+        );
+    }
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             shell::show_main_window(app);
             for arg in argv.iter().skip(1) {
@@ -1956,10 +1979,16 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            Some(vec!["--service"]),
+            Some(package_managed::AUTOSTART_ARGS.to_vec()),
         ))
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init());
+    let builder = if updates_managed {
+        builder.plugin(package_managed::updates_managed_plugin())
+    } else {
+        builder.plugin(tauri_plugin_updater::Builder::new().build())
+    };
+
+    builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(TrayState(std::sync::Mutex::new(None)))
@@ -2030,6 +2059,12 @@ fn main() {
             cfg.service_mode = true;
         }
         let service_mode = cfg.service_mode;
+        #[cfg(target_os = "linux")]
+        if cfg.autostart && package_managed::launch_command().is_some() {
+            if let Err(e) = apply_autostart(app.handle(), true) {
+                tracing::warn!("could not refresh the autostart entry: {}", e);
+            }
+        }
         app.state::<shell::CloseToTrayState>().0.store(
             service_mode || cfg.close_to_tray,
             std::sync::atomic::Ordering::SeqCst,

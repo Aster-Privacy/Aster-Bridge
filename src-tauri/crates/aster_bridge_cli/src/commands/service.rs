@@ -40,6 +40,7 @@ use crate::lock::InstanceLock;
 use crate::output::Tone;
 use crate::secret_backend;
 
+const LAUNCH_COMMAND_ENV: &str = "ASTER_LAUNCH_COMMAND";
 const STOP_WAIT: Duration = Duration::from_secs(30);
 const START_WAIT: Duration = Duration::from_secs(15);
 
@@ -99,6 +100,29 @@ fn current_exe() -> CliResult<PathBuf> {
         Some(stripped) if !stripped.starts_with("UNC\\") => PathBuf::from(stripped),
         _ => exe,
     })
+}
+
+fn service_exe(launch_command: Option<&OsStr>) -> CliResult<PathBuf> {
+    let Some(value) = launch_command.filter(|v| !v.is_empty()) else {
+        return current_exe();
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(CliError::coded(
+            CODE_PROGRAM_PATH,
+            format!("{} must be a full path, and {} isn't one.", LAUNCH_COMMAND_ENV, path.display()),
+        )
+        .with_hint(format!("Set {} to the full path of aster-bridge, or unset it, then run the command again.", LAUNCH_COMMAND_ENV)));
+    }
+    Ok(path)
+}
+
+fn launch_command_from_env() -> Option<std::ffi::OsString> {
+    if cfg!(target_os = "linux") {
+        std::env::var_os(LAUNCH_COMMAND_ENV)
+    } else {
+        None
+    }
 }
 
 fn key_file_for_service(data_dir: &Path) -> CliResult<Option<PathBuf>> {
@@ -166,7 +190,7 @@ async fn install(ctx: &Context) -> CliResult<i32> {
     };
 
     let spec = Spec {
-        exe: current_exe()?,
+        exe: service_exe(launch_command_from_env().as_deref())?,
         data_dir: dir.clone(),
         key_file,
     };
@@ -800,6 +824,27 @@ mod tests {
             platform::command_line(&spec).unwrap(),
             r#""C:\Program Files\Aster\aster-bridge.exe" serve --service --data-dir "D:\.""#
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_exe_prefers_the_launch_command() {
+        let exe = service_exe(Some(OsStr::new("/run/current-system/sw/bin/aster-bridge"))).unwrap();
+        assert_eq!(exe, PathBuf::from("/run/current-system/sw/bin/aster-bridge"));
+    }
+
+    #[test]
+    fn service_exe_falls_back_without_a_launch_command() {
+        let expected = current_exe().unwrap();
+        assert_eq!(service_exe(None).unwrap(), expected);
+        assert_eq!(service_exe(Some(OsStr::new(""))).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_exe_rejects_a_relative_launch_command() {
+        let error = service_exe(Some(OsStr::new("bin/aster-bridge"))).unwrap_err();
+        assert!(error.message.contains(LAUNCH_COMMAND_ENV));
     }
 
     #[test]
