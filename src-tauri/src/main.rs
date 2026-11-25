@@ -956,6 +956,7 @@ struct SendIdentityEntry {
     kind: String,
     display_name: Option<String>,
     enabled: bool,
+    sending_disabled: bool,
     sender_id: String,
 }
 
@@ -969,8 +970,10 @@ async fn list_send_identities(
         .as_ref()
         .ok_or_else(|| "not authenticated".to_string())?
         .clone();
+    let client = guard.client.clone();
     drop(guard);
 
+    auth::session::refresh_sending_blocks(&session, &client).await;
     let s = session.read().await;
     Ok(s.send_identities
         .iter()
@@ -979,6 +982,7 @@ async fn list_send_identities(
             kind: i.kind.as_str().to_string(),
             display_name: i.display_name.clone(),
             enabled: i.enabled,
+            sending_disabled: i.sending_disabled,
             sender_id: i.sender_id.clone(),
         })
         .collect())

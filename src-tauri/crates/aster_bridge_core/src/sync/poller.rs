@@ -6186,6 +6186,7 @@ mod tests {
             display_name: None,
             kind,
             enabled: true,
+            sending_disabled: false,
             sender_id: "id".to_string(),
         };
         let session_handle = mock_session();

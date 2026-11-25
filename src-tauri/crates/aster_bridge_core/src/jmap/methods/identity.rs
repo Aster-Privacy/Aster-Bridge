@@ -182,6 +182,7 @@ mod tests {
             display_name: None,
             kind: SendIdentityKind::Primary,
             enabled: true,
+            sending_disabled: false,
             sender_id: "primary".to_string(),
         };
         assert_eq!(identity_id("acct", &id), "identity-acct");
@@ -195,6 +196,7 @@ mod tests {
             display_name: None,
             kind: SendIdentityKind::Alias,
             enabled: true,
+            sending_disabled: false,
             sender_id: "alias-1".to_string(),
         };
         let other = SendIdentity {
@@ -203,6 +205,7 @@ mod tests {
             display_name: None,
             kind: SendIdentityKind::CustomDomain,
             enabled: true,
+            sending_disabled: false,
             sender_id: "domain-1".to_string(),
         };
         let a = identity_id("acct", &alias);
@@ -224,6 +227,7 @@ mod tests {
                     display_name: None,
                     kind: SendIdentityKind::Primary,
                     enabled: true,
+                    sending_disabled: false,
                     sender_id: "primary".to_string(),
                 },
                 SendIdentity {
@@ -232,6 +236,7 @@ mod tests {
                     display_name: Some("Sales".to_string()),
                     kind: SendIdentityKind::CustomDomain,
                     enabled: true,
+                    sending_disabled: false,
                     sender_id: "domain-2".to_string(),
                 },
                 SendIdentity {
@@ -240,6 +245,7 @@ mod tests {
                     display_name: None,
                     kind: SendIdentityKind::Alias,
                     enabled: false,
+                    sending_disabled: false,
                     sender_id: "alias-2".to_string(),
                 },
             ];

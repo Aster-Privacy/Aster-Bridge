@@ -10549,6 +10549,7 @@ mod tests {
                 display_name: None,
                 kind,
                 enabled,
+                sending_disabled: false,
                 sender_id: sender_id.to_string(),
             }
         };

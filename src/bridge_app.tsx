@@ -1906,7 +1906,8 @@ function IdentitiesGroup() {
   }, []);
 
   const enabled = (identities ?? []).filter((i) => i.enabled);
-  if (identities !== null && enabled.length <= 1) return null;
+  const all_sending_off = enabled.length > 0 && enabled.every((i) => i.sending_disabled);
+  if (identities !== null && enabled.length <= 1 && !all_sending_off) return null;
 
   // The default send-from is the identity whose sender_id matches the stored
   // preference; if none is stored or it no longer exists, the primary account
@@ -1919,6 +1920,10 @@ function IdentitiesGroup() {
 
   const make_primary = async (sid: string) => {
     if (sid === resolved_default || saving) return;
+    if (enabled.find((i) => i.sender_id === sid)?.sending_disabled) {
+      show_toast(t("identity_sending_off_hint"), "error");
+      return;
+    }
     const prev = default_sender;
     set_saving(true);
     set_default_sender_state(sid);
@@ -1976,6 +1981,10 @@ function IdentitiesGroup() {
         />
       )}
 
+      {all_sending_off && (
+        <p role="status" className="text-[12px] text-txt-primary mb-2 leading-relaxed">{t("all_sending_off")}</p>
+      )}
+
       <div>
         {identities === null ? (
           <div className="py-2 text-[13px] text-txt-muted">{t("loading")}</div>
@@ -1984,20 +1993,30 @@ function IdentitiesGroup() {
         ) : (
           filtered.map((id) => {
             const is_primary = id.sender_id === resolved_default;
+            const star_label = is_primary
+              ? t("primary_send_from")
+              : id.sending_disabled
+                ? t("identity_sending_off_hint")
+                : t("set_as_primary");
             return (
               <div key={`${id.kind}:${id.address}`} className="flex items-center gap-2.5 py-2">
                 <button
                   type="button"
-                  title={is_primary ? t("primary_send_from") : t("set_as_primary")}
-                  aria-label={is_primary ? t("primary_send_from") : t("set_as_primary")}
+                  title={star_label}
+                  aria-label={star_label}
                   aria-pressed={is_primary}
-                  disabled={is_primary || saving}
+                  disabled={is_primary || saving || id.sending_disabled}
                   onClick={() => make_primary(id.sender_id)}
                   className={`flex-shrink-0 inline-flex items-center justify-center w-9 h-9 -ml-2 ${is_primary ? "text-brand" : "text-txt-muted"} disabled:cursor-default`}
                 >
                   <StarIcon filled={is_primary} />
                 </button>
                 <span className="flex-shrink-0">{kind_badge(id.kind)}</span>
+                {id.sending_disabled && (
+                  <span className="flex-shrink-0" title={t("identity_sending_off_hint")}>
+                    <Badge color="gray">{t("identity_sending_off")}</Badge>
+                  </span>
+                )}
                 <CopyValue value={id.address} />
               </div>
             );

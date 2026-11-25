@@ -455,6 +455,7 @@ export interface SendIdentity {
   kind: "primary" | "alias" | "custom_domain";
   display_name: string | null;
   enabled: boolean;
+  sending_disabled: boolean;
   sender_id: string;
 }
 

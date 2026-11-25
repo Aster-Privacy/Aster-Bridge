@@ -90,7 +90,8 @@ fn failure_reason(err: &BridgeError) -> String {
     let reason = match err {
         BridgeError::PlanUpgradeRequired(msg)
         | BridgeError::MessageTooLarge(msg)
-        | BridgeError::RecipientKey(msg) => msg.clone(),
+        | BridgeError::RecipientKey(msg)
+        | BridgeError::SendingDisabled(msg) => msg.clone(),
         BridgeError::Network(_) | BridgeError::Io(_) => {
             "Aster Bridge couldn't reach the Aster server.".to_string()
         }
@@ -836,6 +837,15 @@ mod tests {
         assert_eq!(failure_reason(&err), "500 Internal Server Error");
         let err = BridgeError::RecipientKey("bob@example.com changed keys".to_string());
         assert_eq!(failure_reason(&err), "bob@example.com changed keys");
+    }
+
+    #[test]
+    fn a_turned_off_address_reports_the_reason() {
+        let err = BridgeError::SendingDisabled(crate::error::SENDING_DISABLED_TEXT.to_string());
+        assert_eq!(
+            failure_reason(&err),
+            "Sending from this alias is disabled. First enable it."
+        );
     }
 
     #[test]

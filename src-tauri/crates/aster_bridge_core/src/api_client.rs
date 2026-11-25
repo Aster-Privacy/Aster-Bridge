@@ -154,6 +154,9 @@ fn legacy_error_body(status: reqwest::StatusCode, body: &str) -> BridgeError {
     }
     if status == reqwest::StatusCode::FORBIDDEN {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if parsed.get("code").and_then(|v| v.as_str()) == Some(crate::error::SENDING_DISABLED_CODE) {
+                return BridgeError::SendingDisabled(crate::error::SENDING_DISABLED_TEXT.to_string());
+            }
             if parsed.get("error").and_then(|v| v.as_str()) == Some("plan_upgrade_required") {
                 let msg = parsed
                     .get("message")
@@ -874,6 +877,16 @@ pub struct LoginSaltsResponse {
     pub retired_salts: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SendingBlocks {
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub alias_ids: Vec<String>,
+    #[serde(default)]
+    pub domain_address_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct DefaultSenderResponse {
@@ -1212,6 +1225,20 @@ impl ApiClient {
 
         let body: DefaultSenderResponse = resp.json().await.map_err(BridgeError::from)?;
         Ok(body.sender_id)
+    }
+
+    pub async fn get_sending_blocks(&self, access_token: &str) -> Result<SendingBlocks> {
+        let resp = self.client
+            .get(format!("{}/addresses/v1/aliases/sending-blocks", self.base_url))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp).await);
+        }
+
+        resp.json().await.map_err(BridgeError::from)
     }
 
     pub async fn set_default_sender(&self, access_token: &str, sender_id: Option<&str>) -> Result<()> {
@@ -2512,6 +2539,73 @@ mod tests {
             "is_external": false,
             "created_at": "2026-06-14T00:00:00Z"
         })
+    }
+
+    #[tokio::test]
+    async fn a_turned_off_sending_address_explains_itself() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Sending from this alias is disabled. First enable it.",
+                        "code": "ALIAS_SENDING_DISABLED"
+                    })),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .send_mail("token", &serde_json::json!({"to": ["a@example.com"]}))
+            .await
+            .unwrap_err();
+        match &err {
+            BridgeError::SendingDisabled(msg) => {
+                assert_eq!(msg, crate::error::SENDING_DISABLED_TEXT);
+            }
+            other => panic!("expected SendingDisabled, got {:?}", other),
+        }
+        assert_eq!(err.to_string(), "Sending from this alias is disabled. First enable it.");
+    }
+
+    #[tokio::test]
+    async fn other_forbidden_sends_keep_their_old_mapping() {
+        let app = Router::new().route(
+            "/bridge/v1/send",
+            post(|| async {
+                (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "nope", "code": "SOMETHING_ELSE"})))
+                    .into_response()
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let err = client
+            .send_mail("token", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, BridgeError::SendingDisabled(_)), "{:?}", err);
+    }
+
+    #[tokio::test]
+    async fn sending_blocks_parse_from_the_server() {
+        let app = Router::new().route(
+            "/addresses/v1/aliases/sending-blocks",
+            get(|| async {
+                Json(serde_json::json!({
+                    "alias_ids": ["11111111-aaaa-4aaa-8aaa-000000000001"],
+                    "domain_address_ids": []
+                }))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = ApiClient::new_with_base_url(&base);
+        let blocks = client.get_sending_blocks("token").await.unwrap();
+        assert!(!blocks.primary);
+        assert_eq!(blocks.alias_ids, vec!["11111111-aaaa-4aaa-8aaa-000000000001".to_string()]);
+        assert!(blocks.domain_address_ids.is_empty());
     }
 
     #[tokio::test]
