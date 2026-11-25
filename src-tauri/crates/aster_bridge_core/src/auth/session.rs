@@ -56,6 +56,7 @@ pub struct SendIdentity {
     pub display_name: Option<String>,
     pub kind: SendIdentityKind,
     pub enabled: bool,
+    pub sending_disabled: bool,
     // Stable id used by the backend default-sender preference: "primary" for the
     // account address, the raw alias uuid for aliases, "domain-<uuid>" for
     // custom-domain addresses. Mirrors use_sender_aliases.ts.
@@ -111,6 +112,10 @@ impl Session {
             .unwrap_or_else(|| self.email.clone())
     }
 
+    pub fn is_sending_disabled(&self, address: &str) -> bool {
+        self.find_send_identity(address).is_some_and(|i| i.sending_disabled)
+    }
+
     pub fn accepts_login_name(&self, name: &str) -> bool {
         if self.email.is_empty() || name.is_empty() {
             return false;
@@ -163,6 +168,47 @@ pub async fn refresh_send_identities(
     }
 }
 
+pub fn apply_sending_blocks(
+    identities: &mut [SendIdentity],
+    blocks: &crate::api_client::SendingBlocks,
+) {
+    for identity in identities.iter_mut() {
+        identity.sending_disabled = match identity.kind {
+            SendIdentityKind::Primary => blocks.primary,
+            SendIdentityKind::Alias => blocks
+                .alias_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&identity.sender_id)),
+            SendIdentityKind::CustomDomain => identity
+                .sender_id
+                .strip_prefix("domain-")
+                .is_some_and(|own| {
+                    blocks
+                        .domain_address_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(own))
+                }),
+        };
+    }
+}
+
+pub async fn refresh_sending_blocks(
+    session: &std::sync::Arc<tokio::sync::RwLock<Session>>,
+    client: &ApiClient,
+) -> bool {
+    let access_token = session.read().await.access_token.to_string();
+    match client.get_sending_blocks(&access_token).await {
+        Ok(blocks) => {
+            apply_sending_blocks(&mut session.write().await.send_identities, &blocks);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("failed to read the sending blocks, the server still enforces them: {}", e);
+            false
+        }
+    }
+}
+
 // The account's chosen default sender. A failure here is non-fatal: the session
 // falls back to the primary address, which is what Bridge did before.
 pub async fn load_login_salts(client: &ApiClient, access_token: &str, user_id: &Uuid) {
@@ -205,6 +251,7 @@ pub async fn build_send_identities(
         display_name: primary_display_name,
         kind: SendIdentityKind::Primary,
         enabled: true,
+        sending_disabled: false,
         sender_id: "primary".to_string(),
     }];
 
@@ -252,6 +299,7 @@ pub async fn build_send_identities(
                     display_name,
                     kind: SendIdentityKind::Alias,
                     enabled: true,
+                    sending_disabled: false,
                     sender_id: a.id.clone(),
                 });
             }
@@ -313,12 +361,18 @@ pub async fn build_send_identities(
                         display_name,
                         kind: SendIdentityKind::CustomDomain,
                         enabled: true,
+                        sending_disabled: false,
                         sender_id: format!("domain-{}", addr.id),
                     });
                 }
             }
         }
         Err(e) => tracing::warn!("failed to list domains for send identities: {}", e),
+    }
+
+    match client.get_sending_blocks(access_token).await {
+        Ok(blocks) => apply_sending_blocks(&mut identities, &blocks),
+        Err(e) => tracing::warn!("failed to read the sending blocks, the server still enforces them: {}", e),
     }
 
     let custom_domain_count = identities
@@ -1083,8 +1137,90 @@ mod tests {
             display_name: None,
             kind,
             enabled,
+            sending_disabled: false,
             sender_id: sender_id.to_string(),
         }
+    }
+
+    fn blocks(primary: bool, alias_ids: &[&str], domain_address_ids: &[&str]) -> crate::api_client::SendingBlocks {
+        crate::api_client::SendingBlocks {
+            primary,
+            alias_ids: alias_ids.iter().map(|s| s.to_string()).collect(),
+            domain_address_ids: domain_address_ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn blocked_session() -> Session {
+        let mut s = sample_session();
+        s.send_identities = vec![
+            identity("alice@astermail.org", SendIdentityKind::Primary, true, "primary"),
+            identity("shop@astermail.org", SendIdentityKind::Alias, true, "11111111-aaaa-4aaa-8aaa-000000000001"),
+            identity("x7k2@astermail.org", SendIdentityKind::Alias, true, "11111111-aaaa-4aaa-8aaa-000000000002"),
+            identity("me@custom.test", SendIdentityKind::CustomDomain, true, "domain-22222222-bbbb-4bbb-8bbb-000000000001"),
+            identity("you@custom.test", SendIdentityKind::CustomDomain, true, "domain-22222222-bbbb-4bbb-8bbb-000000000002"),
+        ];
+        s
+    }
+
+    #[test]
+    fn sending_blocks_mark_the_primary_aliases_and_domain_addresses() {
+        let mut s = blocked_session();
+        apply_sending_blocks(
+            &mut s.send_identities,
+            &blocks(
+                true,
+                &["11111111-AAAA-4AAA-8AAA-000000000002"],
+                &["22222222-bbbb-4bbb-8bbb-000000000001"],
+            ),
+        );
+        assert!(s.is_sending_disabled("alice@astermail.org"));
+        assert!(s.is_sending_disabled("Alice@AsterMail.org"));
+        assert!(!s.is_sending_disabled("shop@astermail.org"));
+        assert!(s.is_sending_disabled("x7k2@astermail.org"));
+        assert!(s.is_sending_disabled("me@custom.test"));
+        assert!(!s.is_sending_disabled("you@custom.test"));
+        assert!(!s.is_sending_disabled("stranger@custom.test"));
+    }
+
+    #[test]
+    fn a_domain_address_id_never_blocks_an_alias_with_the_same_id() {
+        let mut s = blocked_session();
+        apply_sending_blocks(
+            &mut s.send_identities,
+            &blocks(false, &[], &["11111111-aaaa-4aaa-8aaa-000000000001"]),
+        );
+        assert!(!s.is_sending_disabled("shop@astermail.org"));
+    }
+
+    #[test]
+    fn lifting_a_block_clears_the_mark() {
+        let mut s = blocked_session();
+        apply_sending_blocks(&mut s.send_identities, &blocks(true, &["11111111-aaaa-4aaa-8aaa-000000000001"], &[]));
+        assert!(s.is_sending_disabled("shop@astermail.org"));
+        apply_sending_blocks(&mut s.send_identities, &blocks(false, &[], &[]));
+        assert!(!s.is_sending_disabled("alice@astermail.org"));
+        assert!(!s.is_sending_disabled("shop@astermail.org"));
+    }
+
+    #[test]
+    fn a_blocked_address_still_signs_in_to_receive_mail() {
+        let mut s = blocked_session();
+        apply_sending_blocks(
+            &mut s.send_identities,
+            &blocks(true, &["11111111-aaaa-4aaa-8aaa-000000000001"], &["22222222-bbbb-4bbb-8bbb-000000000001"]),
+        );
+        assert!(s.accepts_login_name("alice@astermail.org"));
+        assert!(s.accepts_login_name("shop@astermail.org"));
+        assert!(s.accepts_login_name("me@custom.test"));
+    }
+
+    #[test]
+    fn an_older_server_without_the_primary_field_blocks_nothing_on_the_primary() {
+        let parsed: crate::api_client::SendingBlocks =
+            serde_json::from_str(r#"{"alias_ids":[],"domain_address_ids":[]}"#).unwrap();
+        assert!(!parsed.primary);
+        let parsed: crate::api_client::SendingBlocks = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, crate::api_client::SendingBlocks::default());
     }
 
     #[test]

@@ -49,6 +49,22 @@ pub fn is_transient_send_error(err: &BridgeError) -> bool {
 
 const SEND_IN_PROGRESS_TEXT: &str = "still being sent";
 
+pub fn sending_disabled_reply() -> String {
+    format!("550 5.7.1 {}\r\n", crate::error::SENDING_DISABLED_TEXT)
+}
+
+async fn sender_is_blocked(
+    session: &Arc<RwLock<Session>>,
+    client: &ApiClient,
+    address: &str,
+) -> bool {
+    if !session.read().await.is_sending_disabled(address) {
+        return false;
+    }
+    crate::auth::session::refresh_sending_blocks(session, client).await
+        && session.read().await.is_sending_disabled(address)
+}
+
 pub fn send_idempotency_key(raw_message: &[u8], from: Option<&str>, recipients: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let mut envelope: Vec<String> = recipients
@@ -462,6 +478,7 @@ where
                                     "550 5.7.5 {}\r\n",
                                     crate::protocol_text::response_text(msg)
                                 ),
+                                BridgeError::SendingDisabled(_) => sending_disabled_reply(),
                                 _ => "550 Send rejected\r\n".to_string(),
                             };
                             tracing::error!("Failed to send mail via API: {}", e);
@@ -723,6 +740,11 @@ where
                             "rejecting MAIL FROM: the address is not one of this account's send identities"
                         );
                         writer.write_all(b"553 5.1.8 Sender address rejected: not an enabled address, alias, or domain address of this account\r\n").await?;
+                        continue;
+                    }
+                    if sender_is_blocked(&session, &client, &session_email).await {
+                        tracing::warn!("rejecting MAIL FROM: sending from this address is turned off");
+                        writer.write_all(sending_disabled_reply().as_bytes()).await?;
                         continue;
                     }
                     smtp.mail_from = Some(session_email);
@@ -1448,6 +1470,97 @@ mod tests {
             out
         );
         assert!(!out.contains("\r\n500"), "{:?}", out);
+    }
+
+    async fn blocks_server(primary: bool) -> Arc<ApiClient> {
+        let app = axum::Router::new().route(
+            "/addresses/v1/aliases/sending-blocks",
+            axum::routing::get(move || async move {
+                axum::Json(serde_json::json!({
+                    "primary": primary,
+                    "alias_ids": [],
+                    "domain_address_ids": []
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Arc::new(ApiClient::new_with_base_url(&format!("http://127.0.0.1:{}", port)))
+    }
+
+    async fn mail_from_with_cached_block(client: Option<Arc<ApiClient>>) -> (String, bool) {
+        use crate::auth::session::{SendIdentity, SendIdentityKind};
+        let crate::sign_in_notice::test_support::Fixture { session, db, client: dead_client, passwords, tls, dir } =
+            crate::sign_in_notice::test_support::fixture();
+        session.write().await.send_identities = vec![SendIdentity {
+            address: "tester@aster.test".to_string(),
+            auth_hash_b64: None,
+            display_name: None,
+            kind: SendIdentityKind::Primary,
+            enabled: true,
+            sending_disabled: true,
+            sender_id: "primary".to_string(),
+        }];
+        let client = client.unwrap_or(dead_client);
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("\0tester@aster.test\0{}", crate::sign_in_notice::test_support::APP_PASSWORD),
+        );
+        let script = format!(
+            "EHLO test\r\nAUTH PLAIN {}\r\nMAIL FROM:<tester@aster.test>\r\nQUIT\r\n",
+            credentials
+        );
+        let server_session = session.clone();
+        let out = crate::sign_in_notice::test_support::transcript(&script, move |stream| {
+            handle_session(stream, server_session, client, passwords, db, None, true)
+        })
+        .await;
+        let still_blocked = session.read().await.is_sending_disabled("tester@aster.test");
+        drop(tls);
+        drop(dir);
+        (out, still_blocked)
+    }
+
+    #[tokio::test]
+    async fn a_turned_off_primary_is_refused_with_the_reason() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let (out, still_blocked) = mail_from_with_cached_block(Some(blocks_server(true).await)).await;
+        assert!(
+            out.contains("\r\n550 5.7.1 Sending from this alias is disabled. First enable it.\r\n"),
+            "{:?}",
+            out
+        );
+        assert!(still_blocked);
+    }
+
+    #[tokio::test]
+    async fn a_lifted_block_lets_the_sender_through() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let (out, still_blocked) = mail_from_with_cached_block(Some(blocks_server(false).await)).await;
+        assert!(!out.contains("\r\n550 "), "{:?}", out);
+        assert!(out.contains("\r\n250 OK\r\n"), "{:?}", out);
+        assert!(!still_blocked);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_block_list_leaves_the_decision_to_the_server() {
+        let _guard = crate::sign_in_notice::test_support::test_lock();
+        let (out, _) = mail_from_with_cached_block(None).await;
+        assert!(!out.contains("\r\n550 "), "{:?}", out);
+        assert!(out.contains("\r\n250 OK\r\n"), "{:?}", out);
+    }
+
+    #[test]
+    fn a_turned_off_address_is_never_queued_for_retry() {
+        let err = BridgeError::SendingDisabled(crate::error::SENDING_DISABLED_TEXT.to_string());
+        assert!(!is_transient_send_error(&err));
+        assert_eq!(
+            sending_disabled_reply(),
+            "550 5.7.1 Sending from this alias is disabled. First enable it.\r\n"
+        );
     }
 
     #[test]
@@ -2298,6 +2411,7 @@ iQEz
             display_name: Some("Sales".to_string()),
             kind: SendIdentityKind::Alias,
             enabled: true,
+            sending_disabled: false,
             sender_id: "alias-1".to_string(),
         };
         let payload = build_send_payload(
@@ -2323,6 +2437,7 @@ iQEz
             display_name: None,
             kind,
             enabled,
+            sending_disabled: false,
             sender_id: address.to_string(),
         };
         fixture.session.try_write().unwrap().send_identities = vec![
@@ -2377,6 +2492,7 @@ iQEz
             display_name: None,
             kind: SendIdentityKind::CustomDomain,
             enabled: true,
+            sending_disabled: false,
             sender_id: "domain-1".to_string(),
         };
         let payload = build_send_payload(
@@ -2419,6 +2535,7 @@ iQEz
             display_name: None,
             kind: SendIdentityKind::CustomDomain,
             enabled: true,
+            sending_disabled: false,
             sender_id: "domain-1".to_string(),
         };
         let payload = build_send_payload(
@@ -2461,6 +2578,7 @@ iQEz
             display_name: Some("Me".to_string()),
             kind: SendIdentityKind::Primary,
             enabled: true,
+            sending_disabled: false,
             sender_id: "primary".to_string(),
         };
         let payload = build_send_payload(

@@ -2786,6 +2786,7 @@ mod tests {
             display_name: None,
             kind: SendIdentityKind::CustomDomain,
             enabled: true,
+            sending_disabled: false,
             sender_id: "domain-1".to_string(),
         };
         session.write().await.send_identities = vec![identity.clone()];
@@ -3476,6 +3477,7 @@ mod tests {
                 display_name: None,
                 kind: SendIdentityKind::Alias,
                 enabled: true,
+                sending_disabled: false,
                 sender_id: "alias-1".to_string(),
             }];
         }

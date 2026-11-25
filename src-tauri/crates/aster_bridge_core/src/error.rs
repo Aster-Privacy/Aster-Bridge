@@ -79,7 +79,14 @@ pub enum BridgeError {
 
     #[error("sign_in_expired: the sign-in code expired")]
     SignInExpired,
+
+    #[error("{0}")]
+    SendingDisabled(String),
 }
+
+pub const SENDING_DISABLED_TEXT: &str = "Sending from this alias is disabled. First enable it.";
+
+pub const SENDING_DISABLED_CODE: &str = "ALIAS_SENDING_DISABLED";
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
 
