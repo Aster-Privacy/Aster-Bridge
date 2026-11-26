@@ -427,8 +427,8 @@ async fn protocol_feature_matrix() {
 
         let caps = imap_cmd(&mut reader, &mut w, "a2", "CAPABILITY").await;
         cl.check(
-            "IMAP CAPABILITY (UIDPLUS, X-GM-EXT-1)",
-            caps.contains("UIDPLUS") && caps.contains("X-GM-EXT-1"),
+            "IMAP CAPABILITY (UIDPLUS, no X-GM-EXT-1)",
+            caps.contains("UIDPLUS") && !caps.contains("X-GM-EXT-1"),
             "advertised",
         );
 

@@ -685,32 +685,186 @@ fn is_store_flags_item(op_and_flags: &str) -> bool {
     )
 }
 
-/// Gmail labels have no Aster equivalent: a label STORE changes nothing and
-/// is answered with the labels the message already has.
-async fn ack_gm_labels_store(
+const MAX_STORE_LABELS: usize = 16;
+const MAX_STORE_LABEL_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelStoreOp {
+    Add,
+    Remove,
+    Replace,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LabelStore {
+    op: LabelStoreOp,
+    silent: bool,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelStoreAction {
+    Unchanged,
+    MoveTo(&'static str),
+    Refuse,
+}
+
+fn is_label_store_item(op_and_labels: &str) -> bool {
+    let item = op_and_labels
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        item.trim_end_matches(".SILENT"),
+        "X-GM-LABELS" | "+X-GM-LABELS" | "-X-GM-LABELS"
+    )
+}
+
+fn parse_label_list(raw: &str) -> Option<Vec<String>> {
+    let raw = raw.trim();
+    let inner = match raw.strip_prefix('(') {
+        Some(rest) => rest.strip_suffix(')')?,
+        None => raw,
+    };
+    let mut labels: Vec<String> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&first) = chars.peek() else { break };
+        let mut label = String::new();
+        if first == '"' {
+            chars.next();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    '\\' => label.push(chars.next()?),
+                    _ => label.push(c),
+                }
+                if label.len() > MAX_STORE_LABEL_LEN {
+                    return None;
+                }
+            }
+            if !closed {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                if matches!(c, '(' | ')' | '"') {
+                    return None;
+                }
+                label.push(c);
+                chars.next();
+                if label.len() > MAX_STORE_LABEL_LEN {
+                    return None;
+                }
+            }
+        }
+        if label.is_empty() || label.chars().any(char::is_control) {
+            return None;
+        }
+        labels.push(label);
+        if labels.len() > MAX_STORE_LABELS {
+            return None;
+        }
+    }
+    Some(labels)
+}
+
+fn parse_label_store(op_and_labels: &str) -> Option<LabelStore> {
+    let trimmed = op_and_labels.trim();
+    let item_end = trimmed
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(trimmed.len());
+    let item = trimmed[..item_end].to_ascii_uppercase();
+    let (base, silent) = match item.strip_suffix(".SILENT") {
+        Some(base) => (base, true),
+        None => (item.as_str(), false),
+    };
+    let op = match base {
+        "X-GM-LABELS" => LabelStoreOp::Replace,
+        "+X-GM-LABELS" => LabelStoreOp::Add,
+        "-X-GM-LABELS" => LabelStoreOp::Remove,
+        _ => return None,
+    };
+    let labels = parse_label_list(&trimmed[item_end..])?;
+    Some(LabelStore { op, silent, labels })
+}
+
+fn folder_for_store_label(label: &str) -> Option<&'static str> {
+    let lowered = label.to_ascii_lowercase();
+    let folder = match lowered.as_str() {
+        "\\inbox" | "inbox" => "inbox",
+        "\\trash" => "trash",
+        "\\spam" | "\\junk" => "spam",
+        "\\sent" => "sent",
+        "\\draft" | "\\drafts" => "drafts",
+        "\\allmail" | "\\all" | "\\archive" => "archive",
+        _ => return crate::folders::system_mailbox(label).map(|m| m.label),
+    };
+    Some(folder)
+}
+
+fn label_store_action(current_folder: &str, store: &LabelStore) -> LabelStoreAction {
+    let mut mapped: Vec<&'static str> = Vec::new();
+    for label in &store.labels {
+        match folder_for_store_label(label) {
+            Some(folder) => {
+                if !mapped.contains(&folder) {
+                    mapped.push(folder);
+                }
+            }
+            None => return LabelStoreAction::Refuse,
+        }
+    }
+    match store.op {
+        LabelStoreOp::Add => {
+            let targets: Vec<&'static str> = mapped
+                .into_iter()
+                .filter(|f| *f != current_folder && *f != "archive")
+                .collect();
+            match targets.as_slice() {
+                [] => LabelStoreAction::Unchanged,
+                [target] if matches!(*target, "inbox" | "trash" | "spam") => LabelStoreAction::MoveTo(target),
+                _ => LabelStoreAction::Refuse,
+            }
+        }
+        LabelStoreOp::Remove => {
+            if !mapped.contains(&current_folder) {
+                return LabelStoreAction::Unchanged;
+            }
+            match current_folder {
+                "inbox" => LabelStoreAction::MoveTo("archive"),
+                "trash" | "spam" => LabelStoreAction::MoveTo("inbox"),
+                _ => LabelStoreAction::Refuse,
+            }
+        }
+        LabelStoreOp::Replace => match mapped.as_slice() {
+            [target] if *target == current_folder => LabelStoreAction::Unchanged,
+            [target] if matches!(*target, "inbox" | "trash" | "spam" | "archive") => {
+                LabelStoreAction::MoveTo(target)
+            }
+            _ => LabelStoreAction::Refuse,
+        },
+    }
+}
+
+async fn write_label_fetch(
     writer: &mut (impl AsyncWrite + Unpin),
-    m: &CachedMessage,
     seq: usize,
     uid: Option<u32>,
-    upper_store: &str,
-    store_args: &str,
+    labels: &[String],
 ) -> std::io::Result<()> {
-    tracing::info!(
-        target: "imap::gm_labels",
-        "gm-labels store not propagated to backend: aster_id={} op={} args={}",
-        m.aster_id,
-        if upper_store.contains("+X-GM-LABELS") { "add" }
-        else if upper_store.contains("-X-GM-LABELS") { "remove" }
-        else { "replace" },
-        store_args
-    );
-    if upper_store.contains(".SILENT") {
-        return Ok(());
-    }
-    let rendered: Vec<String> = gmail_labels_for_message(m)
-        .iter()
-        .map(|l| quote_or_atom_label(l))
-        .collect();
+    let rendered: Vec<String> = labels.iter().map(|l| quote_or_atom_label(l)).collect();
     let uid_item = uid.map(|u| format!("UID {} ", u)).unwrap_or_default();
     writer
         .write_all(
@@ -718,6 +872,66 @@ async fn ack_gm_labels_store(
                 .as_bytes(),
         )
         .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_label_store(
+    writer: &mut (impl AsyncWrite + Unpin),
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    conn: &mut ImapConnection,
+    tag: &str,
+    folder: &str,
+    op_and_labels: &str,
+    selected: Vec<(usize, CachedMessage)>,
+    is_uid: bool,
+) -> std::io::Result<()> {
+    let done = if is_uid { "UID STORE completed" } else { "STORE completed" };
+    let Some(store) = parse_label_store(op_and_labels) else {
+        return write_bad(writer, tag, "Invalid X-GM-LABELS list").await;
+    };
+    let target = match label_store_action(folder, &store) {
+        LabelStoreAction::Refuse => {
+            return write_no(writer, tag, "[CANNOT] that label change has no matching Aster folder").await;
+        }
+        LabelStoreAction::Unchanged => {
+            if !store.silent {
+                for (seq, m) in &selected {
+                    write_label_fetch(writer, *seq, is_uid.then_some(m.imap_uid), &gmail_labels_for_message(m))
+                        .await?;
+                }
+            }
+            return write_ok(writer, tag, done).await;
+        }
+        LabelStoreAction::MoveTo(target) => target,
+    };
+    if selected.is_empty() {
+        return write_ok(writer, tag, done).await;
+    }
+    let Some(flags) = move_flags_between(folder, target) else {
+        return write_no(writer, tag, "[CANNOT] cannot move messages into that mailbox").await;
+    };
+    let verb = if is_uid { "UID STORE" } else { "STORE" };
+    let moved = match move_selected(db, client, session, verb, folder, target, &flags, &selected).await {
+        Ok(moved) => moved,
+        Err(text) => return write_no(writer, tag, text).await,
+    };
+    tracing::info!(target: "imap::gm_labels", "label store moved {} message(s) to {}", selected.len(), target);
+    if !store.silent {
+        let new_labels: Vec<String> = gmail_label_for_folder(target).map(str::to_string).into_iter().collect();
+        for (seq, m) in &selected {
+            write_label_fetch(writer, *seq, is_uid.then_some(m.imap_uid), &new_labels).await?;
+        }
+    }
+    if is_uid {
+        for uid in &moved.src_uids {
+            if let Some(seq) = conn.expunged(*uid) {
+                writer.write_all(format!("* {} EXPUNGE\r\n", seq).as_bytes()).await?;
+            }
+        }
+    }
+    write_ok(writer, tag, done).await
 }
 
 fn parse_store_flags(op_and_flags: &str) -> (i8, u32, bool) {
@@ -1290,9 +1504,9 @@ where
     let _ = client;
     let starttls_capable = tls_config.is_some();
     let greeting_cap = if starttls_capable {
-        format!("* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
+        format!("* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
+        format!("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE] Aster Bridge {} ready\r\n", env!("CARGO_PKG_VERSION"))
     };
     writer.write_all(greeting_cap.as_bytes()).await?;
 
@@ -1448,9 +1662,9 @@ where
         match command.as_str() {
             "CAPABILITY" => {
                 let cap_line: &[u8] = if starttls_capable && conn.state == ImapState::NotAuthenticated {
-                    b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                    b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE\r\n"
                 } else {
-                    b"* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE X-GM-EXT-1\r\n"
+                    b"* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN IDLE UIDPLUS MOVE UNSELECT CHILDREN NAMESPACE\r\n"
                 };
                 writer.write_all(cap_line).await?;
                 write_ok(&mut writer, &tag, "CAPABILITY completed").await?;
@@ -1753,18 +1967,16 @@ where
                             .unwrap_or_else(|| db.list_cached_message_meta(&folder).unwrap_or_default());
                         let view = MailboxView::new(&conn.uids, &messages);
                         let uids = parse_uid_set(uid_set_spec, &conn.uids);
-                        // Routed like STORE: an X-GM-LABELS item fell through
-                        // to the flag code, which cleared every flag of the
-                        // message and pushed "unread" to the server.
-                        let upper_store = op_and_flags.to_ascii_uppercase();
-                        if upper_store.contains("X-GM-LABELS") {
-                            for uid in &uids {
-                                if let Some((seq, m)) = view.by_uid(*uid) {
-                                    ack_gm_labels_store(&mut writer, m, seq, Some(*uid), &upper_store, subargs)
-                                        .await?;
-                                }
-                            }
-                            write_ok(&mut writer, &tag, "UID STORE completed").await?;
+                        if is_label_store_item(op_and_flags) {
+                            let selected: Vec<(usize, CachedMessage)> = uids
+                                .iter()
+                                .filter_map(|uid| view.by_uid(*uid).map(|(seq, m)| (seq, m.clone())))
+                                .collect();
+                            drop(view);
+                            handle_label_store(
+                                &mut writer, &db, &client, &session, &mut conn, &tag, &folder, op_and_flags, selected, true,
+                            )
+                            .await?;
                             continue;
                         }
                         if !is_store_flags_item(op_and_flags) {
@@ -1938,20 +2150,22 @@ where
                     continue;
                 }
                 let op_and_flags = store_args[set_end..].trim();
-                let upper_store = op_and_flags.to_ascii_uppercase();
-                let is_gm_labels = upper_store.contains("X-GM-LABELS");
                 let folder = conn.selected_folder.clone().unwrap_or_default();
                 let messages = db.list_cached_message_meta(&folder).unwrap_or_default();
                 let view = MailboxView::new(&conn.uids, &messages);
                 let seqs = parse_set(set_part, view.len());
-                let mut store_failure: Option<&'static str> = None;
-                if is_gm_labels {
-                    for s in &seqs {
-                        if let Some(m) = view.by_seq(*s) {
-                            ack_gm_labels_store(&mut writer, m, *s as usize, None, &upper_store, store_args)
-                                .await?;
-                        }
-                    }
+                let store_failure: Option<&'static str>;
+                if is_label_store_item(op_and_flags) {
+                    let selected: Vec<(usize, CachedMessage)> = seqs
+                        .iter()
+                        .filter_map(|s| view.by_seq(*s).map(|m| (*s as usize, m.clone())))
+                        .collect();
+                    drop(view);
+                    handle_label_store(
+                        &mut writer, &db, &client, &session, &mut conn, &tag, &folder, op_and_flags, selected, false,
+                    )
+                    .await?;
+                    continue;
                 } else if !is_store_flags_item(op_and_flags) {
                     write_bad(&mut writer, &tag, "Unsupported STORE item").await?;
                     continue;
@@ -3647,6 +3861,131 @@ async fn set_flags_with_backoff(
     }
 }
 
+struct MovedMessages {
+    validity: u64,
+    src_uids: Vec<u32>,
+    tgt_uids: Vec<u32>,
+    all_assigned: bool,
+}
+
+fn move_flags_between(source_folder: &str, target_internal: &str) -> Option<serde_json::Value> {
+    match (crate::folders::token_of_label(target_internal), source_folder) {
+        (Some(_), "drafts") => None,
+        (Some(_), _) => move_flags_for("inbox"),
+        (None, _) => move_flags_for(target_internal),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn move_selected(
+    db: &Arc<Database>,
+    client: &Arc<ApiClient>,
+    session: &Arc<RwLock<Session>>,
+    verb: &str,
+    source_folder: &str,
+    target_internal: &str,
+    flags: &serde_json::Value,
+    selected: &[(usize, CachedMessage)],
+) -> std::result::Result<MovedMessages, &'static str> {
+    let target_token = crate::folders::token_of_label(target_internal).map(str::to_string);
+    let source_token = crate::folders::token_of_label(source_folder).map(str::to_string);
+    let token = session.read().await.access_token.to_string();
+    let validity = {
+        let db = Arc::clone(db);
+        match tokio::task::spawn_blocking(move || uid_validity(&db)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!("{} could not read UIDVALIDITY: {}", verb, e);
+                return Err("[UNAVAILABLE] mailbox state is unavailable, try again");
+            }
+            Err(e) => {
+                tracing::warn!("{} UIDVALIDITY task failed: {}", verb, e);
+                return Err("[SERVERBUG] mailbox state is unavailable");
+            }
+        }
+    };
+    let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
+    if let Err(e) = relabel_with_backoff(
+        client,
+        &token,
+        &selected_ids,
+        target_token.as_deref(),
+        source_token.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("{} folder update failed: {}", verb, e);
+        return Err("[SERVERBUG] could not move message on the server");
+    }
+    for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
+        let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
+        if bulk_move_chunk(client, &token, &ids, flags).await {
+            continue;
+        }
+        for (_, m) in chunk {
+            if let Err(e) = set_flags_with_backoff(client, &token, &m.aster_id, flags).await {
+                let is_missing_item = matches!(
+                    &e,
+                    crate::error::BridgeError::Api(msg) if msg.starts_with("404")
+                );
+                let draft_removed = is_missing_item
+                    && source_folder == "drafts"
+                    && client.delete_draft(&token, &m.aster_id).await.is_ok();
+                if !draft_removed {
+                    tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
+                    return Err("[SERVERBUG] could not move message on the server");
+                }
+            }
+        }
+    }
+    let assigned = {
+        let db = Arc::clone(db);
+        let folder = source_folder.to_string();
+        let target = target_internal.to_string();
+        let entries = selected.to_vec();
+        crate::shutdown::spawn_blocking_held(move || {
+            db.write_batch(|batch| {
+                let mut src: Vec<u32> = Vec::new();
+                let mut tgt: Vec<u32> = Vec::new();
+                let mut all_assigned = true;
+                for (_, m) in &entries {
+                    let _ = batch.upsert_cached_message(
+                        &m.aster_id,
+                        &target,
+                        m.subject.as_deref(),
+                        m.sender.as_deref(),
+                        m.recipients.as_deref(),
+                        m.date.as_deref(),
+                        m.size,
+                        m.body_text.as_deref(),
+                        m.raw_headers.as_deref(),
+                    );
+                    let _ = batch.remove_uid_mapping(m.imap_uid as i64, &folder);
+                    src.push(m.imap_uid);
+                    match batch.assign_uid_if_missing(&target, &m.aster_id) {
+                        Ok(uid) => tgt.push(uid),
+                        Err(e) => {
+                            tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
+                            all_assigned = false;
+                        }
+                    }
+                }
+                (src, tgt, all_assigned)
+            })
+        })
+        .await
+    };
+    let (src_uids, tgt_uids, all_assigned) = match assigned {
+        Some(Ok(result)) => result,
+        None => return Err("[UNAVAILABLE] Aster Bridge is stopping"),
+        Some(Err(e)) => {
+            tracing::warn!("{} cache update task failed: {}", verb, e);
+            return Err("[SERVERBUG] could not update the local mailbox");
+        }
+    };
+    Ok(MovedMessages { validity, src_uids, tgt_uids, all_assigned })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_copy_move(
     writer: &mut (impl AsyncWrite + Unpin),
@@ -3691,14 +4030,7 @@ async fn handle_copy_move(
         )
         .await;
     }
-    let target_token = crate::folders::token_of_label(&target_internal).map(str::to_string);
-    let source_token = crate::folders::token_of_label(&source_folder).map(str::to_string);
-    let flags = match (&target_token, source_folder.as_str()) {
-        (Some(_), "drafts") => None,
-        (Some(_), _) => move_flags_for("inbox"),
-        (None, _) => move_flags_for(&target_internal),
-    };
-    let flags = match flags {
+    let flags = match move_flags_between(&source_folder, &target_internal) {
         Some(f) => f,
         None => return write_no(writer, tag, "[CANNOT] cannot move messages into that mailbox").await,
     };
@@ -3729,102 +4061,11 @@ async fn handle_copy_move(
         return write_ok(writer, tag, &format!("{} completed", verb)).await;
     }
 
-    let token = session.read().await.access_token.to_string();
-    let validity = {
-        let db = Arc::clone(db);
-        match tokio::task::spawn_blocking(move || uid_validity(&db)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!("{} could not read UIDVALIDITY: {}", verb, e);
-                return write_no(writer, tag, "[UNAVAILABLE] mailbox state is unavailable, try again")
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!("{} UIDVALIDITY task failed: {}", verb, e);
-                return write_no(writer, tag, "[SERVERBUG] mailbox state is unavailable").await;
-            }
-        }
+    let moved = match move_selected(db, client, session, verb, &source_folder, &target_internal, &flags, &selected).await {
+        Ok(moved) => moved,
+        Err(text) => return write_no(writer, tag, text).await,
     };
-    let selected_ids: Vec<String> = selected.iter().map(|(_, m)| m.aster_id.clone()).collect();
-    if let Err(e) = relabel_with_backoff(
-        client,
-        &token,
-        &selected_ids,
-        target_token.as_deref(),
-        source_token.as_deref(),
-    )
-    .await
-    {
-        tracing::warn!("{} folder update failed: {}", verb, e);
-        return write_no(writer, tag, "[SERVERBUG] could not move message on the server").await;
-    }
-    for chunk in selected.chunks(ApiClient::MAX_BULK_METADATA_ITEMS) {
-        let ids: Vec<String> = chunk.iter().map(|(_, m)| m.aster_id.clone()).collect();
-        if bulk_move_chunk(client, &token, &ids, &flags).await {
-            continue;
-        }
-        for (_, m) in chunk {
-            if let Err(e) = set_flags_with_backoff(client, &token, &m.aster_id, &flags).await {
-                let is_missing_item = matches!(
-                    &e,
-                    crate::error::BridgeError::Api(msg) if msg.starts_with("404")
-                );
-                let draft_removed = is_missing_item
-                    && source_folder == "drafts"
-                    && client.delete_draft(&token, &m.aster_id).await.is_ok();
-                if !draft_removed {
-                    tracing::warn!("{} backend update failed for {}: {}", verb, m.aster_id, e);
-                    return write_no(writer, tag, "[SERVERBUG] could not move message on the server")
-                        .await;
-                }
-            }
-        }
-    }
-    let assigned = {
-        let db = Arc::clone(db);
-        let folder = source_folder.clone();
-        let target = target_internal.clone();
-        let entries = selected.clone();
-        crate::shutdown::spawn_blocking_held(move || {
-            db.write_batch(|batch| {
-                let mut src: Vec<u32> = Vec::new();
-                let mut tgt: Vec<u32> = Vec::new();
-                let mut all_assigned = true;
-                for (_, m) in &entries {
-                    let _ = batch.upsert_cached_message(
-                        &m.aster_id,
-                        &target,
-                        m.subject.as_deref(),
-                        m.sender.as_deref(),
-                        m.recipients.as_deref(),
-                        m.date.as_deref(),
-                        m.size,
-                        m.body_text.as_deref(),
-                        m.raw_headers.as_deref(),
-                    );
-                    let _ = batch.remove_uid_mapping(m.imap_uid as i64, &folder);
-                    src.push(m.imap_uid);
-                    match batch.assign_uid_if_missing(&target, &m.aster_id) {
-                        Ok(uid) => tgt.push(uid),
-                        Err(e) => {
-                            tracing::warn!("MOVE could not assign a target UID to {}: {}", m.aster_id, e);
-                            all_assigned = false;
-                        }
-                    }
-                }
-                (src, tgt, all_assigned)
-            })
-        })
-        .await
-    };
-    let (src_uids, tgt_uids, all_assigned) = match assigned {
-        Some(Ok(result)) => result,
-        None => return write_no(writer, tag, "[UNAVAILABLE] Aster Bridge is stopping").await,
-        Some(Err(e)) => {
-            tracing::warn!("{} cache update task failed: {}", verb, e);
-            return write_no(writer, tag, "[SERVERBUG] could not update the local mailbox").await;
-        }
-    };
+    let MovedMessages { validity, src_uids, tgt_uids, all_assigned } = moved;
 
     if all_assigned {
         let src_set = src_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
@@ -5151,6 +5392,330 @@ mod tests {
         assert!(out.contains("a3 OK"), "{:?}", out);
     }
 
+    fn label_store(op_and_labels: &str) -> LabelStore {
+        parse_label_store(op_and_labels).unwrap_or_else(|| panic!("did not parse: {}", op_and_labels))
+    }
+
+    #[test]
+    fn label_store_items_are_recognized_exactly() {
+        assert!(is_label_store_item("+X-GM-LABELS (\\Trash)"));
+        assert!(is_label_store_item("-x-gm-labels.silent (\\Inbox)"));
+        assert!(is_label_store_item("X-GM-LABELS(\\Inbox)"));
+        assert!(!is_label_store_item("+FLAGS (\\Deleted)"));
+        assert!(!is_label_store_item("+X-GM-LABELSX (\\Trash)"));
+        assert!(!is_label_store_item("X-GM-MSGID 1"));
+    }
+
+    #[test]
+    fn label_store_lists_parse_with_bounds() {
+        let parsed = label_store("+X-GM-LABELS.SILENT (\\Trash \"My \\\"Label\\\"\" Work)");
+        assert_eq!(parsed.op, LabelStoreOp::Add);
+        assert!(parsed.silent);
+        assert_eq!(parsed.labels, vec!["\\Trash", "My \"Label\"", "Work"]);
+
+        let parsed = label_store("-X-GM-LABELS \\Inbox");
+        assert_eq!(parsed.op, LabelStoreOp::Remove);
+        assert!(!parsed.silent);
+        assert_eq!(parsed.labels, vec!["\\Inbox"]);
+
+        let parsed = label_store("X-GM-LABELS ()");
+        assert_eq!(parsed.op, LabelStoreOp::Replace);
+        assert!(parsed.labels.is_empty());
+
+        assert_eq!(parse_label_store("+X-GM-LABELS (\\Trash"), None);
+        assert_eq!(parse_label_store("+X-GM-LABELS (\"open)"), None);
+        assert_eq!(parse_label_store("+X-GM-LABELS (\"ends\\"), None);
+        assert_eq!(parse_label_store("+X-GM-LABELS (a(b)"), None);
+        assert_eq!(parse_label_store("+X-GM-LABELS (\"\")"), None);
+        assert_eq!(parse_label_store("+X-GM-LABELS (\"a\u{1}b\")"), None);
+        assert_eq!(parse_label_store("+FLAGS (\\Seen)"), None);
+
+        let many = vec!["l"; MAX_STORE_LABELS].join(" ");
+        assert_eq!(label_store(&format!("+X-GM-LABELS ({})", many)).labels.len(), MAX_STORE_LABELS);
+        let too_many = vec!["l"; MAX_STORE_LABELS + 1].join(" ");
+        assert_eq!(parse_label_store(&format!("+X-GM-LABELS ({})", too_many)), None);
+
+        let longest = "x".repeat(MAX_STORE_LABEL_LEN);
+        assert!(parse_label_store(&format!("+X-GM-LABELS ({})", longest)).is_some());
+        assert!(parse_label_store(&format!("+X-GM-LABELS (\"{}\")", longest)).is_some());
+        let too_long = "x".repeat(MAX_STORE_LABEL_LEN + 1);
+        assert_eq!(parse_label_store(&format!("+X-GM-LABELS ({})", too_long)), None);
+        assert_eq!(parse_label_store(&format!("+X-GM-LABELS (\"{}\")", too_long)), None);
+    }
+
+    #[test]
+    fn label_stores_map_to_the_moves_they_express() {
+        let action = |folder: &str, store: &str| label_store_action(folder, &label_store(store));
+        use LabelStoreAction::{MoveTo, Refuse, Unchanged};
+
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Trash)"), MoveTo("trash"));
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\trash)"), MoveTo("trash"));
+        assert_eq!(action("inbox", "-X-GM-LABELS (\\Inbox)"), MoveTo("archive"));
+        assert_eq!(action("inbox", "-X-GM-LABELS (INBOX)"), MoveTo("archive"));
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Junk)"), MoveTo("spam"));
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Spam)"), MoveTo("spam"));
+        assert_eq!(action("archive", "+X-GM-LABELS (\\Inbox)"), MoveTo("inbox"));
+        assert_eq!(action("spam", "+X-GM-LABELS (\\Inbox)"), MoveTo("inbox"));
+        assert_eq!(action("trash", "-X-GM-LABELS (\\Trash)"), MoveTo("inbox"));
+        assert_eq!(action("spam", "-X-GM-LABELS (\\Spam)"), MoveTo("inbox"));
+        assert_eq!(action("folder:tok_w", "+X-GM-LABELS (\\Trash)"), MoveTo("trash"));
+        assert_eq!(action("inbox", "+X-GM-LABELS (Trash)"), MoveTo("trash"));
+        assert_eq!(action("inbox", "X-GM-LABELS (\\Trash)"), MoveTo("trash"));
+        assert_eq!(action("inbox", "X-GM-LABELS (\\Allmail)"), MoveTo("archive"));
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Inbox \\Trash)"), MoveTo("trash"));
+
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Inbox)"), Unchanged);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Allmail)"), Unchanged);
+        assert_eq!(action("inbox", "+X-GM-LABELS ()"), Unchanged);
+        assert_eq!(action("inbox", "-X-GM-LABELS (\\Trash)"), Unchanged);
+        assert_eq!(action("archive", "-X-GM-LABELS (\\Inbox)"), Unchanged);
+        assert_eq!(action("folder:tok_w", "-X-GM-LABELS (\\Inbox)"), Unchanged);
+        assert_eq!(action("trash", "X-GM-LABELS (\\Trash)"), Unchanged);
+
+        assert_eq!(action("inbox", "+X-GM-LABELS (Work)"), Refuse);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Important)"), Refuse);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Trash Work)"), Refuse);
+        assert_eq!(action("inbox", "-X-GM-LABELS (\\Inbox Work)"), Refuse);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Trash \\Spam)"), Refuse);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Sent)"), Refuse);
+        assert_eq!(action("inbox", "+X-GM-LABELS (\\Drafts)"), Refuse);
+        assert_eq!(action("archive", "-X-GM-LABELS (\\Allmail)"), Refuse);
+        assert_eq!(action("sent", "-X-GM-LABELS (\\Sent)"), Refuse);
+        assert_eq!(action("inbox", "X-GM-LABELS ()"), Refuse);
+        assert_eq!(action("inbox", "X-GM-LABELS (\\Inbox \\Trash)"), Refuse);
+        assert_eq!(action("inbox", "X-GM-LABELS (\\Sent)"), Refuse);
+    }
+
+    fn server_folders(log: &[(String, String)]) -> HashMap<String, String> {
+        let mut folders: HashMap<String, String> = HashMap::new();
+        for (kind, value) in log {
+            if kind == "SERVER_FOLDER" {
+                if let Some((id, folder)) = value.split_once('|') {
+                    folders.insert(id.to_string(), folder.to_string());
+                }
+            }
+        }
+        folders
+    }
+
+    async fn select_exists(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tag: &str,
+        mailbox: &str,
+    ) -> u32 {
+        let resp = imap_cmd_lines(reader, writer, tag, &format!("SELECT {}", mailbox)).await;
+        assert!(resp.contains(&format!("{} OK", tag)), "{}", resp);
+        resp.lines()
+            .find_map(|l| l.strip_prefix("* ").and_then(|r| r.strip_suffix(" EXISTS")))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no EXISTS in {}", resp))
+    }
+
+    #[tokio::test]
+    async fn label_and_standard_deletes_and_moves_reach_the_server_and_stay_applied() {
+        let (addr, db, _tx, calls, _dir) =
+            start_test_server_mock(MockOpts { bulk_metadata: true, ..Default::default() }, Some("test-ik")).await;
+        add_folder(&db, "tok_w", "Work", None);
+        for n in 1..=7 {
+            seed(&db, &format!("e2e-{}", n), "inbox", &format!("message {}", n));
+        }
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut writer = w;
+        let mut greeting = String::new();
+        reader.read_line(&mut greeting).await.unwrap();
+        assert!(!greeting.contains("X-GM-EXT-1"), "{}", greeting);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c1", "CAPABILITY").await;
+        assert!(resp.contains("* CAPABILITY ") && resp.contains("MOVE") && resp.contains("UIDPLUS"), "{}", resp);
+        assert!(!resp.contains("X-GM-EXT-1"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "c2", "LOGIN \"tester@aster.test\" \"abcd-efgh-ijkl-mnop\"").await;
+        assert!(resp.contains("c2 OK"), "{}", resp);
+        assert_eq!(select_exists(&mut reader, &mut writer, "c3", "INBOX").await, 7);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l1", "UID STORE 1 +X-GM-LABELS (\\Trash)").await;
+        assert!(resp.contains("l1 OK"), "{}", resp);
+        assert!(resp.contains("* 1 FETCH (UID 1 X-GM-LABELS (\\Trash))"), "{}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-1").unwrap().unwrap().folder, "trash");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l2", "UID STORE 2 -X-GM-LABELS (\\Inbox)").await;
+        assert!(resp.contains("l2 OK"), "{}", resp);
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-2").unwrap().unwrap().folder, "archive");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l3", "STORE 1 +X-GM-LABELS.SILENT (\\Trash)").await;
+        assert!(resp.contains("l3 OK"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE") && !resp.contains("FETCH"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-3").unwrap().unwrap().folder, "trash");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l4", "NOOP").await;
+        assert!(resp.contains("* 1 EXPUNGE"), "{}", resp);
+
+        let writes = |log: &[(String, String)]| {
+            log.iter()
+                .filter(|(m, _)| matches!(m.as_str(), "PATCH" | "BULK_PATCH" | "ADD_LABEL" | "REMOVE_LABEL" | "DELETE"))
+                .count()
+        };
+        let before = writes(&calls.lock().await);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "l5", "UID STORE 4 +X-GM-LABELS (Work)").await;
+        assert!(resp.contains("l5 NO"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
+        assert_eq!(writes(&calls.lock().await), before, "a refused label store reached the server");
+        assert_eq!(db.get_cached_message("e2e-4").unwrap().unwrap().folder, "inbox");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d1", "STORE 1 +FLAGS (\\Deleted)").await;
+        assert!(resp.contains("d1 OK"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "d2", "EXPUNGE").await;
+        assert!(resp.contains("* 1 EXPUNGE") && resp.contains("d2 OK"), "{}", resp);
+        assert!(db.get_cached_message("e2e-4").unwrap().is_none());
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m1", "UID MOVE 5 Trash").await;
+        assert!(resp.contains("[COPYUID ") && resp.contains("* 1 EXPUNGE") && resp.contains("m1 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-5").unwrap().unwrap().folder, "trash");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m2", "UID STORE 7 +X-GM-LABELS (\\Junk)").await;
+        assert!(resp.contains("m2 OK") && resp.contains("* 2 EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-7").unwrap().unwrap().folder, "spam");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m3", "UID MOVE 6 Work").await;
+        assert!(resp.contains("* 1 EXPUNGE") && resp.contains("m3 OK"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-6").unwrap().unwrap().folder, "folder:tok_w");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m4", "NOOP").await;
+        assert!(!resp.contains("EXPUNGE") && !resp.contains("EXISTS"), "{}", resp);
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "m5", "LOGOUT").await;
+        assert!(resp.contains("m5 OK"), "{}", resp);
+
+        let log = calls.lock().await.clone();
+        let server = server_folders(&log);
+        assert_eq!(server.get("e2e-1").map(String::as_str), Some("trash"), "{:?}", log);
+        assert_eq!(server.get("e2e-2").map(String::as_str), Some("archive"), "{:?}", log);
+        assert_eq!(server.get("e2e-3").map(String::as_str), Some("trash"), "{:?}", log);
+        assert_eq!(server.get("e2e-4").map(String::as_str), Some("trash"), "{:?}", log);
+        assert_eq!(server.get("e2e-5").map(String::as_str), Some("trash"), "{:?}", log);
+        assert_eq!(server.get("e2e-7").map(String::as_str), Some("spam"), "{:?}", log);
+        assert!(log.iter().any(|(m, v)| m == "ADD_LABEL" && v == "tok_w|1"), "{:?}", log);
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "f1", "UID SEARCH ALL").await;
+        assert!(resp.lines().any(|l| l.trim_end() == "* SEARCH"), "{}", resp);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f2", "INBOX").await, 0);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f3", "Trash").await, 3);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f4", "Archive").await, 1);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f5", "Work").await, 1);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f6", "Junk").await, 1);
+
+        let spam_uid = db.get_cached_message("e2e-7").unwrap().unwrap().imap_uid;
+        let resp = imap_cmd_lines(
+            &mut reader,
+            &mut writer,
+            "f7",
+            &format!("UID STORE {} +X-GM-LABELS (\\Inbox)", spam_uid),
+        )
+        .await;
+        assert!(resp.contains("f7 OK") && resp.contains("* 1 EXPUNGE"), "{}", resp);
+        assert_eq!(db.get_cached_message("e2e-7").unwrap().unwrap().folder, "inbox");
+        assert_eq!(select_exists(&mut reader, &mut writer, "f8", "INBOX").await, 1);
+        let log = calls.lock().await.clone();
+        assert_eq!(server_folders(&log).get("e2e-7").map(String::as_str), Some("inbox"), "{:?}", log);
+    }
+
+    fn move_in_cache(db: &Database, id: &str, folder: &str) {
+        let m = db.get_cached_message(id).unwrap().unwrap();
+        db.remove_uid_mapping(m.imap_uid as i64, &m.folder).unwrap();
+        db.upsert_cached_message(
+            id,
+            folder,
+            m.subject.as_deref(),
+            m.sender.as_deref(),
+            m.recipients.as_deref(),
+            m.date.as_deref(),
+            m.size,
+            m.body_text.as_deref(),
+            m.raw_headers.as_deref(),
+        )
+        .unwrap();
+        db.assign_uid_if_missing(folder, id).unwrap();
+    }
+
+    async fn idle_until_line(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        tx: &broadcast::Sender<StateChange>,
+        tag: &str,
+        change: impl FnOnce(),
+    ) -> String {
+        writer.write_all(format!("{} IDLE\r\n", tag).as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut plus = String::new();
+        reader.read_line(&mut plus).await.unwrap();
+        assert!(plus.starts_with("+ "), "{}", plus);
+        change();
+        let mut changed = HashMap::new();
+        changed.insert("Email".to_string(), "1".to_string());
+        let _ = tx.send(StateChange { changed });
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("no update during IDLE")
+            .unwrap();
+        writer.write_all(b"DONE\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let rest = read_until_tag(reader, tag).await.join("\n");
+        assert!(rest.contains(&format!("{} OK", tag)), "{}", rest);
+        line
+    }
+
+    #[tokio::test]
+    async fn changes_made_in_aster_reach_an_open_session_on_noop_and_idle() {
+        let (addr, db, tx, _dir) = start_test_server().await;
+        for n in 1..=4 {
+            seed(&db, &format!("srv-{}", n), "inbox", &format!("message {}", n));
+        }
+        let (mut reader, mut writer) = login_and_select(addr).await;
+
+        db.delete_message_by_aster_id("srv-1").unwrap();
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n1", "NOOP").await;
+        assert!(resp.contains("* 1 EXPUNGE") && resp.contains("n1 OK"), "{}", resp);
+
+        move_in_cache(&db, "srv-2", "trash");
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n2", "NOOP").await;
+        assert!(resp.contains("* 1 EXPUNGE") && resp.contains("n2 OK"), "{}", resp);
+
+        let line = idle_until_line(&mut reader, &mut writer, &tx, "i1", || move_in_cache(&db, "srv-3", "archive")).await;
+        assert_eq!(line, "* 1 EXPUNGE\r\n");
+
+        let line = idle_until_line(&mut reader, &mut writer, &tx, "i2", || {
+            db.delete_message_by_aster_id("srv-4").unwrap();
+        })
+        .await;
+        assert_eq!(line, "* 1 EXPUNGE\r\n");
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "n3", "NOOP").await;
+        assert!(!resp.contains("EXPUNGE") && !resp.contains("EXISTS"), "{}", resp);
+
+        let (mut reader, mut writer) = login_and_select(addr).await;
+        assert_eq!(select_exists(&mut reader, &mut writer, "f1", "INBOX").await, 0);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f2", "Trash").await, 1);
+        assert_eq!(select_exists(&mut reader, &mut writer, "f3", "Archive").await, 1);
+    }
+
+    fn mock_flags_folder(flags: &serde_json::Value) -> Option<&'static str> {
+        let flag = |name: &str| flags.get(name).and_then(|v| v.as_bool());
+        let (trashed, archived, spam) = (flag("is_trashed"), flag("is_archived"), flag("is_spam"));
+        if trashed.is_none() && archived.is_none() && spam.is_none() {
+            return None;
+        }
+        Some(match (trashed, archived, spam) {
+            (Some(true), _, _) => "trash",
+            (_, _, Some(true)) => "spam",
+            (_, Some(true), _) => "archive",
+            _ => "inbox",
+        })
+    }
+
     #[derive(Debug, Default, Clone, Copy)]
     struct MockOpts {
         fail: bool,
@@ -5236,10 +5801,19 @@ mod tests {
                             .and_then(|v| v.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
-                        calls
-                            .lock()
-                            .await
-                            .push(("BULK_PATCH".to_string(), count.to_string()));
+                        {
+                            let mut log = calls.lock().await;
+                            log.push(("BULK_PATCH".to_string(), count.to_string()));
+                            if !fail && bulk_metadata {
+                                for item in body.get("items").and_then(|v| v.as_array()).into_iter().flatten() {
+                                    if let (Some(id), Some(folder)) =
+                                        (item.get("id").and_then(|v| v.as_str()), mock_flags_folder(item))
+                                    {
+                                        log.push(("SERVER_FOLDER".to_string(), format!("{}|{}", id, folder)));
+                                    }
+                                }
+                            }
+                        }
                         if fail || !bulk_metadata {
                             (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
                         } else {
@@ -5251,13 +5825,19 @@ mod tests {
             )
             .route(
                 "/bridge/v1/messages/:id/metadata",
-                patch(move |AxumPath(id): AxumPath<String>| {
+                patch(move |AxumPath(id): AxumPath<String>, body: axum::body::Bytes| {
                     let calls = c2.clone();
                     async move {
                         if slow_metadata_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(slow_metadata_ms)).await;
                         }
                         calls.lock().await.push(("PATCH".to_string(), id.clone()));
+                        let flags: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                        if let Some(folder) = flags.as_ref().and_then(mock_flags_folder) {
+                            if !fail_metadata && !id.starts_with("draft-") {
+                                calls.lock().await.push(("SERVER_FOLDER".to_string(), format!("{}|{}", id, folder)));
+                            }
+                        }
                         if fail_metadata {
                             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
                         }
@@ -5864,7 +6444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capability_advertises_idle_and_gmail() {
+    async fn capability_advertises_idle_without_label_extension() {
         let (addr, _db, _tx, _dir) = start_test_server().await;
         let stream = TcpStream::connect(addr).await.unwrap();
         let (r, w) = stream.into_split();
@@ -5886,10 +6466,11 @@ mod tests {
         reader.read_line(&mut ok_line).await.unwrap();
         assert!(cap_line.contains("IDLE"), "cap missing IDLE: {}", cap_line);
         assert!(
-            cap_line.contains("X-GM-EXT-1"),
-            "cap missing X-GM-EXT-1: {}",
+            !cap_line.contains("X-GM-EXT-1"),
+            "cap must not advertise X-GM-EXT-1: {}",
             cap_line
         );
+        assert!(!greeting.contains("X-GM-EXT-1"), "greeting must not advertise X-GM-EXT-1: {}", greeting);
         assert!(ok_line.starts_with("a1 OK"));
     }
 
@@ -8539,19 +9120,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uid_store_of_gm_labels_leaves_flags_alone() {
+    async fn uid_store_of_an_unmapped_label_is_refused_and_leaves_flags_alone() {
         let (addr, db, _tx, calls, _dir) = start_test_server_with_backend(false).await;
         seed(&db, "gl-1", "inbox", "one");
         db.set_message_flags_by_id("gl-1", 5).unwrap(); // \Seen \Flagged
         let (mut reader, mut writer) = login_and_select(addr).await;
 
         let resp = imap_cmd_lines(&mut reader, &mut writer, "g1", "UID STORE 1 +X-GM-LABELS (Work)").await;
-        assert!(resp.contains("g1 OK"), "{}", resp);
-        assert!(resp.contains("* 1 FETCH (UID 1 X-GM-LABELS ("), "{}", resp);
-        assert!(!resp.contains("FLAGS ()"), "flags must not be touched: {}", resp);
+        assert!(resp.contains("g1 NO"), "an unmapped label must not be acknowledged: {}", resp);
+        assert!(!resp.contains("* 1 FETCH"), "{}", resp);
+        assert!(!resp.contains("EXPUNGE"), "{}", resp);
 
         let resp = imap_cmd_lines(&mut reader, &mut writer, "g2", "UID STORE 1 -X-GM-LABELS.SILENT (Work)").await;
-        assert!(!resp.contains("* 1 FETCH"), "silent store must not answer: {}", resp);
+        assert!(resp.contains("g2 NO"), "{}", resp);
+        assert!(!resp.contains("* 1 FETCH"), "{}", resp);
+
+        let resp = imap_cmd_lines(&mut reader, &mut writer, "g2b", "UID STORE 1 +X-GM-LABELS (\\Inbox \"unterminated)").await;
+        assert!(resp.contains("g2b BAD"), "{}", resp);
 
         let resp = imap_cmd_lines(&mut reader, &mut writer, "g3", "FETCH 1 (FLAGS)").await;
         assert!(resp.contains("\\Seen") && resp.contains("\\Flagged"), "flags lost: {}", resp);
@@ -8566,10 +9151,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let captured = calls.lock().await.clone();
         assert!(
-            !captured.iter().any(|(m, _)| m == "PATCH"),
-            "no read-status change may reach the server: {:?}",
+            !captured.iter().any(|(m, _)| matches!(m.as_str(), "PATCH" | "BULK_PATCH" | "ADD_LABEL" | "REMOVE_LABEL" | "DELETE")),
+            "a refused label store may not reach the server: {:?}",
             captured
         );
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
     #[test]
@@ -9906,7 +10492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_gm_labels_acknowledged() {
+    async fn store_of_an_unmapped_label_is_refused() {
         let (addr, db, _tx, _dir) = start_test_server().await;
         seed(&db, "msg-store-1", "inbox", "subject one");
         let (mut reader, mut writer) = login_and_select(addr).await;
@@ -9918,7 +10504,8 @@ mod tests {
         writer.flush().await.unwrap();
         let lines = read_until_tag(&mut reader, "a3").await;
         let combined = lines.join("\n");
-        assert!(combined.contains("a3 OK"), "store failed: {}", combined);
+        assert!(combined.contains("a3 NO"), "an unmapped label must be refused: {}", combined);
+        assert_eq!(db.count_cached_messages("inbox").unwrap(), 1);
     }
 
     #[test]
