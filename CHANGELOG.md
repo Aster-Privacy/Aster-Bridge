@@ -2,6 +2,20 @@
 
 All notable changes to Aster Bridge are recorded here. Earlier history lives in the git log.
 
+## 1.0.19 - 2026-11-26
+
+### What's new
+- When Aster Guard is on, a new Aster Bridge sign-in waits one hour before your mail apps can connect, and you can approve it sooner from a device you already use.
+- You can choose whether Aster Bridge keeps running or quits when you close its window.
+- Aster Bridge shows which addresses have sending turned off and explains why a send from one of them can't go out.
+- When a package manager installs Aster Bridge, the package manager handles updates and the in-app updater stays hidden.
+
+### Fixed
+- Labels you add or remove in your mail app now move the message in Aster, so deleted and moved messages no longer come back.
+- Drafts you save while Aster Bridge is syncing stay in your Drafts folder.
+- Drafts you delete on the web disappear from your mail app on the next sync.
+- Encrypted messages are checked more strictly before Aster Bridge opens them.
+
 ## 1.0.18 - 2026-11-19
 
 ### What's new
