@@ -32,6 +32,16 @@ export function is_desktop_runtime(): boolean {
   return Boolean(w.__TAURI_INTERNALS__);
 }
 
+export function updates_managed_externally(): boolean {
+  if (typeof window === "undefined") return false;
+  const w = window as unknown as { __ASTER_UPDATES_MANAGED__?: unknown };
+  return w.__ASTER_UPDATES_MANAGED__ === true;
+}
+
+export function updates_supported(): boolean {
+  return is_desktop_runtime() && !updates_managed_externally();
+}
+
 export function get_last_notified_version(): string | null {
   try {
     return localStorage.getItem(LAST_NOTIFIED_VERSION_KEY);
@@ -85,6 +95,7 @@ async function load_process(): Promise<{ relaunch: () => Promise<void> }> {
 }
 
 export async function check_for_update(): Promise<UpdateInfo | null> {
+  if (!updates_supported()) return null;
   const { check } = await load_updater();
   const result = await check();
   remember_update(result);
@@ -113,6 +124,7 @@ export function update_progress_percent(progress: UpdateProgress): number | null
 export async function download_and_install(
   on_progress?: (progress: UpdateProgress) => void,
 ): Promise<void> {
+  if (!updates_supported()) throw new Error("updates_managed_externally");
   let update = pending_update;
   if (!update) {
     const { check } = await load_updater();

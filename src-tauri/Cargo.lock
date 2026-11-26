@@ -267,6 +267,7 @@ name = "aster-bridge-desktop"
 version = "1.0.18"
 dependencies = [
  "aster-bridge-core",
+ "auto-launch",
  "mail-parser",
  "objc2",
  "objc2-app-kit",

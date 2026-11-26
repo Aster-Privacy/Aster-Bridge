@@ -20,7 +20,7 @@
 //
 use std::sync::Mutex;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, Wry,
 };
@@ -196,21 +196,24 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<tauri::tray::TrayIcon> {
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let updates = MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Aster Bridge", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &status,
-            &PredefinedMenuItem::separator(app)?,
-            &toggle,
-            &sync,
-            &PredefinedMenuItem::separator(app)?,
-            &show,
-            &settings,
-            &updates,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let status_separator = PredefinedMenuItem::separator(app)?;
+    let actions_separator = PredefinedMenuItem::separator(app)?;
+    let quit_separator = PredefinedMenuItem::separator(app)?;
+    let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![
+        &status,
+        &status_separator,
+        &toggle,
+        &sync,
+        &actions_separator,
+        &show,
+        &settings,
+    ];
+    if !crate::package_managed::updater_disabled() {
+        items.push(&updates);
+    }
+    items.push(&quit_separator);
+    items.push(&quit);
+    let menu = Menu::with_items(app, &items)?;
 
     #[cfg(target_os = "macos")]
     let icon_bytes: &[u8] = include_bytes!("../icons/tray_template.png");

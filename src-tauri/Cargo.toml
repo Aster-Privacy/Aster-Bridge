@@ -92,6 +92,9 @@ objc2-foundation = { version = "0.3", features = ["NSData"] }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus = "5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+auto-launch = "0.5"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
