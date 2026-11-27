@@ -207,7 +207,7 @@ const en = {
   copy_diagnostic_bundle: "Copy diagnostic bundle",
   refresh: "Refresh",
   no_log_entries: "No log entries yet.",
-  bundle_hint: "The bundle includes app version, OS, ports, log lines, and counts. Passphrase, access tokens, app passwords, and message contents are never included.",
+  bundle_hint: "The bundle includes app version, OS, ports, log lines, and counts. Your account password, access tokens, app passwords, and message contents are never included.",
   section_updates: "Updates",
   notif_update_title: "Aster Bridge update",
   update_available: "v{{version}} is available",
