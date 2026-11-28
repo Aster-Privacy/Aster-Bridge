@@ -2218,19 +2218,24 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     }
   }, [conn_info]);
 
-  useEffect(() => {
-    api.get_service_settings().then((s) => {
+  const sync_service_settings = useCallback(async () => {
+    try {
+      const s = await api.get_service_settings();
       set_autostart(s.autostart);
       set_close_to_tray(s.close_to_tray);
       set_service_mode(s.service_mode);
       set_require_post_quantum(s.require_post_quantum);
-      set_autostart_loading(false);
-      set_service_mode_loading(false);
-    }).catch(() => {
+    } catch {
+      return;
+    }
+  }, []);
+
+  useEffect(() => {
+    sync_service_settings().finally(() => {
       set_autostart_loading(false);
       set_service_mode_loading(false);
     });
-  }, []);
+  }, [sync_service_settings]);
 
   useEffect(() => {
     import("@tauri-apps/api/app").then(({ getVersion }) => getVersion()).then(set_app_version).catch(() => {});
@@ -2255,6 +2260,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       set_full_history(!new_value);
       show_toast(t("toast_full_history_failed"), "error");
     }
+    await api.get_full_mail_history().then(set_full_history).catch(() => {});
     set_full_history_loading(false);
   };
 
@@ -2267,6 +2273,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_service_mode(!new_value);
       show_toast(t("toast_background_mode_failed"), "error");
+      await sync_service_settings();
     }
   };
 
@@ -2279,19 +2286,31 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_require_post_quantum(!new_value);
       show_toast(t("toast_require_post_quantum_failed"), "error");
+      await sync_service_settings();
     }
   };
 
   const handle_toggle_autostart = async () => {
     const new_value = !autostart;
     set_autostart(new_value);
+    set_autostart_loading(true);
     try {
-      await api.set_autostart_enabled(new_value);
-      show_toast(new_value ? t("toast_autolaunch_enabled") : t("toast_autolaunch_disabled"), "success");
-    } catch {
+      const enabled = await api.set_autostart_enabled(new_value);
+      set_autostart(enabled);
+      show_toast(enabled ? t("toast_autolaunch_enabled") : t("toast_autolaunch_disabled"), "success");
+    } catch (autostart_error) {
       set_autostart(!new_value);
-      show_toast(t("toast_autolaunch_failed"), "error");
+      show_toast(
+        autostart_error === "autostart_machine_wide"
+          ? t("toast_autolaunch_failed_machine_wide")
+          : autostart_error === "autostart_access_denied"
+            ? t("toast_autolaunch_failed_access_denied")
+            : t("toast_autolaunch_failed"),
+        "error",
+      );
+      await sync_service_settings();
     }
+    set_autostart_loading(false);
   };
 
   const handle_toggle_close_to_tray = async () => {
@@ -2303,6 +2322,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
     } catch {
       set_close_to_tray(!new_value);
       show_toast(t("toast_close_to_tray_failed"), "error");
+      await sync_service_settings();
     }
   };
 

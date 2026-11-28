@@ -342,6 +342,8 @@ const en = {
   toast_autolaunch_enabled: "Auto-launch enabled",
   toast_autolaunch_disabled: "Auto-launch disabled",
   toast_autolaunch_failed: "Failed to update auto-launch setting",
+  toast_autolaunch_failed_machine_wide: "Aster Bridge is set to start for everyone who uses this computer. To turn it off, open Task Manager and go to Startup apps.",
+  toast_autolaunch_failed_access_denied: "Your computer didn't let Aster Bridge change its startup setting.",
   toast_close_to_tray_on: "Aster Bridge keeps running when you close the window.",
   toast_close_to_tray_off: "Aster Bridge quits when you close the window.",
   toast_close_to_tray_failed: "Couldn't update the setting.",

@@ -22,6 +22,7 @@
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod a11y_bus;
+mod autostart;
 #[cfg(target_os = "macos")]
 mod dock_icon;
 mod guard_status;
@@ -108,6 +109,8 @@ struct AppState(SharedBridgeState);
 struct TrayState(std::sync::Mutex<Option<tauri::tray::TrayIcon>>);
 
 struct PendingDeepLink(std::sync::Mutex<Option<String>>);
+
+struct ServiceLaunch(std::sync::atomic::AtomicBool);
 
 #[cfg(windows)]
 fn read_text_scale_factor() -> f64 {
@@ -1487,15 +1490,43 @@ struct ServiceSettingsResponse {
 
 #[tauri::command]
 async fn get_service_settings(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ServiceSettingsResponse, String> {
-    let guard = state.0.lock().await;
+    let system_autostart = match autostart_is_enabled(&app) {
+        Ok(enabled) => Some(enabled),
+        Err(error) => {
+            tracing::warn!(code = error.code(), "could not read the autostart entry: {}", error.detail());
+            None
+        }
+    };
+    let mut guard = state.0.lock().await;
+    if let Some(enabled) = system_autostart {
+        guard.config.autostart = enabled;
+    }
     Ok(ServiceSettingsResponse {
         service_mode: guard.config.service_mode,
         autostart: guard.config.autostart,
         close_to_tray: guard.config.close_to_tray,
         require_post_quantum: guard.config.require_post_quantum,
     })
+}
+
+const SETTINGS_SAVE_FAILED: &str = "settings_save_failed";
+
+fn update_setting(
+    config: &mut config::BridgeConfig,
+    field: fn(&mut config::BridgeConfig) -> &mut bool,
+    enabled: bool,
+    setting: &str,
+) -> Result<(), String> {
+    let previous = std::mem::replace(field(config), enabled);
+    if let Err(error) = config::save_config(config) {
+        *field(config) = previous;
+        tracing::warn!(setting, "could not save the setting: {}", autostart::redact_home(&error));
+        return Err(SETTINGS_SAVE_FAILED.to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1507,25 +1538,65 @@ async fn get_full_mail_history(state: State<'_, AppState>) -> Result<bool, Strin
 #[tauri::command]
 async fn set_full_mail_history(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
-    guard.config.full_mail_history = enabled;
-    config::save_config(&guard.config)
+    update_setting(&mut guard.config, |c| &mut c.full_mail_history, enabled, "full_mail_history")
 }
 
 #[tauri::command]
 async fn set_require_post_quantum(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
-    guard.config.require_post_quantum = enabled;
-    config::save_config(&guard.config)
+    update_setting(&mut guard.config, |c| &mut c.require_post_quantum, enabled, "require_post_quantum")
 }
 
 #[tauri::command]
 async fn set_service_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut guard = state.0.lock().await;
-    guard.config.service_mode = enabled;
-    config::save_config(&guard.config)
+    update_setting(&mut guard.config, |c| &mut c.service_mode, enabled, "service_mode")
 }
 
-fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+#[cfg(windows)]
+fn autostart_command() -> Result<String, autostart::AutostartError> {
+    let exe = std::env::current_exe()?;
+    Ok(autostart::launch_command(
+        &exe.display().to_string(),
+        &package_managed::AUTOSTART_ARGS,
+    ))
+}
+
+#[cfg(windows)]
+fn autostart_is_enabled(app: &tauri::AppHandle) -> Result<bool, autostart::AutostartError> {
+    autostart::is_enabled(&autostart::windows_registry::WindowsRegistry, &app.package_info().name)
+}
+
+#[cfg(not(windows))]
+fn autostart_is_enabled(app: &tauri::AppHandle) -> Result<bool, autostart::AutostartError> {
+    use autostart::AutostartError;
+    #[cfg(target_os = "linux")]
+    if let Some(command) = package_managed::launch_command() {
+        let launcher = package_managed::launcher(&app.package_info().name, &command)
+            .map_err(|e| AutostartError::from_message(&e))?;
+        return launcher
+            .is_enabled()
+            .map_err(|e| AutostartError::from_message(&e.to_string()));
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AutostartError::from_message(&e.to_string()))
+}
+
+#[cfg(windows)]
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), autostart::AutostartError> {
+    let registry = autostart::windows_registry::WindowsRegistry;
+    let name = &app.package_info().name;
+    if enabled {
+        autostart::enable(&registry, name, &autostart_command()?)
+    } else {
+        autostart::disable(&registry, name)
+    }
+}
+
+#[cfg(not(windows))]
+fn run_autostart_change(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if let Some(command) = package_managed::launch_command() {
         let launcher = package_managed::launcher(&app.package_info().name, &command)?;
@@ -1546,16 +1617,72 @@ fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> 
     result.map_err(|e| e.to_string())
 }
 
+#[cfg(not(windows))]
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), autostart::AutostartError> {
+    use autostart::AutostartError;
+    run_autostart_change(app, enabled).map_err(|e| AutostartError::from_message(&e))?;
+    if autostart_is_enabled(app)? == enabled {
+        Ok(())
+    } else {
+        Err(AutostartError::NotApplied)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_autostart_entry(app: &tauri::AppHandle, configured: bool) {
+    if configured && package_managed::launch_command().is_some() {
+        if let Err(error) = apply_autostart(app, true) {
+            tracing::warn!(code = error.code(), "could not refresh the autostart entry: {}", error.detail());
+        }
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn refresh_autostart_entry(app: &tauri::AppHandle, _configured: bool) {
+    let refreshed = autostart_command().and_then(|command| {
+        autostart::refresh(
+            &autostart::windows_registry::WindowsRegistry,
+            &app.package_info().name,
+            &command,
+        )
+    });
+    match refreshed {
+        Ok(true) => tracing::info!("updated the autostart entry to the current app location"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(code = error.code(), "could not refresh the autostart entry: {}", error.detail()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", all(windows, not(debug_assertions)))))]
+fn refresh_autostart_entry(_app: &tauri::AppHandle, _configured: bool) {}
+
 #[tauri::command]
 async fn set_autostart(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
-) -> Result<(), String> {
-    apply_autostart(&app, enabled)?;
-    let mut guard = state.0.lock().await;
-    guard.config.autostart = enabled;
-    config::save_config(&guard.config)
+) -> Result<bool, String> {
+    let result = apply_autostart(&app, enabled);
+    if let Err(error) = &result {
+        tracing::warn!(
+            code = error.code(),
+            enabled,
+            "could not update the autostart entry: {}",
+            error.detail()
+        );
+    }
+    let state_now = autostart_is_enabled(&app)
+        .unwrap_or(if result.is_ok() { enabled } else { !enabled });
+    {
+        let mut guard = state.0.lock().await;
+        if guard.config.autostart != state_now {
+            guard.config.autostart = state_now;
+            if let Err(error) = config::save_config(&guard.config) {
+                tracing::warn!("could not save the autostart setting: {}", autostart::redact_home(&error));
+            }
+        }
+    }
+    result.map(|()| state_now).map_err(|error| error.code().to_string())
 }
 
 #[tauri::command]
@@ -1565,15 +1692,14 @@ async fn set_close_to_tray(
     enabled: bool,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().await;
-    let previous = guard.config.close_to_tray;
-    guard.config.close_to_tray = enabled;
-    if let Err(error) = config::save_config(&guard.config) {
-        guard.config.close_to_tray = previous;
-        return Err(error);
-    }
+    update_setting(&mut guard.config, |c| &mut c.close_to_tray, enabled, "close_to_tray")?;
+    let running_as_service = app
+        .state::<ServiceLaunch>()
+        .0
+        .load(std::sync::atomic::Ordering::SeqCst);
     app.state::<shell::CloseToTrayState>()
         .0
-        .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        .store(enabled || running_as_service, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -1996,6 +2122,7 @@ fn main() {
         .manage(shell::QuitState(std::sync::atomic::AtomicBool::new(false)))
         .manage(shell::CloseToTrayState(std::sync::atomic::AtomicBool::new(true)))
         .manage(PendingDeepLink(std::sync::Mutex::new(None)))
+        .manage(ServiceLaunch(std::sync::atomic::AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_bridge_status,
             start_bridge,
@@ -2047,7 +2174,7 @@ fn main() {
             set_tls_enabled,
         ])
         .setup(move |app| {
-        let mut cfg = match preliminary_cfg {
+        let cfg = match preliminary_cfg {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("failed to load config: {}", e);
@@ -2055,16 +2182,11 @@ fn main() {
             }
         };
 
-        if std::env::args().any(|a| a == "--service") {
-            cfg.service_mode = true;
-        }
-        let service_mode = cfg.service_mode;
-        #[cfg(target_os = "linux")]
-        if cfg.autostart && package_managed::launch_command().is_some() {
-            if let Err(e) = apply_autostart(app.handle(), true) {
-                tracing::warn!("could not refresh the autostart entry: {}", e);
-            }
-        }
+        let service_mode = cfg.service_mode || std::env::args().any(|a| a == "--service");
+        app.state::<ServiceLaunch>()
+            .0
+            .store(service_mode, std::sync::atomic::Ordering::SeqCst);
+        refresh_autostart_entry(app.handle(), cfg.autostart);
         app.state::<shell::CloseToTrayState>().0.store(
             service_mode || cfg.close_to_tray,
             std::sync::atomic::Ordering::SeqCst,
