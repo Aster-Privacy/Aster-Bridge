@@ -1574,7 +1574,7 @@ function TlsInfoBlock({
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
       <InfoRow label={t("tls_cert_sha256")} value={fingerprint} copy={!!tls_info?.fingerprint_sha256} mono={!!tls_info?.fingerprint_sha256} />
       <IslandRow
-        description={<span className={tls_info?.cert_path ? "font-mono" : ""} title={cert_path}>{cert_path.split(/[/\]/).pop() ?? cert_path}</span>}
+        description={<span className={tls_info?.cert_path ? "font-mono" : ""} title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>}
         label={t("tls_cert_path")}
         trailing={tls_info?.cert_path ? (
           <Button size="sm" variant="secondary" onClick={() => api.open_tls_cert().catch(() => {})}>
