@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ExclamationCircleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
@@ -382,7 +382,7 @@ function get_toast_icon(type: ToastType) {
   const c = "w-4 h-4";
   if (type === "success") return <CheckIcon className={c} />;
   if (type === "warning") return <ExclamationTriangleIcon className={c} />;
-  if (type === "error") return <XMarkIcon className={c} />;
+  if (type === "error") return <ExclamationCircleIcon className={c} />;
   return <InformationCircleIcon className={c} />;
 }
 
@@ -2300,14 +2300,18 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       show_toast(enabled ? t("toast_autolaunch_enabled") : t("toast_autolaunch_disabled"), "success");
     } catch (autostart_error) {
       set_autostart(!new_value);
-      show_toast(
-        autostart_error === "autostart_machine_wide"
-          ? t("toast_autolaunch_failed_machine_wide")
-          : autostart_error === "autostart_access_denied"
+      const is_windows = navigator.userAgent.includes("Windows");
+      if (autostart_error === "autostart_machine_wide" && is_windows) {
+        show_toast(t("toast_autolaunch_failed_machine_wide"), "info", 8000);
+      } else {
+        show_toast(
+          autostart_error === "autostart_access_denied"
             ? t("toast_autolaunch_failed_access_denied")
             : t("toast_autolaunch_failed"),
-        "error",
-      );
+          "error",
+          5000,
+        );
+      }
       await sync_service_settings();
     }
     set_autostart_loading(false);
