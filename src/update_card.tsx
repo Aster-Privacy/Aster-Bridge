@@ -246,7 +246,7 @@ function ProgressRing({
             {phase === "failed" ? (
               <ExclamationTriangleIcon className="h-2.5 w-2.5 text-white" />
             ) : (
-              <CheckIcon className="h-3 w-3 text-white" />
+              <CheckIcon className="h-3 w-3 text-[var(--accent-fg,#fff)]" />
             )}
           </motion.span>
         )}

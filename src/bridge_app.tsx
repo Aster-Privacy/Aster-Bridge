@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
@@ -38,6 +38,7 @@ import {
   on_toast_position_change,
   invalidate_preferences_sync,
   current_sync_generation,
+  accent_foreground_for,
 } from "@/lib/theme_sync";
 import {
   check_for_update,
@@ -60,7 +61,11 @@ import {
   Modal,
   ModalBody,
   ModalActions,
-  Badge,
+  IslandSection,
+  IslandRow,
+  IslandEmpty,
+  SettingNote,
+  Switch,
 } from "@aster/ui";
 
 type SyncProgress = {
@@ -589,6 +594,29 @@ function CopyValue({ value, mono = true, secret = false }: { value: string; mono
   );
 }
 
+function CopyIconButton({ value }: { value: string }) {
+  const { t } = useTranslation();
+  const on_copy = async () => {
+    try {
+      await copy_text(value);
+      show_toast(t("copied_to_clipboard"), "success");
+    } catch {
+      show_toast(t("failed_to_copy"), "error");
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={on_copy}
+      title={t("copy_to_clipboard")}
+      aria-label={t("copy_to_clipboard")}
+      className="inline-flex items-center justify-center w-8 h-8 rounded-full text-txt-muted transition-colors hover:bg-[var(--aster-field-hover)] hover:text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary"
+    >
+      <CopyIcon />
+    </button>
+  );
+}
+
 function ChevronRightIcon() {
   return (
     <svg className="w-4 h-4 flex-shrink-0 text-txt-muted opacity-60 group-hover:opacity-100" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -597,90 +625,51 @@ function ChevronRightIcon() {
   );
 }
 
-function SettingsGroup({ title, icon, hint, children }: { title?: string; icon?: ReactNode; hint?: ReactNode; children: ReactNode }) {
+function SettingsGroup({ title, description, hint, trailing, tone, children }: { title?: string; icon?: ReactNode; description?: ReactNode; hint?: ReactNode; trailing?: ReactNode; tone?: "default" | "danger" | "accent" | "warning" | "success"; children: ReactNode }) {
   return (
-    <section className="mb-6">
-      {title && (
-        <div className="mb-1">
-          <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
-            {icon && <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
-            {title}
-          </h3>
-        </div>
-      )}
-      <div>{children}</div>
-      {hint && <p className="text-[12px] text-txt-muted mt-2 leading-relaxed">{hint}</p>}
-    </section>
+    <IslandSection className="mb-6" description={description} divided footer={hint} title={title} tone={tone} trailing={trailing}>
+      {children}
+    </IslandSection>
   );
 }
 
-function ServerCard({ icon, title, hint, children }: { icon?: ReactNode; title: string; hint?: ReactNode; children: ReactNode }) {
+function IslandBlockRow({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <section className="aster_island px-5 py-4">
-      <div className="flex items-center gap-2 mb-2.5">
-        {icon && <span className="w-[17px] h-[17px] flex-shrink-0 text-txt-secondary [&>svg]:w-full [&>svg]:h-full">{icon}</span>}
-        <h3 className="text-[14px] font-semibold text-txt-primary">{title}</h3>
-      </div>
-      <div>{children}</div>
-      {hint && <p className="text-[12px] text-txt-muted mt-2.5 leading-relaxed">{hint}</p>}
-    </section>
+    <div className={`aster_island_row aster_island_row_block px-[var(--aster-island-row-pad-x)] py-[var(--aster-island-row-pad-y)] ${className}`}>
+      {children}
+    </div>
+  );
+}
+
+function ServerCard({ title, hint, children }: { icon?: ReactNode; title: string; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <IslandSection className="mb-6" divided footer={hint} title={title}>
+      {children}
+    </IslandSection>
   );
 }
 
 function SettingRow({ icon, label, sublabel, danger, children }: { icon?: ReactNode; label: ReactNode; sublabel?: ReactNode; danger?: boolean; children?: ReactNode }) {
-  return (
-    <div className="flex items-center gap-3 py-3">
-      {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted"}`}>{icon}</span>}
-      <div className="min-w-0 flex-1">
-        <p className={`text-[14px] leading-tight ${danger ? "text-aster-danger" : "text-txt-primary"}`}>{label}</p>
-        {sublabel && <p className="text-[12px] text-txt-muted mt-0.5 leading-snug">{sublabel}</p>}
-      </div>
-      {children && <div className="flex-shrink-0">{children}</div>}
-    </div>
-  );
+  return <IslandRow description={sublabel} destructive={danger} icon={icon} label={label} trailing={children} />;
 }
 
 function ActionRow({ icon, label, sublabel, on_click, disabled, right, danger }: { icon?: ReactNode; label: ReactNode; sublabel?: ReactNode; on_click: () => void; disabled?: boolean; right?: ReactNode; danger?: boolean }) {
-  return (
-    <button
-      type="button"
-      onClick={on_click}
-      disabled={disabled}
-      className="group w-full flex items-center gap-3 py-3 px-3 -mx-3 rounded-[var(--aster-radius-item)] text-start transition-colors duration-150 hover:bg-[var(--aster-field-bg)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-edge-primary disabled:opacity-50 disabled:pointer-events-none"
-    >
-      {icon && <span className={`w-[18px] h-[18px] flex-shrink-0 ${danger ? "text-aster-danger" : "text-txt-muted group-hover:text-txt-secondary"}`}>{icon}</span>}
-      <div className="min-w-0 flex-1">
-        <p className={`text-[14px] leading-tight ${danger ? "text-aster-danger" : "text-txt-primary"}`}>{label}</p>
-        {sublabel && <p className="text-[12px] text-txt-muted mt-0.5 leading-snug truncate">{sublabel}</p>}
-      </div>
-      {right !== undefined ? right : <ChevronRightIcon />}
-    </button>
-  );
+  return <IslandRow chevron={right === undefined} description={sublabel} destructive={danger} disabled={disabled} icon={icon} label={label} on_press={on_click} trailing={right} />;
 }
 
 function Toggle({ checked, disabled, on_click }: { checked: boolean; disabled?: boolean; on_click: () => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={on_click}
-      className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors disabled:opacity-50 ${checked ? "bg-brand" : "bg-edge-secondary"}`}
-    >
-      <span className={`absolute top-0.5 start-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-4 rtl:-translate-x-4" : ""}`} />
-    </button>
-  );
+  return <Switch checked={checked} disabled={disabled} onCheckedChange={() => on_click()} />;
 }
 
 function InfoRow({ label, value, copy = true, mono = true, secret = false }: { label: string; value: string; copy?: boolean; mono?: boolean; secret?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
-      <span className="text-[13px] text-txt-muted flex-shrink-0">{label}</span>
-      {copy
+    <IslandRow
+      className="[&_.aster_island_row_text]:flex-none [&_.aster_island_row_trailing]:min-w-0 [&_.aster_island_row_trailing]:flex-1 [&_.aster_island_row_trailing]:justify-end"
+      label={label}
+      trailing={copy
         ? <CopyValue value={value} mono={mono} secret={secret} />
-        : <span className={`text-[13px] text-right text-txt-primary truncate ${mono ? "font-mono" : ""}`} title={value}>{value}</span>}
-    </div>
+        : <span className={`text-[14px] text-end text-txt-secondary truncate ${mono ? "font-mono" : ""}`} title={value}>{value}</span>}
+    />
   );
 }
 
@@ -720,7 +709,7 @@ function SetupBox({ children }: { children: ReactNode }) {
 }
 
 function SetupGroupLabel({ children }: { children: ReactNode }) {
-  return <p className="text-[11px] font-semibold uppercase tracking-wide text-txt-muted pt-1">{children}</p>;
+  return <p className="text-[13px] font-medium text-txt-secondary pt-1">{children}</p>;
 }
 
 function SetupRow({ label, value, hint, mono = true }: { label: string; value?: string; hint?: string; mono?: boolean }) {
@@ -1051,7 +1040,7 @@ function SidebarNavButton({
       </span>
       <span className="flex-1 text-start">{label}</span>
       {badge != null && badge > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-aster-danger/15 text-aster-danger font-mono font-medium min-w-[18px] text-center">
+        <span className="text-[13px] text-txt-muted tabular-nums">
           {badge}
         </span>
       )}
@@ -1116,7 +1105,7 @@ function Sidebar({
           </div>
           <div className="flex flex-col items-start min-w-0 flex-1">
             <span className="text-[15px] font-semibold text-txt-primary">{t("app_name")}</span>
-            <span className="text-[11px] truncate w-full text-start text-txt-muted">
+            <span className="text-[12px] truncate w-full text-start text-txt-muted">
               {display_name || email || t("not_connected")}
             </span>
           </div>
@@ -1165,10 +1154,10 @@ function Sidebar({
                   )}
                 </div>
                 <div className="flex flex-col min-w-0 flex-1">
-                  <span className="text-[12px] font-medium truncate" style={{ color: "var(--text-primary)" }}>
+                  <span className="text-[13px] font-medium truncate" style={{ color: "var(--text-primary)" }}>
                     {display_name || email || ""}
                   </span>
-                  <span className="text-[11px] truncate" style={{ color: "var(--text-muted)" }}>
+                  <span className="text-[12px] truncate" style={{ color: "var(--text-muted)" }}>
                     {email}
                   </span>
                 </div>
@@ -1276,14 +1265,14 @@ function PortConflictNotice({
   return (
     <div
       role="alert"
-      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+      className="aster_island flex items-start gap-3 px-[var(--aster-island-row-pad-x)] py-3.5 mb-6"
     >
       <ExclamationTriangleIcon className="w-5 h-5 flex-shrink-0 mt-0.5" style={{ color: "var(--color-danger)" }} />
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-semibold text-txt-primary leading-tight">
+        <p className="text-[15px] font-medium text-txt-primary leading-tight">
           {t("port_conflict_title", { port: conflict.port })}
         </p>
-        <p className="text-[12px] text-txt-muted mt-1">
+        <p className="text-[13px] text-txt-muted mt-1">
           {conflict.held_by_bridge
             ? t("port_conflict_bridge_body", { port: conflict.port })
             : t("port_conflict_body", { port: conflict.port, service: conflict.service })}
@@ -1311,12 +1300,12 @@ function InsecureSignInNotice({
   return (
     <div
       role="alert"
-      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+      className="aster_island flex items-start gap-3 px-[var(--aster-island-row-pad-x)] py-3.5 mb-6"
     >
       <ExclamationTriangleIcon className="w-5 h-5 flex-shrink-0 mt-0.5" style={{ color: "var(--color-danger)" }} />
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-semibold text-txt-primary leading-tight">{t("insecure_sign_in_title")}</p>
-        <p className="text-[12px] text-txt-muted mt-1">
+        <p className="text-[15px] font-medium text-txt-primary leading-tight">{t("insecure_sign_in_title")}</p>
+        <p className="text-[13px] text-txt-muted mt-1">
           {t("insecure_sign_in_body", {
             protocol: attempt.protocol.toUpperCase(),
             date: new Date(attempt.at * 1000).toLocaleDateString(undefined, { dateStyle: "medium" }),
@@ -1342,12 +1331,12 @@ function UnverifiedKeysNotice({
   return (
     <div
       role="status"
-      className="flex items-start gap-3 rounded-xl border border-edge-primary bg-surf-primary px-5 py-4 mb-5"
+      className="aster_island flex items-start gap-3 px-[var(--aster-island-row-pad-x)] py-3.5 mb-6"
     >
       <InformationCircleIcon className="w-5 h-5 flex-shrink-0 mt-0.5 text-txt-muted" />
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-semibold text-txt-primary leading-tight">{t("unverified_keys_title")}</p>
-        <p className="text-[12px] text-txt-muted mt-1">{t("unverified_keys_body", { count })}</p>
+        <p className="text-[15px] font-medium text-txt-primary leading-tight">{t("unverified_keys_title")}</p>
+        <p className="text-[13px] text-txt-muted mt-1">{t("unverified_keys_body", { count })}</p>
       </div>
       <button type="button" onClick={on_dismiss} className="flex-shrink-0 text-txt-muted hover:text-txt-primary" aria-label={t("dismiss")}>
         <XMarkIcon className="w-4 h-4" />
@@ -1421,25 +1410,25 @@ function ConfigPanel({
   const avatar_bg = profile_color && HEX_COLOR.test(profile_color) ? profile_color : DEFAULT_PROFILE_COLOR;
 
   return (
-    <div className="p-6">
-      <div className="flex items-center gap-3 mb-5">
-        <div className="w-10 h-10 rounded-[var(--aster-radius-item)] flex-shrink-0 overflow-hidden">
+    <div className="p-6 mx-auto max-w-3xl">
+      <div className="flex items-center gap-3 mb-6">
+        <div className="w-10 h-10 rounded-full flex-shrink-0 overflow-hidden">
           {profile_picture ? (
             <img src={profile_picture} className="w-full h-full object-cover" alt="" draggable={false} />
           ) : (
-            <div className="w-full h-full flex items-center justify-center text-white font-semibold text-sm" style={{ backgroundColor: avatar_bg }}>
+            <div className="w-full h-full flex items-center justify-center font-semibold text-[15px]" style={{ backgroundColor: avatar_bg, color: accent_foreground_for(avatar_bg) }}>
               {avatar_letter}
             </div>
           )}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold text-txt-primary truncate">{display_name || email?.split("@")[0] || "-"}</p>
-          <p className="text-[11px] text-txt-muted truncate">{email_value}</p>
+          <p className="text-[15px] font-semibold text-txt-primary truncate">{display_name || email?.split("@")[0] || "-"}</p>
+          <p className="text-[13px] text-txt-muted truncate">{email_value}</p>
         </div>
       </div>
 
       <div
-        className="aster_island flex items-center justify-between gap-4 px-5 py-4 mb-5"
+        className="aster_island flex items-center justify-between gap-4 px-[var(--aster-island-row-pad-x)] py-4 mb-6"
         title={bridge_running
           ? (connected_since
               ? `${t("connected_since_label")} ${new Date(connected_since).toLocaleString()}. ${t("connected_tooltip_servers")}`
@@ -1452,21 +1441,21 @@ function ConfigPanel({
             style={{ color: bridge_running ? "var(--accent-color)" : "var(--color-danger)" }}
           >
             {bridge_running
-              ? <SignalIcon className="w-6 h-6" />
-              : <SignalSlashIcon className="w-6 h-6" />}
+              ? <SignalIcon className="w-5 h-5" />
+              : <SignalSlashIcon className="w-5 h-5" />}
           </span>
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-txt-primary leading-tight truncate">
+            <p className="text-[15px] font-medium text-txt-primary leading-tight truncate">
               {bridge_running ? t("connected") : t("not_connected")}
             </p>
             {bridge_running && connected_since && (
-              <p className="text-[12px] text-txt-muted leading-tight mt-0.5 tabular-nums">
+              <p className="text-[13px] text-txt-muted leading-tight mt-0.5 tabular-nums">
                 <UptimeCounter since={connected_since} />
               </p>
             )}
           </div>
         </div>
-        <Button variant={bridge_running ? "destructive" : "depth"} size="lg" className="flex-shrink-0" onClick={on_toggle_bridge}>
+        <Button variant={bridge_running ? "secondary" : "depth"} size="md" className="flex-shrink-0" onClick={on_toggle_bridge}>
           {bridge_running ? t("disconnect") : t("connect")}
         </Button>
       </div>
@@ -1483,7 +1472,7 @@ function ConfigPanel({
       )}
 
       {bridge_running && sync_progress && (
-        <div className="aster_island px-4 py-3 mb-4">
+        <div className="aster_island px-[var(--aster-island-row-pad-x)] py-3.5 mb-6">
           <div className="flex items-end justify-between mb-1.5 gap-3">
             <span className="flex items-center gap-1.5 text-xs font-medium text-txt-primary truncate min-w-0">
               <svg className="w-3.5 h-3.5 text-brand animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24">
@@ -1511,7 +1500,7 @@ function ConfigPanel({
         <ImportPanel progress={import_progress} on_dismiss={on_dismiss_import} />
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+      <div>
         <ServerCard title={t("section_incoming")} icon={<InboxArrowDownIcon />}>
           <InfoRow label={t("field_protocol")} value="IMAP" copy={false} />
           <InfoRow label={t("field_hostname")} value={imap_host} />
@@ -1536,10 +1525,7 @@ function ConfigPanel({
           <InfoRow label={t("field_port")} value={jmap_port} />
           <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
           <InfoRow label={t("field_username")} value={email_value} />
-          <div className="flex items-center justify-between gap-4 py-2">
-            <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
-            <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
-          </div>
+          <InfoRow label={t("field_password")} value={t("field_password_hint")} copy={false} mono={false} />
         </ServerCard>
 
         <ServerCard title={carddav_enabled ? t("section_carddav") : t("section_carddav_disabled")} icon={<UserGroupIcon />} hint={t("carddav_hint")}>
@@ -1549,10 +1535,7 @@ function ConfigPanel({
           <InfoRow label={t("field_port")} value={carddav_port} />
           <InfoRow label={t("field_authentication")} value={t("field_http_basic")} copy={false} mono={false} />
           <InfoRow label={t("field_username")} value={email_value} />
-          <div className="flex items-center justify-between gap-4 py-2">
-            <span className="text-[13px] text-txt-muted flex-shrink-0">{t("field_password")}</span>
-            <span className="text-[13px] text-txt-tertiary text-right">{t("field_password_hint")}</span>
-          </div>
+          <InfoRow label={t("field_password")} value={t("field_password_hint")} copy={false} mono={false} />
         </ServerCard>
 
         <ServerCard title={t("section_pop3")} icon={<ArrowDownTrayIcon />}>
@@ -1564,9 +1547,7 @@ function ConfigPanel({
         </ServerCard>
 
         {tls_enabled && (
-          <div className="xl:col-span-2">
-            <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />
-          </div>
+          <TlsInfoBlock jmap_https_enabled={jmap_https_enabled} />
         )}
       </div>
     </div>
@@ -1591,21 +1572,15 @@ function TlsInfoBlock({
     <ServerCard title={t("section_tls")} icon={<LockClosedIcon />} hint={t("tls_hint")}>
       <InfoRow label={t("tls_status")} value={t("tls_enabled")} copy={false} mono={false} />
       <InfoRow label={t("tls_cert_sha256")} value={fingerprint} copy={!!tls_info?.fingerprint_sha256} mono={!!tls_info?.fingerprint_sha256} />
-      <div className="flex items-center justify-between gap-4 min-h-[40px] py-1">
-        <span className="text-[13px] text-txt-muted flex-shrink-0">{t("tls_cert_path")}</span>
-        <span className="inline-flex items-center justify-end gap-2 min-w-0">
-          <span className={`text-[13px] text-txt-primary truncate max-w-[140px] ${tls_info?.cert_path ? "font-mono" : ""}`} title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>
-          {tls_info?.cert_path && (
-            <button
-              type="button"
-              className="text-[11px] text-txt-muted hover:text-txt-primary underline underline-offset-2 transition-colors flex-shrink-0 rounded-[4px] focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary"
-              onClick={() => api.open_tls_cert().catch(() => {})}
-            >
-              {t("tls_open_cert_folder")}
-            </button>
-          )}
-        </span>
-      </div>
+      <IslandRow
+        description={<span className={tls_info?.cert_path ? "font-mono" : ""} title={cert_path}>{cert_path.split(/[/\\]/).pop() ?? cert_path}</span>}
+        label={t("tls_cert_path")}
+        trailing={tls_info?.cert_path ? (
+          <Button size="sm" variant="secondary" onClick={() => api.open_tls_cert().catch(() => {})}>
+            {t("tls_open_cert_folder")}
+          </Button>
+        ) : undefined}
+      />
       <InfoRow label={t("tls_jmap_scheme")} value={jmap_https_enabled ? "https://" : "http://"} copy={false} />
     </ServerCard>
   );
@@ -1666,86 +1641,73 @@ function PasswordsPanel({
 
   return (
     <div className="p-6 mx-auto max-w-3xl">
-      <h2 className="text-base font-semibold text-txt-primary mb-0.5">{t("passwords_title")}</h2>
-      <p className="text-sm text-txt-tertiary mb-4">
-        {t("passwords_subtitle")}
-      </p>
+      <h2 className="text-[20px] font-semibold text-txt-primary mb-6">{t("passwords_title")}</h2>
 
       {generated_password && (
-        <div className="aster_island aster_island_tone_accent mb-4 p-4">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium text-txt-primary">{t("password_created_banner")}</span>
+        <IslandSection className="mb-6" tone="accent" title={t("password_created_banner")} footer={t("password_copy_hint")}
+          trailing={
             <button type="button" className="h-7 w-7 flex items-center justify-center rounded-full text-txt-muted transition-colors duration-150 hover:bg-[var(--aster-field-hover)] hover:text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("dismiss")} onClick={() => set_generated_password(null)}>
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+              <XMarkIcon className="w-4 h-4" />
             </button>
+          }
+        >
+          <IslandRow
+            className="[&_.aster_island_row_text]:min-w-0"
+            label={<code className="font-mono text-[15px] text-txt-primary select-all break-all">{generated_password}</code>}
+            trailing={<Button variant="depth" size="sm" onClick={() => void handle_copy(generated_password)}>{t("copy")}</Button>}
+          />
+        </IslandSection>
+      )}
+
+      <IslandSection className="mb-6" description={t("passwords_subtitle")} title={t("passwords_new_section")}>
+        <IslandBlockRow>
+          <div className="flex gap-2 items-stretch">
+            <input
+              className="bridge_field flex-1 h-9 px-3 text-[15px] text-txt-primary placeholder-txt-muted focus:outline-none"
+              placeholder={t("password_label_placeholder")}
+              type="text"
+              value={new_password_label}
+              onChange={(e) => set_new_password_label(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handle_generate(); }}
+            />
+            <Button is_loading={generating} variant="depth" size="md" onClick={handle_generate}>
+              {t("generate")}
+            </Button>
           </div>
-          <div className="flex items-center gap-2">
-            <code className="bridge_field flex-1 text-sm font-mono text-txt-primary px-3 py-2 select-all">
-              {generated_password}
-            </code>
-            <button type="button" className="bridge_field h-9 w-9 flex items-center justify-center text-txt-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-edge-primary" aria-label={t("copy")} onClick={() => void handle_copy(generated_password)}>
-              <CopyIcon />
-            </button>
+          <div className="flex flex-wrap items-center gap-1.5 mt-3">
+            {["Thunderbird", "Outlook", "Apple Mail", "iPhone", "iPad", "Android"].map(s => (
+              <button
+                key={s}
+                type="button"
+                className="text-[13px] h-7 px-3 rounded-full bg-[var(--aster-field-bg)] text-txt-secondary transition-colors hover:bg-[var(--aster-field-hover)] hover:text-txt-primary"
+                onClick={() => set_new_password_label(s)}
+              >
+                {s}
+              </button>
+            ))}
           </div>
-          <p className="mt-2 text-xs text-txt-muted">{t("password_copy_hint")}</p>
-        </div>
-      )}
+        </IslandBlockRow>
+      </IslandSection>
 
-      <div className="flex gap-2 mb-2 items-stretch">
-        <input
-          className="bridge_field flex-1 h-9 px-3 text-sm text-txt-primary placeholder-txt-muted focus:outline-none"
-          placeholder={t("password_label_placeholder")}
-          type="text"
-          value={new_password_label}
-          onChange={(e) => set_new_password_label(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") handle_generate(); }}
-        />
-        <Button is_loading={generating} variant="depth" size="lg" onClick={handle_generate}>
-          {t("generate")}
-        </Button>
-      </div>
-      <div className="flex flex-wrap items-center gap-1.5 mb-4">
-        <span className="text-[11px] text-txt-muted">{t("label_quick")}</span>
-        {["Thunderbird", "Outlook", "Apple Mail", "iPhone", "iPad", "Android"].map(s => (
-          <button
-            key={s}
-            type="button"
-            className="text-[11px] px-2 py-0.5 rounded-full bg-[var(--aster-field-bg)] transition-colors hover:bg-[var(--aster-field-hover)]"
-            style={{ color: "var(--text-secondary)" }}
-            onClick={() => set_new_password_label(s)}
-          >
-            {s}
-          </button>
-        ))}
-      </div>
-
-      {passwords.length === 0 && !generated_password && (
-        <p className="text-sm text-txt-muted py-8 text-center">{t("no_passwords")}</p>
-      )}
-
-      {passwords.length > 0 && (
-        <div className="space-y-2">
-          {passwords.map((pw) => {
-            const last_used_label = pw.last_used_at
-              ? pw.last_client
-                ? t("last_used_from", { time: format_relative_time(pw.last_used_at), client: pw.last_client })
-                : t("last_used", { time: format_relative_time(pw.last_used_at) })
-              : t("never_used");
-            return (
-              <div key={pw.id} className="aster_island flex items-center justify-between p-3">
-                <div className="min-w-0 pe-3">
-                  <p className="text-sm font-medium text-txt-primary truncate">{pw.label}</p>
-                  <p className="text-[11px] text-txt-muted mt-0.5">{t("created_date", { date: format_date(pw.created_at) })}</p>
-                  <p className="text-[11px] text-txt-muted mt-0.5 truncate" title={last_used_label}>{last_used_label}</p>
-                </div>
-                <Button variant="outline" size="sm" onClick={() => set_delete_target(pw)}>{t("delete")}</Button>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <IslandSection className="mb-6" divided title={t("passwords_saved_section")}>
+        {passwords.length === 0 ? (
+          <IslandEmpty description={t("no_passwords_hint")} title={t("no_passwords")} />
+        ) : passwords.map((pw) => {
+          const last_used_label = pw.last_used_at
+            ? pw.last_client
+              ? t("last_used_from", { time: format_relative_time(pw.last_used_at), client: pw.last_client })
+              : t("last_used", { time: format_relative_time(pw.last_used_at) })
+            : t("never_used");
+          return (
+            <IslandRow
+              key={pw.id}
+              description={<span title={last_used_label}>{t("created_date", { date: format_date(pw.created_at) })} - {last_used_label}</span>}
+              label={pw.label}
+              trailing={<Button variant="secondary" size="sm" onClick={() => set_delete_target(pw)}>{t("delete")}</Button>}
+            />
+          );
+        })}
+      </IslandSection>
 
       <Modal open={!!delete_target} on_close={() => set_delete_target(null)}>
         <p className="text-base font-semibold text-txt-primary">{t("delete_password_title")}</p>
@@ -1756,14 +1718,6 @@ function PasswordsPanel({
         </ModalActions>
       </Modal>
     </div>
-  );
-}
-
-function StarIcon({ filled }: { filled: boolean }) {
-  return (
-    <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill={filled ? "currentColor" : "none"} stroke="currentColor" strokeWidth={1.8}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.5a.56.56 0 0 1 1.04 0l2.12 5.11a.56.56 0 0 0 .48.34l5.52.45c.5.04.7.66.32.99l-4.2 3.6a.56.56 0 0 0-.18.56l1.28 5.38a.56.56 0 0 1-.84.61l-4.72-2.88a.56.56 0 0 0-.59 0l-4.72 2.88a.56.56 0 0 1-.84-.61l1.28-5.38a.56.56 0 0 0-.18-.56l-4.2-3.6a.56.56 0 0 1 .32-.99l5.52-.45a.56.56 0 0 0 .48-.34L11.48 3.5Z" />
-    </svg>
   );
 }
 
@@ -1859,7 +1813,7 @@ function BuiltinTagsGroup() {
           </SettingRow>
           {creating === entry.slot && (
             <form
-              className="flex items-center gap-2 pb-3"
+              className="flex items-center gap-2 px-[var(--aster-island-row-pad-x)] pb-3"
               onSubmit={(e) => { e.preventDefault(); void create_label(entry.slot); }}
             >
               <input
@@ -1909,9 +1863,6 @@ function IdentitiesGroup() {
   const all_sending_off = enabled.length > 0 && enabled.every((i) => i.sending_disabled);
   if (identities !== null && enabled.length <= 1 && !all_sending_off) return null;
 
-  // The default send-from is the identity whose sender_id matches the stored
-  // preference; if none is stored or it no longer exists, the primary account
-  // address is the default.
   const primary = enabled.find((i) => i.kind === "primary");
   const resolved_default =
     enabled.find((i) => i.sender_id === default_sender)?.sender_id
@@ -1938,11 +1889,6 @@ function IdentitiesGroup() {
     }
   };
 
-  const kind_badge = (k: string) => {
-    if (k === "primary") return <Badge color="blue">{t("identity_primary")}</Badge>;
-    if (k === "custom_domain") return <Badge color="green">{t("identity_custom_domain")}</Badge>;
-    return <Badge color="gray">{t("identity_alias")}</Badge>;
-  };
 
   const q = query.trim().toLowerCase();
   const filtered = q ? enabled.filter((i) => i.address.toLowerCase().includes(q)) : enabled;
@@ -1957,74 +1903,68 @@ function IdentitiesGroup() {
   };
 
   return (
-    <section className="mb-6">
-      <div className="flex items-center justify-between gap-2 mb-1">
-        <h3 className="text-base font-semibold text-txt-primary flex items-center gap-2">
-          <span className="w-[18px] h-[18px] flex-shrink-0 text-txt-primary [&>svg]:w-full [&>svg]:h-full"><AtSymbolIcon /></span>
-          {t("section_send_addresses")}
-          {identities !== null && <span className="text-[13px] font-normal text-txt-muted">({enabled.length})</span>}
-        </h3>
-        {enabled.length > 3 && (
-          <button type="button" onClick={copy_all} className="text-[11px] font-medium text-txt-muted hover:text-txt-primary">
-            {t("copy_all")}
-          </button>
-        )}
-      </div>
-
+    <IslandSection
+      className="mb-6"
+      divided
+      footer={t("send_addresses_hint")}
+      title={identities !== null ? `${t("section_send_addresses")} (${enabled.length})` : t("section_send_addresses")}
+      trailing={enabled.length > 3 ? <Button variant="ghost" size="sm" onClick={copy_all}>{t("copy_all")}</Button> : undefined}
+    >
       {enabled.length > 6 && (
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => set_query(e.target.value)}
-          placeholder={t("search_addresses")}
-          className="bridge_field w-full mb-2 h-8 px-3 text-[13px] text-txt-primary placeholder-txt-muted focus:outline-none"
-        />
+        <IslandBlockRow>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => set_query(e.target.value)}
+            placeholder={t("search_addresses")}
+            className="bridge_field w-full h-9 px-3 text-[15px] text-txt-primary placeholder-txt-muted focus:outline-none"
+          />
+        </IslandBlockRow>
       )}
-
       {all_sending_off && (
-        <p role="status" className="text-[12px] text-txt-primary mb-2 leading-relaxed">{t("all_sending_off")}</p>
+        <IslandBlockRow>
+          <SettingNote tone="warning">{t("all_sending_off")}</SettingNote>
+        </IslandBlockRow>
       )}
-
-      <div>
-        {identities === null ? (
-          <div className="py-2 text-[13px] text-txt-muted">{t("loading")}</div>
-        ) : filtered.length === 0 ? (
-          <div className="py-2 text-[13px] text-txt-muted">{t("no_matching_addresses")}</div>
-        ) : (
-          filtered.map((id) => {
-            const is_primary = id.sender_id === resolved_default;
-            const star_label = is_primary
-              ? t("primary_send_from")
-              : id.sending_disabled
-                ? t("identity_sending_off_hint")
-                : t("set_as_primary");
-            return (
-              <div key={`${id.kind}:${id.address}`} className="flex items-center gap-2.5 py-2">
-                <button
-                  type="button"
-                  title={star_label}
-                  aria-label={star_label}
-                  aria-pressed={is_primary}
-                  disabled={is_primary || saving || id.sending_disabled}
-                  onClick={() => make_primary(id.sender_id)}
-                  className={`flex-shrink-0 inline-flex items-center justify-center w-9 h-9 -ml-2 ${is_primary ? "text-brand" : "text-txt-muted"} disabled:cursor-default`}
-                >
-                  <StarIcon filled={is_primary} />
-                </button>
-                <span className="flex-shrink-0">{kind_badge(id.kind)}</span>
-                {id.sending_disabled && (
-                  <span className="flex-shrink-0" title={t("identity_sending_off_hint")}>
-                    <Badge color="gray">{t("identity_sending_off")}</Badge>
-                  </span>
-                )}
-                <CopyValue value={id.address} />
-              </div>
-            );
-          })
-        )}
-      </div>
-      <p className="text-[12px] text-txt-muted mt-2 leading-relaxed">{t("send_addresses_hint")}</p>
-    </section>
+      {identities === null ? (
+        <IslandRow description={t("loading")} label={t("section_send_addresses")} />
+      ) : filtered.length === 0 ? (
+        <IslandEmpty title={t("no_matching_addresses")} />
+      ) : (
+        filtered.map((id) => {
+          const is_primary = id.sender_id === resolved_default;
+          const kind_text = id.kind === "primary" ? t("identity_primary") : id.kind === "custom_domain" ? t("identity_custom_domain") : t("identity_alias");
+          return (
+            <IslandRow
+              key={`${id.kind}:${id.address}`}
+              description={id.sending_disabled ? `${kind_text} - ${t("identity_sending_off")}` : kind_text}
+              label={<span className="truncate">{id.address}</span>}
+              trailing={
+                <div className="flex items-center gap-2">
+                  {is_primary ? (
+                    <span className="inline-flex items-center gap-1 text-[13px] text-txt-muted">
+                      <CheckIcon aria-hidden="true" className="w-3.5 h-3.5" />
+                      {t("identity_default")}
+                    </span>
+                  ) : (
+                    <Button
+                      disabled={saving || id.sending_disabled}
+                      size="sm"
+                      title={id.sending_disabled ? t("identity_sending_off_hint") : undefined}
+                      variant="secondary"
+                      onClick={() => make_primary(id.sender_id)}
+                    >
+                      {t("set_as_primary")}
+                    </Button>
+                  )}
+                  <CopyIconButton value={id.address} />
+                </div>
+              }
+            />
+          );
+        })
+      )}
+    </IslandSection>
   );
 }
 
@@ -2379,7 +2319,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
   return (
     <div className="p-6 mx-auto max-w-3xl">
-      <h2 className="text-base font-semibold text-txt-primary mb-4">{t("settings_title")}</h2>
+      <h2 className="text-[20px] font-semibold text-txt-primary mb-6">{t("settings_title")}</h2>
 
       <SettingsGroup title={t("section_general")} icon={<Cog6ToothIcon />}>
         <SettingRow label={t("launch_on_startup")} sublabel={t("launch_on_startup_hint")}>
@@ -2448,7 +2388,7 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={imap_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_imap_port(v); set_ports_dirty(true); }}
-            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
+            className="bridge_field w-20 h-8 px-2.5 text-[14px] text-txt-primary text-center font-mono"
           />
         </SettingRow>
         <SettingRow label={t("smtp_port")}>
@@ -2458,11 +2398,11 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
             pattern="[0-9]*"
             value={smtp_port}
             onChange={(e) => { const v = e.target.value.replace(/\D/g, ""); set_smtp_port(v); set_ports_dirty(true); }}
-            className="bridge_field w-20 h-8 px-2.5 text-sm text-txt-primary text-center font-mono"
+            className="bridge_field w-20 h-8 px-2.5 text-[14px] text-txt-primary text-center font-mono"
           />
         </SettingRow>
         {ports_dirty && (
-          <div className="flex justify-end py-2.5">
+          <div className="flex justify-end px-[var(--aster-island-row-pad-x)] py-3">
             <Button variant="depth" size="sm" is_loading={saving_ports} onClick={handle_save_ports}>
               {t("save")}
             </Button>
@@ -2473,19 +2413,19 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
       {outbox_items.length > 0 && (
         <SettingsGroup title={t("section_outbox")} icon={<PaperAirplaneIcon />} hint={t("auto_sync_note")}>
           {outbox_items.map((item) => (
-            <div key={item.id} className="flex items-start justify-between gap-3 py-3">
+            <div key={item.id} className="flex items-start justify-between gap-3 px-[var(--aster-island-row-pad-x)] py-[var(--aster-island-row-pad-y)]">
               <div className="min-w-0 flex-1">
-                <div className="text-[14px] text-txt-primary truncate">
+                <div className="text-[15px] text-txt-primary truncate">
                   {item.subject && item.subject.trim().length > 0 ? item.subject : t("no_subject")}
                 </div>
-                <div className="text-[12px] text-txt-muted truncate mt-0.5">
+                <div className="text-[13px] text-txt-muted truncate mt-0.5">
                   {t("outbox_to", { to: item.envelope_to || "-" })}
                 </div>
-                <div className="text-[12px] text-txt-muted mt-0.5">
+                <div className="text-[13px] text-txt-muted mt-0.5">
                   {t("outbox_status", { status: item.status, count: item.attempts })}
                 </div>
                 {item.last_error && (
-                  <div className="text-[12px] text-aster-danger mt-1 break-words">
+                  <div className="text-[13px] text-aster-danger mt-1 break-words">
                     {sanitize_error(item.last_error)}
                   </div>
                 )}
@@ -2521,9 +2461,9 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
           </Button>
         </SettingRow>
         {logs_open && (
-          <div className="py-3">
+          <div className="px-[var(--aster-island-row-pad-x)] py-3">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-txt-muted">{t("show_recent_logs")}</span>
+              <span className="text-[13px] font-medium text-txt-secondary">{t("show_recent_logs")}</span>
               <Button variant="ghost" size="sm" is_loading={logs_loading} onClick={handle_refresh_logs}>
                 {t("refresh")}
               </Button>
@@ -2545,8 +2485,8 @@ function SettingsPanel({ on_reset, conn_info, email, bridge_running }: { on_rese
 
       <SettingsGroup title={t("section_updates")} icon={<ArrowDownTrayIcon />}>
         {update_info && updates_supported() && (
-          <div className="py-3">
-            <div className="rounded-[var(--aster-radius-item,12px)] bg-brand/[0.07] p-3.5">
+          <div className="px-[var(--aster-island-row-pad-x)] py-3">
+            <div className="rounded-[var(--aster-radius-item,12px)] bg-[var(--aster-field-bg)] p-3.5">
               <UpdateCard
                 install={update_install_state}
                 notes={update_info.notes}
