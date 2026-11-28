@@ -188,6 +188,36 @@ pub fn handle_menu_action(app: &AppHandle, id: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn tray_icon_bytes(_app: &tauri::App) -> &'static [u8] {
+    include_bytes!("../icons/tray_template@2x.png")
+}
+
+#[cfg(target_os = "windows")]
+fn tray_icon_bytes(app: &tauri::App) -> &'static [u8] {
+    let scale = app
+        .handle()
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0);
+    if scale >= 1.75 {
+        include_bytes!("../icons/tray_32.png")
+    } else if scale >= 1.375 {
+        include_bytes!("../icons/tray_24.png")
+    } else if scale >= 1.125 {
+        include_bytes!("../icons/tray_20.png")
+    } else {
+        include_bytes!("../icons/tray_16.png")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn tray_icon_bytes(_app: &tauri::App) -> &'static [u8] {
+    include_bytes!("../icons/tray_32.png")
+}
+
 pub fn build_tray(app: &tauri::App) -> tauri::Result<tauri::tray::TrayIcon> {
     let status = MenuItem::with_id(app, "tray_status", "Bridge: Starting…", false, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle_bridge", "Start Bridge", false, None::<&str>)?;
@@ -215,11 +245,7 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<tauri::tray::TrayIcon> {
     items.push(&quit);
     let menu = Menu::with_items(app, &items)?;
 
-    #[cfg(target_os = "macos")]
-    let icon_bytes: &[u8] = include_bytes!("../icons/tray_template.png");
-    #[cfg(not(target_os = "macos"))]
-    let icon_bytes: &[u8] = include_bytes!("../icons/128x128.png");
-    let icon = tauri::image::Image::from_bytes(icon_bytes)?;
+    let icon = tauri::image::Image::from_bytes(tray_icon_bytes(app))?;
 
     let builder = TrayIconBuilder::with_id("aster-bridge")
         .icon(icon)
