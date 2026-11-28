@@ -325,8 +325,8 @@ export async function get_autostart_enabled(): Promise<boolean> {
   return s.autostart;
 }
 
-export async function set_autostart_enabled(enabled: boolean): Promise<void> {
-  return tauri_invoke("set_autostart", { enabled });
+export async function set_autostart_enabled(enabled: boolean): Promise<boolean> {
+  return tauri_invoke<boolean>("set_autostart", { enabled });
 }
 
 export async function set_close_to_tray(enabled: boolean): Promise<void> {
