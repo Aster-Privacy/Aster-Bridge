@@ -11,19 +11,27 @@
       (function () {
         try {
           var pref = "system";
+          var parsed = null;
+          var root_theme = null;
           var raw = localStorage.getItem("aster_bridge_theme_cache");
           if (raw) {
-            var parsed = JSON.parse(raw);
+            parsed = JSON.parse(raw);
             if (parsed && (parsed.theme === "light" || parsed.theme === "dark" || parsed.theme === "system")) {
               pref = parsed.theme;
             }
           }
+          var dark_only = ["purple", "green", "rose", "orange", "teal", "indigo", "amber", "cyan", "slate", "aster-blue", "lime", "fuchsia", "emerald", "pink", "black"];
           var is_dark = pref === "system"
             ? !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches)
             : pref === "dark";
+          if (parsed && dark_only.indexOf(parsed.color_theme) >= 0) {
+            is_dark = true;
+            root_theme = "theme-" + parsed.color_theme;
+          }
           var root = document.documentElement;
           if (is_dark) root.classList.add("dark");
           else root.classList.remove("dark");
+          if (root_theme) root.classList.add(root_theme);
           root.style.background = is_dark ? "#0a0a0a" : "#f5f5f5";
           if (parsed) {
             var scale = (typeof parsed.font_size_scale === "number" && parsed.font_size_scale > 0) ? parsed.font_size_scale : 15;

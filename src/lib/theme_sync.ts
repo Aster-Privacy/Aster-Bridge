@@ -35,6 +35,70 @@ const DEFAULT_CUSTOM_SEED = "#3b82f6";
 
 const CACHE_KEY = "aster_bridge_theme_cache";
 
+export const DARK_ONLY_COLOR_THEMES = [
+  "purple",
+  "green",
+  "rose",
+  "orange",
+  "teal",
+  "indigo",
+  "amber",
+  "cyan",
+  "slate",
+  "aster-blue",
+  "lime",
+  "fuchsia",
+  "emerald",
+  "pink",
+  "black",
+];
+
+const LIGHT_FOREGROUND = "#ffffff";
+const DARK_FOREGROUND = "#111827";
+const LARGE_TEXT_CONTRAST = 3;
+
+export function is_dark_only_color_theme(color_theme: unknown): boolean {
+  return typeof color_theme === "string" && DARK_ONLY_COLOR_THEMES.includes(color_theme);
+}
+
+function relative_luminance(hex: string): number {
+  const normalized = hex.replace("#", "");
+  const full = normalized.length === 3 ? normalized.split("").map((c) => c + c).join("") : normalized;
+  const value = parseInt(full, 16);
+  const channels = [(value >> 16) & 255, (value >> 8) & 255, value & 255].map((c) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+export function contrast_ratio(a: string, b: string): number {
+  const la = relative_luminance(a);
+  const lb = relative_luminance(b);
+
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+export function accent_foreground_for(accent: string): string {
+  if (!is_valid_hex_color(accent)) return LIGHT_FOREGROUND;
+
+  return contrast_ratio(accent, LIGHT_FOREGROUND) < LARGE_TEXT_CONTRAST ? DARK_FOREGROUND : LIGHT_FOREGROUND;
+}
+
+function resolved_accent_hex(): string {
+  const root = document.documentElement;
+  const inline = root.style.getPropertyValue("--accent-color").trim();
+  if (is_valid_hex_color(inline)) return inline;
+
+  if (typeof getComputedStyle === "function") {
+    const computed = getComputedStyle(root).getPropertyValue("--accent-color").trim();
+    if (is_valid_hex_color(computed)) return computed;
+  }
+
+  return DEFAULT_ACCENT;
+}
+
 const TOAST_POSITIONS = [
   "top",
   "bottom",
@@ -174,6 +238,10 @@ function resolve_is_dark(theme: ThemePreference): boolean {
   return theme === "system" ? system_is_dark() : theme === "dark";
 }
 
+export function resolve_appearance_is_dark(resolved: ResolvedPreferences): boolean {
+  return resolve_is_dark(resolved.theme) || is_dark_only_color_theme(resolved.color_theme);
+}
+
 function apply_color_theme(resolved: ResolvedPreferences, is_dark: boolean): void {
   const root = document.documentElement;
 
@@ -184,6 +252,7 @@ function apply_color_theme(resolved: ResolvedPreferences, is_dark: boolean): voi
   for (const cls of Array.from(root.classList)) {
     if (cls.startsWith("theme-")) root.classList.remove(cls);
   }
+  root.style.removeProperty("--accent-fg");
 
   const set_inline_accent = () => {
     root.style.setProperty("--accent-color", resolved.accent_color);
@@ -218,6 +287,8 @@ function apply_color_theme(resolved: ResolvedPreferences, is_dark: boolean): voi
       set_inline_accent();
     }
   }
+
+  root.style.setProperty("--accent-fg", accent_foreground_for(resolved_accent_hex()));
 }
 
 function apply_accessibility(resolved: ResolvedPreferences): void {
@@ -241,8 +312,11 @@ function apply_accessibility(resolved: ResolvedPreferences): void {
 export function apply_preferences(resolved: ResolvedPreferences): void {
   if (typeof document === "undefined") return;
 
-  const is_dark = resolve_is_dark(resolved.theme);
-  document.documentElement.classList.toggle("dark", is_dark);
+  const is_dark = resolve_appearance_is_dark(resolved);
+  const root = document.documentElement;
+  root.classList.toggle("dark", is_dark);
+  root.classList.toggle("light", !is_dark);
+  root.style.removeProperty("background");
   apply_color_theme(resolved, is_dark);
   apply_accessibility(resolved);
   set_toast_position(resolved.toast_position);
