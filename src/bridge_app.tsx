@@ -23,7 +23,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
-import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, AtSymbolIcon, TagIcon } from "@heroicons/react/24/outline";
+import { CheckIcon, XMarkIcon, InformationCircleIcon, ExclamationTriangleIcon, ArrowDownTrayIcon, SignalIcon, SignalSlashIcon, InboxArrowDownIcon, PaperAirplaneIcon, GlobeAltIcon, LockClosedIcon, Cog6ToothIcon, EnvelopeIcon, LifebuoyIcon, ServerStackIcon, WrenchScrewdriverIcon, AdjustmentsHorizontalIcon, UserGroupIcon, TagIcon } from "@heroicons/react/24/outline";
 import i18next from "./i18n";
 import * as api from "@/api";
 import type { ConnectionInfo, GuardPending, HistoryProgress, ImportProgress, InsecureSignIn, PortConflict, ProvisionBundle } from "@/api";
@@ -61,7 +61,6 @@ import {
   Modal,
   ModalBody,
   ModalActions,
-  Badge,
   IslandSection,
   IslandRow,
   IslandEmpty,
@@ -1041,7 +1040,7 @@ function SidebarNavButton({
       </span>
       <span className="flex-1 text-start">{label}</span>
       {badge != null && badge > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-aster-danger/15 text-aster-danger font-mono font-medium min-w-[18px] text-center">
+        <span className="text-[13px] text-txt-muted tabular-nums">
           {badge}
         </span>
       )}
@@ -1939,16 +1938,14 @@ function IdentitiesGroup() {
             <IslandRow
               key={`${id.kind}:${id.address}`}
               description={id.sending_disabled ? `${kind_text} - ${t("identity_sending_off")}` : kind_text}
-              icon={
-                <span className="w-10 h-10 rounded-full flex items-center justify-center bg-brand" style={{ color: "var(--accent-fg, #fff)" }}>
-                  <AtSymbolIcon className="w-5 h-5" />
-                </span>
-              }
               label={<span className="truncate">{id.address}</span>}
               trailing={
                 <div className="flex items-center gap-2">
                   {is_primary ? (
-                    <Badge color="blue">{t("identity_default")}</Badge>
+                    <span className="inline-flex items-center gap-1 text-[13px] text-txt-muted">
+                      <CheckIcon aria-hidden="true" className="w-3.5 h-3.5" />
+                      {t("identity_default")}
+                    </span>
                   ) : (
                     <Button
                       disabled={saving || id.sending_disabled}
