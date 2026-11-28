@@ -920,8 +920,8 @@ function SetupView({
       <div className="min-h-full flex items-center justify-center px-4 py-8">
         <div className="flex flex-col items-center w-full max-w-sm px-4">
           <div className="flex items-center gap-3">
-            <img alt="" className="w-12 h-12 select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
-            <span className="text-[26px] font-bold tracking-tight text-txt-primary">{t("app_name")}</span>
+            <img alt="" className="w-9 h-9 select-none" decoding="async" draggable={false} src="/bridge_mark.svg" />
+            <span className="text-[20px] font-semibold tracking-tight text-txt-primary">{t("app_name")}</span>
           </div>
 
           {state === "idle" && (
@@ -1111,11 +1111,11 @@ function Sidebar({
           className="w-full flex items-center gap-3 group"
           onClick={() => set_show_menu(!show_menu)}
         >
-          <div className="w-9 h-9 flex-shrink-0">
-            <img alt="" className="w-full h-full select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
+          <div className="w-7 h-7 flex-shrink-0">
+            <img alt="" className="w-full h-full select-none" decoding="async" draggable={false} src="/bridge_mark.svg" />
           </div>
           <div className="flex flex-col items-start min-w-0 flex-1">
-            <span className="text-[15px] font-semibold text-txt-primary">{t("app_name")}</span>
+            <span className="text-[14px] font-semibold leading-tight text-txt-primary">{t("app_name")}</span>
             <span className="text-[11px] truncate w-full text-start text-txt-muted">
               {display_name || email || t("not_connected")}
             </span>

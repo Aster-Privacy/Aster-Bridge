@@ -153,8 +153,8 @@ export function GuardPendingPanel({
       <div className="min-h-full flex items-center justify-center px-4 py-8">
         <div className="flex flex-col items-center w-full max-w-sm px-4">
           <div className="flex items-center gap-3">
-            <img alt="" className="w-12 h-12 select-none rounded-[var(--aster-radius-item)]" decoding="async" draggable={false} src="/mail_logo.webp" />
-            <span className="text-[26px] font-bold tracking-tight text-txt-primary">{t("app_name")}</span>
+            <img alt="" className="w-9 h-9 select-none" decoding="async" draggable={false} src="/bridge_mark.svg" />
+            <span className="text-[20px] font-semibold tracking-tight text-txt-primary">{t("app_name")}</span>
           </div>
           <h1 className="text-xl font-semibold mt-6 text-txt-primary text-center">{t("guard_pending_title")}</h1>
           <p className="text-sm mt-2 leading-relaxed text-txt-tertiary text-center">{t("guard_pending_body")}</p>

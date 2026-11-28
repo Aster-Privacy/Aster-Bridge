@@ -226,7 +226,7 @@ function ProgressRing({
           alt=""
           className="h-full w-full select-none"
           draggable={false}
-          src="/mail_logo.webp"
+          src="/bridge_mark.svg"
         />
       </motion.div>
       <AnimatePresence>
